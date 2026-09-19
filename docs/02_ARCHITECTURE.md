@@ -100,13 +100,15 @@ from __future__ import annotations
 from typing import Any, Literal, TypedDict
 from pydantic import BaseModel, Field
 
+
 class Step(BaseModel):
-    id: str                      # "s1", "s2", ...
-    tool: str                    # must exist in registry
-    args: dict[str, Any]         # validated against the tool's args model in `validate`
-    rationale: str               # short, user-visible
-    expect: str = ""             # human-readable success condition (used by verify + LLM replan)
-    depends_on_untrusted: bool = False   # set by the plan node if args derive from web/file text
+    id: str  # "s1", "s2", ...
+    tool: str  # must exist in registry
+    args: dict[str, Any]  # validated against the tool's args model in `validate`
+    rationale: str  # short, user-visible
+    expect: str = ""  # human-readable success condition (used by verify + LLM replan)
+    depends_on_untrusted: bool = False  # set by the plan node if args derive from web/file text
+
 
 class Plan(BaseModel):
     goal: str
@@ -114,38 +116,41 @@ class Plan(BaseModel):
     needs_clarification: bool = False
     clarification_question: str | None = None
 
+
 class Decision(BaseModel):
     step_id: str
-    tier: int                    # 0..3
-    allowed: bool                # False when Tier 3 or hard rule hit
+    tier: int  # 0..3
+    allowed: bool  # False when Tier 3 or hard rule hit
     needs_confirm: bool
     needs_unlock: bool
-    needs_typed_confirmation: str | None = None   # e.g. folder name to type
+    needs_typed_confirmation: str | None = None  # e.g. folder name to type
     reasons: list[str]
-    summary: str                 # exact text shown to the user
-    action_hash: str             # sha256(tool + canonical(args)); binds confirmation to this action
+    summary: str  # exact text shown to the user
+    action_hash: str  # sha256(tool + canonical(args)); binds confirmation to this action
+
 
 class StepResult(BaseModel):
     step_id: str
     ok: bool
-    output: str = ""             # short text for the LLM/user (truncated)
+    output: str = ""  # short text for the LLM/user (truncated)
     data: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     verified: bool | None = None
-    tainted: bool = False        # output contains untrusted external text
+    tainted: bool = False  # output contains untrusted external text
     duration_ms: int = 0
+
 
 class AgentState(TypedDict, total=False):
     task_id: str
     source: Literal["terminal", "voice", "benchmark"]
     user_input: str
-    memory_context: list[dict]           # retrieved skills/failures/preferences (examples only)
+    memory_context: list[dict]  # retrieved skills/failures/preferences (examples only)
     plan: Plan | None
     step_index: int
-    decisions: dict[str, Decision]       # by step_id
-    approved_hashes: list[str]           # action hashes the user approved (this task only)
+    decisions: dict[str, Decision]  # by step_id
+    approved_hashes: list[str]  # action hashes the user approved (this task only)
     results: list[StepResult]
-    retry_count: int                     # for current step
+    retry_count: int  # for current step
     replan_count: int
     api_calls: int
     tokens: int
@@ -226,7 +231,9 @@ that need a password open a small tkinter dialog on the user's desktop (topmost)
 
 ```python
 class LLMClient(Protocol):
-    def structured(self, *, system: str, user: str, schema: type[BaseModel], model_role: str = "planner") -> tuple[BaseModel, Usage]: ...
+    def structured(
+        self, *, system: str, user: str, schema: type[BaseModel], model_role: str = "planner"
+    ) -> tuple[BaseModel, Usage]: ...
     def text(self, *, system: str, user: str, model_role: str = "fast") -> tuple[str, Usage]: ...
 ```
 - Roles map to model names in `config.toml` (`planner`, `fast`, `vision`). Defaults must be verified against current provider docs.

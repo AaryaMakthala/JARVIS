@@ -73,7 +73,8 @@ class RiskClassifier:
     def predict(self, step: Step, user_input: str, tainted: bool) -> tuple[Label, float]: ...
     def min_tier(self, step, user_input, tainted) -> int:
         label, p = self.predict(...)
-        if p < self.threshold: label = more_severe(label)
+        if p < self.threshold:
+            label = more_severe(label)
         return {"safe": 0, "sensitive": 1, "dangerous": 2}[label]
 ```
 - Load lazily with `onnxruntime` (CPU provider) and the `tokenizers`/`transformers` tokenizer only (avoid importing torch at runtime).

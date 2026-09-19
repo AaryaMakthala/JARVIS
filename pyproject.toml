@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-agent"
+version = "0.1.0"
+description = "JARVIS - safe Windows desktop AI agent (final year project)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  # core
+  "pydantic>=2",
+  "pydantic-settings",
+  "platformdirs",
+  "tomli-w",
+  "pyyaml",
+  "typer",
+  "rich",
+  "httpx",
+  # agent
+  "langgraph",
+  "langgraph-checkpoint-sqlite",
+  "langchain-core",
+  "groq",
+  # security / os
+  "keyring",
+  "argon2-cffi",
+  "send2trash",
+  "psutil",
+  "pywin32; sys_platform == 'win32'",
+  "pywinauto; sys_platform == 'win32'",
+  "pyautogui",
+  "pyperclip",
+  # web + memory
+  "ddgs",
+  "numpy",
+  "fastembed",
+]
+
+[project.optional-dependencies]
+gemini = ["langchain-google-genai"]
+voice = ["sounddevice", "openwakeword", "faster-whisper", "piper-tts", "pyttsx3"]
+browser = ["playwright"]
+ml = ["onnxruntime", "tokenizers", "optimum"]
+dev = ["pytest", "pytest-asyncio", "pytest-cov", "hypothesis", "ruff", "mypy", "types-PyYAML"]
+
+[project.scripts]
+jarvis = "jarvis.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = ["windows_only", "voice", "slow"]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+files = ["src/jarvis"]
+
+[[tool.mypy.overrides]]
+module = "jarvis.policy.*"
+strict = true

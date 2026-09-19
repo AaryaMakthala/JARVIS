@@ -1,4 +1,3 @@
-@"
 # Environment and secrets
 .env
 .env.*
@@ -15,15 +14,48 @@ env/
 # Testing / coverage
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
+coverage.xml
+
+# Databases and local runtime data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+daemon.json
 
 # Logs
 *.log
+logs/
+
+# Reports / benchmark artifacts / browser profile
+reports/
+benchmarks/results/
+benchmarks/sandbox/
+browser_profile/
+
+# Training data (may contain private content)
+training/data/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Models (large binaries; ship via release downloads / LFS)
+*.onnx
+
+# Caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
 
 # OS files
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # VS Code local settings
 .vscode/
-"@ | Set-Content .gitignore

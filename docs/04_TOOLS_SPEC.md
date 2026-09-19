@@ -5,15 +5,17 @@
 ```python
 from pydantic import BaseModel
 
+
 class ToolResult(BaseModel):
     ok: bool
-    output: str = ""              # short, user-readable, <= 4 KB
-    data: dict = {}               # structured details (paths, urls, counts)
+    output: str = ""  # short, user-readable, <= 4 KB
+    data: dict = {}  # structured details (paths, urls, counts)
     error: str | None = None
-    tainted: bool = False         # output contains untrusted external text
+    tainted: bool = False  # output contains untrusted external text
     verified: bool | None = None  # filled by verify()
 
-class ToolContext(BaseModel):     # dependency container passed to every tool
+
+class ToolContext(BaseModel):  # dependency container passed to every tool
     settings: Settings
     dry_run: bool
     cancel: CancelToken
@@ -22,16 +24,22 @@ class ToolContext(BaseModel):     # dependency container passed to every tool
     logger: logging.Logger
     # (not pydantic in reality; use a dataclass with arbitrary types)
 
-class ToolSpec:                   # one per tool
-    name: str                     # snake_case, unique
-    description: str              # shown to the planner LLM (1-2 sentences, precise)
-    args_model: type[BaseModel]   # Pydantic; path args use PathStr type so the policy engine can find them
-    base_tier: int               # 0..2 (3 is never a registered tool)
+
+class ToolSpec:  # one per tool
+    name: str  # snake_case, unique
+    description: str  # shown to the planner LLM (1-2 sentences, precise)
+    args_model: type[
+        BaseModel
+    ]  # Pydantic; path args use PathStr type so the policy engine can find them
+    base_tier: int  # 0..2 (3 is never a registered tool)
     windows_only: bool
     timeout_s: int
+
     def run(self, args, ctx) -> ToolResult: ...
-    def verify(self, args, result, ctx) -> ToolResult: ...   # post-condition check; may poll up to N seconds
-    def describe(self, args) -> str: ...                     # canonical summary used in confirmations
+    def verify(
+        self, args, result, ctx
+    ) -> ToolResult: ...  # post-condition check; may poll up to N seconds
+    def describe(self, args) -> str: ...  # canonical summary used in confirmations
 ```
 
 **Registry rules**

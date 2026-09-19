@@ -41,28 +41,45 @@ Final tier = `max(tool.base_tier, rule_tier, classifier_min_tier, taint_escalati
 
 ```python
 def decide(step: Step, ctx: PolicyContext) -> Decision:
-    spec = registry.get(step.tool)                    # unknown tool -> Decision(allowed=False, tier=3, reasons=["unknown tool"])
+    spec = registry.get(
+        step.tool
+    )  # unknown tool -> Decision(allowed=False, tier=3, reasons=["unknown tool"])
     args = spec.args_model.model_validate(step.args)  # invalid args -> not allowed
     tier = spec.base_tier
     reasons = []
 
     # 1. hard blocks (Tier 3)
-    if rules.matches_blocked(spec, args): return blocked(...)
+    if rules.matches_blocked(spec, args):
+        return blocked(...)
     # 2. path rules (for any arg typed as PathArg)
     for p in spec.path_args(args):
-        rp = paths.resolve_safe(p)                    # absolute, real path, junction-aware
-        if paths.is_protected(rp): return blocked(...)
-        if not paths.within_allowed_roots(rp): return blocked(...)   # v1: outside roots = blocked
-        tier = max(tier, rules.path_tier(spec, rp))   # e.g. overwrite existing -> 1, folder delete -> 2
+        rp = paths.resolve_safe(p)  # absolute, real path, junction-aware
+        if paths.is_protected(rp):
+            return blocked(...)
+        if not paths.within_allowed_roots(rp):
+            return blocked(...)  # v1: outside roots = blocked
+        tier = max(
+            tier, rules.path_tier(spec, rp)
+        )  # e.g. overwrite existing -> 1, folder delete -> 2
     # 3. tool-specific rules (URL scheme allowlist, WhatsApp contact must exist, recipient count == 1, …)
     tier = max(tier, rules.tool_tier(spec, args, ctx))
     # 4. taint escalation
-    if step.depends_on_untrusted and tier >= 1: tier = max(tier, 1); reasons.append("derived from untrusted content"); warn=True
+    if step.depends_on_untrusted and tier >= 1:
+        tier = max(tier, 1)
+        reasons.append("derived from untrusted content")
+        warn = True
     # 5. optional ML classifier (Phase 8): can only raise
     tier = max(tier, ctx.classifier.min_tier(step) if ctx.classifier else 0)
     # 6. build summary from canonical args (NOT from LLM rationale), compute action_hash
-    return Decision(tier=tier, allowed=tier < 3, needs_confirm=tier >= 1,
-                    needs_unlock=tier >= 2, needs_typed_confirmation=..., summary=..., action_hash=...)
+    return Decision(
+        tier=tier,
+        allowed=tier < 3,
+        needs_confirm=tier >= 1,
+        needs_unlock=tier >= 2,
+        needs_typed_confirmation=...,
+        summary=...,
+        action_hash=...,
+    )
 ```
 
 The **summary shown to the user is generated from the validated args**, not from LLM prose, so the LLM cannot mislead the user about what will run.
