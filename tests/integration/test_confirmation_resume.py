@@ -41,6 +41,7 @@ def test_approve_runs_verifies_and_reports(tmp_path: Any) -> None:
             "summary": "fake_echo text='hi'",
             "needs_unlock": False,
             "typed_confirmation": None,
+            "resolved_paths": [],
             "action_hash": first.confirmation["action_hash"],
             "untrusted": False,
         }

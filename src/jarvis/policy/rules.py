@@ -6,12 +6,17 @@ output or untrusted content (docs/03_SECURITY_AND_POLICY.md sections 3-4).
 
 Phase 1 scope: hard-block names, URL-scheme allowlist, unknown app names, and
 an overwrite-warning rule for ``create_file``.
+
+Phase 2 adds: an exact-name exemption so the sanctioned ``delete_path`` and
+``undo_last_delete`` tools are not caught by the ``delete``/``rm`` name
+fragments below, and the typed folder-name confirmation rule for deletes.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 from jarvis.config import Settings
@@ -44,15 +49,24 @@ BLOCKED_NAME_FRAGMENTS = (
     "rm",
 )
 
+#: The ONLY tool names allowed to contain a ``BLOCKED_NAME_FRAGMENT``.  These
+#: are the deliberately destructive tools, each exhaustively hardened and
+#: tested (Recycle-Bin only + undo log + Tier 2 + typed confirmation for
+#: folders).  Any other future tool named ``*delete*`` stays hard-blocked.
+_SANCTIONED_TOOLS = frozenset({"delete_path", "undo_last_delete"})
+
 _URL_MAX = 2083
 
 
 def matches_blocked(spec: ToolSpec, args: Any) -> bool:
     """Return ``True`` when this exact (tool, args) pair is hard-blocked.
 
-    A tool name containing a blocked fragment is refused regardless of args.
+    A tool name containing a blocked fragment is refused regardless of args -
+    except for the few names in :data:`_SANCTIONED_TOOLS`.
     """
     name = spec.name.lower()
+    if name in _SANCTIONED_TOOLS:
+        return False
     return any(fragment in name for fragment in BLOCKED_NAME_FRAGMENTS)
 
 
@@ -79,10 +93,31 @@ def tool_tier(spec: ToolSpec, args: Any) -> int:
 
 
 def path_tier(spec: ToolSpec, resolved_path: str, args: Any) -> int:
-    """Return any extra tier for a resolved path (v1: overwrite rule)."""
+    """Return any extra tier for a resolved path."""
     if spec.name == "create_file" and getattr(args, "overwrite", False):
         return tiers.TIER_CONFIRM  # overwrite only ever needs Tier 1 here
+    if spec.name == "delete_path":
+        # Deleting a folder is Tier 2 regardless (base) and the engine adds a
+        # typed folder-name confirmation (typed_confirmation()).  A plain file
+        # delete stays at base_tier 2.
+        return tiers.TIER_CONFIRM
     return tiers.TIER_SAFE
+
+
+def typed_confirmation(spec: ToolSpec, resolved_paths: list[str], settings: Settings) -> str | None:
+    """Return the text the user must type to confirm folder deletes, else None.
+
+    Folder deletion is the least reversible action we offer, so when enabled
+    the user must type the folder names(s) from the summary instead of a bare
+    yes/no (docs/04_TOOLS_SPEC.md ``delete_path``).  The confirmation is bound
+    to the exact folder names, re-checked on resume by the policy gate.
+    """
+    if spec.name != "delete_path":
+        return None
+    if settings is not None and not settings.policy.typed_confirmation_for_folders:
+        return None
+    names = sorted(Path(p).name for p in resolved_paths if Path(p).is_dir())
+    return ", ".join(names) if names else None
 
 
 def overwrite_warning(spec: ToolSpec, args: Any) -> str | None:

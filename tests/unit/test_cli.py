@@ -54,16 +54,103 @@ def test_status_stub() -> None:
     assert "Phase 3" in result.output
 
 
-def test_password_set_stub_reports_phase_2() -> None:
-    result = runner.invoke(cli.app, ["password", "set"])
-    assert result.exit_code == 2
-    assert "Phase 2" in result.output
+def test_password_set_cli_non_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = FakeStore()
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+    monkeypatch.setattr(cli.config, "load_settings", lambda: cli.config.Settings())
+    result = runner.invoke(
+        cli.app,
+        [
+            "password",
+            "set",
+            "--password",
+            "s3cure-pass-9",
+            "--confirm-password",
+            "s3cure-pass-9",
+            "--non-interactive",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "password set" in result.output.lower()
+    assert "s3cure-pass-9" not in result.output  # never echoed
+    stored = store.get("password_hash")
+    assert stored and stored.startswith("$argon2id$")
 
 
-def test_password_change_stub_reports_phase_2() -> None:
-    result = runner.invoke(cli.app, ["password", "change"])
-    assert result.exit_code == 2
-    assert "Phase 2" in result.output
+def test_password_set_cli_requires_current_when_hash_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+    manager = cli.UnlockManager(store)
+    manager.set_password("old-pass-1234")
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+    monkeypatch.setattr(cli.config, "load_settings", lambda: cli.config.Settings())
+    result = runner.invoke(
+        cli.app,
+        [
+            "password",
+            "set",
+            "--password",
+            "new-pass-5678",
+            "--confirm-password",
+            "new-pass-5678",
+            "--non-interactive",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "current password" in result.output.lower()
+    assert manager.verify("old-pass-1234") is True  # old hash untouched
+
+
+def test_password_change_cli_non_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = FakeStore()
+    manager = cli.UnlockManager(store)
+    manager.set_password("old-pass-1234")
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+    monkeypatch.setattr(cli.config, "load_settings", lambda: cli.config.Settings())
+    result = runner.invoke(
+        cli.app,
+        [
+            "password",
+            "change",
+            "--current-password",
+            "old-pass-1234",
+            "--password",
+            "new-pass-5678",
+            "--confirm-password",
+            "new-pass-5678",
+            "--non-interactive",
+        ],
+    )
+    assert result.exit_code == 0
+    assert manager.verify("new-pass-5678") is True
+    assert manager.verify("old-pass-1234") is False
+
+
+def test_lock_and_unlock_command_contract() -> None:
+    manager = cli.UnlockManager(FakeStore())
+    manager.set_password("long-pass-9000")
+    assert cli.lock_command(manager) == "JARVIS session locked"
+    assert manager.is_unlocked() is False
+    message = cli.unlock_command(manager, password="long-pass-9000", interactive=False)
+    assert message.startswith("JARVIS session unlocked")
+    assert manager.is_unlocked() is True
+    with pytest.raises(ValueError):
+        cli.unlock_command(manager, password="wrong", interactive=False)
+
+
+def test_confirmation_answer_never_carries_a_password() -> None:
+    answer = cli._confirmation_answer(True, {"action_hash": "h" * 64, "tier": 2}, "Reports")
+    assert answer == {
+        "approved": True,
+        "action_hash": "h" * 64,
+        "typed_confirmation": "Reports",
+    }
+    assert "password" not in answer
+    assert set(cli._confirmation_answer(True, {"action_hash": "x"}, None)) == {
+        "approved",
+        "action_hash",
+    }
 
 
 def test_doctor_full_pass_directory() -> None:

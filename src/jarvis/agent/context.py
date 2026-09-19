@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from jarvis.config import Settings, load_settings
 from jarvis.llm.client import LLMClient
@@ -31,6 +33,8 @@ class AppContext:
     dry_run: bool = False
     cancel: CancelToken = field(default_factory=CancelToken)
     logger: logging.Logger = field(default_factory=lambda: get_logger("agent"))
+    trash: Any | None = None  # TrashService | None (defaults to the real recycle bin)
+    undo_log: Path | None = None  # override for the undo log path (tests)
 
     def tool_context(self) -> ToolContext:
         """Build a ToolContext for the current step (no secret leaks)."""
@@ -41,6 +45,9 @@ class AppContext:
             llm=self.llm,
             memory=None,
             logger=self.logger,
+            trash=self.trash,
+            unlock=self.unlock,
+            undo_log=self.undo_log,
         )
 
 
@@ -52,6 +59,8 @@ def make_app_context(
     unlock: UnlockManager | None = None,
     classifier: RiskClassifier | None = None,
     dry_run: bool = False,
+    trash: Any | None = None,
+    undo_log: Path | None = None,
 ) -> AppContext:
     """Build a ready-to-use :class:`AppContext` with defaults."""
     settings = settings or load_settings()
@@ -69,4 +78,6 @@ def make_app_context(
         unlock=unlock,
         classifier=classifier,
         dry_run=dry_run,
+        trash=trash,
+        undo_log=undo_log,
     )

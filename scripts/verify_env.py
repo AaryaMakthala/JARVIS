@@ -290,6 +290,46 @@ def check_argon2() -> None:
         )
 
 
+def check_recycle_bin() -> None:
+    """Send2trash round-trip into the real Recycle Bin (WARN on odd setups)."""
+    if not IS_WIN:
+        add("recycle bin (send2trash)", "SKIP", "Windows-only", "", 2)
+        return
+    import tempfile
+    from pathlib import Path
+
+    probe = Path(tempfile.mkstemp(prefix="jarvis_probe_", suffix=".txt")[1])
+    try:
+        probe.write_text("jarvis env probe", encoding="utf-8")
+        import send2trash
+
+        send2trash.send2trash(str(probe))
+        if probe.exists():
+            add(
+                "recycle bin (send2trash)",
+                "FAIL",
+                "file still exists after send2trash",
+                "Check antivirus policies; Restore/MoveToRecycleBin may be disabled",
+                2,
+            )
+        else:
+            add("recycle bin (send2trash)", "PASS", "delete -> Recycle Bin works", "", 2)
+    except Exception as e:  # noqa: BLE001
+        add(
+            "recycle bin (send2trash)",
+            "WARN",
+            f"{type(e).__name__}: {e}",
+            "During the demo, deletes still go through 'Recycle Bin' - investigate before the viva",
+            2,
+        )
+    finally:
+        try:
+            if probe.exists():
+                probe.unlink()
+        except OSError:
+            pass
+
+
 def check_windows_tools() -> None:
     if not IS_WIN:
         for n in ("schtasks", "powershell", "winget", "WhatsApp desktop"):
@@ -438,6 +478,7 @@ def main() -> int:
     check_keyring()
     check_argon2()
     check_windows_tools()
+    check_recycle_bin()
     check_audio()
     if a.live:
         check_live_groq()

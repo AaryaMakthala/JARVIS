@@ -69,6 +69,9 @@ class ToolContext:
     memory: Any | None = None
     logger: logging.Logger | None = None
     scratch_dir: Path | None = None
+    trash: Any | None = None  # TrashService | None (defaults to the real recycle bin)
+    unlock: Any | None = None  # UnlockManager | None (shared with the policy engine)
+    undo_log: Path | None = None  # override for the undo log path (tests)
 
 
 ArgsModel = type[BaseModel]
@@ -139,12 +142,18 @@ class ToolSpec:
         return result
 
     def path_arg_values(self, args: BaseModel) -> list[tuple[str, str]]:
-        """Return (name, raw string) for every declared path argument."""
+        """Return (name, raw string) for every declared path argument.
+
+        A field may be a single path string or a list of them (delete_path);
+        every element is yielded so the engine checks all of them.
+        """
         values: list[tuple[str, str]] = []
         for name in self.path_args:
             value = getattr(args, name, None)
             if isinstance(value, str):
                 values.append((name, value))
+            elif isinstance(value, list):
+                values.extend((name, item) for item in value if isinstance(item, str))
         return values
 
 

@@ -46,6 +46,7 @@ class Decision(BaseModel):
     needs_confirm: bool
     needs_unlock: bool
     needs_typed_confirmation: str | None = None  # e.g. folder name to type
+    resolved_paths: list[str] = Field(default_factory=list)  # real paths the gate saw
     reasons: list[str] = Field(default_factory=list)
     summary: str  # exact text shown to the user
     action_hash: str  # sha256(tool + canonical(args)); binds approval to action
@@ -90,6 +91,7 @@ class AgentState(TypedDict, total=False):
     error: str | None
     # operational (Phase 1)
     validate_attempts: int
+    gated_resolved_paths: dict[str, list[str]]  # step_id -> pre-interrupt resolved paths (TOCTOU)
     halted_reason: str | None
     retry_now: bool | None
 

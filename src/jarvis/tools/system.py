@@ -117,3 +117,45 @@ def make_system_info_spec() -> ToolSpec:
         verify=_verify_system_info,
         describe=_describe_system_info,
     )
+
+
+class LockJarvisArgs(BaseModel):
+    """Lock the current JARVIS session (no further Tier-2 actions)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def _run_lock_jarvis(args: LockJarvisArgs, ctx: ToolContext) -> ToolResult:
+    del args
+    if ctx.unlock is None:
+        return ToolResult(ok=False, error="no unlock manager available in this session")
+    ctx.unlock.lock()
+    return ToolResult(
+        ok=True, output="JARVIS session locked (Tier 2 actions now refused)", data={"locked": True}
+    )
+
+
+def _verify_lock_jarvis(args: LockJarvisArgs, result: ToolResult, ctx: ToolContext) -> ToolResult:
+    del args
+    if ctx.unlock is None:
+        return result.model_copy(update={"verified": False})
+    locked = not ctx.unlock.is_unlocked()
+    return result.model_copy(update={"verified": bool(locked)})
+
+
+def make_lock_jarvis_spec() -> ToolSpec:
+    """Build the ``lock_jarvis`` tool (Tier 0; locking is harmless)."""
+    return ToolSpec(
+        name="lock_jarvis",
+        description=(
+            "Lock the JARVIS session: after this, Tier-2 actions (deletes, "
+            "anything requiring the password) are refused until the password "
+            "is entered again. Safe to call at any time."
+        ),
+        args_model=LockJarvisArgs,
+        base_tier=0,
+        timeout_s=10,
+        run=_run_lock_jarvis,
+        verify=_verify_lock_jarvis,
+        describe=lambda args: "Lock the JARVIS session",
+    )

@@ -8,12 +8,16 @@ that fails (verification failure) while the action itself "succeeded".
 
 from __future__ import annotations
 
+import secrets
+import shutil
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from jarvis.agent.state import Plan, Step
 from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
+from jarvis.tools.files import TrashRecord
 from jarvis.tools.registry import ToolRegistry
 
 
@@ -66,7 +70,11 @@ def echo_plan(text: str = "hi") -> Plan:
 
 def approve(confirmation: dict[str, Any]) -> dict[str, Any]:
     """A user answer that approves the exact confirmation payload."""
-    return {"approved": True, "action_hash": confirmation["action_hash"]}
+    return {
+        "approved": True,
+        "action_hash": confirmation["action_hash"],
+        "resolved_paths": list(confirmation.get("resolved_paths", [])),
+    }
 
 
 def deny(confirmation: dict[str, Any]) -> dict[str, Any]:
@@ -77,3 +85,70 @@ def deny(confirmation: dict[str, Any]) -> dict[str, Any]:
 def tamper(confirmation: dict[str, Any]) -> dict[str, Any]:
     """A user answer whose action_hash does not match the payload."""
     return {"approved": True, "action_hash": "0" * 64}
+
+
+def approve_typed(confirmation: dict[str, Any], typed: str) -> dict[str, Any]:
+    """An approval that also types the required folder-name confirmation."""
+    return approve(confirmation) | {"typed_confirmation": typed}
+
+
+def delete_plan(step_id: str = "s1", paths: list[str] | None = None) -> Plan:
+    """A single-step plan that calls the real ``delete_path`` tool."""
+    return Plan(
+        goal="delete the given paths to the Recycle Bin",
+        steps=[
+            Step(
+                id=step_id,
+                tool="delete_path",
+                args={"paths": list(paths or [])},
+                rationale="delete the given paths (reversible)",
+            )
+        ],
+    )
+
+
+class FakeDirTrash:
+    """TrashService that keeps items in a test folder instead of the OS Bin.
+
+    Implements the same :class:`TrashService` contract (``send`` / ``restore``)
+    as the real recycle bin so the delete/undo logic can be tested without ever
+    touching ``$Recycle.Bin``.  ``send`` records the sha256 of the moved copy,
+    exactly like the real implementation on Windows.
+    """
+
+    def __init__(self, root: Path) -> None:
+        from jarvis.tools.files import _describe_target
+
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._describe_target = _describe_target
+
+    def send(self, path: Path) -> TrashRecord:
+        dest = self.root / secrets.token_hex(8)
+        try:
+            shutil.move(str(path), str(dest))
+        except OSError as exc:
+            return TrashRecord(
+                original_path=str(path), kind="file", size=0, item_count=0, error=str(exc)
+            )
+        kind, size, count, digest = self._describe_target(dest)
+        return TrashRecord(
+            original_path=str(path.resolve(strict=False)),
+            kind=kind,
+            size=size,
+            item_count=count,
+            sha256=digest,
+            recycled_path=str(dest),
+        )
+
+    def restore(self, record: TrashRecord) -> bool:
+        src = Path(record.recycled_path) if record.recycled_path else None
+        if src is None or not src.exists():
+            return False
+        try:
+            target = Path(record.original_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(target))
+        except OSError:
+            return False
+        return Path(record.original_path).exists()

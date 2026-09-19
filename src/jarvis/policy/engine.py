@@ -79,7 +79,7 @@ class PolicyEngine:
 
         tier = spec.base_tier
         reasons: list[str] = []
-        blocked: str | None = None
+        resolved_paths: list[str] = []
 
         if rules.matches_blocked(spec, args):
             # Hard block: treat exactly like an unknown/invalid step - Tier 3,
@@ -90,22 +90,32 @@ class PolicyEngine:
                 spec.describe(args),
             )
 
-        # Path rules: apply to every declared path argument.
-        if blocked is None:
-            roots = paths.roots_from_settings(ctx.settings)
-            for name, raw in spec.path_arg_values(args):
-                try:
-                    resolved = paths.resolve_safe(raw)
-                except paths.PathError as exc:
-                    blocked = f"bad path in argument {name!r}: {exc}"
-                    break
-                if paths.is_protected(resolved):
-                    blocked = f"path is protected: {resolved}"
-                    break
-                if not paths.within_any_root(resolved, roots):
-                    blocked = f"path is outside the allowed folders: {resolved}"
-                    break
-                tier = max(tier, rules.path_tier(spec, str(resolved), args))
+        # Path rules: apply to every declared path argument.  Every resolved
+        # path is recorded so act() can re-check nothing changed after the
+        # confirmation (TOCTOU, docs/03 section 5 T4).  Every rule failure is a
+        # hard block (Tier 3) with its reason recorded on the Decision.
+        roots = paths.roots_from_settings(ctx.settings)
+        for name, raw in spec.path_arg_values(args):
+            try:
+                resolved = paths.resolve_safe(raw)
+            except paths.PathError as exc:
+                return _blocked(step, [f"bad path in argument {name!r}: {exc}"], str(exc))
+            if paths.is_protected(resolved):
+                return _blocked(step, [f"path is protected: {resolved}"], str(resolved))
+            if not paths.within_any_root(resolved, roots):
+                return _blocked(
+                    step,
+                    [f"path is outside the allowed folders: {resolved}"],
+                    f"outside allowed folders: {resolved}",
+                )
+            if spec.name == "delete_path" and paths.covers_any_root(resolved, roots):
+                return _blocked(
+                    step,
+                    [f"refusing to delete an allowed folder (or an ancestor of one): {resolved}"],
+                    f"refusing to delete an allowed folder: {resolved}",
+                )
+            resolved_paths.append(str(resolved))
+            tier = max(tier, rules.path_tier(spec, str(resolved), args))
 
         tier = max(tier, rules.tool_tier(spec, args))
 
@@ -116,12 +126,14 @@ class PolicyEngine:
         if ctx.classifier is not None:
             tier = max(tier, ctx.classifier.min_tier(step))
 
-        allowed = _matches(blocked, tier)
+        allowed = tier < tiers.TIER_BLOCKED
 
         summary = spec.describe(args)
         overwrite = rules.overwrite_warning(spec, args)
         if overwrite:
             summary = f"{summary} ({overwrite})"
+
+        typed = rules.typed_confirmation(spec, resolved_paths, ctx.settings)
 
         return Decision(
             step_id=step.id,
@@ -129,12 +141,9 @@ class PolicyEngine:
             allowed=allowed,
             needs_confirm=tier >= tiers.TIER_CONFIRM,
             needs_unlock=tier >= tiers.TIER_CONFIRM_UNLOCK,
-            needs_typed_confirmation=None,
+            needs_typed_confirmation=typed,
+            resolved_paths=resolved_paths,
             reasons=reasons,
             summary=summary,
             action_hash=rules.action_hash(spec, args),
         )
-
-
-def _matches(blocked: str | None, tier: int) -> bool:
-    return tier < tiers.TIER_BLOCKED and blocked is None

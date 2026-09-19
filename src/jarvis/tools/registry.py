@@ -87,15 +87,22 @@ class ToolRegistry:
 
 
 def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
-    """Register the Phase 1 minimum tool set.
+    """Register the Phase 2 minimum tool set.
 
     ``settings`` is accepted for forward compatibility (aliases, platform
     choices) but not currently read.
     """
     _ = settings
     from jarvis.tools.apps import make_open_app_spec
-    from jarvis.tools.files import make_create_file_spec
-    from jarvis.tools.system import make_system_info_spec
+    from jarvis.tools.files import (
+        make_append_file_spec,
+        make_create_file_spec,
+        make_delete_path_spec,
+        make_list_dir_spec,
+        make_read_file_spec,
+        make_undo_last_delete_spec,
+    )
+    from jarvis.tools.system import make_lock_jarvis_spec, make_system_info_spec
     from jarvis.tools.web import make_google_search_spec, make_open_url_spec
 
     registry = ToolRegistry()
@@ -104,7 +111,13 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_open_url_spec(),
         make_google_search_spec(),
         make_system_info_spec(),
+        make_lock_jarvis_spec(),
         make_create_file_spec(),
+        make_append_file_spec(),
+        make_list_dir_spec(),
+        make_read_file_spec(),
+        make_delete_path_spec(),
+        make_undo_last_delete_spec(),
     ):
         registry.register(spec)
     return registry

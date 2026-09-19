@@ -42,6 +42,17 @@ def validate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     if errors:
         return _reject(state, "; ".join(errors))
 
+    # Pre-compute and stash the resolved paths for each step so that
+    # policy_gate can detect TOCTOU changes after interrupt/resume.
+    # On the first pass this populates the dict; on resume the stashed
+    # values from the checkpoint pass through unchanged.
+    gated = state.get("gated_resolved_paths")
+    if gated is None:
+        gated = {}
+        for step in plan.steps:
+            decision = ctx.engine.decide(step, ctx.policy_ctx)
+            gated[step.id] = list(decision.resolved_paths)
+
     return {
         "plan": plan,
         "error": None,
@@ -52,6 +63,7 @@ def validate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         "decisions": {},
         "approved_hashes": [],
         "results": [],
+        "gated_resolved_paths": gated,
         "halted_reason": None,
     }
 

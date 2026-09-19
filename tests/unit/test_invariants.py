@@ -16,7 +16,11 @@ resume) that the Phase 2+ tools plug into:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import shutil
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -25,9 +29,20 @@ from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import build_graph, open_sqlite_checkpointer
 from jarvis.agent.runner import resume_task, run_task
 from jarvis.agent.state import Plan, Step
-from jarvis.config import AgentSettings, Settings
+from jarvis.config import AgentSettings, PolicySettings, Settings
 from jarvis.llm.client import FakeLLM
-from support import approve, deny, echo_plan, make_spec, registry_with, tamper
+from jarvis.policy.unlock import UnlockManager
+from jarvis.tools.base import ToolContext
+from jarvis.tools.files import make_delete_path_spec
+from support import (
+    FakeDirTrash,
+    approve,
+    deny,
+    echo_plan,
+    make_spec,
+    registry_with,
+    tamper,
+)
 
 # ---------------------------------------------------------------------------
 # Invariant 1: unknown tool -> rejected before any execution
@@ -204,7 +219,7 @@ def test_invariant_7_values_in_state_never_contain_secrets(tmp_path: Any) -> Non
 
         # (4) our protocol's own resume payload never carries a secret field.
         payload = approve(first.confirmation)
-        assert set(payload) == {"approved", "action_hash"}
+        assert set(payload) == {"approved", "action_hash", "resolved_paths"}
     finally:
         saver.conn.close()
 
@@ -362,9 +377,133 @@ def test_no_blocked_deserialization_warnings_through_full_flow(tmp_path: Any, ca
 
 
 # ---------------------------------------------------------------------------
+# Invariant 4: protected/escaping paths can never be targeted
+# ---------------------------------------------------------------------------
+
+
+def test_invariant_4_delete_escape_and_protected_paths_never_even_decide(tmp_path: Any) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ctx = make_app_context(
+        Settings(policy=PolicySettings(allowed_roots=[str(ws)])),
+        registry=registry_with(make_delete_path_spec()),
+    )
+    targets = [str(ws / ".." / ".." / ".." / "Windows" / "x"), str(tmp_path / "outside")]
+    if os.name == "nt":
+        targets.append(str(Path(os.environ["SystemRoot"]) / "System32"))
+    for raw in targets:
+        decision = ctx.engine.decide(_step("delete_path", {"paths": [raw]}), ctx.policy_ctx)
+        assert decision.allowed is False, raw
+        assert decision.tier == 3
+    # the allowed root itself / an ancestor of it is also untouchable
+    for raw in (str(ws), str(ws.parent)):
+        decision = ctx.engine.decide(_step("delete_path", {"paths": [raw]}), ctx.policy_ctx)
+        assert decision.allowed is False, raw
+
+
+# ---------------------------------------------------------------------------
+# Invariant 5: deletes go to the Recycle Bin (undo-logged), never permanent
+# ---------------------------------------------------------------------------
+
+
+def test_invariant_5_delete_uses_bin_undo_log_and_no_permanent_fallback(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    settings = Settings(policy=PolicySettings(allowed_roots=[str(ws)]))
+    target = ws / "precious.txt"
+    target.write_text("do not lose me", encoding="utf-8")
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("permanent deletion API used")
+
+    monkeypatch.setattr(os, "remove", _boom)
+    monkeypatch.setattr(shutil, "rmtree", _boom)
+
+    ctx = ToolContext(
+        settings=settings,
+        trash=FakeDirTrash(tmp_path / "trash"),
+        undo_log=tmp_path / "undo.jsonl",
+    )
+    spec = make_delete_path_spec()
+    result = spec.run(spec.args_model(paths=[str(target)]), ctx)
+    assert result.ok is True, result.error
+    assert target.exists() is False  # moved to the bin
+    assert tuple((tmp_path / "trash").iterdir())  # something is in the bin
+    log = (tmp_path / "undo.jsonl").read_text(encoding="utf-8")
+    record = json.loads(log.strip().splitlines()[-1])
+    assert record["op"] == "delete"
+    assert record["succeeded"] is True
+
+
+# ---------------------------------------------------------------------------
+# Invariant 7 & 14: the JARVIS password is hash-only and outside the graph
+# ---------------------------------------------------------------------------
+
+
+class _PwStore:
+    def __init__(self) -> None:
+        self._values: dict[str, str] = {}
+
+    def get(self, name: str) -> str | None:
+        return self._values.get(name)
+
+    def set(self, name: str, value: str) -> None:
+        self._values[name] = value
+
+    def has(self, name: str) -> bool:
+        return name in self._values
+
+
+def test_invariant_7_and_14_jarvis_password_lives_only_as_a_hash_outside_the_graph(
+    tmp_path: Any, caplog: Any
+) -> None:
+    """The password enters through the manager, not the resume payload; only
+    the Argon2id hash is stored; nothing reaches state, checkpoints or logs."""
+    store = _PwStore()
+    manager = UnlockManager(store)  # real argon2 hashing
+    manager.set_password("hunter2-jarvis-1")
+
+    record: list[tuple[str, dict[str, Any]]] = []
+    ctx = make_app_context(
+        Settings(),
+        llm=FakeLLM([_plan("fake_tier2", {"text": "x"})]),
+        registry=registry_with(make_spec("fake_tier2", base_tier=2, record=record)),
+        unlock=manager,
+    )
+    saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
+    try:
+        first = run_task(ctx, saver, "do secret thing")
+        # the password is verified OUTSIDE the graph; resume only forwards
+        # approved+action_hash (invariant 8).
+        assert manager.verify("hunter2-jarvis-1") is True
+        with caplog.at_level(logging.DEBUG):
+            outcome = resume_task(ctx, saver, first.task_id, approve(first.confirmation))
+        assert record == [("fake_tier2", {"text": "x"})]
+
+        # only an Argon2id hash is stored; plaintext is nowhere
+        stored = store.get("password_hash")
+        assert stored is not None and stored.startswith("$argon2id$")
+        assert "hunter2-jarvis-1" not in stored
+
+        # no log line, checkpoint blob or state carries the password
+        assert "hunter2-jarvis-1" not in caplog.text
+        for (blob,) in saver.conn.execute("SELECT checkpoint FROM checkpoints"):
+            assert b"hunter2-jarvis-1" not in (blob or b"")
+        assert "hunter2-jarvis-1" not in repr(outcome.state)
+    finally:
+        saver.conn.close()
+
+
+# ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
 
 def _plan(tool: str, args: dict[str, Any]) -> Plan:
     return Plan(goal=f"run {tool}", steps=[Step(id="s1", tool=tool, args=args, rationale="r")])
+
+
+def _step(tool: str, args: dict[str, Any]) -> Step:
+    return Step(id="s1", tool=tool, args=args, rationale="r")

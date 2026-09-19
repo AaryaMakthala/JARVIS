@@ -10,10 +10,11 @@ here; the logic behind each command is a plain function (``init_config``,
 
 from __future__ import annotations
 
+import getpass
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import tomli_w
 import typer
@@ -34,6 +35,7 @@ from jarvis.agent import (
 from jarvis.llm.client import GroqClient, LLMError
 from jarvis.platform_guard import is_64bit, is_python_supported, is_windows
 from jarvis.policy import tiers
+from jarvis.policy.unlock import UnlockManager
 
 app = typer.Typer(
     name="jarvis",
@@ -292,6 +294,50 @@ def _chat_prompt(text: str) -> str:
     return Prompt.ask(text)
 
 
+def _chat_password_prompt(text: str) -> str:
+    """Prompt helper for the JARVIS password; separate for monkeypatching."""
+    return getpass.getpass(text)
+
+
+def _confirmation_answer(agreed: bool, req: dict[str, Any], typed: str | None) -> dict[str, Any]:
+    """Build the resume payload from a chat answer.
+
+    The only keys ever sent are ``approved``, ``action_hash`` and - when a
+    typed folder-name confirmation is required - ``typed_confirmation``.
+    The password is never part of a resume payload (docs/03 invariant 8).
+    """
+    answer: dict[str, Any] = {"approved": agreed, "action_hash": req.get("action_hash")}
+    if typed is not None:
+        answer["typed_confirmation"] = typed
+    return answer
+
+
+def _tier2_unlock_or_refuse(ctx: AppContext, req: dict[str, Any]) -> bool:
+    """Gate a Tier-2 answer behind a live unlocked session (password entry)."""
+    manager = ctx.unlock
+    if manager is None or not hasattr(manager, "has_password"):
+        console.print(
+            "[red]Tier 2 action needs an unlocked JARVIS session, but no unlock "
+            "manager is available in this session - refusing.[/red]"
+        )
+        return False
+    if not manager.has_password():
+        console.print(
+            "[red]No JARVIS password is set. Run `jarvis password set` first - "
+            "refusing the Tier 2 action.[/red]"
+        )
+        return False
+    if manager.is_unlocked():
+        return True
+    password = _chat_password_prompt("JARVIS password: ")
+    if manager.verify(password):
+        return True
+    console.print(
+        "[red]Wrong password or the session is locked out - refusing the Tier 2 action.[/red]"
+    )
+    return False
+
+
 def chat_loop(ctx: AppContext, saver: SqliteSaver) -> None:
     """One interactive session over the Phase 1 agent (no daemon)."""
     while True:
@@ -317,13 +363,25 @@ def chat_loop(ctx: AppContext, saver: SqliteSaver) -> None:
                 )
             )
             console.print(req.get("summary") or "(no summary)")
+            if req.get("untrusted"):
+                console.print(
+                    "[red]NOTE: this action was derived from untrusted content "
+                    "(web/file text).[/red]"
+                )
             answer = _chat_prompt("Approve?")
             agreed = (answer or "").strip().lower() in ("y", "yes")
+            typed: str | None = None
+            if agreed and req.get("typed_confirmation"):
+                typed = _chat_prompt(
+                    f"Type this exactly to confirm the delete: {req.get('typed_confirmation')}"
+                )
+            if agreed and req.get("needs_unlock"):
+                agreed = _tier2_unlock_or_refuse(ctx, req)
             outcome = resume_task(
                 ctx,
                 saver,
                 outcome.task_id,
-                {"approved": agreed, "action_hash": req.get("action_hash")},
+                _confirmation_answer(agreed, req, typed),
             )
 
         if outcome.error:
@@ -362,7 +420,8 @@ def chat(
 
     try:
         llm = GroqClient(groq_key, settings)
-        ctx = make_app_context(settings, llm=llm)
+        unlock_manager = UnlockManager(store, settings=settings)
+        ctx = make_app_context(settings, llm=llm, unlock=unlock_manager)
         saver = open_sqlite_checkpointer(str(config.checkpoints_db()))
     except LLMError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -373,21 +432,178 @@ def chat(
 
 
 @password_app.command("set")
-def password_set() -> None:
-    """Set the JARVIS unlock password (Phase 2)."""
-    console.print(
-        "[yellow]password management is not implemented yet (planned for Phase 2)[/yellow]"
-    )
-    raise typer.Exit(code=2)
+def password_set(
+    new_password: Annotated[
+        str | None,
+        typer.Option("--password", help="New JARVIS password (non-interactive).", hide_input=True),
+    ] = None,
+    confirm_password: Annotated[
+        str | None, typer.Option("--confirm-password", help="Repeat the password.", hide_input=True)
+    ] = None,
+    current_password: Annotated[
+        str | None,
+        typer.Option(
+            "--current-password", help="Current password (if one is set).", hide_input=True
+        ),
+    ] = None,
+    non_interactive: Annotated[
+        bool, typer.Option("--non-interactive", help="Never prompt; use flags only.")
+    ] = False,
+) -> None:
+    """Set the JARVIS unlock password (stored as an Argon2id hash)."""
+    try:
+        message = password_set_command(
+            UnlockManager(secret_module.SecretStore(), settings=config.load_settings()),
+            password=new_password,
+            confirm_password=confirm_password,
+            current_password=current_password,
+            interactive=not non_interactive,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]{message}[/green]")
 
 
 @password_app.command("change")
-def password_change() -> None:
-    """Change the JARVIS unlock password (Phase 2)."""
-    console.print(
-        "[yellow]password management is not implemented yet (planned for Phase 2)[/yellow]"
-    )
-    raise typer.Exit(code=2)
+def password_change(
+    current_password: Annotated[
+        str | None,
+        typer.Option("--current-password", help="Current JARVIS password.", hide_input=True),
+    ] = None,
+    new_password: Annotated[
+        str | None, typer.Option("--password", help="New JARVIS password.", hide_input=True)
+    ] = None,
+    confirm_password: Annotated[
+        str | None,
+        typer.Option("--confirm-password", help="Repeat the new password.", hide_input=True),
+    ] = None,
+    non_interactive: Annotated[
+        bool, typer.Option("--non-interactive", help="Never prompt; use flags only.")
+    ] = False,
+) -> None:
+    """Change the JARVIS unlock password (requires the current one)."""
+    try:
+        message = password_change_command(
+            UnlockManager(secret_module.SecretStore(), settings=config.load_settings()),
+            current_password=current_password,
+            new_password=new_password,
+            confirm_password=confirm_password,
+            interactive=not non_interactive,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]{message}[/green]")
+
+
+@app.command()
+def lock() -> None:
+    """Lock the JARVIS session (Tier-2 actions are refused until unlock)."""
+    manager = UnlockManager(secret_module.SecretStore(), settings=config.load_settings())
+    console.print(f"[green]{lock_command(manager)}[/green]")
+
+
+@app.command()
+def unlock(
+    password: Annotated[
+        str | None,
+        typer.Option("--password", help="JARVIS password (non-interactive).", hide_input=True),
+    ] = None,
+    non_interactive: Annotated[
+        bool, typer.Option("--non-interactive", help="Never prompt; use flags only.")
+    ] = False,
+) -> None:
+    """Unlock the JARVIS session for Tier-2 actions."""
+    manager = UnlockManager(secret_module.SecretStore(), settings=config.load_settings())
+    try:
+        message = unlock_command(manager, password=password, interactive=not non_interactive)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]{message}[/green]")
+
+
+def _apply_new_password(manager: UnlockManager, new: str | None, confirm: str | None) -> str:
+    """Validate + store a new password; returns a success message."""
+    if new is None or confirm is None or new != confirm:
+        raise ValueError("the two password entries do not match")
+    manager.set_password(new)  # raises ValueError when too short
+    return "JARVIS password set (Argon2id hash stored in the OS credential store)"
+
+
+def password_set_command(
+    manager: UnlockManager,
+    *,
+    password: str | None = None,
+    confirm_password: str | None = None,
+    current_password: str | None = None,
+    interactive: bool = True,
+) -> str:
+    """Plain-function password set/change logic (readable + testable).
+
+    When an existing password is present, the current one must be supplied and
+    verified before the hash may be replaced (fail closed: an unlocked-but-casual
+    CLI session cannot silently rewrite the password).
+    """
+    if interactive:
+        if manager.has_password():
+            current = getpass.getpass("Current JARVIS password: ")
+            if not manager.verify(current):
+                raise ValueError("current password is wrong (or the session is locked out)")
+        password = getpass.getpass("New JARVIS password: ")
+        confirm_password = getpass.getpass("Repeat new JARVIS password: ")
+        return _apply_new_password(manager, password, confirm_password)
+    if not password:
+        raise ValueError("a password is required (use --password in non-interactive mode)")
+    if manager.has_password() and not (current_password and manager.verify(current_password)):
+        raise ValueError("current password is required (and must be correct) to overwrite it")
+    return _apply_new_password(manager, password, confirm_password)
+
+
+def password_change_command(
+    manager: UnlockManager,
+    *,
+    current_password: str | None = None,
+    new_password: str | None = None,
+    confirm_password: str | None = None,
+    interactive: bool = True,
+) -> str:
+    """Plain-function password-change logic (readable + testable)."""
+    if interactive:
+        current = getpass.getpass("Current JARVIS password: ")
+        if not manager.verify(current):
+            raise ValueError("current password is wrong (or the session is locked out)")
+        new = getpass.getpass("New JARVIS password: ")
+        confirm = getpass.getpass("Repeat new JARVIS password: ")
+        return _apply_new_password(manager, new, confirm)
+    if not current_password or not new_password:
+        raise ValueError("current_password and new_password are required in non-interactive mode")
+    if not manager.verify(current_password):
+        raise ValueError("current password is wrong (or the session is locked out)")
+    return _apply_new_password(manager, new_password, confirm_password)
+
+
+def lock_command(manager: UnlockManager) -> str:
+    """Lock the session; returns a status message."""
+    manager.lock()
+    return "JARVIS session locked"
+
+
+def unlock_command(
+    manager: UnlockManager,
+    *,
+    password: str | None = None,
+    interactive: bool = True,
+) -> str:
+    """Unlock the session for Tier-2 actions; returns a status message."""
+    if interactive:
+        password = getpass.getpass("JARVIS password: ")
+    if password is None:
+        raise ValueError("a password is required to unlock")
+    if manager.verify(password):
+        return f"JARVIS session unlocked for {manager.remaining_seconds():.0f}s"
+    raise ValueError("wrong password (or the session is locked out)")
 
 
 def main() -> None:

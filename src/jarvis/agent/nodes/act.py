@@ -49,6 +49,23 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             halted="Refused: the approved action no longer matches — the plan was likely altered after confirmation.",
         )
 
+    # TOCTOU guard: the confirmation was bound to the exact resolved paths the
+    # gate stashed before interrupt.  If any of them resolves differently now
+    # (file swapped for a junction, folder renamed in between), refuse instead
+    # of acting on a path the user never confirmed.
+    prior_paths = (state.get("gated_resolved_paths") or {}).get(step.id)
+    if prior_paths is not None and list(prior_paths) != decision.resolved_paths:
+        return append_result(
+            state,
+            StepResult(
+                step_id=step.id,
+                ok=False,
+                error="resolved path changed after confirmation",
+                verified=False,
+            ),
+            halted="Refused: a file path changed after you confirmed — not acting on it.",
+        )
+
     try:
         args = spec.args_model.model_validate(step.args)
     except Exception as exc:  # noqa: BLE001 - defensive; validate() already checked
