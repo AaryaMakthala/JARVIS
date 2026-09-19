@@ -40,4 +40,4 @@ Write-Host "==> verify_env --phase 1"
 & $py scripts\verify_env.py --phase 1
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "[ OK ] all Phase 0 checks passed" -ForegroundColor Green
+Write-Host "[ OK ] all JARVIS checks passed" -ForegroundColor Green

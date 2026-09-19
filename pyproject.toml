@@ -55,6 +55,7 @@ where = ["src"]
 markers = ["windows_only", "voice", "slow"]
 addopts = "-q"
 testpaths = ["tests"]
+pythonpath = ["tests"]
 
 [tool.ruff]
 line-length = 100

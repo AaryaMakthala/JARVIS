@@ -1,5 +1,9 @@
-"""Deterministic safety policy engine (implemented in Phase 2).
+"""Deterministic safety policy engine.
 
-Invariants that must never be weakened: the LLM only proposes; this package
-decides. See docs/03_SECURITY_AND_POLICY.md.
+The LLM only proposes; this package decides (docs/03_SECURITY_AND_POLICY.md).
+Invariants that must never be weakened live here and in ``engine.py``: tiers
+come from base_tier + rules (never LLM output), Tier 3 is blocked in code, and
+path arguments are resolved + contained before any decision.
 """
+
+__all__ = ["engine", "paths", "rules", "tiers", "unlock"]

@@ -3,11 +3,11 @@
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
 ## Current phase
-Phase 0 — DONE
+Phase 1 — DONE (confirmation/resume flakiness fixed, secure checkpoint serialization, full test coverage)
 
 ## Phase checklist
 - [x] Phase 0: Skeleton, config, secrets, `jarvis init`, `jarvis doctor`
-- [ ] Phase 1: LangGraph planner + policy engine + confirmation (interrupt) + basic verify
+- [x] Phase 1: LangGraph planner + policy engine + confirmation (interrupt) + basic verify
 - [ ] Phase 2: File tools, Recycle Bin delete, undo log, JARVIS password/unlock
 - [ ] Phase 3: Daemon, socket client, Task Scheduler autostart, on/off
 - [ ] Phase 4: Google open/search, web answers with sources
@@ -19,30 +19,32 @@ Phase 0 — DONE
 - [ ] Phase 10: Packaging, deployment (wheel + pipx, autostart XML, uninstall), clean-machine test
 - [ ] Dependency freeze (`requirements.lock`, `verify_env.py --all --live` green)
 
-## What works (verified)
-- `pip install -e ".[dev]"` on `.venv` (Python 3.11.15 64-bit via uv); `pip check` clean.
-- `src/` package skeleton created; every subpackage/module from `docs/02_ARCHITECTURE.md`
-  imports on any OS (Phase 1+ modules are docstring-only placeholders).
-- `config.py`: nested `Settings` (pydantic-settings, `JARVIS_` + `__` delimiter), validates
-  TOML + env precedence against real pydantic-settings 2.15.0 API.
-- `secrets.py`: `SecretStore` over keyring → Windows Credential Manager
-  (`WinVaultKeyring`); probe round-trip `check_store_access()` returns backend name.
-- `logging_setup.py`: redacts registered secrets + key prefixes + sensitive fields +
-  phones (keeps last 2 digits); JSONL rotating handler (5 MB × 5) on the root logger.
-- `platform_guard.py`: `is_windows`, `require_windows`, `@windows_only`, thread-safe
-  `LazyImport`.
-- `llm/client.py`: `LLMClient` protocol, `GroqClient` (JSON-schema mode → JSON mode
-  fallback on HTTP 400 + Pydantic validation + one repair retry; 429/5xx backoff;
-  Usage counters), `GeminiClient` stub, scripted `FakeLLM` used by graph tests.
-- `cli.py`: `jarvis init` (writes config.toml + stores keys/IPC token in credential
-  store), `jarvis doctor` (PASS/WARN/FAIL table naming missing keys; `--live` real call),
-  `status` / `password set|change` stubs (explicit Phase 2/3), `--version`.
-- `scripts/check.ps1` runs: ruff format --check, ruff check, mypy (policy strict),
-  pytest (`not windows_only/voice/slow`), `verify_env.py --phase 1`.
-- `scripts/verify_env.py --phase 1`: 29 pass, 0 warn, 0 fail, 21 skipped. (moved from repo
-  root to `scripts/` to match docs).
-- Tests: 109 unit/integration tests green (`pytest -q`); `tests/windows_only` covered by
-  skip-not-run on non-Windows; real-keyring test passes on this dev PC.
+## What works (verified), Phase 1 additions
+- `agent/` Phase 1 graph: `intake → memory_retrieve → plan → validate → policy_gate(interrupt)
+  → act → verify → respond` compiled on a file-backed `SqliteSaver`; `run_task`/`resume_task`
+  with per-task thread ids; `extract_interrupt` surfaces the `confirm` payload.
+- `policy/engine.py` decides deterministically: tier = max(base, rules, classifier[, taint]);
+  unknown tool / invalid args / `matches_blocked` (e.g. `disable_defender`) all return a
+  Tier-3 refused Decision carrying a recorded reason; summary comes from `spec.describe(canonical args)`;
+  `action_hash = sha256(tool + canonical json args)`.
+- Secure checkpoint serialization: `graph.build_secure_serde()` = `JsonPlusSerializer` with an
+  explicit allowlist of exactly `Plan/Step/Decision/StepResult`, `pickle_fallback=False`,
+  `allowed_msgpack_modules` is a set (never `True`). `open_sqlite_checkpointer` uses it; the CLI
+  `jarvis chat` routes through it too. `tests/conftest.py` sets `LANGGRAPH_STRICT_MSGPACK=true`
+  so any unmanaged serde path becomes loud.
+- Confirmation/resume e2e proven (integration suite): approved runs+verifies+reports;
+  denied / tampered-hash / plan-mutated-after-approval all fail closed with provider different
+  message and tool never runs; unknown tool and Tier-3 hard block refuse before any side effect;
+  verification failure is reported honestly, never claimed as success; fresh-connection resume
+  (simulated daemon restart) works.
+- Runner state access fixed/regression-tested: runner reads state via `graph.get_state(config)`,
+  never `checkpointer.get_state` (SqliteSaver has no such method). Decisions appear in state
+  only after resume (they are written after `interrupt()` returns) — documented in a test.
+- Tests: added `tests/conftest.py`, `tests/support.py` (fake tool harness), `tests/unit/test_serializer.py`,
+  `tests/unit/test_agent.py`, `tests/unit/test_invariants.py`,
+  `tests/integration/test_confirmation_resume.py`. Full `pytest -q` green (`scripts/check.ps1`:
+  ruff format/check, mypy strict on policy, pytest `not windows_only/voice/slow`, verify_env --phase 1).
+- Phase 0 items unchanged and still green.
 
 ## Known fragile areas
 - Groq JSON-schema `strict: True` mode is unverified against a live model (no API key
@@ -50,9 +52,12 @@ Phase 0 — DONE
 - Model names are empty placeholders; must be chosen from current Groq/Gemini docs.
 - typer 0.27.2 `no_args_is_help` exits with code 2 (not 0) when run with no args; help text
   is still shown. Accepted as upstream behaviour.
+- `verify_env.py` phase tags/skips are per-phase; the "all Phase 0 checks passed" banner in
+  `check.ps1` was renamed to "all JARVIS checks passed".
 
 ## Known bugs
-- none
+- none in this session (see Decisions log for the two real bugs found & fixed: engine
+  hard-block tier/reasons, respond claiming success on verification failure).
 
 ## Decisions log
 | Date | Decision | Reason |
@@ -62,11 +67,16 @@ Phase 0 — DONE
 | 2026-09-19 | `--version` needs eager option callback (not inside command callback) | typer/click resolves commands before invoking the callback; the eager pattern short-circuits first |
 | 2026-09-19 | `SecretStore.check_store_access()` method added (module-level fn kept) | duck-typing lets `run_doctor` swap in fake stores for tests |
 | 2026-09-19 | `scripts/check.ps1` created and used as the per-change gate | gives one command the human can run in the viva |
+| 2026-09-19 | Phase 1 checkpoint serde: explicit allowlist of the 4 State models; no pickle fallback; `LANGGRAPH_STRICT_MSGPACK=true` in tests | reservations: block arbitrary type revival from checkpoint bytes (docs/03 §5); strict env makes future warnings loud for the whole suite |
+| 2026-09-19 | `graph.update_state(config, {"plan": ...})` can mutate a paused task's plan; policy_gate recomputes the action_hash and refuses | used by the "modified after approval" e2e; deterministic, no code change needed |
+| 2026-09-19 | Hard-blocked steps (`matches_blocked`) now go through `_blocked()` → tier 3 + recorded reason | engine previously returned tier 0, empty reasons → misleading "(blocked by policy)" refusal |
+| 2026-09-19 | `respond` treats `verified is False` as a hard failure, never claims success | action executed but post-condition check failed (docs/02 §11) |
+| 2026-09-19 | langgraph **persists the raw resume payload** in its internal `__resume__` write channel | earlier smoke test reading only `checkpoints` was wrong; consequence: the daemon must never put secrets in resume values (docs/03 invariant 8 — password verified in daemon layer before resume). State/channel_values stay clean; invariant 7 test asserts that exact boundary |
 
 ## Manual tests to run on the PC
 ```powershell
 .venv\Scripts\activate
-scripts\check.ps1                  # full Phase 0 gate (expect "all Phase 0 checks passed")
+scripts\check.ps1                  # full gate (expect "all JARVIS checks passed")
 jarvis doctor                       # plan PASS/WARN/FAIL; missing groq key expected
 jarvis init --non-interactive      # used API; CREDENTIAL STORE read/write flow
 jarvis init --groq-api-key ...     # (optional) store your real Groq key, then `jarvis doctor`
@@ -75,4 +85,6 @@ jarvis --version ; jarvis status ; jarvis password set   # stubs print their pha
 `jarvis doctor --live` requires a real Groq key + a model name in `config.toml [llm]`.
 
 ## Next step
-Run the Phase 1 prompt from `docs/06_OPENCODE_PROMPTS.md` (LangGraph planner + policy engine + confirmation interrupt + basic verify). Do not modify Phase 1 files before then.
+Phase 2 prompt from `docs/06_OPENCODE_PROMPTS.md` (file tools — create_file verified on
+Windows, Recycle Bin delete + undo log, JARVIS password/unlock gate). Do not modify Phase 2
+files before then.

@@ -1,10 +1,11 @@
 """JARVIS command line interface.
 
 Commands implemented in Phase 0: ``init`` (writes config + stores API keys in
-the OS credential store), ``doctor`` (environment checks), ``status`` and
-``password`` are stubs until later phases. Rendering lives only here; the
-logic behind each command is a plain function in :func:`init_config` and
-:func:`run_doctor` so tests can call it without a console.
+the OS credential store), ``doctor`` (environment checks) and the ``status`` /
+``password`` stubs.  Phase 1 adds ``chat --no-daemon``: an in-process REPL that
+runs the LangGraph agent and blocks on rich confirmations. Rendering lives only
+here; the logic behind each command is a plain function (``init_config``,
+``run_doctor``, ``chat_loop``) so tests can call it without a console.
 """
 
 from __future__ import annotations
@@ -16,13 +17,23 @@ from typing import Annotated
 
 import tomli_w
 import typer
+from langgraph.checkpoint.sqlite import SqliteSaver
 from rich.console import Console
+from rich.prompt import Prompt
 from rich.table import Table
 
 from jarvis import __version__, config, logging_setup
 from jarvis import secrets as secret_module
+from jarvis.agent import (
+    AppContext,
+    make_app_context,
+    open_sqlite_checkpointer,
+    resume_task,
+    run_task,
+)
 from jarvis.llm.client import GroqClient, LLMError
 from jarvis.platform_guard import is_64bit, is_python_supported, is_windows
+from jarvis.policy import tiers
 
 app = typer.Typer(
     name="jarvis",
@@ -274,6 +285,91 @@ def doctor(
 def status() -> None:
     """Show daemon status (Phase 3)."""
     console.print("[yellow]daemon is not implemented yet (planned for Phase 3)[/yellow]")
+
+
+def _chat_prompt(text: str) -> str:
+    """Prompt helper; separate for monkeypatching in tests."""
+    return Prompt.ask(text)
+
+
+def chat_loop(ctx: AppContext, saver: SqliteSaver) -> None:
+    """One interactive session over the Phase 1 agent (no daemon)."""
+    while True:
+        try:
+            line = _chat_prompt("[bold cyan]you>[/]")
+        except (KeyboardInterrupt, EOFError):
+            console.print("[dim]bye[/dim]")
+            break
+        line = (line or "").strip()
+        if not line:
+            continue
+
+        outcome = run_task(ctx, saver, line)
+        while outcome.confirmation:
+            req = outcome.confirmation
+            console.print(
+                "".join(
+                    (
+                        "[yellow]approval needed[/yellow] (",
+                        tiers.tier_label(req.get("tier")),
+                        ")",
+                    )
+                )
+            )
+            console.print(req.get("summary") or "(no summary)")
+            answer = _chat_prompt("Approve?")
+            agreed = (answer or "").strip().lower() in ("y", "yes")
+            outcome = resume_task(
+                ctx,
+                saver,
+                outcome.task_id,
+                {"approved": agreed, "action_hash": req.get("action_hash")},
+            )
+
+        if outcome.error:
+            console.print(f"[red]{outcome.error}[/red]")
+        elif outcome.final_answer:
+            console.print(f"[green]{outcome.final_answer}[/green]")
+        else:
+            console.print("[dim](no answer)[/dim]")
+
+
+@app.command()
+def chat(
+    no_daemon: Annotated[
+        bool, typer.Option("--no-daemon", help="Run the agent in-process (Phase 1).")
+    ] = False,
+) -> None:
+    """Talk to JARVIS (interactive REPL)."""
+    if not no_daemon:
+        console.print(
+            "[yellow]daemon mode is not implemented yet (planned for Phase 3); "
+            "use `jarvis chat --no-daemon`.[/yellow]"
+        )
+        raise typer.Exit(code=2)
+
+    settings = config.load_settings()
+    store = secret_module.SecretStore()
+    groq_key = store.get("groq_api_key")
+    if not groq_key:
+        console.print("[red]no Groq API key found - run `jarvis init` first.[/red]")
+        raise typer.Exit(code=1)
+    if not settings.llm.planner_model:
+        console.print(
+            "[red]llm.planner_model is unset - pick a model and set it in config.toml.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        llm = GroqClient(groq_key, settings)
+        ctx = make_app_context(settings, llm=llm)
+        saver = open_sqlite_checkpointer(str(config.checkpoints_db()))
+    except LLMError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+    console.print("[dim]JARVIS chat (Ctrl+C to exit)[/dim]")
+    chat_loop(ctx, saver)
 
 
 @password_app.command("set")
