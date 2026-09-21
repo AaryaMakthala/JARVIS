@@ -16,6 +16,7 @@ resume) that the Phase 2+ tools plug into:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -494,6 +495,112 @@ def test_invariant_7_and_14_jarvis_password_lives_only_as_a_hash_outside_the_gra
         assert "hunter2-jarvis-1" not in repr(outcome.state)
     finally:
         saver.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Invariant 10: IPC requires token — unauthenticated connection is rejected
+# ---------------------------------------------------------------------------
+
+
+def test_invariant_10_ipc_requires_token() -> None:
+    """Unauthenticated or wrong-token IPC connections are rejected.
+
+    This test verifies the auth gate by attempting to connect to a daemon
+    with a wrong token and verifying the connection is closed without
+    executing any command.
+    """
+    import json
+    import threading
+    import time
+
+    from jarvis.config import Settings
+    from jarvis.daemon.protocol import AuthMessage, StatusRequest
+    from jarvis.daemon.server import DaemonServer
+
+    TEST_TOKEN = "invariant10-test-token"
+
+    class _FakeStore:
+        def __init__(self) -> None:
+            self._kv: dict[str, str] = {"ipc_token": TEST_TOKEN}
+
+        def get(self, name: str) -> str | None:
+            return self._kv.get(name)
+
+        def set(self, name: str, value: str) -> None:
+            self._kv[name] = value
+
+        def has(self, name: str) -> bool:
+            return name in self._kv
+
+        def check_store_access(self) -> str:
+            return "FakeStore"
+
+    from unittest.mock import MagicMock
+
+    settings = Settings()
+    store = _FakeStore()
+    ctx = MagicMock()
+    server = DaemonServer(settings=settings, store=store, ctx=ctx)
+
+    loop = asyncio.new_event_loop()
+    actual_port = 0
+
+    async def _start() -> None:
+        nonlocal actual_port
+        srv = await asyncio.start_server(server._handle_client, "127.0.0.1", 0)
+        actual_port = srv.sockets[0].getsockname()[1]
+        async with srv:
+            await server._shutdown_event.wait()
+
+    def _run() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_start())
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    time.sleep(0.3)
+
+    try:
+        import asyncio as _aio
+
+        async def _test_auth() -> None:
+            # Test 1: wrong token -> rejected
+            reader, writer = await _aio.open_connection("127.0.0.1", actual_port)
+            line = AuthMessage(token="wrong-token").model_dump_json() + "\n"
+            writer.write(line.encode())
+            await writer.drain()
+            raw = await _aio.wait_for(reader.readline(), timeout=2)
+            # Connection should be closed (EOF or error)
+            assert raw == b"" or b"auth" in raw.lower()
+            writer.close()
+
+            # Test 2: correct token -> accepted
+            reader, writer = await _aio.open_connection("127.0.0.1", actual_port)
+            line = AuthMessage(token=TEST_TOKEN).model_dump_json() + "\n"
+            writer.write(line.encode())
+            await writer.drain()
+            raw = await _aio.wait_for(reader.readline(), timeout=2)
+            data = json.loads(raw.decode())
+            assert data["type"] == "auth_ok"
+            writer.close()
+
+            # Test 3: no auth message -> rejected
+            reader, writer = await _aio.open_connection("127.0.0.1", actual_port)
+            line = StatusRequest().model_dump_json() + "\n"
+            writer.write(line.encode())
+            await writer.drain()
+            raw = await _aio.wait_for(reader.readline(), timeout=2)
+            assert raw == b""  # closed without response
+            writer.close()
+
+        _aio.run(_test_auth())
+    finally:
+        # The server loop is blocked on _shutdown_event.wait() in the
+        # background thread; cancelling tasks does not wake it.  Use the
+        # thread-safe path (same as _ServerHarness.stop()).
+        loop.call_soon_threadsafe(server._shutdown_event.set)
+        t.join(timeout=3)
+        loop.close()
 
 
 # ---------------------------------------------------------------------------

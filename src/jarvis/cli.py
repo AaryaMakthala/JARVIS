@@ -3,9 +3,14 @@
 Commands implemented in Phase 0: ``init`` (writes config + stores API keys in
 the OS credential store), ``doctor`` (environment checks) and the ``status`` /
 ``password`` stubs.  Phase 1 adds ``chat --no-daemon``: an in-process REPL that
-runs the LangGraph agent and blocks on rich confirmations. Rendering lives only
-here; the logic behind each command is a plain function (``init_config``,
-``run_doctor``, ``chat_loop``) so tests can call it without a console.
+runs the LangGraph agent and blocks on rich confirmations.  Phase 3 adds the
+daemon server, IPC client, ``jarvis daemon --foreground``, ``jarvis stop``,
+``jarvis autostart``, and makes ``jarvis chat`` (without ``--no-daemon``)
+connect to a running daemon over IPC.
+
+Rendering lives only here; the logic behind each command is a plain function
+(``init_config``, ``run_doctor``, ``chat_loop``) so tests can call it without
+a console.
 """
 
 from __future__ import annotations
@@ -43,8 +48,10 @@ app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
 )
-password_app = typer.Typer(help="Unlock-password management (Phase 2).", no_args_is_help=True)
+password_app = typer.Typer(help="Unlock-password management.", no_args_is_help=True)
+autostart_app = typer.Typer(help="Daemon autostart management.", no_args_is_help=True)
 app.add_typer(password_app, name="password")
+app.add_typer(autostart_app, name="autostart")
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -119,7 +126,7 @@ def init_config(
         import secrets as stdlib_secrets
 
         store.set("ipc_token", stdlib_secrets.token_urlsafe(32))
-        messages.append("ipc_token: generated and stored (daemon auth, Phase 3)")
+        messages.append("ipc_token: generated and stored (daemon auth)")
 
     return messages
 
@@ -235,6 +242,9 @@ def _main(
     pass  # option is handled by the eager callback above
 
 
+# ── init ─────────────────────────────────────────────────────────────────
+
+
 @app.command()
 def init(
     groq_api_key: Annotated[
@@ -266,6 +276,9 @@ def init(
         console.print(line)
 
 
+# ── doctor ───────────────────────────────────────────────────────────────
+
+
 @app.command()
 def doctor(
     live: Annotated[
@@ -283,10 +296,128 @@ def doctor(
         raise typer.Exit(code=1)
 
 
+# ── status ───────────────────────────────────────────────────────────────
+
+
 @app.command()
 def status() -> None:
-    """Show daemon status (Phase 3)."""
-    console.print("[yellow]daemon is not implemented yet (planned for Phase 3)[/yellow]")
+    """Show daemon status."""
+    try:
+        from jarvis.daemon.client import DaemonClient
+
+        client = DaemonClient()
+        client.connect()
+        try:
+            resp = client.get_status()
+            console.print(f"[green]daemon:[/green] {resp.daemon}")
+            console.print(f"[green]voice:[/green] {resp.voice}")
+            console.print(f"[green]unlocked:[/green] {resp.unlocked}")
+            console.print(f"[green]queue:[/green] {resp.queue}")
+            if resp.active_task:
+                console.print(f"[green]active task:[/green] {resp.active_task}")
+            console.print(f"[green]version:[/green] {resp.version}")
+        finally:
+            client.close()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]daemon not running: {exc}[/yellow]")
+        raise typer.Exit(code=1)
+
+
+# ── stop ─────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def stop() -> None:
+    """Stop the daemon gracefully."""
+    try:
+        from jarvis.daemon.client import DaemonClient
+
+        client = DaemonClient()
+        client.connect()
+        try:
+            client.send_shutdown()
+            console.print("[green]shutdown signal sent[/green]")
+        finally:
+            client.close()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]daemon not running: {exc}[/yellow]")
+        raise typer.Exit(code=1)
+
+
+# ── daemon (foreground) ──────────────────────────────────────────────────
+
+
+@app.command()
+def daemon(
+    foreground: Annotated[
+        bool, typer.Option("--foreground", help="Run in foreground (dev mode).")
+    ] = True,
+) -> None:
+    """Run the JARVIS daemon (normally started by Task Scheduler)."""
+    from jarvis.daemon.server import DaemonServer
+
+    if not foreground:
+        console.print("[yellow]background mode not yet implemented; use --foreground[/yellow]")
+        raise typer.Exit(code=2)
+
+    settings = config.load_settings()
+    store = secret_module.SecretStore()
+    server = DaemonServer(settings=settings, store=store)
+    console.print("[dim]JARVIS daemon starting (Ctrl+C to stop)...[/dim]")
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        console.print("[dim]daemon stopped[/dim]")
+
+
+# ── autostart ────────────────────────────────────────────────────────────
+
+
+@autostart_app.command("enable")
+def autostart_enable_cmd() -> None:
+    """Enable daemon autostart at login."""
+    from jarvis.daemon.autostart import enable
+
+    result = enable()
+    if result["ok"]:
+        console.print(f"[green]{result['message']}[/green]")
+    else:
+        console.print(f"[red]{result['error']}[/red]")
+        raise typer.Exit(code=1)
+
+
+@autostart_app.command("disable")
+def autostart_disable_cmd() -> None:
+    """Disable daemon autostart."""
+    from jarvis.daemon.autostart import disable
+
+    result = disable()
+    if result["ok"]:
+        console.print(f"[green]{result['message']}[/green]")
+    else:
+        console.print(f"[red]{result['error']}[/red]")
+        raise typer.Exit(code=1)
+
+
+@autostart_app.command("status")
+def autostart_status_cmd() -> None:
+    """Check daemon autostart status."""
+    from jarvis.daemon.autostart import status
+
+    result = status()
+    if not result["ok"]:
+        console.print(f"[red]{result['error']}[/red]")
+        raise typer.Exit(code=1)
+    if result.get("enabled"):
+        console.print("[green]autostart: enabled[/green]")
+        for key in ("status", "last_run", "next_run", "last_result"):
+            if key in result:
+                console.print(f"  {key}: {result[key]}")
+    else:
+        console.print("[yellow]autostart: not enabled[/yellow]")
+
+
+# ── chat ─────────────────────────────────────────────────────────────────
 
 
 def _chat_prompt(text: str) -> str:
@@ -392,20 +523,101 @@ def chat_loop(ctx: AppContext, saver: SqliteSaver) -> None:
             console.print("[dim](no answer)[/dim]")
 
 
+def _daemon_chat_loop(client: Any) -> None:
+    """Interactive REPL that talks to the daemon over IPC."""
+    from jarvis.daemon.client import DaemonError
+    from jarvis.daemon.protocol import (
+        ConfirmRequest,
+        ErrorMessage,
+        EventMessage,
+        FinalMessage,
+    )
+
+    console.print("[dim]JARVIS chat via daemon (Ctrl+C to exit)[/dim]")
+    while True:
+        try:
+            line = _chat_prompt("[bold cyan]you>[/]")
+        except (KeyboardInterrupt, EOFError):
+            console.print("[dim]bye[/dim]")
+            break
+        line = (line or "").strip()
+        if not line:
+            continue
+
+        try:
+            task_id = client.send_chat(line)
+        except DaemonError as exc:
+            console.print(f"[red]{exc.message}[/red]")
+            continue
+
+        # Wait for events, confirmations, or final answer
+        while True:
+            msg = client.wait_for_event(timeout=300)
+            if msg is None:
+                console.print("[yellow]timed out waiting for response[/yellow]")
+                break
+            if isinstance(msg, FinalMessage):
+                console.print(f"[green]{msg.text}[/green]")
+                break
+            if isinstance(msg, ConfirmRequest):
+                # Display confirmation
+                from jarvis.policy import tiers as _tiers
+
+                console.print(
+                    "".join(
+                        (
+                            "[yellow]approval needed[/yellow] (",
+                            _tiers.tier_label(msg.tier),
+                            ")",
+                        )
+                    )
+                )
+                console.print(msg.summary or "(no summary)")
+                if msg.untrusted:
+                    console.print("[red]NOTE: this action was derived from untrusted content[/red]")
+                answer = _chat_prompt("Approve?")
+                agreed = (answer or "").strip().lower() in ("y", "yes")
+                typed: str | None = None
+                if agreed and msg.typed_confirmation:
+                    typed = _chat_prompt(f"Type this exactly to confirm: {msg.typed_confirmation}")
+                password: str | None = None
+                if agreed and msg.needs_password:
+                    password = _chat_password_prompt("JARVIS password: ")
+
+                try:
+                    client.send_confirm(
+                        task_id,
+                        approved=agreed,
+                        action_hash=msg.action_hash,
+                        password=password,
+                        typed_confirmation=typed,
+                    )
+                except DaemonError as exc:
+                    console.print(f"[red]{exc.message}[/red]")
+            elif isinstance(msg, ErrorMessage):
+                console.print(f"[red]{msg.message}[/red]")
+            elif isinstance(msg, EventMessage):
+                # Streaming events (plan, step_start, step_result, log)
+                data = msg.data
+                if msg.kind == "log" and "message" in data:
+                    console.print(f"[dim]{data['message']}[/dim]")
+
+
 @app.command()
 def chat(
     no_daemon: Annotated[
-        bool, typer.Option("--no-daemon", help="Run the agent in-process (Phase 1).")
+        bool, typer.Option("--no-daemon", help="Run the agent in-process (no daemon).")
     ] = False,
 ) -> None:
     """Talk to JARVIS (interactive REPL)."""
-    if not no_daemon:
-        console.print(
-            "[yellow]daemon mode is not implemented yet (planned for Phase 3); "
-            "use `jarvis chat --no-daemon`.[/yellow]"
-        )
-        raise typer.Exit(code=2)
+    if no_daemon:
+        _chat_no_daemon()
+    else:
+        _chat_with_daemon()
 
+
+def _chat_no_daemon() -> None:
+    """Run the agent in-process (Phase 1 mode)."""
     settings = config.load_settings()
     store = secret_module.SecretStore()
     groq_key = store.get("groq_api_key")
@@ -429,6 +641,27 @@ def chat(
 
     console.print("[dim]JARVIS chat (Ctrl+C to exit)[/dim]")
     chat_loop(ctx, saver)
+
+
+def _chat_with_daemon() -> None:
+    """Connect to the daemon and start an interactive chat session."""
+    from jarvis.daemon.client import DaemonClient, DaemonError
+
+    try:
+        client = DaemonClient()
+        client.connect()
+    except DaemonError as exc:
+        console.print(f"[red]cannot connect to daemon: {exc.message}[/red]")
+        console.print("[dim]start the daemon with: jarvis daemon --foreground[/dim]")
+        raise typer.Exit(code=1)
+
+    try:
+        _daemon_chat_loop(client)
+    finally:
+        client.close()
+
+
+# ── password commands ────────────────────────────────────────────────────
 
 
 @password_app.command("set")
@@ -497,6 +730,9 @@ def password_change(
     console.print(f"[green]{message}[/green]")
 
 
+# ── lock / unlock ────────────────────────────────────────────────────────
+
+
 @app.command()
 def lock() -> None:
     """Lock the JARVIS session (Tier-2 actions are refused until unlock)."""
@@ -522,6 +758,9 @@ def unlock(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
     console.print(f"[green]{message}[/green]")
+
+
+# ── plain-function commands (testable without typer) ─────────────────────
 
 
 def _apply_new_password(manager: UnlockManager, new: str | None, confirm: str | None) -> str:

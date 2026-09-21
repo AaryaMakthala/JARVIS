@@ -48,10 +48,10 @@ def test_no_args_shows_help() -> None:
     assert "init" in result.output
 
 
-def test_status_stub() -> None:
+def test_status_when_daemon_not_running() -> None:
     result = runner.invoke(cli.app, ["status"])
-    assert result.exit_code == 0
-    assert "Phase 3" in result.output
+    assert result.exit_code == 1
+    assert "daemon not running" in result.output.lower() or "not running" in result.output.lower()
 
 
 def test_password_set_cli_non_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
