@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 from platformdirs import PlatformDirs
 from pydantic import BaseModel, ConfigDict
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
 
 APP_NAME = "jarvis"
 APP_AUTHOR = "jarvis"
@@ -150,7 +151,8 @@ class Settings(BaseSettings):
 
     Reads ``config.toml`` (path given to the constructor, normally from
     :func:`config_file`) and environment variables prefixed ``JARVIS_``.
-    Environment variables take precedence over the file.
+    Environment variables take precedence over the file, init kwargs take
+    precedence over both (see :meth:`settings_customise_sources`).
     """
 
     model_config = SettingsConfigDict(
@@ -166,6 +168,35 @@ class Settings(BaseSettings):
     daemon: DaemonSettings = DaemonSettings()
     voice: VoiceSettings = VoiceSettings()
     config_version: int = 1
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: Any,
+        env_settings: Any,
+        dotenv_settings: Any,
+        file_secret_settings: Any,
+    ) -> tuple[Any, ...]:
+        """Add the ``config.toml`` file as a settings source.
+
+        The file path travels as the private ``_toml_file`` init kwarg (set by
+        :func:`load_settings`) and is consumed here, so it never leaks into the
+        model fields.  Source priority (highest first):
+
+        init kwargs > env vars > dotenv > ``config.toml`` > hard-coded defaults.
+
+        ``TomlConfigSettingsSource`` is available from pydantic-settings >= 2.2;
+        this is asserted by ``scripts/verify_env.py``.
+        """
+        path = init_settings.init_kwargs.pop("_toml_file", None)
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            TomlConfigSettingsSource(settings_cls, toml_file=path),
+            file_secret_settings,
+        )
 
 
 def user_data_dir(*parts: str) -> Path:
@@ -233,6 +264,8 @@ def load_settings(toml: Path | None = None) -> Settings:
     """Load application settings, optionally from a specific TOML file.
 
     Defaults to :func:`config_file`. Returns defaults when the file is absent.
+    The path is passed as the private ``_toml_file`` init kwarg, which
+    :meth:`Settings.settings_customise_sources` turns into the TOML source.
     """
     path = toml if toml is not None else config_file()
     if path.is_file():

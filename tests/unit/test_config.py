@@ -59,6 +59,67 @@ def test_missing_toml_returns_defaults(tmp_path: Path) -> None:
     assert settings.llm.planner_model == ""
 
 
+def test_voice_enabled_true_loaded_from_toml(tmp_path: Path) -> None:
+    toml = tmp_path / "config.toml"
+    toml.write_text('[voice]\nenabled = true\nwake_word = "zzz_wake"\n', encoding="utf-8")
+    settings = config.load_settings(toml)
+    assert settings.voice.enabled is True
+    assert settings.voice.wake_word == "zzz_wake"
+    assert settings.llm.planner_model == ""
+
+
+def test_voice_enabled_false_loaded_from_toml(tmp_path: Path) -> None:
+    toml = tmp_path / "config.toml"
+    toml.write_text("[voice]\nenabled = false\n", encoding="utf-8")
+    settings = config.load_settings(toml)
+    assert settings.voice.enabled is False
+
+
+def test_env_override_wins_over_toml_true_to_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    toml = tmp_path / "config.toml"
+    toml.write_text("[voice]\nenabled = true\n", encoding="utf-8")
+    monkeypatch.setenv("JARVIS_VOICE__ENABLED", "false")
+    settings = config.load_settings(toml)
+    assert settings.voice.enabled is False
+
+
+def test_env_override_wins_over_toml_false_to_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    toml = tmp_path / "config.toml"
+    toml.write_text("[voice]\nenabled = false\n", encoding="utf-8")
+    monkeypatch.setenv("JARVIS_VOICE__ENABLED", "true")
+    settings = config.load_settings(toml)
+    assert settings.voice.enabled is True
+
+
+def test_cli_and_daemon_resolve_same_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both `jarvis on` (CLI) and the daemon load via the same loader/--file."""
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    config_path = config.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        '[voice]\nenabled = true\nwake_word = "cli_daemon_shared"\n', encoding="utf-8"
+    )
+
+    from jarvis.daemon.server import DaemonServer
+
+    class _FakeStore:
+        def get(self, name: str) -> str:
+            return "t"
+
+    server = DaemonServer(settings=None, store=_FakeStore())
+    cli_settings = config.load_settings()
+    assert server._settings.voice.enabled is True
+    assert server._settings.voice.wake_word == "cli_daemon_shared"
+    assert cli_settings.voice.enabled is True
+    assert server._settings.voice == cli_settings.voice
+
+
 def test_user_data_dir_override(isolated_data_dir: Path) -> None:
     assert config.user_data_dir() == isolated_data_dir
     assert config.user_data_dir("a", "b") == isolated_data_dir / "a" / "b"
