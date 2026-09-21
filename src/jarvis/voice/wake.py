@@ -43,11 +43,22 @@ class OpenWakeWordDetector:
         self._threshold = threshold
 
     def detect(self, segment: AudioSegment) -> WakeWordResult:
-        """Run wake-word inference on the audio segment."""
+        """Run wake-word inference on the audio segment.
+
+        The samples are scaled from the normalized float32 form that
+        :class:`AudioSegment` carries into the 16-bit PCM format
+        openWakeWord 0.6.0 requires: its mel-spectrogram preprocessor
+        casts input to ``int16`` (``AudioFeatures._get_melspectrogram``),
+        so feeding the [-1, 1] floats directly would truncate every sample
+        to {0, ±1} and the detector would silently hear nothing.  Verified
+        on real hardware: the same "hey jarvis" clip scores 0.966 as int16
+        versus 0.000 as float32.
+        """
         import numpy as np
 
-        audio_np = np.array(segment.samples, dtype=np.float32)
-        prediction = self._model.predict(audio_np)
+        samples = np.asarray(segment.samples, dtype=np.float32)
+        audio_int16 = np.round(np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16)
+        prediction = self._model.predict(audio_int16)
         # openWakeWord returns a dict mapping model names to scores.
         score = 0.0
         if isinstance(prediction, dict) or hasattr(prediction, "get"):

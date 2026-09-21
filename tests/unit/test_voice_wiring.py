@@ -81,9 +81,7 @@ def _load_legacy_voice_builder(tmp_path: Path) -> Callable[[Any], Any]:
     ``audio=create_vad(...)``).  The body is exec'd so the regression runs
     the committed code, not a recollection of it.
     """
-    blob = subprocess.check_output(
-        ["git", "show", "326727b:src/jarvis/daemon/server.py"]
-    )
+    blob = subprocess.check_output(["git", "show", "326727b:src/jarvis/daemon/server.py"])
     method = textwrap.dedent(_extract_method(blob.decode("utf-8"), "_build_voice_service"))
     namespace: dict[str, Any] = {"logger": logging.getLogger("legacy-server")}
     exec(method, namespace)  # noqa: S102  # deliberate: run the committed old source
@@ -120,13 +118,13 @@ class TestCurrentWiring:
 
 
 class TestLegacyWiringRegression:
-    def test_legacy_audio_was_a_vad_and_violates_audio_input(self, monkeypatch: Any, tmp_path: Path) -> None:
+    def test_legacy_audio_was_a_vad_and_violates_audio_input(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
         """The pre-fix server passed a VAD as the loop's audio — must never
         satisfy today's AudioInput contract (that is why it crashed)."""
         _patch_factories(monkeypatch)
-        monkeypatch.setattr(
-            "jarvis.voice.vad.create", lambda **kw: SoundDeviceVAD(object())
-        )
+        monkeypatch.setattr("jarvis.voice.vad.create", lambda **kw: SoundDeviceVAD(object()))
         builder = _load_legacy_voice_builder(tmp_path)
         legacy_self = SimpleNamespace(
             _settings=Settings(voice=VoiceSettings(enabled=True)),

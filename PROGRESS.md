@@ -3,10 +3,11 @@
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
 ## Current phase
-Phase 5 — COMPLETE (voice input/output, dictation, focus-verified type_text)
-All **472** automated tests pass (`pytest tests -m "not slow and not voice"` —
-0 failures, 0 errors), including 5 `windows_only` and 29 integration tests.
-`scripts/check.ps1` green.
+Phase 6 — DONE (WhatsApp contacts + whatsapp_send, verification-before-send, rate limits; fail-closed invariant #9).
+Native Windows suite: **601 tests, 0 errors, 0 failures, 1 skipped** (`pytest tests
+-m "not slow and not voice"`, includes the 5 windows_only tests and the NTFS ADS path
+test). `scripts/check.ps1` green (29 pass, 0 fail). WSL hermetic run: 596 collected,
+1 known failure (NTFS ADS test — passes only on real Windows, as before).
 Phase 5 security review (13 findings — F1..F13) — **all fixed & tested**, see below.
 - **Config regression fixed (Phase 5)**: real `config.toml` `[voice] enabled=true`
   was previously ignored — ``load_settings`` silently returned defaults because
@@ -238,6 +239,11 @@ factory functions.
 | 2026-09-21 | Voice confirmations re-arm the wake word and fail closed (F6); Tier 2+ only via terminal | Phase 5 security review: a late "yes" must not fire off a prior confirmation; docs/03 §7 tier rules |
 | 2026-09-21 | Save only to *resolved* root-checked absolute paths; symlink escape rejected (F3) | Phase 5 security review: a relative/`..`/symlinked path must never be written open |
 | 2026-09-21 | save_dictation reads Notepad via Ctrl+A/Ctrl+C | Most reliable cross-version approach; pywinauto read-back varies by Notepad version |
+| 2026-09-21 | wake audio converted to int16 before openWakeWord `predict()` | 0.6.0 mel-preprocessor casts input to int16; float [-1,1] truncated to {0,±1} = score 0.000 (proven on hardware) |
+| 2026-09-21 | audio `read()` deadline is a stall clock, not wall-clock | absolute 0.5s deadline capped every read (~7680 samples) and would truncate commands |
+| 2026-09-21 | WhatsApp reached only via `DesktopWindowProvider` protocol; tests inject a fake window | docs/06: no desktop in CI; unverifiable chat → never press Enter (invariant #9) |
+| 2026-09-21 | `whatsapp_send` Tier 2, rate limit enforced in code before any window opens | docs/03 §3, docs/04 §2.6 step 7: recipient count == 1, 10/h, 5s minimum |
+| 2026-09-21 | contacts edited only through `jarvis contacts …`; numbers masked in CLI/describe (+last 2 digits) | docs/04 §2.6: no LLM-driven contact writes; docs/03 redaction |
 
 ## Manual tests to run on the PC
 ```powershell
@@ -295,8 +301,75 @@ jarvis off                          # Stop voice listening
 `jarvis doctor --live` requires a real Groq key + a model name in `config.toml [llm]`.
 
 ## Next step
-Phase 6: WhatsApp with contacts and confirmation.  Do not modify Phase 5 files unless
-a Phase 6 dependency requires it.
+Phase 7: audit (tools/audit) with hard-coded whitelisted commands, per-check timeouts,
+`jarvis audit` — read-only, graceful degradation without admin, fixtures-based unit tests.
+
+---
+
+## Real voice bug fix + `jarvis voice doctor` + Phase 6 (WhatsApp) — run on native Windows
+
+### Real-hardware voice bug: "voice activated but 'Hey Jarvis' never responds" — FIXED
+- **Root cause (proven)**: `wake.py` fed openWakeWord 0.6.0 float32 samples in [-1,1];
+  its mel-preprocessor casts to `int16` (`AudioFeatures._get_melspectrogram`), so the
+  floats truncated to {0,±1}. Real "hey jarvis" clip through the real mic: float path
+  max score **0.000**, int16 path **0.966**. The mic, audio input and TTS were all fine.
+- **Fix A** `voice/wake.py`: `detect()` now scales/clips to `int16` before `predict()`.
+- **Fix B** `voice/audio_input.py`: `read()` used an absolute wall-clock deadline (0.5s)
+  — ANY read was capped at ~0.5s (read(480000) returned 7680). Now a stall clock reset
+  per delivered block. This would have truncated spoken commands after wake.
+- Regression tests: `test_voice_wake.py` (int16 contract, clipping, threshold, reset,
+  create() None paths) + 3 long-window/stall tests in `test_voice_audio_input.py`.
+- **Real validation**: fixed detector on the recorded clip → `PIPELINE_WAKE=PASS`
+  (6 frames, max 0.974).
+
+### `jarvis voice doctor` (new)
+- `jarvis voice doctor` reports audio library / input device / mic open+read / wake
+  model / wake detection / STT model / TTS, wired exactly like the daemon's
+  `_build_voice_service`. No speech recorded beyond a short sample probe; no raw
+  audio/transcripts shown. Flags `--no-mic/--no-stt/--no-tts` skip slow/downloading
+  probes. `Check`/`_check` moved to `jarvis/checks.py` (shared with `cli.py`).
+- **Real run on this PC: all 8 checks PASS** (mic = Microphone Array, wake model loaded,
+  faster-whisper-base cached, SAPI fallback). 11 unit tests.
+
+### Phase 6 WhatsApp — DONE
+- `tools/whatsapp.py`: `ContactStore` (contacts.json, E.164-ish validation 8-15 digits,
+  masked display +last 2 digits, dedupe), `RateLimiter` (persisted, max/hour + min
+  interval), `WhatsAppWindow`/`DesktopWindowProvider` protocols + best-effort
+  pywinauto provider (every UI read fails closed), and `whatsapp_send` (Tier 2) with
+  the exact §2.6 flow: resolve exactly one contact → rate-limit → open
+  `whatsapp://send?phone=…&text=…` → verify chat header (name or digits) → verify
+  draft (when readable) → Enter → best-effort read-back. Unverifiable chat → never
+  press Enter, leave the draft.
+- CLI `jarvis contacts add|list|remove` (numbers masked in list output; raw number
+  never printed). Config `[whatsapp]` block (`app_name`, `max_per_hour=10`,
+  `min_interval_s=5.0`, `window_timeout_s=10.0`). 17 tools registered.
+- **Invariant 9 strengthened**: `test_invariant_9_whatsapp_unverifiable_window_never_sends`
+  (window never found → not sent, no Enter, nothing recorded).
+- Tests: `test_whatsapp.py` (contacts, rate limit, tool flow with fake window incl.
+  invariant-9 paths), `test_contacts_cli.py`. ~35 new Phase 6 tests; suite 535→**601**.
+- Manual/real WhatsApp Desktop send deferred (docs/05: own test number only); pywinauto
+  reads of the live WhatsApp UI (header/draft) remain unproven on real hardware —
+  provider degrades to fail-closed by design (docs/12).
+
+## Manual tests added this session (PC)
+```powershell
+.venv\Scripts\python.exe -m jarvis voice doctor        # all PASS expected
+jarvis contacts add "Test Contact" +<your second number>
+jarvis contacts list                                   # masked, +••••••••xx
+jarvis contacts remove "Test Contact"
+# WhatsApp end-to-end (test number only):
+#   jarvis daemon --foreground → jarvis on → "hey jarvis, send message to <contact> …"
+#   or in chat: send a WhatsApp message → confirm shows masked number + exact text,
+#   unlock, approve; watch the desktop chat verify before Enter.
+jarvis on   # re-verify: "hey jarvis" → "Yes?" now (was silent)
+```
+
+## Known fragile areas (Phase 6)
+- pywinauto may not read the WhatsApp header/draft (docs/12 §1) — the tool then
+  reports "Could not verify chat" and leaves the draft; that is correct fail-closed
+  behaviour, not a bug, but it needs one manual pass with a real WhatsApp Desktop chat.
+- contacts.json / rate-limit file live in the data dir; a corrupt contacts file is
+  treated as empty (safe) rather than blocking every tool call.
 
 ---
 

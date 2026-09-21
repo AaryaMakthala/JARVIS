@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import getpass
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -37,6 +36,7 @@ from jarvis.agent import (
     resume_task,
     run_task,
 )
+from jarvis.checks import Check, _check
 from jarvis.llm.client import GroqClient, LLMError
 from jarvis.platform_guard import is_64bit, is_python_supported, is_windows
 from jarvis.policy import tiers
@@ -50,28 +50,13 @@ app = typer.Typer(
 )
 password_app = typer.Typer(help="Unlock-password management.", no_args_is_help=True)
 autostart_app = typer.Typer(help="Daemon autostart management.", no_args_is_help=True)
+voice_app = typer.Typer(help="Voice diagnostics and control.", no_args_is_help=True)
 app.add_typer(password_app, name="password")
 app.add_typer(autostart_app, name="autostart")
+app.add_typer(voice_app, name="voice")
 
 console = Console()
 logger = logging.getLogger(__name__)
-
-_CHECK_STATUS = ("PASS", "WARN", "FAIL")
-
-
-@dataclass(frozen=True)
-class Check:
-    """Single doctor check result."""
-
-    name: str
-    status: str  # one of _CHECK_STATUS
-    detail: str
-
-
-def _check(name: str, status: str, detail: str) -> Check:
-    if status not in _CHECK_STATUS:
-        raise ValueError(f"unknown check status {status!r}")
-    return Check(name, status, detail)
 
 
 def init_config(
@@ -848,6 +833,77 @@ def unlock_command(
     raise ValueError("wrong password (or the session is locked out)")
 
 
+# ── contacts ─────────────────────────────────────────────────────────────
+
+
+def _contacts_store() -> Any:
+    from jarvis.tools.whatsapp import ContactStore
+
+    return ContactStore(config.contacts_file())
+
+
+def contacts_add_command(store: Any, name: str, number: str) -> str:
+    """Add a WhatsApp contact after E.164-ish validation (testable)."""
+    return store.add(name, number)
+
+
+def contacts_remove_command(store: Any, name: str) -> str:
+    """Remove a WhatsApp contact by name (testable)."""
+    return store.remove(name)
+
+
+def contacts_list_command(store: Any) -> list[str]:
+    """Render contact rows with masked numbers (testable; no raw numbers)."""
+    from jarvis.tools.whatsapp import masked_number
+
+    return [
+        f"{c.name:<20} {masked_number(c.number)}"
+        for c in sorted(store.load(), key=lambda c: c.name.lower())
+    ]
+
+
+contacts_app = typer.Typer(help="WhatsApp contacts.", no_args_is_help=True)
+app.add_typer(contacts_app, name="contacts")
+
+
+@contacts_app.command("add")
+def contacts_add(
+    name: Annotated[str, typer.Argument(help="Contact display name.")],
+    number: Annotated[str, typer.Argument(help="Phone number (E.164-ish: +cc… or cc…).")],
+) -> None:
+    """Add a WhatsApp contact (non-interactive, validated)."""
+    try:
+        message = contacts_add_command(_contacts_store(), name, number)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]{message}[/green]")
+
+
+@contacts_app.command("remove")
+def contacts_remove(
+    name: Annotated[str, typer.Argument(help="Contact display name (case-insensitive).")],
+) -> None:
+    """Remove a WhatsApp contact."""
+    try:
+        message = contacts_remove_command(_contacts_store(), name)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]{message}[/green]")
+
+
+@contacts_app.command("list")
+def contacts_list() -> None:
+    """List WhatsApp contacts (numbers masked to the last 2 digits)."""
+    rows = contacts_list_command(_contacts_store())
+    if not rows:
+        console.print("[yellow]no contacts yet; add one with `jarvis contacts add`[/yellow]")
+        return
+    for row in rows:
+        console.print(row)
+
+
 # ── voice on / off ────────────────────────────────────────────────────────
 
 
@@ -927,6 +983,42 @@ def off() -> None:
         console.print(f"[green]{message}[/green]")
     finally:
         client.close()
+
+
+# ── voice doctor ─────────────────────────────────────────────────────────
+
+
+@voice_app.command("doctor")
+def voice_doctor(
+    mic: Annotated[
+        bool, typer.Option("--mic", help="Probe the microphone (reads ~1s of audio).")
+    ] = True,
+    stt: Annotated[
+        bool,
+        typer.Option("--stt", help="Load and probe the STT model (downloads on first use)."),
+    ] = True,
+    tts: Annotated[
+        bool, typer.Option("--tts", help="Initialise the TTS engine (may play no audio).")
+    ] = True,
+) -> None:
+    """Diagnose the voice pipeline: mic, wake word, STT, TTS.
+
+    Reports each component exactly as the daemon would wire it.  No speech is
+    recorded beyond a short fixed-length sample probe and no transcripts are
+    shown.
+
+    First run of ``--stt`` downloads the faster-whisper model to the cache.
+    """
+    from jarvis.voice.doctor import run_voice_doctor
+
+    checks = run_voice_doctor(mic=mic, stt=stt, tts=tts)
+    table = Table(show_header=False, box=None)
+    for check in checks:
+        table.add_row(check.status, check.name, check.detail)
+    console.print(table)
+    failures = [c for c in checks if c.status == "FAIL"]
+    if failures:
+        raise typer.Exit(code=1)
 
 
 def main() -> None:

@@ -312,6 +312,45 @@ def test_invariant_9_verification_failure_fails_closed(tmp_path: Any) -> None:
         saver.conn.close()
 
 
+def test_invariant_9_whatsapp_unverifiable_window_never_sends(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """docs/03 #9: WhatsApp with an unverifiable chat -> nothing is sent."""
+    from jarvis.tools.base import ToolContext
+    from jarvis.tools.whatsapp import (
+        ContactStore,
+        RateLimiter,
+        WhatsAppSendArgs,
+        make_whatsapp_send_spec,
+    )
+
+    entered: list[bool] = []
+
+    class _Provider:
+        def open_chat(self, phone_digits: str, text: str) -> None:
+            pass  # the URI opens, the window never appears
+
+        def find_chat_window(self, timeout_s: float) -> None:
+            return None  # window cannot be found -> unverifiable
+
+    monkeypatch.setattr("jarvis.platform_guard.is_windows", lambda: True)
+    monkeypatch.setattr("jarvis.tools.whatsapp._build_provider", lambda settings: _Provider())
+
+    store = ContactStore(tmp_path / "contacts.json")
+    store.add("Tester", "+9112345678")
+    limiter = RateLimiter(tmp_path / "rl.json", max_per_hour=10, min_interval_s=0.0)
+    spec = make_whatsapp_send_spec(store=store, limiter=limiter)
+    result = spec.run(
+        WhatsAppSendArgs(contact="Tester", message="psst"),
+        ToolContext(settings=Settings()),
+    )
+    assert result.ok is False
+    assert "Could not verify chat" in result.error
+    assert entered == []  # Enter was never pressed
+    assert limiter.traffic_count() == 0  # nothing was recorded as sent
+    assert not result.data  # no recipient/success payload escaped
+
+
 # ---------------------------------------------------------------------------
 # Invariant 11: Tier 2 needs an unlocked session even if the user says yes
 # ---------------------------------------------------------------------------

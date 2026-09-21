@@ -152,32 +152,39 @@ class SoundDeviceAudioInput:
         """Read *num_frames* samples as float; surplus is kept for next read.
 
         Returns **exactly** ``num_frames`` samples whenever the stream keeps
-        delivering data.  It returns early (possibly with fewer samples)
-        only in two cases:
+        delivering data — including windows far longer than
+        ``read_timeout_s``, which is a *stall* timeout, not a cap on the
+        read length.  It returns early (possibly with fewer samples) only
+        in two cases:
 
         * the stream has been **closed** — a reader blocked in another
           thread is released within ~0.1 s because the queue is polled in
           short slices; or
         * the stream **stalled** — no data arrived within
-          ``read_timeout_s``.
+          ``read_timeout_s`` (the clock resets every time a block arrives,
+          so a live mic always satisfies the full window).
 
         int16 input is converted to float by dividing by 32768.  Samples
         left over from the last block stay in ``_read_buffer`` and are
         served on the next call, so read sizes never need to align with
         block sizes.
         """
-        deadline = time.monotonic() + self._read_timeout_s
+        # Stall clock, refreshed on every delivered block.  An absolute
+        # deadline here would silently cap any read at ~read_timeout_s of
+        # wall time, truncating a multi-second spoken command.
+        stall_deadline = time.monotonic() + self._read_timeout_s
         while len(self._read_buffer) < num_frames:
             if not self._open:
                 break  # closed while reading — return what we have
-            wait = deadline - time.monotonic()
-            if wait <= 0:
-                break  # stalled — no data within the poll window
+            remaining = stall_deadline - time.monotonic()
+            if remaining <= 0:
+                break  # stalled — no data within read_timeout_s
             try:
-                block = self._queue.get(timeout=min(wait, _READ_POLL_S))
+                block = self._queue.get(timeout=min(remaining, _READ_POLL_S))
             except queue.Empty:
                 continue
             self._read_buffer.extend(self._block_to_float(block))
+            stall_deadline = time.monotonic() + self._read_timeout_s
         taken = self._read_buffer[:num_frames]
         self._read_buffer = self._read_buffer[num_frames:]
         return AudioSegment(samples=taken, sample_rate=self._sample_rate)
@@ -267,13 +274,11 @@ class SoundDeviceAudioInput:
             total = max(sd.query_devices().__len__(), 1)
             if device < 0 or device >= total:
                 raise VoiceInputError(
-                    f"voice.input_device {device} is out of range "
-                    f"(0..{total - 1} on this machine)"
+                    f"voice.input_device {device} is out of range (0..{total - 1} on this machine)"
                 )
             if int(sd.query_devices(device).get("max_input_channels", 0)) <= 0:
                 raise VoiceInputError(
-                    f"voice.input_device {device} is not a microphone "
-                    "(it has no input channels)"
+                    f"voice.input_device {device} is not a microphone (it has no input channels)"
                 )
             return device
 

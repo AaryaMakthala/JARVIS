@@ -64,9 +64,7 @@ class StrictInputStream:
     def __init__(self, **kwargs: Any) -> None:
         unknown = set(kwargs) - _REAL_STREAM_PARAMS
         if unknown:
-            raise TypeError(
-                f"InputStream got unexpected keyword arguments {sorted(unknown)}"
-            )
+            raise TypeError(f"InputStream got unexpected keyword arguments {sorted(unknown)}")
         self.kwargs = dict(kwargs)
         self.started = False
         self.stopped = False
@@ -118,9 +116,7 @@ class FakeSD:
                 raise IndexError(f"invalid device id {device}")
             return dict(self._devices[device])
         raw = str(device).lower()
-        idx = next(
-            (i for i, d in enumerate(self._devices) if raw in d["name"].lower()), None
-        )
+        idx = next((i for i, d in enumerate(self._devices) if raw in d["name"].lower()), None)
         if idx is None:
             raise ValueError(f"no device named {device!r}")
         return dict(self._devices[idx])
@@ -206,9 +202,7 @@ class TestRead:
         audio._stream.callback(_int16_block(values), len(values), None, None)
         seg = audio.read(len(values))
         assert seg.sample_rate == 16000
-        assert seg.samples == pytest.approx(
-            [0.0, 0.5, 32767 / 32768.0, -1.0, -0.5]
-        )
+        assert seg.samples == pytest.approx([0.0, 0.5, 32767 / 32768.0, -1.0, -0.5])
         audio.close()
 
     def test_read_returns_exact_n_and_keeps_surplus(self) -> None:
@@ -244,6 +238,56 @@ class TestRead:
         seg = audio.read(100)  # only 5 available → stalls → partial
         elapsed = time.monotonic() - start
         assert seg.samples == [1 / 32768.0] * 5
+        assert elapsed < 1.0
+        audio.close()
+
+    def test_read_returns_full_window_while_stream_keeps_delivering(self) -> None:
+        """A live stream must satisfy reads *longer* than read_timeout_s.
+
+        read_timeout_s is a stall timeout (no data for X), not a cap on the
+        read length.  Previously the whole read was bounded by an absolute
+        wall-clock deadline of read_timeout_s → any command capture was cut
+        to ~half a second.  Here 8 blocks arrive over ~0.1 s while the
+        caller asks for all 8; the old code returned the first deadline's
+        worth, the new code returns the full window.
+        """
+        audio = SoundDeviceAudioInput(stream_factory=StrictInputStream, read_timeout_s=_READ_OK)
+        audio.open()
+        cb = audio._stream.callback
+        deliver = 8
+        collected: list[str] = []
+
+        def feed() -> None:
+            try:
+                for _ in range(deliver):
+                    cb(_int16_block([3] * _BLOCK), _BLOCK, None, None)
+                    time.sleep(0.01)
+                collected.append("done")
+            except Exception as exc:  # noqa: BLE001 - test helper
+                collected.append(str(exc))
+
+        thread = threading.Thread(target=feed)
+        start = time.monotonic()
+        thread.start()
+        seg = audio.read(deliver * _BLOCK)
+        thread.join(timeout=5.0)
+        elapsed = time.monotonic() - start
+        assert len(seg.samples) == deliver * _BLOCK
+        assert seg.samples == pytest.approx([3 / 32768.0] * (deliver * _BLOCK))
+        assert collected == ["done"]
+        assert elapsed < 2.0  # far longer than read_timeout_s, but bounded
+        audio.close()
+
+    def test_read_full_window_does_not_refresh_stall_when_no_data_comes(self) -> None:
+        """Once data stops, the stall clock must not keep a read alive forever."""
+        audio = SoundDeviceAudioInput(stream_factory=StrictInputStream, read_timeout_s=_READ_OK)
+        audio.open()
+        cb = audio._stream.callback
+        cb(_int16_block([1] * 10), 10, None, None)  # a little data, then silence
+        start = time.monotonic()
+        seg = audio.read(1_000_000)  # far more than will ever arrive
+        elapsed = time.monotonic() - start
+        assert len(seg.samples) == 10
         assert elapsed < 1.0
         audio.close()
 
@@ -394,4 +438,6 @@ class TestStreamKwargsHelper:
         kwargs = _stream_kwargs(
             sample_rate=16000, channels=1, block_size=1280, device=None, callback=lambda *a: None
         )
-        assert not (set(kwargs) - params), f"unknown kwargs for sd.InputStream: {set(kwargs) - params}"
+        assert not (set(kwargs) - params), (
+            f"unknown kwargs for sd.InputStream: {set(kwargs) - params}"
+        )

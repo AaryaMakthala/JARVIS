@@ -70,6 +70,12 @@ listen_timeout_s = 30.0
 idle_timeout_s = 120.0
 max_session_s = 1800.0
 max_dictation_chars = 20000
+
+[whatsapp]
+app_name = "WhatsApp"
+max_per_hour = 10
+min_interval_s = 5.0
+window_timeout_s = 10.0
 """
 
 
@@ -147,6 +153,19 @@ class VoiceSettings(BaseModel):
     max_dictation_chars: int = 20000
 
 
+class WhatsAppSettings(BaseModel):
+    """WhatsApp send behaviour (used from Phase 6 onwards).
+
+    ``max_per_hour`` and ``min_interval_s`` bound send frequency; they are
+    enforced in code before any window is opened (docs/04 §2.6 step 7).
+    """
+
+    app_name: str = "WhatsApp"
+    max_per_hour: int = 10
+    min_interval_s: float = 5.0
+    window_timeout_s: float = 10.0
+
+
 class Settings(BaseSettings):
     """Top-level application settings.
 
@@ -168,6 +187,7 @@ class Settings(BaseSettings):
     apps: AppSettings = AppSettings()
     daemon: DaemonSettings = DaemonSettings()
     voice: VoiceSettings = VoiceSettings()
+    whatsapp: WhatsAppSettings = WhatsAppSettings()
     config_version: int = 1
 
     @classmethod
@@ -229,6 +249,11 @@ def log_file() -> Path:
 def contacts_file() -> Path:
     """Path to the WhatsApp contacts file."""
     return user_data_dir("contacts.json")
+
+
+def whatsapp_ratelimit_file() -> Path:
+    """Path to the persisted WhatsApp send-history timestamps."""
+    return user_data_dir("whatsapp_ratelimit.json")
 
 
 def memory_db() -> Path:
