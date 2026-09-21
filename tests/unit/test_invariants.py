@@ -35,6 +35,7 @@ from jarvis.llm.client import FakeLLM
 from jarvis.policy.unlock import UnlockManager
 from jarvis.tools.base import ToolContext
 from jarvis.tools.files import make_delete_path_spec
+from jarvis.voice.fakes import make_speech
 from support import (
     FakeDirTrash,
     approve,
@@ -660,6 +661,60 @@ def test_invariant_10_ipc_requires_token() -> None:
         loop.call_soon_threadsafe(server._shutdown_event.set)
         t.join(timeout=3)
         loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Invariant 15: audio never reaches the LLM
+# ---------------------------------------------------------------------------
+
+
+def test_invariant_15_audio_not_sent_to_llm() -> None:
+    """The LLM client mock never receives bytes or audio data — only text.
+
+    This test builds a fake LLM and a voice loop, runs a voice command
+    through the loop's routing, and asserts that every call to the LLM
+    used string arguments only.
+    """
+    from jarvis.voice.fakes import FakeAudioInput, FakeSTT, FakeTTS, FakeWakeWord
+    from jarvis.voice.interfaces import STTResult, WakeWordResult
+    from jarvis.voice.loop import VoiceLoop
+
+    llm_received: list[tuple[str, str]] = []
+
+    def fake_submit(text: str, source: str) -> Any:
+        llm_received.append((text, source))
+        return type(
+            "Outcome",
+            (),
+            {
+                "final_answer": "ok",
+                "confirmation": None,
+                "error": None,
+            },
+        )()
+
+    audio = FakeAudioInput(segments=[make_speech("fake", duration_s=0.5)] * 50)
+    wake = FakeWakeWord(results=[WakeWordResult(detected=True)])
+    stt = FakeSTT(results=[STTResult(text="open notepad")])
+    tts = FakeTTS()
+
+    loop = VoiceLoop(
+        audio=audio,
+        wake_detector=wake,
+        stt=stt,
+        tts=tts,
+        submit_task=fake_submit,
+    )
+    loop._route("open notepad")
+
+    assert len(llm_received) == 1
+    text_arg, source_arg = llm_received[0]
+    # Only strings — never bytes, ndarray, or audio segments
+    assert isinstance(text_arg, str)
+    assert isinstance(source_arg, str)
+    assert not isinstance(text_arg, (bytes, bytearray))
+    # The text is the transcript, not raw audio
+    assert text_arg == "open notepad"
 
 
 # ---------------------------------------------------------------------------

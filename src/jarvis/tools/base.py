@@ -72,6 +72,7 @@ class ToolContext:
     trash: Any | None = None  # TrashService | None (defaults to the real recycle bin)
     unlock: Any | None = None  # UnlockManager | None (shared with the policy engine)
     undo_log: Path | None = None  # override for the undo log path (tests)
+    voice: Any | None = None  # VoiceToolsFacade | None (live voice loop for dictation tools)
 
 
 ArgsModel = type[BaseModel]

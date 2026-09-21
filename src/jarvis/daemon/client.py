@@ -24,6 +24,7 @@ from jarvis.daemon.protocol import (
     ShutdownMessage,
     StatusRequest,
     StatusResponse,
+    VoiceToggleMessage,
 )
 from jarvis.logging_setup import get_logger
 from jarvis.secrets import SecretStore
@@ -167,6 +168,16 @@ class DaemonClient:
     def send_shutdown(self) -> None:
         """Ask the daemon to shut down gracefully."""
         self._send_sync(ShutdownMessage())
+
+    def send_voice_toggle(self, state: bool) -> str:
+        """Turn the daemon's voice pipeline on/off.  Returns the status text."""
+        msg = VoiceToggleMessage(state=state)
+        resp = self._send_recv_sync(msg)
+        if isinstance(resp, EventMessage):
+            return str(resp.data.get("message", "voice toggled"))
+        if isinstance(resp, ErrorMessage):
+            raise DaemonError(code=resp.code, message=resp.message)
+        return "voice toggled"
 
     def get_status(self) -> StatusResponse:
         """Request daemon status."""

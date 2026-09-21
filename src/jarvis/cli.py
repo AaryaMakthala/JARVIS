@@ -845,6 +845,76 @@ def unlock_command(
     raise ValueError("wrong password (or the session is locked out)")
 
 
+# ── voice on / off ────────────────────────────────────────────────────────
+
+
+def voice_on_command(settings: config.Settings, client: Any) -> str:
+    """Ask the daemon to start listening.  Returns the status text to print."""
+    if not settings.voice.enabled:
+        return "voice is disabled in config — set [voice] enabled = true"
+    try:
+        return client.send_voice_toggle(True)
+    except Exception as exc:  # noqa: BLE001
+        message = getattr(exc, "message", None) or str(exc)
+        return f"voice error: {message}"
+
+
+def voice_off_command(client: Any) -> str:
+    """Ask the daemon to stop listening.  Returns the status text to print."""
+    try:
+        return client.send_voice_toggle(False)
+    except Exception as exc:  # noqa: BLE001
+        message = getattr(exc, "message", None) or str(exc)
+        return f"voice error: {message}"
+
+
+@app.command()
+def on() -> None:
+    """Start voice listening (mic + wake word)."""
+    settings = config.load_settings()
+    from jarvis.daemon.client import DaemonClient, DaemonError
+
+    try:
+        client = DaemonClient()
+        client.connect()
+    except DaemonError as exc:
+        console.print(f"[yellow]cannot connect to daemon: {exc.message}[/yellow]")
+        console.print("[dim]start the daemon with: jarvis daemon --foreground[/dim]")
+        raise typer.Exit(code=1)
+
+    try:
+        message = voice_on_command(settings, client)
+        if "active" in message:
+            console.print(f"[green]{message}[/green]")
+            console.print("[dim]say 'stop listening' or 'jarvis off' to stop[/dim]")
+        else:
+            console.print(f"[yellow]{message}[/yellow]")
+            if "disabled" in message:
+                raise typer.Exit(code=1)
+    finally:
+        client.close()
+
+
+@app.command()
+def off() -> None:
+    """Stop voice listening."""
+    from jarvis.daemon.client import DaemonClient, DaemonError
+
+    try:
+        client = DaemonClient()
+        client.connect()
+    except DaemonError as exc:
+        console.print(f"[yellow]cannot connect to daemon: {exc.message}[/yellow]")
+        console.print("[dim]start the daemon with: jarvis daemon --foreground[/dim]")
+        raise typer.Exit(code=1)
+
+    try:
+        message = voice_off_command(client)
+        console.print(f"[green]{message}[/green]")
+    finally:
+        client.close()
+
+
 def main() -> None:
     """Console entry point (also used by python -m jarvis)."""
     logging_setup.configure_logging(config.logs_dir())

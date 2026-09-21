@@ -152,3 +152,60 @@ class FakeDirTrash:
         except OSError:
             return False
         return Path(record.original_path).exists()
+
+
+# ── Voice helpers ───────────────────────────────────────────────────────
+
+
+def voice_silence(duration_s: float = 1.0, sample_rate: int = 16_000):
+    """Create a silence AudioSegment for voice tests."""
+    from jarvis.voice.interfaces import AudioSegment
+
+    n = int(duration_s * sample_rate)
+    return AudioSegment(samples=[0.0] * n, sample_rate=sample_rate)
+
+
+def voice_speech(duration_s: float = 2.0, sample_rate: int = 16_000):
+    """Create a fake speech AudioSegment for voice tests."""
+    from jarvis.voice.interfaces import AudioSegment
+
+    n = int(duration_s * sample_rate)
+    return AudioSegment(samples=[0.5] * n, sample_rate=sample_rate)
+
+
+def make_voice_loop(
+    wake_detected: bool = True,
+    transcript: str = "open notepad",
+    response: str | None = None,
+):
+    """Build a VoiceLoop with all fakes for testing."""
+    from jarvis.voice.fakes import (
+        FakeAudioInput,
+        FakeSTT,
+        FakeTTS,
+        FakeWakeWord,
+    )
+    from jarvis.voice.loop import VoiceLoop
+
+    wake_results = []
+    if wake_detected:
+        from jarvis.voice.interfaces import WakeWordResult
+
+        wake_results.append(WakeWordResult(detected=True, confidence=0.9))
+
+    audio = FakeAudioInput(
+        segments=[voice_speech(0.5)] * 50,  # plenty of speech segments
+    )
+    wake = FakeWakeWord(results=wake_results)
+    from jarvis.voice.interfaces import STTResult
+
+    stt = FakeSTT(results=[STTResult(text=transcript)])
+    tts = FakeTTS()
+
+    loop = VoiceLoop(
+        audio=audio,
+        wake_detector=wake,
+        stt=stt,
+        tts=tts,
+    )
+    return loop, audio, wake, stt, tts

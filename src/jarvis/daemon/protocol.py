@@ -6,7 +6,7 @@ from keyring (constant-time compare via ``hmac.compare_digest``).
 
 Client → server: :class:`AuthMessage`, :class:`ChatMessage`,
 :class:`ConfirmResponse`, :class:`CancelMessage`, :class:`StatusRequest`,
-:class:`ShutdownMessage`.
+:class:`ShutdownMessage`, :class:`VoiceToggleMessage`.
 
 Server → client: :class:`AuthOk`, :class:`EventMessage`,
 :class:`ConfirmRequest`, :class:`FinalMessage`, :class:`ErrorMessage`,
@@ -36,6 +36,7 @@ __all__ = [
     "ShutdownMessage",
     "StatusRequest",
     "StatusResponse",
+    "VoiceToggleMessage",
 ]
 
 #: Maximum size of a single NDJSON line (bytes).  Server rejects anything larger.
@@ -70,6 +71,11 @@ class ConfirmResponse(BaseModel):
     The ``password`` field is consumed exactly once by the daemon (to verify
     the unlock) and is **never** included in the resume payload sent to the
     graph (docs/03 invariant 8).
+
+    ``source`` records where the answer came from.  The daemon refuses answers
+    claiming ``voice`` for Tier 2+ actions (docs/03 §7.8): those must be
+    answered at a terminal.  Voice-driven Tier 1 answers never travel over
+    IPC at all — they are resolved inside the daemon worker thread.
     """
 
     type: Literal["confirm_response"] = "confirm_response"
@@ -78,6 +84,7 @@ class ConfirmResponse(BaseModel):
     action_hash: str
     password: str | None = None  # only for Tier 2 unlocks; discarded after use
     typed_confirmation: str | None = None  # folder-name confirmation
+    source: Literal["terminal", "dialog", "voice"] = "terminal"
 
 
 class CancelMessage(BaseModel):
@@ -97,6 +104,13 @@ class ShutdownMessage(BaseModel):
     """Gracefully stop the daemon."""
 
     type: Literal["shutdown"] = "shutdown"
+
+
+class VoiceToggleMessage(BaseModel):
+    """Turn the voice pipeline on/off via the daemon (``jarvis on`` / ``off``)."""
+
+    type: Literal["voice_toggle"] = "voice_toggle"
+    state: bool
 
 
 # ── Server → Client ──────────────────────────────────────────────────────
@@ -166,6 +180,12 @@ class StatusResponse(BaseModel):
 # ── Union type for parsing ───────────────────────────────────────────────
 
 DaemonMessage = (
-    AuthMessage | ChatMessage | ConfirmResponse | CancelMessage | StatusRequest | ShutdownMessage
+    AuthMessage
+    | ChatMessage
+    | ConfirmResponse
+    | CancelMessage
+    | StatusRequest
+    | ShutdownMessage
+    | VoiceToggleMessage
 )
 """Union of all client→server message types (used for dispatch)."""

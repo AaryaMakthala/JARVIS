@@ -43,11 +43,17 @@ from jarvis.daemon.protocol import (
     ShutdownMessage,
     StatusRequest,
     StatusResponse,
+    VoiceToggleMessage,
 )
 from jarvis.logging_setup import get_logger
 from jarvis.policy.unlock import UnlockManager
 from jarvis.secrets import SecretStore
 from jarvis.tools.base import CancelToken
+
+try:
+    from jarvis.voice.service import VoiceService
+except ImportError:
+    VoiceService = None  # type: ignore[assignment,misc]
 
 logger = get_logger("daemon.server")
 
@@ -59,6 +65,11 @@ CONFIRMATION_TIMEOUT_S = 60
 
 #: How often to check for stale confirmations (seconds).
 STALE_CHECK_INTERVAL_S = 10
+
+#: Sentinel owner id for tasks submitted by the voice pipeline.  These have no
+#: IPC client socket; results are read back by the blocked voice thread
+#: directly (see :meth:`DaemonServer._voice_submit`).
+VOICE_OWNER = "__voice__"
 
 
 # ── NDJSON framing ──────────────────────────────────────────────────────
@@ -80,6 +91,7 @@ def _parse_message(text: str) -> DaemonMessage | None:
         "cancel": CancelMessage,
         "status": StatusRequest,
         "shutdown": ShutdownMessage,
+        "voice_toggle": VoiceToggleMessage,
     }
     cls = dispatch.get(msg_type)
     if cls is None:
@@ -156,6 +168,7 @@ class TaskSlot:
     # Worker-thread signals
     event: threading.Event = field(default_factory=threading.Event)
     confirm_payload: dict[str, Any] | None = None
+    confirm_tier: int = 0  # tier of the pending confirmation (for IPC guarding)
     resume_answer: dict[str, Any] | None = None
     result_text: str | None = None
     error: str | None = None
@@ -163,6 +176,19 @@ class TaskSlot:
     # Timestamps
     started_at: float = 0.0
     confirm_sent_at: float = 0.0
+
+
+@dataclass
+class _VoiceOutcome:
+    """Minimal outcome object returned to the voice loop by ``_voice_submit``.
+
+    Confirmation is always resolved inside the worker before this is returned,
+    which is why ``confirmation`` is fixed to ``None``.
+    """
+
+    final_answer: str | None = None
+    error: str | None = None
+    confirmation: None = None
 
 
 # ── Server ───────────────────────────────────────────────────────────────
@@ -198,6 +224,7 @@ class DaemonServer:
         # loop via _wake_dispatch(), which schedules on the loop thread.
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pid_file: Any = None
+        self._voice_service: Any = None  # VoiceService | None
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -282,6 +309,10 @@ class DaemonServer:
 
     async def _serve(self) -> None:
         """Accept connections, manage the task queue, clean up stale confirmations."""
+        # Initialise the voice service first so the agent context can be wired
+        # to its live loop (dictation tools need ``ctx.voice``).
+        self._bootstrap_voice()
+
         if self._ctx is None:
             self._ctx = self._build_default_context()
 
@@ -314,11 +345,32 @@ class DaemonServer:
         await server.wait_closed()
         for conn in list(self._clients.values()):
             conn.close()
+        self._stop_voice()
         logger.info("daemon shut down cleanly")
+
+    def _bootstrap_voice(self) -> None:
+        """Initialise the VoiceService and honour ``[voice] enabled`` (boot).
+
+        Idempotent and safe to call from tests/shareholders; building the
+        service may be slow (backend discovery) so it is done once at startup.
+        """
+        self._voice_service = None
+        if self._settings.voice.enabled and VoiceService is not None:
+            try:
+                self._voice_service = self._build_voice_service()
+            except Exception:
+                logger.warning("could not initialise voice service", exc_info=True)
+
+        if self._voice_service is not None:
+            try:
+                msg = self._voice_service.start()
+                logger.info("voice auto-start: %s", msg)
+            except Exception:
+                logger.warning("failed to auto-start voice", exc_info=True)
 
     def _build_default_context(self) -> Any:
         """Build an AppContext with the current settings."""
-        from jarvis.agent.context import make_app_context
+        from jarvis.agent.context import VoiceToolsFacade, make_app_context
 
         groq_key = self._store.get("groq_api_key") or ""
         llm = None
@@ -329,7 +381,97 @@ class DaemonServer:
                 llm = GroqClient(groq_key, self._settings)
             except Exception:  # noqa: BLE001
                 logger.warning("could not create GroqClient")
-        return make_app_context(self._settings, llm=llm, unlock=self._unlock)
+        return make_app_context(
+            self._settings,
+            llm=llm,
+            unlock=self._unlock,
+            voice=VoiceToolsFacade(service=self._voice_service),
+        )
+
+    def _build_voice_service(self) -> Any:
+        """Build a VoiceService with lazy-imported backends."""
+        from jarvis.voice.service import VoiceService
+
+        audio = None
+        wake = None
+        stt = None
+        tts = None
+        focus = None
+
+        try:
+            from jarvis.voice.vad import create as create_vad
+
+            audio = create_vad(
+                sample_rate=16_000,
+                silence_threshold=self._settings.voice.silence_threshold,
+                silence_timeout_s=self._settings.voice.silence_timeout_s,
+            )
+        except Exception:
+            logger.debug("VAD unavailable", exc_info=True)
+
+        try:
+            from jarvis.voice.wake import create as create_wake
+
+            wake = create_wake(model_name=self._settings.voice.wake_word)
+        except Exception:
+            logger.debug("wake-word unavailable", exc_info=True)
+
+        try:
+            from jarvis.voice.stt import create as create_stt
+
+            stt = create_stt(model_size=self._settings.voice.stt_model)
+        except Exception:
+            logger.debug("STT unavailable", exc_info=True)
+
+        try:
+            from jarvis.voice.tts import create as create_tts
+
+            tts = create_tts(backend=self._settings.voice.tts_backend)
+        except Exception:
+            logger.debug("TTS unavailable", exc_info=True)
+
+        try:
+            from jarvis.voice.focus import WindowFocusChecker
+
+            focus = WindowFocusChecker()
+        except Exception:
+            logger.debug("focus checker unavailable", exc_info=True)
+
+        return VoiceService(
+            audio=audio,
+            wake_detector=wake,
+            stt=stt,
+            tts=tts,
+            focus_checker=focus,
+            submit_task=self._voice_submit,
+            wake_word=self._settings.voice.wake_word,
+            listen_timeout_s=self._settings.voice.listen_timeout_s,
+            idle_timeout_s=self._settings.voice.idle_timeout_s,
+            max_session_s=self._settings.voice.max_session_s,
+            max_dictation_chars=self._settings.voice.max_dictation_chars,
+        )
+
+    def _stop_voice(self) -> None:
+        """Stop the voice pipeline on shutdown / toggle-off (idempotent)."""
+        if self._voice_service is None:
+            return
+        try:
+            self._voice_service.stop()
+        except Exception:
+            logger.warning("error stopping voice service", exc_info=True)
+
+    def _refresh_ctx_voice_bridge(self) -> None:
+        """Point ``ctx.voice`` at the current voice service.
+
+        The context is built once, but a lazily-created toggle-on service must
+        reach the agent's dictation tools through the same facade.
+        """
+        ctx = self._ctx
+        if ctx is None:
+            return
+        voice = getattr(ctx, "voice", None)
+        if voice is not None and hasattr(voice, "service"):
+            voice.service = self._voice_service
 
     # ── dispatch loop: monitors the worker thread ──────────────────────
 
@@ -489,10 +631,55 @@ class DaemonServer:
                 await self._handle_status(conn)
             case ShutdownMessage():
                 self._shutdown_event.set()
+            case VoiceToggleMessage() as toggle:
+                await self._handle_voice_toggle(toggle, conn)
             case _:
                 await conn.send(
                     ErrorMessage(code="unknown_type", message="unrecognised message type")
                 )
+
+    # ── voice toggle (jarvis on / off) ─────────────────────────────────
+
+    async def _handle_voice_toggle(self, msg: VoiceToggleMessage, conn: ClientConnection) -> None:
+        """Turn voice listening on/off at the daemon level.
+
+        The CLI no longer runs a private voice loop; it asks the daemon so
+        `jarvis on`/`off` control the same pipeline that the agent's dictation
+        tools talk to through ``ctx.voice``.
+        """
+        if not msg.state:
+            self._stop_voice()
+            await conn.send(
+                EventMessage(task_id="", kind="log", data={"message": "voice deactivated"})
+            )
+            return
+
+        if not self._settings.voice.enabled:
+            await conn.send(
+                ErrorMessage(
+                    code="voice_disabled",
+                    message="voice is disabled in config — set [voice] enabled = true",
+                )
+            )
+            return
+
+        if self._voice_service is None:
+            try:
+                self._voice_service = self._build_voice_service()
+            except Exception:
+                logger.warning("could not initialise voice service", exc_info=True)
+            if self._voice_service is None:
+                await conn.send(
+                    ErrorMessage(
+                        code="voice_unavailable",
+                        message="voice dependencies are not installed",
+                    )
+                )
+                return
+            self._refresh_ctx_voice_bridge()
+
+        text = self._voice_service.start()
+        await conn.send(EventMessage(task_id="", kind="log", data={"message": text}))
 
     # ── chat ───────────────────────────────────────────────────────────
 
@@ -532,6 +719,96 @@ class DaemonServer:
                 conn.active_task = task_id
                 threading.Thread(target=self._worker_run, args=(slot,), daemon=True).start()
 
+    # ── voice task submission (runs in the voice loop thread) ──────────
+
+    def _voice_submit(self, text: str, source: str = "voice") -> Any:
+        """Submit a task from the voice-loop thread and block until it finishes.
+
+        Voice tasks have ``owner_id == VOICE_OWNER`` because there is no IPC
+        socket to route confirmations/results back to; the blocked voice thread
+        reads the outcome straight off the :class:`TaskSlot`.  Confirmations
+        for voice tasks are driven inside the worker thread by
+        :meth:`_run_voice_confirmation` (Tier 1 only), never over IPC.
+        """
+        task_id = f"v{int(time.time() * 1000)}"
+        slot = TaskSlot(task_id=task_id, text=text, source=source, owner_id=VOICE_OWNER)
+
+        with self._lock:
+            if self._active is not None and not self._active.done:
+                if len(self._queue) >= MAX_QUEUE_SIZE:
+                    return _VoiceOutcome(error="queue is full — try again later")
+                self._queue.append(slot)
+            else:
+                slot.started_at = time.time()
+                self._active = slot
+                threading.Thread(target=self._worker_run, args=(slot,), daemon=True).start()
+
+        while not slot.done:
+            slot.event.wait(0.25)
+            slot.event.clear()
+
+        if slot.error:
+            return _VoiceOutcome(error=slot.error)
+        return _VoiceOutcome(final_answer=slot.result_text)
+
+    def _ctx_voice_loop(self) -> Any | None:
+        """The live voice loop driving confirmations, or ``None``."""
+        svc = self._voice_service
+        if svc is not None:
+            try:
+                if svc.is_active() and svc.loop is not None:
+                    return svc.loop
+            except Exception:
+                logger.debug("voice service not reportable", exc_info=True)
+        ctx = self._ctx
+        voice = getattr(ctx, "voice", None)
+        if voice is not None:
+            for attr in ("active_loop", "loop"):
+                value = getattr(voice, attr, None)
+                if callable(value):
+                    value = value()
+                if value is not None:
+                    return value
+        return None
+
+    def _run_voice_confirmation(self, slot: TaskSlot, payload: dict[str, Any]) -> None:
+        """Drive a Tier-1 confirmation by voice from the worker thread.
+
+        The speech dialogue runs on the audio device while the voice-loop
+        thread is blocked inside :meth:`_voice_submit`, so the audio stream is
+        not contended.  Fails closed: without a live loop, or when the action
+        cannot be confirmed by voice (Tier 2+ / typed folder names), the
+        answer is a refusal and the graph's own policy gate denies the step.
+        """
+        loop = self._ctx_voice_loop()
+        if loop is None or not getattr(loop, "is_active", lambda: True)():
+            logger.warning("voice confirmation dropped: no active voice loop")
+            slot.resume_answer = {"approved": False, "action_hash": payload.get("action_hash", "")}
+            slot.confirm_payload = None
+            slot.event.set()
+            return
+
+        can_confirm = getattr(loop, "can_confirm_by_voice", lambda p: False)
+        if not can_confirm(payload):
+            slot.resume_answer = {"approved": False, "action_hash": payload.get("action_hash", "")}
+            slot.confirm_payload = None
+            slot.event.set()
+            return
+
+        def responder(answer: dict[str, Any]) -> Any:
+            slot.resume_answer = answer
+            slot.event.set()
+            return None
+
+        try:
+            loop.confirm_by_voice(payload, on_confirmation=responder)
+        except Exception:
+            logger.exception("voice confirmation failed; refusing")
+            slot.resume_answer = {"approved": False, "action_hash": payload.get("action_hash", "")}
+        finally:
+            slot.confirm_payload = None
+            slot.event.set()
+
     # ── worker thread ──────────────────────────────────────────────────
 
     def _worker_run(self, slot: TaskSlot) -> None:
@@ -564,17 +841,38 @@ class DaemonServer:
                     slot.error = outcome.error
                     slot.done = True
                     self._wake_dispatch()
+                    if slot.owner_id == VOICE_OWNER:
+                        slot.event.set()
                     return
 
                 if outcome.final_answer and not outcome.confirmation:
                     slot.result_text = outcome.final_answer
                     slot.done = True
                     self._wake_dispatch()
+                    if slot.owner_id == VOICE_OWNER:
+                        slot.event.set()
                     return
 
                 if outcome.confirmation:
+                    if slot.source == "voice":
+                        # Voice confirmations are driven here, on the worker
+                        # thread, while the voice-loop thread waits on
+                        # ``slot.event`` inside _voice_submit().
+                        self._run_voice_confirmation(slot, outcome.confirmation)
+                        slot.event.clear()
+                        answer = slot.resume_answer
+                        slot.resume_answer = None
+                        if answer is None:
+                            answer = {
+                                "approved": False,
+                                "action_hash": outcome.confirmation.get("action_hash", ""),
+                            }
+                        outcome = resume_task(self._ctx, saver, task_id, answer)
+                        continue
+
                     # Signal the loop: "here's a confirmation request"
                     slot.confirm_payload = outcome.confirmation
+                    slot.confirm_tier = int(outcome.confirmation.get("tier", 0) or 0)
                     slot.event.clear()
                     self._wake_dispatch()
 
@@ -591,6 +889,8 @@ class DaemonServer:
                         slot.error = "confirmation timed out"
                         slot.done = True
                         self._wake_dispatch()
+                        if slot.owner_id == VOICE_OWNER:
+                            slot.event.set()
                         return
                 else:
                     # No confirmation and no final answer — shouldn't happen, but be safe
@@ -602,6 +902,8 @@ class DaemonServer:
             slot.error = f"{type(exc).__name__}: {exc}"
             slot.done = True
             self._wake_dispatch()
+            if slot.owner_id == VOICE_OWNER:
+                slot.event.set()
             logger.error("worker for %s failed: %s", task_id, slot.error)
 
     # ── confirmation response ──────────────────────────────────────────
@@ -614,6 +916,19 @@ class DaemonServer:
                 ErrorMessage(
                     code="no_such_task",
                     message=f"no active task awaiting confirmation: {msg.task_id!r}",
+                    task_id=msg.task_id,
+                )
+            )
+            return
+
+        # Tier 2+ can never be approved by voice (docs/03 §7.8): anything that
+        # claims a voice origin for a Tier 2+ action is refused here, on top of
+        # the refusal inside the worker's own voice-confirmation path.
+        if msg.source == "voice" and slot.confirm_tier >= 2:
+            await conn.send(
+                ErrorMessage(
+                    code="tier_requires_terminal",
+                    message="this action requires terminal confirmation — it cannot be approved by voice",
                     task_id=msg.task_id,
                 )
             )
@@ -679,10 +994,13 @@ class DaemonServer:
         with self._lock:
             queue_len = len(self._queue)
             active_id = self._active.task_id if self._active and not self._active.done else None
+        voice_status = "off"
+        if self._voice_service is not None and self._voice_service.is_active():
+            voice_status = "on"
         await conn.send(
             StatusResponse(
                 daemon="running",
-                voice="off",
+                voice=voice_status,
                 unlocked=self._unlock.is_unlocked(),
                 queue=queue_len,
                 active_task=active_id,

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,6 +36,16 @@ def lookup_command(name: str, ctx: ToolContext) -> str | None:
         if isinstance(command, str) and str(configured_name).lower() == key and command:
             return command
     return None
+
+
+def allowlist_names(settings: Any) -> list[str]:
+    """Lower-cased configured app names via ``model_dump``.
+
+    ``vars()`` on the Pydantic model only sees the declared fields, so apps
+    added through the ``extra='allow'`` model config would be invisible to
+    tools that read it that way; ``model_dump()`` sees every configured entry.
+    """
+    return [str(name).lower() for name in settings.apps.model_dump()]
 
 
 def split_command(command: str) -> list[str]:

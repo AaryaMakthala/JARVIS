@@ -94,6 +94,11 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     """
     _ = settings
     from jarvis.tools.apps import make_open_app_spec
+    from jarvis.tools.dictation import (
+        make_save_dictation_spec,
+        make_start_dictation_spec,
+        make_stop_dictation_spec,
+    )
     from jarvis.tools.files import (
         make_append_file_spec,
         make_create_file_spec,
@@ -102,6 +107,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_read_file_spec,
         make_undo_last_delete_spec,
     )
+    from jarvis.tools.keyboard import make_type_text_spec
     from jarvis.tools.system import make_lock_jarvis_spec, make_system_info_spec
     from jarvis.tools.web import make_google_search_spec, make_open_url_spec, make_web_answer_spec
 
@@ -119,6 +125,10 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_read_file_spec(),
         make_delete_path_spec(),
         make_undo_last_delete_spec(),
+        make_type_text_spec(),
+        make_start_dictation_spec(),
+        make_stop_dictation_spec(),
+        make_save_dictation_spec(),
     ):
         registry.register(spec)
     return registry
