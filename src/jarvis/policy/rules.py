@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
@@ -81,13 +82,48 @@ def url_is_blocked(url: str) -> str | None:
     return None
 
 
+def args_overlap_taint(args: Any, fragments: tuple[str, ...], min_len: int = 12) -> bool:
+    """Deterministic taint check: do any arg values overlap with tainted text?
+
+    Per docs/03_SECURITY_AND_POLICY.md §8, a step is tainted when its args
+    contain substrings (≥ ``min_len`` chars) of text from a previous tainted
+    result.  This check is independent of ``step.depends_on_untrusted`` (which
+    is LLM-controlled and therefore untrusted itself).  The engine uses this
+    to *raise* taint even when the LLM omits the flag.
+    """
+    if not fragments:
+        return False
+    for val in _iter_arg_strings(args):
+        for frag in fragments:
+            if len(frag) >= min_len and val in frag:
+                return True
+    return False
+
+
+def _iter_arg_strings(args: Any) -> Generator[str]:
+    """Yield every string leaf value from an args object or dict."""
+    if isinstance(args, dict):
+        items = args.values()
+    elif hasattr(args, "model_dump"):
+        items = args.model_dump(mode="json").values()
+    else:
+        return
+    for v in items:
+        if isinstance(v, str):
+            yield v
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, str):
+                    yield item
+
+
 def tool_tier(spec: ToolSpec, args: Any) -> int:
     """Return the extra tier a tool-specific rule imposes (may raise only)."""
     if spec.name == "open_app":
         # The allowlist lives in settings.apps; an unknown app is refused in
         # run() but the tier itself stays at base (0) - harmless either way.
         return tiers.TIER_SAFE
-    if spec.name in ("open_url", "google_search"):
+    if spec.name in ("open_url", "google_search", "web_answer"):
         return tiers.TIER_SAFE
     return tiers.TIER_SAFE
 

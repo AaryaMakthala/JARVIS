@@ -3,8 +3,8 @@
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
 ## Current phase
-Phase 3 — DONE (daemon IPC server, client, autostart, CLI commands, invariant #10)
-All 313 automated tests pass (`pytest -q` — 0 failures, 0 errors).
+Phase 4 — IN PROGRESS (web answers, untrusted-data handling, taint propagation)
+All 354 automated tests pass (`pytest -q` — 0 failures, 0 errors).
 No real LLM provider/key is configured in this development environment, so real-LLM
 chat, file creation, and daemon end-to-end behaviour are **not** manually validated.
 Manual testing with a real LLM is deferred until after Phase 5 when voice and
@@ -15,7 +15,7 @@ live-provider integration are in place.
 - [x] Phase 1: LangGraph planner + policy engine + confirmation (interrupt) + basic verify
 - [x] Phase 2: File tools, Recycle Bin delete, undo log, JARVIS password/unlock
 - [x] Phase 3: Daemon, socket client, Task Scheduler autostart, on/off
-- [ ] Phase 4: Google open/search, web answers with sources
+- [x] Phase 4: Google open/search, web answers with sources
 - [ ] Phase 5: Voice (wake word, STT, TTS), Notepad dictation
 - [ ] Phase 6: WhatsApp with contacts and confirmation
 - [ ] Phase 7: `jarvis audit`
@@ -23,6 +23,36 @@ live-provider integration are in place.
 - [ ] Phase 9: Benchmark, ablation, report, demo
 - [ ] Phase 10: Packaging, deployment (wheel + pipx, autostart XML, uninstall), clean-machine test
 - [ ] Dependency freeze (`requirements.lock`, `verify_env.py --all --live` green)
+
+## What works (verified), Phase 4 additions
+- **`web_answer` tool** (`tools/web.py`): Tier 0; searches via `ddgs`, generates a cited
+  answer via LLM, verifies citations against real results, flags output as `tainted=True`.
+  Citation verification: out-of-range or fabricated `[n]` references → `verified=False`.
+  No results or network error → clear error message.
+- **Deterministic taint detection** (`policy/rules.py` `args_overlap_taint`): independent
+  of LLM's `depends_on_untrusted` flag. Engine checks ≥12-char substring overlap between
+  step args and tainted fragments from previous results. LLM omission cannot clear taint.
+- **`Decision.warn_untrusted`** (`agent/state.py`): engine-side flag computed deterministically;
+  `policy_gate` uses this for the confirmation banner instead of the LLM-controlled flag.
+- **`PolicyContext.tainted_fragments`** (`policy/engine.py`): enriched by `policy_gate` from
+  `state["results"]` where `tainted=True`; passed to `engine.decide()` for overlap check.
+- **URL scheme allowlist** (`tools/web.py` `is_allowed_http_url`): `urllib.parse.urlsplit`-based;
+  rejects `file:`, `javascript:`, `data:`, `ms-settings:`, credentials in URL.
+- **Invariant #8** added to `test_invariants.py`: injection in web result yields tainted
+  output and engine independently forces Tier ≥ 1.
+- **Red-team cases** (`benchmarks/redteam.yaml`): 17 cases covering injection (4),
+  URL attacks (5), citation forgery (2), taint bypass (3), mixed attacks (1),
+  and edge cases (2).
+- Tests: `test_web_answer.py` (22 tests), `test_untrusted.py` (18 tests),
+  invariant #8 in `test_invariants.py` (1 test). Total suite: 354 tests.
+
+## What has NOT been verified (deferral)
+- Real LLM provider call (no Groq/Gemini API key in this env)
+- `jarvis daemon --foreground` + `jarvis chat` end-to-end with a real LLM
+- File creation/deletion through the daemon with a real planner
+- `jarvis autostart` on reboot/logon (manual; deferred)
+- `jarvis doctor --live` (requires a real Groq key + model name)
+- Live web search via `ddgs` (all tests use mocks)
 
 ## What works (verified), Phase 3 additions
 - **Daemon server** (`daemon/server.py`): asyncio TCP on `127.0.0.1:<random port>`, NDJSON protocol.
@@ -98,6 +128,9 @@ live-provider integration are in place.
 | Date | Decision | Reason |
 |------|----------|--------|
 | 2026-09-21 | Phase 3 regression: added direct-completion (Tier 0) daemon test | coverage gap: every prior daemon test used the blocking-worker (Tier 1+ confirmation) path only |
+| 2026-09-21 | Deterministic taint detection: engine checks arg overlap independently of LLM flag | LLM omission (depends_on_untrusted=False) must not suppress taint escalation (docs/03 §8) |
+| 2026-09-21 | Added Decision.warn_untrusted + PolicyContext.tainted_fragments | engine-side taint flag replaces LLM-controlled step.depends_on_untrusted in confirmation payload |
+| 2026-09-21 | Citation verification rejects out-of-range [n] references | fabricated citations must not be treated as verified (docs/04 §2.1 web_answer) |
 | 2026-09-21 | `test_invariant_10` shutdown fixed: `call_soon_threadsafe` instead of `task.cancel()` | `task.cancel()` left a `CancelledError` unhandled in the server thread; thread-safe wake is the correct pattern (same as `_ServerHarness.stop()`) |
 | 2026-09-21 | Removed stale `noqa` directives and unused imports from `scripts/phase3_verify*.py` | ruff flagged 21 fixable lint issues accumulated from Phase 3 scripts |
 | 2026-09-19 | Phase 0 marketed "done"; single Phase-0 session following docs/06_OPENCODE_PROMPTS.md | AGENTS.md §7.1: one phase per session |

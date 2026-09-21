@@ -103,13 +103,14 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_undo_last_delete_spec,
     )
     from jarvis.tools.system import make_lock_jarvis_spec, make_system_info_spec
-    from jarvis.tools.web import make_google_search_spec, make_open_url_spec
+    from jarvis.tools.web import make_google_search_spec, make_open_url_spec, make_web_answer_spec
 
     registry = ToolRegistry()
     for spec in (
         make_open_app_spec(),
         make_open_url_spec(),
         make_google_search_spec(),
+        make_web_answer_spec(),
         make_system_info_spec(),
         make_lock_jarvis_spec(),
         make_create_file_spec(),

@@ -50,6 +50,7 @@ class Decision(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     summary: str  # exact text shown to the user
     action_hash: str  # sha256(tool + canonical(args)); binds approval to action
+    warn_untrusted: bool = False  # True when args overlap with tainted text (deterministic)
 
 
 class StepResult(BaseModel):

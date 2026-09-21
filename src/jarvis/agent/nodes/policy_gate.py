@@ -10,12 +10,27 @@ tampered approval from being trusted.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from langgraph.types import interrupt
 
 from jarvis.agent.context import AppContext
-from jarvis.agent.state import Decision
+from jarvis.agent.state import Decision, StepResult
+
+
+def _collect_tainted_fragments(state: dict[str, Any]) -> tuple[str, ...]:
+    """Extract tainted output text from previous step results.
+
+    Only fragments from ``StepResult`` objects where ``tainted=True`` are
+    included.  This data is trusted (produced by our own tools, not by the
+    LLM) and used by the engine for deterministic taint detection.
+    """
+    fragments: list[str] = []
+    for r in state.get("results") or []:
+        if isinstance(r, StepResult) and r.tainted and r.output:
+            fragments.append(r.output)
+    return tuple(fragments)
 
 
 def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
@@ -30,7 +45,17 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         return {"halted_reason": "No step remaining at the gate."}
 
     step = plan.steps[idx]
-    decision = ctx.engine.decide(step, ctx.policy_ctx)
+
+    # Build a PolicyContext enriched with tainted fragments from previous
+    # results so the engine can independently verify taint, regardless of
+    # what the LLM asserted in ``step.depends_on_untrusted`` (docs/03 §8).
+    tainted = _collect_tainted_fragments(state)
+    if tainted and ctx.policy_ctx is not None:
+        pctx = dataclasses.replace(ctx.policy_ctx, tainted_fragments=tainted)
+    else:
+        pctx = ctx.policy_ctx
+
+    decision = ctx.engine.decide(step, pctx)
     decisions = dict(state.get("decisions") or {})
     decisions[step.id] = decision
 
@@ -40,7 +65,10 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     if not decision.needs_confirm:
         return {"decisions": decisions}
 
-    payload = confirmation_payload(decision, step.depends_on_untrusted)
+    # Use the engine's deterministic ``warn_untrusted`` flag (which considers
+    # both the LLM's ``depends_on_untrusted`` and the engine's own overlap
+    # check) rather than the LLM-controlled ``step.depends_on_untrusted``.
+    payload = confirmation_payload(decision, decision.warn_untrusted)
     answer = interrupt(payload)  # graph pauses; checkpoint saved; no side effects above
 
     # TOCTOU guard: compare the stashed pre-interrupt paths against the fresh

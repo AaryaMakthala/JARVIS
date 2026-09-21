@@ -46,6 +46,10 @@ class PolicyContext:
     settings: Settings
     classifier: RiskClassifier | None = None
     unlock: UnlockManager | None = None
+    #: Tainted output text from previous steps (docs/03 §8).  The engine
+    #: checks these independently of ``step.depends_on_untrusted`` so an
+    #: LLM omission cannot suppress the taint escalation.
+    tainted_fragments: tuple[str, ...] = ()
 
 
 def _blocked(step: Step, reasons: list[str], summary: str) -> Decision:
@@ -119,7 +123,14 @@ class PolicyEngine:
 
         tier = max(tier, rules.tool_tier(spec, args))
 
-        if step.depends_on_untrusted and tier >= tiers.TIER_CONFIRM:
+        # ── Taint escalation (docs/03 §8) ────────────────────────────
+        # The LLM may set ``depends_on_untrusted`` but an LLM *omission*
+        # must not suppress taint.  We therefore also perform a deterministic
+        # substring overlap check against known tainted fragments from
+        # previous results.  Either signal forces the escalation.
+        llm_says_tainted = bool(step.depends_on_untrusted)
+        engine_says_tainted = rules.args_overlap_taint(step.args, ctx.tainted_fragments)
+        if (llm_says_tainted or engine_says_tainted) and tier >= tiers.TIER_CONFIRM:
             tier = max(tier, tiers.TIER_CONFIRM)
             reasons.append("derived from untrusted content")
 
@@ -146,4 +157,5 @@ class PolicyEngine:
             reasons=reasons,
             summary=summary,
             action_hash=rules.action_hash(spec, args),
+            warn_untrusted=llm_says_tainted or engine_says_tainted,
         )
