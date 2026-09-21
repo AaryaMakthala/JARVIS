@@ -64,6 +64,28 @@ class VoiceCommand:
 
 
 @runtime_checkable
+class VoiceActivityDetector(Protocol):
+    """Pure voice-activity detection over audio frames it is *given*.
+
+    Implementations must **not** own a microphone stream.  They receive
+    chunks (via the ``read_chunk`` callable supplied by the caller) and
+    return the contiguous speech segment once the utterance ends — so the
+    single :class:`AudioInput` stream is owned by exactly one component.
+    """
+
+    def listen_for_speech(
+        self,
+        read_chunk: Callable[[int], AudioSegment],
+    ) -> AudioSegment:
+        """Return one spoken segment, read via *read_chunk* (blocking)."""
+        ...
+
+    def close(self) -> None:
+        """Release any resources held by the detector."""
+        ...
+
+
+@runtime_checkable
 class AudioInput(Protocol):
     """Captures audio from the microphone.
 

@@ -399,15 +399,15 @@ class DaemonServer:
         focus = None
 
         try:
-            from jarvis.voice.vad import create as create_vad
+            from jarvis.voice.audio_input import create as create_audio_input
 
-            audio = create_vad(
+            audio = create_audio_input(
                 sample_rate=16_000,
-                silence_threshold=self._settings.voice.silence_threshold,
-                silence_timeout_s=self._settings.voice.silence_timeout_s,
+                channels=1,
+                input_device=self._settings.voice.input_device,
             )
         except Exception:
-            logger.debug("VAD unavailable", exc_info=True)
+            logger.debug("microphone audio unavailable", exc_info=True)
 
         try:
             from jarvis.voice.wake import create as create_wake

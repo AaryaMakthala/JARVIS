@@ -137,6 +137,7 @@ class VoiceSettings(BaseModel):
     wake_word: str = "hey_jarvis"
     stt_model: str = "base"
     tts_backend: str = "piper"
+    input_device: int | str | None = None
     silence_threshold: float = 0.01
     silence_timeout_s: float = 0.7
     max_segment_s: float = 30.0
