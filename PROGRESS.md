@@ -8,6 +8,15 @@ All **472** automated tests pass (`pytest tests -m "not slow and not voice"` —
 0 failures, 0 errors), including 5 `windows_only` and 29 integration tests.
 `scripts/check.ps1` green.
 Phase 5 security review (13 findings — F1..F13) — **all fixed & tested**, see below.
+- **Config regression fixed (Phase 5)**: real `config.toml` `[voice] enabled=true`
+  was previously ignored — ``load_settings`` silently returned defaults because
+  pydantic-settings ≥2.9 no longer auto-registers a TOML source; the ``_toml_file``
+  init kwarg and ``toml_file`` model_config key are both inert there, so the file
+  was never read while env overrides (unaffected source) still worked.  Now wired
+  via ``settings_customise_sources`` -> ``TomlConfigSettingsSource`` in
+  ``config.py``; CLI and daemon both call ``load_settings`` so each now reads the
+  file.  Verified on the user's real runtime config: file loaded, `voice.enabled`
+  now `True`. 12 new/updated tests; suite still **472 pass / 0 fail**.
 No real LLM provider/key is configured, so voice→LLM→TTS end-to-end is
 **not** manually validated.  No voice deps (`openwakeword`, `faster-whisper`,
 `piper-tts`, `pyttsx3`, `sounddevice`) are installed in this env — all real
