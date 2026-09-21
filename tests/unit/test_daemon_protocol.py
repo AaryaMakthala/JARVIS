@@ -76,6 +76,7 @@ class TestSerializationRoundTrip:
             FinalMessage(task_id="t1", text="Done!"),
             ErrorMessage(code="queue_full", message="queue is full"),
             StatusResponse(daemon="running", voice="off", unlocked=False, queue=0),
+            StatusResponse(voice="error", voice_reason="loop-crashed", queue=1),
         ],
     )
     def test_server_to_client_round_trip(self, msg: Any) -> None:
@@ -115,6 +116,15 @@ class TestDefaults:
         assert msg.unlocked is False
         assert msg.queue == 0
         assert msg.active_task is None
+        assert msg.voice_reason is None
+
+    def test_status_response_voice_reason_is_optional(self) -> None:
+        msg = StatusResponse(voice="error", voice_reason="mic-open-failed")
+        assert msg.voice == "error"
+        assert msg.voice_reason == "mic-open-failed"
+        # round-trips through the wire format
+        parsed = StatusResponse.model_validate(json.loads(msg.model_dump_json()))
+        assert parsed.voice_reason == "mic-open-failed"
 
 
 # ── Validation ───────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@ Audio never leaves the machine; only text goes to LLM APIs.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 

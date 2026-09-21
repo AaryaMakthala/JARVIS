@@ -353,6 +353,8 @@ class DaemonServer:
 
         Idempotent and safe to call from tests/shareholders; building the
         service may be slow (backend discovery) so it is done once at startup.
+        A failed auto-start moves the service into ``error`` state but never
+        stops the daemon — text/CLI operation continues.
         """
         self._voice_service = None
         if self._settings.voice.enabled and VoiceService is not None:
@@ -364,7 +366,11 @@ class DaemonServer:
         if self._voice_service is not None:
             try:
                 msg = self._voice_service.start()
-                logger.info("voice auto-start: %s", msg)
+                if self._service_state(self._voice_service) == "error":
+                    code = self._service_error_code(self._voice_service) or "loop-crashed"
+                    logger.warning("voice auto-start failed: %s (%s)", code, msg)
+                else:
+                    logger.info("voice auto-start: %s", msg)
             except Exception:
                 logger.warning("failed to auto-start voice", exc_info=True)
 
@@ -459,6 +465,21 @@ class DaemonServer:
             self._voice_service.stop()
         except Exception:
             logger.warning("error stopping voice service", exc_info=True)
+
+    @staticmethod
+    def _service_state(service: Any) -> str:
+        """Read the voice state machine (defaults to the legacy active flag)."""
+        state = getattr(service, "state", None)
+        if state is None:
+            return "on" if service.is_active() else "off"
+        return state
+
+    @staticmethod
+    def _service_error_code(service: Any) -> str | None:
+        """Read the fixed voice error code, else ``None``."""
+        if getattr(service, "state", None) != "error":
+            return None
+        return getattr(service, "error_code", None) or None
 
     def _refresh_ctx_voice_bridge(self) -> None:
         """Point ``ctx.voice`` at the current voice service.
@@ -679,7 +700,11 @@ class DaemonServer:
             self._refresh_ctx_voice_bridge()
 
         text = self._voice_service.start()
-        await conn.send(EventMessage(task_id="", kind="log", data={"message": text}))
+        if self._service_state(self._voice_service) == "error":
+            code = self._service_error_code(self._voice_service) or "loop-crashed"
+            await conn.send(ErrorMessage(code=code, message=text))
+        else:
+            await conn.send(EventMessage(task_id="", kind="log", data={"message": text}))
 
     # ── chat ───────────────────────────────────────────────────────────
 
@@ -995,12 +1020,21 @@ class DaemonServer:
             queue_len = len(self._queue)
             active_id = self._active.task_id if self._active and not self._active.done else None
         voice_status = "off"
-        if self._voice_service is not None and self._voice_service.is_active():
-            voice_status = "on"
+        voice_reason: str | None = None
+        if self._voice_service is not None:
+            state = self._service_state(self._voice_service)
+            if state == "error":
+                voice_status = "error"
+                voice_reason = self._service_error_code(self._voice_service)
+            elif state == "starting":
+                voice_status = "starting"
+            elif state == "on":
+                voice_status = "on"
         await conn.send(
             StatusResponse(
                 daemon="running",
                 voice=voice_status,
+                voice_reason=voice_reason,
                 unlocked=self._unlock.is_unlocked(),
                 queue=queue_len,
                 active_task=active_id,

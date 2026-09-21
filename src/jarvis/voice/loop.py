@@ -65,6 +65,7 @@ class VoiceLoop:
         submit_task: Callable[[str, str], Any] | None = None,
         on_confirmation: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         on_dictation: Callable[[str], None] | None = None,
+        on_exit: Callable[[str | None], None] | None = None,
         wake_word: str = "hey jarvis",
         listen_timeout_s: float = 30.0,
         idle_timeout_s: float = 120.0,
@@ -79,6 +80,7 @@ class VoiceLoop:
         self._submit_task = submit_task
         self._on_confirmation = on_confirmation
         self._on_dictation = on_dictation
+        self._on_exit = on_exit
         self._wake_word = wake_word
         self._listen_timeout_s = listen_timeout_s
         self._idle_timeout_s = idle_timeout_s
@@ -95,6 +97,7 @@ class VoiceLoop:
         self._idle_timed_out = False
         self._stop_event = threading.Event()
         self._stopped = threading.Event()
+        self._audio_opened = False
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -221,9 +224,18 @@ class VoiceLoop:
     # ── main loop (runs in background thread) ───────────────────────────
 
     def _run(self) -> None:
-        """Main voice loop body."""
+        """Main voice loop body.
+
+        Any unhandled exception is logged and reported through the
+        ``on_exit`` callback with a fixed reason code so the owning
+        service can move the state machine to ``error``.  The audio device
+        is always closed in ``finally`` — even on a crash — so the mic is
+        never left held by a dead thread.
+        """
+        reason: str | None = None
         try:
             self._audio.open()
+            self._audio_opened = True
             if self._wake_detector is not None:
                 self._wake_detector.reset()
 
@@ -263,6 +275,7 @@ class VoiceLoop:
 
         except Exception:
             logger.exception("voice loop crashed")
+            reason = "mic-open-failed" if not self._audio_opened else "loop-crashed"
         finally:
             self._running = False
             self._idle_timed_out = False
@@ -270,6 +283,11 @@ class VoiceLoop:
                 self._audio.close()
             except Exception:
                 logger.debug("error closing audio on exit", exc_info=True)
+            if self._on_exit is not None:
+                try:
+                    self._on_exit(reason)
+                except Exception:
+                    logger.debug("voice loop on_exit callback failed", exc_info=True)
             self._stopped.set()
 
     def _wait_for_wake(self) -> bool:

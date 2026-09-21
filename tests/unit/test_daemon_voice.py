@@ -28,6 +28,8 @@ from jarvis.daemon.protocol import (
     VoiceToggleMessage,
 )
 from jarvis.daemon.server import DaemonServer, TaskSlot, _parse_message
+from jarvis.voice.fakes import FakeSTT, FakeTTS, FakeWakeWord
+from jarvis.voice.service import VoiceService
 
 TEST_TOKEN = "daemon-voice-token-0123456789"
 
@@ -56,21 +58,33 @@ class _FakeVoiceService:
         self.start_calls = 0
         self.stop_calls = 0
         self.active = False
+        self._state = "off"
+        self._error_code: str | None = None
 
     def start(self) -> str:
         if self.active:
             return "voice is already active"
         self.start_calls += 1
         self.active = True
+        self._state = "on"
         return "voice activated"
 
     def stop(self) -> str:
         self.stop_calls += 1
         self.active = False
+        self._state = "off"
         return "voice deactivated"
 
     def is_active(self) -> bool:
         return self.active
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def error_code(self) -> str | None:
+        return self._error_code
 
     @property
     def loop(self) -> Any:
@@ -409,8 +423,112 @@ class TestVoiceWorkerBridge:
 # ── F7: chat still works while voice queue helpers exist ────────────────
 
 
+# ── F7: chat still works while voice queue helpers exist ────────────────
+
+
 class TestVoiceDoesNotBreakChat:
     def test_chat_message_parses_unchanged(self) -> None:
         msg = _parse_message(_json.dumps({"type": "chat", "id": "1", "text": "hi"}))
         assert isinstance(msg, ChatMessage)
         assert msg.text == "hi"
+
+
+# ── Stage 2: voice error states surface through the daemon ──────────────
+
+
+class _FlakyMic:
+    """AudioInput that fails the first open (mic busy) then works."""
+
+    def __init__(self) -> None:
+        self._fail = True
+        self.close_calls = 0
+        self.open_calls = 0
+
+    def open(self, sample_rate: int = 16_000, channels: int = 1) -> None:
+        self.open_calls += 1
+        if self._fail:
+            self._fail = False
+            raise RuntimeError("device busy")
+
+    def read(self, num_frames: int) -> Any:
+        from jarvis.voice.interfaces import AudioSegment
+
+        return AudioSegment(samples=[0.0] * num_frames, sample_rate=16_000)
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    def is_open(self) -> bool:
+        return not self._fail
+
+
+class TestVoiceErrorStates:
+    def _server(self, service: Any) -> DaemonServer:
+        server = DaemonServer(
+            settings=Settings(voice=VoiceSettings(enabled=True)), store=_FakeStore()
+        )
+        server._voice_service = service
+        return server
+
+    def test_toggle_on_sends_error_message_with_fixed_code(self) -> None:
+        svc = VoiceService()  # audio None → no-audio-library
+        server = self._server(svc)
+        conn = _FakeConn()
+        asyncio.run(server._handle_voice_toggle(VoiceToggleMessage(state=True), conn))
+        err = conn.sent[-1]
+        assert isinstance(err, ErrorMessage)
+        assert err.code == "no-audio-library"
+        assert "no-audio-library" in err.message
+        assert svc.state == "error"
+
+    def test_toggle_on_after_error_retries_and_activates(self) -> None:
+        mic = _FlakyMic()
+        svc = VoiceService(
+            audio=mic,
+            wake_detector=FakeWakeWord(results=[]),
+            stt=FakeSTT(),
+            tts=FakeTTS(),
+            idle_timeout_s=600.0,
+        )
+        server = self._server(svc)
+        conn = _FakeConn()
+        asyncio.run(server._handle_voice_toggle(VoiceToggleMessage(state=True), conn))
+        assert conn.sent[-1].code == "mic-open-failed"
+        assert svc.state == "error"
+        conn.sent.clear()
+        asyncio.run(server._handle_voice_toggle(VoiceToggleMessage(state=True), conn))
+        ev = conn.sent[-1]
+        assert ev.type == "event"
+        assert "voice activated" in ev.data["message"]
+        assert svc.state == "on"
+        asyncio.run(server._handle_voice_toggle(VoiceToggleMessage(state=False), conn))
+        assert svc.state == "off"  # loop stopped cleanly
+
+    def test_status_reports_error_and_reason(self) -> None:
+        svc = VoiceService()
+        assert "no-audio-library" in svc.start()
+        server = self._server(svc)
+        conn = _FakeConn()
+        asyncio.run(server._handle_status(conn))
+        resp = conn.sent[-1]
+        assert resp.voice == "error"
+        assert resp.voice_reason == "no-audio-library"
+        assert resp.daemon == "running"
+
+    def test_boot_auto_start_failure_sets_error_and_keeps_daemon_alive(self) -> None:
+        """Boot auto-start may fail (e.g. no voice deps) but the daemon lives on."""
+        server = DaemonServer(
+            settings=Settings(voice=VoiceSettings(enabled=True)), store=_FakeStore()
+        )
+        server._build_voice_service = lambda: VoiceService()  # type: ignore[method-assign]
+        server._bootstrap_voice()  # must not raise
+        assert server._voice_service is not None
+        assert server._voice_service.state == "error"
+        assert server._voice_service.error_code == "no-audio-library"
+        # The daemon control plane still answers.
+        conn = _FakeConn()
+        asyncio.run(server._handle_status(conn))
+        resp = conn.sent[-1]
+        assert resp.daemon == "running"
+        assert resp.voice == "error"
+        assert resp.voice_reason == "no-audio-library"

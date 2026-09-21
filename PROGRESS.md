@@ -297,3 +297,84 @@ jarvis off                          # Stop voice listening
 ## Next step
 Phase 6: WhatsApp with contacts and confirmation.  Do not modify Phase 5 files unless
 a Phase 6 dependency requires it.
+
+---
+
+## Post-session update (created by WSL coding run — voice Phase 5, Stage 0 + Stage 1)
+
+**Stage 0 (ground truth)** — verified from source, not docs:
+- Loop reads one fixed window `read(listen_timeout_s * 16000)` per utterance (loop.py:243);
+  wake detection reads 1280-sample chunks (loop.py:293, 320). **The VAD was never invoked**
+  (normal path). `stop()` blocks up to 10 s on `_stopped` (loop.py:125).
+- wake.py:49-50 feeds `np.array(segment.samples, dtype=np.float32)`; no int16 scale/clip;
+  `reset()` runs at loop start and before confirmations; no cooldown.
+- `VoiceService.start()` returns the generic "voice dependencies not available — install
+  with: pip install jarvis-agent[voice]" message (service.py:78-80) when deps are missing.
+- "lock jarvis" routes to the planner via `_submit_task` (loop.py:395).  Malformed
+  `config.toml` raises from pydantic-settings (config.py:264) — no fallback.
+
+**Root-cause fix (the user's real crash)**: `open()` passed `sample_rate=`/`block_size=`
+to `sd.InputStream`, whose real kwargs are `samplerate`/`blocksize`. On a machine with
+sounddevice installed the strict `__init__` raised `TypeError` → "could not open the
+microphone".  **Demonstrated**: old HEAD code raises `VoiceInputError` under a strict
+fake stream; new code opens and reads exactly.  (User's pasted `threading.current_event_time`
+traceback is from a stale/OneDrive-synced copy — not in this tree.)
+
+**Stage 1 changes** (in `src/jarvis/voice/`):
+- `audio_input.py`: protocol-compatible `open(sample_rate=None, channels=None)`;
+  stream built via new `_stream_kwargs()` (`samplerate`/`blocksize`/`dtype="int16"`);
+  per-instance callback rate-limiting (5 s); module-global `_callback_last_status_log`
+  removed; `_read_buffer` surplus so `read(n)` returns **exactly n** (old code dropped
+  the surplus tail of each block); `close()` clears `_open` first → unblocks a blocked
+  reader in ~0.1 s and clears the buffer; `flush()` resets buffer + dropped counter.
+  Targeted-only-noqa added at the four `except Exception` sites.
+- `interfaces.py`: `Callable` imported from `collections.abc` (ruff F821).
+- New tests: `tests/unit/test_voice_audio_input.py` (~21, strict-fake sounddevice),
+  `tests/unit/test_voice_wiring.py` (current server wires an `AudioInput`, never a VAD;
+  plus a regression that extracts the **old** `_build_voice_service` from commit `326727b`
+  and pins that it produced a VAD with no `read` — the crash), and
+  `tests/unit/test_voice_contracts.py` (conformance matrix + **recorded VAD gap**:
+  `listen_for_speech` takes no `read_chunk`; Stage 3 makes the VAD pure).
+
+**Status (WSL run, excludes `windows_only`, marker "not slow and not voice")**:
+`496 passed, 7 skipped, 1 failed` — the single failure
+`test_paths::test_resolve_safe_rejects_alternate_data_streams_and_drive_relative` is
+NTFS ADS semantics and passes on real Windows (also failed at the 464-pass baseline).
+Ruff: clean across `src` + `tests`. `mypy src/jarvis/policy` clean under `--python-version 3.12`
+(numpy's newer `.pyi` uses 3.12-only `type` syntax under the 3.11 target → env artifact).
+**Not yet verified on real Windows hardware/mic** — see the manual smoke-test list the
+agent reported.  Fixes are untested against a live `config.toml` with `voice.enabled=true`.
+
+---
+
+## Voice Phase 5 Stage 2 (voice state machine + fixed error codes) — DONE (run on native Windows)
+
+**Behavior change**: `VoiceService.start()` now *identifies the missing component* and
+moves a state machine `off | starting | on | error`, instead of the old generic
+"voice dependencies not available" message. Fixed codes (closed set, invariant-tested):
+`no-audio-library`, `mic-open-failed`, `wake-model-missing`, `stt-model-missing`,
+`tts-unavailable`, `loop-crashed`. A missing wake detector is now a *hard* `wake-model-missing`
+error (the old "voice-activity gate" fallback is gone — voice refuses to start without one).
+
+- Mic open happens synchronously in `start()` (Stage 1 made `open()` idempotent, so the
+  loop thread's open is a no-op) → `mic-open-failed` is reported *now*, not silently in the thread.
+- `VoiceLoop` gains `on_exit(reason)` — the loop thread reports `mic-open-failed` (open failed)
+  or `loop-crashed` (mid-loop) from `finally`; audio is still closed in finally. Clean exits
+  (idle timeout / "stop listening" / explicit stop) report `None` → state `off`.
+- `StatusResponse` gains optional `voice_reason`; server status/toggle/bootstrap now read the
+  service state, so `jarvis status` shows the reason and `jarvis on` prints the reason + hint and
+  exits 1 on error; `jarvis on` after an error retries. Boot auto-start failure sets `error`
+  without stopping the daemon.
+- **Demonstrated old-vs-new**: old HEAD service/loop fail 4/5 contract checks (generic message,
+  no state, mic failure "voice activated", unreported crash); new passes all 5.
+- Tests: `test_voice_cli.py` (state machine, per-code identification, sync mic-open, retry,
+  loop-crash→error, clean-exit→off), `test_voice_loop.py` (on_exit crash reporting),
+  `test_daemon_protocol.py` (voice_reason field), `test_daemon_voice.py` (toggle sends
+  ErrorMessage with code, retry at daemon level, status reason, boot-failure keeps daemon alive),
+  `test_invariants.py` (closed error-code set).
+
+**Status (native Windows venv, Python 3.11.15)**: full suite `-m "not slow and not voice"`
+= **535 tests, 0 errors, 0 failures, 1 skipped**. `ruff check src tests` clean. `mypy
+src/jarvis/policy` clean. voice+daemon mypy = 21 pre-existing errors (no new ones from this
+stage; service/protocol/cli are clean). NOT verified on real mic hardware — manual smoke
+tests below.

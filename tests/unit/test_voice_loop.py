@@ -466,3 +466,89 @@ class TestVoiceLoopStop:
         assert loop._thread is not None and not loop._thread.is_alive()
         assert audio.close_calls >= 1
         assert not loop.is_active()
+
+
+# ── Stage 2: on_exit reports crashes to the owning service ──────────────
+
+
+class _OpenFailAudio:
+    """AudioInput whose open() fails — a broken/unplugged mic."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def open(self, sample_rate: int = 16_000, channels: int = 1) -> None:
+        raise RuntimeError("no audio device")
+
+    def read(self, num_frames: int) -> Any:
+        raise AssertionError("read must not be reached")
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    def is_open(self) -> bool:
+        return False
+
+
+class TestVoiceLoopOnExit:
+    def _run_to_exit(self, loop: VoiceLoop) -> None:
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=5.0)
+        assert not loop._thread.is_alive()
+        assert not loop.is_active()
+
+    def test_open_failure_reports_mic_open_failed_and_closes_audio(self) -> None:
+        reasons: list[str | None] = []
+        audio = _OpenFailAudio()
+        loop = VoiceLoop(
+            audio=audio,
+            stt=FakeSTT(),
+            tts=FakeTTS(),
+            on_exit=reasons.append,
+        )
+        self._run_to_exit(loop)
+        assert reasons == ["mic-open-failed"]
+        assert audio.close_calls == 1  # audio closed in finally even on open failure
+
+    def test_mid_loop_crash_reports_loop_crashed(self) -> None:
+        reasons: list[str | None] = []
+
+        def boom(seg: AudioSegment) -> STTResult:
+            raise RuntimeError("device disconnected")
+
+        audio = FakeAudioInput(segments=[make_silence(0.01)])
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=FakeWakeWord(results=[WakeWordResult(detected=True)]),
+            stt=FakeSTT(transcribe_fn=boom),
+            tts=FakeTTS(),
+            on_exit=reasons.append,
+        )
+        self._run_to_exit(loop)
+        assert reasons == ["loop-crashed"]
+        assert audio.close_calls >= 1  # closed in finally
+
+    def test_clean_stop_reports_none(self) -> None:
+        reasons: list[str | None] = []
+        loop, audio, _, _, _ = _make_loop()
+        loop._on_exit = reasons.append  # type: ignore[method-assign]
+        loop.start()
+        time.sleep(0.05)
+        loop.stop()
+        assert reasons == [None]
+        assert audio.close_calls >= 1
+
+    def test_idle_timeout_reports_none(self) -> None:
+        reasons: list[str | None] = []
+        audio = FakeAudioInput(segments=[make_silence(0.01)] * 2)
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=FakeWakeWord(results=[WakeWordResult(detected=False)]),
+            stt=FakeSTT(),
+            tts=FakeTTS(),
+            idle_timeout_s=0.02,
+            on_exit=reasons.append,
+        )
+        self._run_to_exit(loop)
+        assert reasons == [None]

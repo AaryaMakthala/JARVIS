@@ -310,7 +310,10 @@ def status() -> None:
         try:
             resp = client.get_status()
             console.print(f"[green]daemon:[/green] {resp.daemon}")
-            console.print(f"[green]voice:[/green] {resp.voice}")
+            if resp.voice_reason:
+                console.print(f"[red]voice:[/red] {resp.voice} ({resp.voice_reason})")
+            else:
+                console.print(f"[green]voice:[/green] {resp.voice}")
             console.print(f"[green]unlocked:[/green] {resp.unlocked}")
             console.print(f"[green]queue:[/green] {resp.queue}")
             if resp.active_task:
@@ -849,11 +852,19 @@ def unlock_command(
 
 
 def voice_on_command(settings: config.Settings, client: Any) -> str:
-    """Ask the daemon to start listening.  Returns the status text to print."""
+    """Ask the daemon to start listening.  Returns the status text to print.
+
+    A voice error reasons from the daemon is returned verbatim (it already
+    includes the fixed code and a hint) so the CLI can print it and exit 1.
+    """
     if not settings.voice.enabled:
         return "voice is disabled in config — set [voice] enabled = true"
+    from jarvis.daemon.client import DaemonError
+
     try:
         return client.send_voice_toggle(True)
+    except DaemonError as exc:
+        return str(exc.message or exc)
     except Exception as exc:  # noqa: BLE001
         message = getattr(exc, "message", None) or str(exc)
         return f"voice error: {message}"
@@ -884,6 +895,9 @@ def on() -> None:
 
     try:
         message = voice_on_command(settings, client)
+        if message.startswith("voice is in error:"):
+            console.print(f"[red]{message}[/red]")
+            raise typer.Exit(code=1)
         if "active" in message:
             console.print(f"[green]{message}[/green]")
             console.print("[dim]say 'stop listening' or 'jarvis off' to stop[/dim]")

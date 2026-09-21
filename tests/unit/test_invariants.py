@@ -717,6 +717,33 @@ def test_invariant_15_audio_not_sent_to_llm() -> None:
     assert text_arg == "open notepad"
 
 
+def test_invariant_16_voice_error_codes_are_a_closed_set() -> None:
+    """Voice pipelines may only emit the fixed error codes (Phase 5 Stage 2).
+
+    ``voice_error_message`` falls back to ``loop-crashed`` for anything not
+    in the allowed set, so an arbitrary string can never surface as the
+    voice error reason to ``jarvis status`` / ``jarvis on``.
+    """
+    from jarvis.voice.service import VOICE_ERROR_CODES, VOICE_HINTS, voice_error_message
+
+    fixed = {
+        "no-audio-library",
+        "mic-open-failed",
+        "wake-model-missing",
+        "stt-model-missing",
+        "tts-unavailable",
+        "loop-crashed",
+    }
+    assert VOICE_ERROR_CODES == frozenset(fixed)
+    assert set(VOICE_HINTS) == fixed  # every code has a hint
+    # unknown codes are sanitised to the closed set, never passed through
+    out = voice_error_message("totally-invented-code", hint=False)
+    assert "totally-invented-code" not in out
+    for code in fixed:
+        rendered = voice_error_message(code, hint=False)
+        assert rendered == f"voice is in error: {code}"
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------

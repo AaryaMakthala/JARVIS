@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import logging
 import queue
-import threading
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from jarvis.voice.interfaces import AudioSegment
 
@@ -31,11 +31,11 @@ _DEFAULT_CHANNELS = 1
 _DEFAULT_BLOCK_SIZE = 1280  # 80 ms at 16 kHz
 _DEFAULT_QUEUE_MAXSIZE = 8  # at most 8 blocks buffered (~640 ms)
 _DEFAULT_READ_TIMEOUT_S = 0.5
+_READ_POLL_S = 0.05  # queue poll slice so close() unblocks a reader in <0.3 s
 
 _INT16_DIVISOR = 32_768.0
 
 _CALLBACK_STATUS_LOG_INTERVAL_S = 5.0
-_callback_last_status_log = 0.0
 
 
 class VoiceInputError(Exception):
@@ -75,17 +75,34 @@ class SoundDeviceAudioInput:
         self._stream_factory = stream_factory
         self._stream: Any = None
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=queue_maxsize)
+        self._read_buffer: list[float] = []
         self._dropped_oldest = 0
         self._open = False
+        self._last_status_log = 0.0
 
     # ── AudioInput protocol ──────────────────────────────────────────────
 
-    def open(self) -> None:
-        """Open the microphone stream (idempotent; clears stale audio)."""
+    def open(
+        self,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> None:
+        """Open the microphone stream (idempotent; clears stale audio).
+
+        ``sample_rate`` and ``channels`` may override the values configured
+        in the constructor for this session.  Calling ``open()`` with no
+        arguments keeps the constructor-configured format, so the voice
+        loop's existing no-arg ``audio.open()`` keeps working unchanged.
+        """
         if self._open:
             return
+        if sample_rate is not None:
+            self._sample_rate = sample_rate
+        if channels is not None:
+            self._channels = channels
         self._dropped_oldest = 0
         self._clear_queue()
+        self._read_buffer.clear()
 
         device: Any = None
         if self._device is not None:
@@ -100,30 +117,23 @@ class SoundDeviceAudioInput:
                 ) from None
 
         try:
+            kwargs = _stream_kwargs(
+                sample_rate=self._sample_rate,
+                channels=self._channels,
+                block_size=self._block_size,
+                device=device,
+                callback=self._callback,
+            )
             if self._stream_factory is not None:
-                self._stream = self._stream_factory(
-                    sample_rate=self._sample_rate,
-                    channels=self._channels,
-                    block_size=self._block_size,
-                    dtype="int16",
-                    callback=self._callback,
-                    device=device,
-                )
+                self._stream = self._stream_factory(**kwargs)
             else:
                 import sounddevice as sd
 
-                self._stream = sd.InputStream(
-                    sample_rate=self._sample_rate,
-                    channels=self._channels,
-                    block_size=self._block_size,
-                    dtype="int16",
-                    callback=self._callback,
-                    device=device,
-                )
+                self._stream = sd.InputStream(**kwargs)
             self._stream.start()
         except VoiceInputError:
             raise
-        except Exception:
+        except Exception:  # noqa: BLE001  # deliberate: sanitize the raw driver/OS error
             logger.warning(
                 "could not open the microphone — check that a microphone is "
                 "connected and enabled on Windows"
@@ -139,33 +149,56 @@ class SoundDeviceAudioInput:
         )
 
     def read(self, num_frames: int) -> AudioSegment:
-        """Read *num_frames* samples as float (blocking, bounded).
+        """Read *num_frames* samples as float; surplus is kept for next read.
 
-        Expected to be called in a tight loop (e.g. from the voice loop);
-        returns whatever is available up to the queue timeout.  int16 input
-        is converted to float by dividing by 32768.
+        Returns **exactly** ``num_frames`` samples whenever the stream keeps
+        delivering data.  It returns early (possibly with fewer samples)
+        only in two cases:
+
+        * the stream has been **closed** — a reader blocked in another
+          thread is released within ~0.1 s because the queue is polled in
+          short slices; or
+        * the stream **stalled** — no data arrived within
+          ``read_timeout_s``.
+
+        int16 input is converted to float by dividing by 32768.  Samples
+        left over from the last block stay in ``_read_buffer`` and are
+        served on the next call, so read sizes never need to align with
+        block sizes.
         """
-        frames: list[float] = []
-        while len(frames) < num_frames:
+        deadline = time.monotonic() + self._read_timeout_s
+        while len(self._read_buffer) < num_frames:
+            if not self._open:
+                break  # closed while reading — return what we have
+            wait = deadline - time.monotonic()
+            if wait <= 0:
+                break  # stalled — no data within the poll window
             try:
-                block = self._queue.get(timeout=self._read_timeout_s)
+                block = self._queue.get(timeout=min(wait, _READ_POLL_S))
             except queue.Empty:
-                break
-            frames.extend(self._block_to_float(block))
-        return AudioSegment(samples=frames, sample_rate=self._sample_rate)
+                continue
+            self._read_buffer.extend(self._block_to_float(block))
+        taken = self._read_buffer[:num_frames]
+        self._read_buffer = self._read_buffer[num_frames:]
+        return AudioSegment(samples=taken, sample_rate=self._sample_rate)
 
     def close(self) -> None:
-        """Close the stream and drain the queue (safe to call twice)."""
+        """Close the stream and drain the queue (safe to call twice).
+
+        ``_open`` is cleared *first* so a read blocked in another thread
+        (polling the queue in short slices) wakes up within ~0.1 s.
+        """
         if not self._open:
             return
+        self._open = False
         try:
             self._stream.stop()
             self._stream.close()
         except Exception:
             logger.debug("error closing microphone stream", exc_info=True)
         self._stream = None
-        self._open = False
         self._clear_queue()
+        self._read_buffer.clear()
         logger.info("microphone closed")
 
     def is_open(self) -> bool:
@@ -182,6 +215,7 @@ class SoundDeviceAudioInput:
         so a voice response is never mistaken for a follow-up command.
         """
         self._clear_queue()
+        self._read_buffer.clear()
         self._dropped_oldest = 0
         logger.debug("audio input flushed")
 
@@ -194,11 +228,10 @@ class SoundDeviceAudioInput:
 
     def _callback(self, indata: Any, frames: int, time_info: Any, status: Any) -> None:
         """Realtime callback (never blocks, never grows the queue)."""
-        global _callback_last_status_log
         if status:
             now = time.monotonic()
-            if now - _callback_last_status_log >= _CALLBACK_STATUS_LOG_INTERVAL_S:
-                _callback_last_status_log = now
+            if now - self._last_status_log >= _CALLBACK_STATUS_LOG_INTERVAL_S:
+                self._last_status_log = now
                 logger.warning("microphone stream status=%r", str(status))
         try:
             block = bytes(indata)  # int16 mono, C-contiguous
@@ -252,7 +285,7 @@ class SoundDeviceAudioInput:
                 dev = sd.query_devices(idx)
                 if name.lower() in str(dev.get("name", "")).lower():
                     candidates.append(idx)
-        except Exception:
+        except Exception:  # noqa: BLE001  # deliberate: enumerate failure → sanitized error
             raise VoiceInputError("could not enumerate audio devices") from None
         if not candidates:
             raise VoiceInputError(
@@ -263,7 +296,7 @@ class SoundDeviceAudioInput:
         # (MME/DirectSound on Windows); otherwise take the first match.
         try:
             default_hostapi = int(sd.query_devices(kind="input").get("hostapi", -1))
-        except Exception:
+        except Exception:  # noqa: BLE001  # deliberate: no default input → -1, keep matching
             default_hostapi = -1
         for idx in candidates:
             if int(sd.query_devices(idx).get("max_input_channels", 0)) <= 0:
@@ -279,15 +312,21 @@ class SoundDeviceAudioInput:
     def _device_label(device: Any) -> str:
         """Return a human-readable label for a resolved device id.
 
-        Falls back to ``"default microphone"`` when sounddevice is not
-        installed.  No raw device-driver text is included.
+        The *default* input device is looked up with
+        ``query_devices(kind="input")`` (never by the literal name
+        "default"); a resolved id is looked up by id.  Falls back to
+        ``"default microphone"`` when sounddevice is not installed.  No
+        raw device-driver text is included.
         """
         try:
             import sounddevice as sd
 
-            dev = sd.query_devices(device if device is not None else "default")
-            return str(dev.get("name", "default microphone"))
-        except Exception:
+            if device is None:
+                info = sd.query_devices(kind="input")
+            else:
+                info = sd.query_devices(device)
+            return str(info.get("name", "default microphone"))
+        except Exception:  # noqa: BLE001  # deliberate: label is best-effort only
             return "default microphone"
 
     def _clear_queue(self) -> None:
@@ -298,6 +337,32 @@ class SoundDeviceAudioInput:
                 break
 
 
+def _stream_kwargs(
+    *,
+    sample_rate: int,
+    channels: int,
+    block_size: int,
+    device: Any,
+    callback: Callable[[Any, Any, Any, Any], None],
+) -> dict[str, Any]:
+    """Keyword arguments for ``sounddevice.InputStream`` (real sd names).
+
+    ``sd.InputStream.__init__`` takes ``samplerate`` and ``blocksize`` (not
+    ``sample_rate``/``block_size``) — verified against the installed source.
+    Kept as a single dict so tests can check every key against
+    ``inspect.signature`` of the real library (see the ``voice``-marked
+    signature test).
+    """
+    return {
+        "samplerate": sample_rate,
+        "blocksize": block_size,
+        "channels": channels,
+        "dtype": "int16",
+        "callback": callback,
+        "device": device,
+    }
+
+
 def create(
     *,
     input_device: int | str | None = None,
@@ -306,7 +371,7 @@ def create(
     block_size: int = _DEFAULT_BLOCK_SIZE,
     queue_maxsize: int = _DEFAULT_QUEUE_MAXSIZE,
     read_timeout_s: float = _DEFAULT_READ_TIMEOUT_S,
-) -> "SoundDeviceAudioInput | None":
+) -> SoundDeviceAudioInput | None:
     """Create a microphone input backed by sounddevice.
 
     Returns ``None`` if sounddevice is not installed (the daemon then runs
