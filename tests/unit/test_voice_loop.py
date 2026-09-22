@@ -291,6 +291,105 @@ class TestAudioNotSentToLLM:
         assert not isinstance(text_arg, (bytes, bytearray))
 
 
+# ── G1: stale audio is flushed before command / confirmation reads ──────
+
+
+class TestStaleAudioFlush:
+    def _capture_outcome(self) -> tuple[list[str], Any]:
+        submitted: list[str] = []
+
+        def fake_submit(text: str, source: str) -> Any:
+            submitted.append(text)
+            return type(
+                "Outcome", (), {"final_answer": "ok", "confirmation": None, "error": None}
+            )()
+
+        return submitted, fake_submit
+
+    def test_flush_before_command_read_on_full_cycle(self) -> None:
+        """A full wake->command cycle flushes the mic before reading."""
+        submitted, fake_submit = self._capture_outcome()
+        loop, audio, _, _, _ = _make_loop(
+            stt_results=[STTResult(text="open notepad")],
+            submit_task=fake_submit,
+            audio_segments=[make_speech("x", duration_s=0.5)] * 50,
+        )
+        loop.start()
+        for _ in range(100):
+            if submitted:
+                break
+            time.sleep(0.05)
+        loop.stop()
+        assert submitted == ["open notepad"]
+        assert audio.flush_calls >= 1
+        # The flush must happen before the command is read from the mic.
+        assert audio.read_calls  # command read occurred
+
+    def test_flush_before_confirmation_read(self) -> None:
+        """confirm_by_voice flushes the mic before listening for yes/no."""
+        answers: list[dict[str, Any]] = []
+        loop, audio, _, _, _ = _make_loop(
+            stt_results=[STTResult(text="yes")],
+            audio_segments=[make_speech("x", duration_s=0.5)] * 200,
+        )
+        loop.confirm_by_voice(
+            {"tier": 1, "summary": "create file", "action_hash": "abc"},
+            on_confirmation=answers.append,
+            rearm_timeout_s=1.0,
+        )
+        assert answers == [{"approved": True, "action_hash": "abc"}]
+        assert audio.flush_calls >= 1
+
+    def test_flush_happens_after_wake_but_before_command_read(self) -> None:
+        """Ordering: wake detect ... flush ... read(command window)."""
+        events: list[tuple[str, int]] = []
+        submitted, fake_submit = self._capture_outcome()
+
+        class TrackingAudio(FakeAudioInput):
+            def read(self, num_frames: int) -> AudioSegment:
+                events.append(("read", num_frames))
+                return super().read(num_frames)
+
+            def flush(self) -> None:
+                events.append(("flush", 0))
+                super().flush()
+
+        listen_timeout_s = 1.0
+        command_frames = int(listen_timeout_s * 16_000)
+        audio = TrackingAudio(segments=[make_speech("x", duration_s=0.5)] * 50)
+        wake = FakeWakeWord(results=[WakeWordResult(detected=True, confidence=0.9)])
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(results=[STTResult(text="open notepad")]),
+            tts=FakeTTS(),
+            submit_task=fake_submit,
+            listen_timeout_s=listen_timeout_s,
+            idle_timeout_s=0.5,
+        )
+        loop.start()
+        for _ in range(100):
+            if submitted:
+                break
+            time.sleep(0.05)
+        loop.stop()
+        assert submitted == ["open notepad"]
+        # Wake detection reads small chunks (1280 frames); the command read is
+        # the full listen window (16000 * listen_timeout_s).
+        command_reads = [
+            i for i, (op, n) in enumerate(events) if op == "read" and n == command_frames
+        ]
+        assert command_reads, f"no command-window read in {events}"
+        flushes = [i for i, (op, _) in enumerate(events) if op == "flush"]
+        assert flushes, f"no flush in {events}"
+        # The flush must occur immediately before the command read, i.e. no
+        # other read between the last flush and the command read.
+        last_flush = flushes[-1]
+        assert last_flush < command_reads[0]
+        assert events[last_flush] == ("flush", 0)
+        assert not any(op == "read" for op, _ in events[last_flush + 1 : command_reads[0]])
+
+
 # ── F2: dictation pauses (fail closed) when the target loses focus ──────
 
 

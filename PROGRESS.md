@@ -244,8 +244,20 @@ factory functions.
 | 2026-09-21 | WhatsApp reached only via `DesktopWindowProvider` protocol; tests inject a fake window | docs/06: no desktop in CI; unverifiable chat → never press Enter (invariant #9) |
 | 2026-09-21 | `whatsapp_send` Tier 2, rate limit enforced in code before any window opens | docs/03 §3, docs/04 §2.6 step 7: recipient count == 1, 10/h, 5s minimum |
 | 2026-09-21 | contacts edited only through `jarvis contacts …`; numbers masked in CLI/describe (+last 2 digits) | docs/04 §2.6: no LLM-driven contact writes; docs/03 redaction |
+## Audit session (2026-09-22) — full spec/code review delivered, G1 fixed
+
+- Full audit report (sections A–J) delivered: phases 0–6 COMPLETE, 7/8 INCOMPLETE (stubs),
+  quality checks all green (pytest 0, ruff 0, mypy policy 0, diff-check 0).
+- **G1 fixed**: `audio.flush()` was never called despite its docstring. Now called in
+  `voice/loop.py` before the command read and before the confirmation read, so stale
+  pre-prompt mic audio cannot be mistaken for a command or an approval. `flush()` added to
+  the `AudioInput` protocol + `FakeAudioInput`; ordering tests added. NOT verified on real
+  mic hardware (manual pass needed).
+- Deferred (P2, out of scope for this session): `jarvis run`, chat Ctrl+C cancel,
+  Phase 7 (audit) implementation — next phase.
 
 ## Manual tests to run on the PC
+
 ```powershell
 .venv\Scripts\activate
 scripts\check.ps1                  # full gate (expect "all JARVIS checks passed")

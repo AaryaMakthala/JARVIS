@@ -205,6 +205,9 @@ class VoiceLoop:
             return "No response received. Action cancelled."
 
         self._tts.speak(f"{summary}. Please say yes or no.")
+        # Discard audio captured before the prompt: stale ambient audio must
+        # never be used to approve an action.
+        self._audio.flush()
         seg = self._audio.read(int(self._listen_timeout_s * 16_000))
         if seg.duration_s < 0.3:
             if callback is not None:
@@ -252,6 +255,10 @@ class VoiceLoop:
                 logger.info("wake acknowledged — listening for command")
 
                 # Phase 3: Capture speech
+                # Discard audio buffered before/during the acknowledgement so
+                # the spoken command is read fresh and TTS output is never
+                # mistaken for a follow-up command.
+                self._audio.flush()
                 segment = self._audio.read(int(self._listen_timeout_s * 16_000))
                 if segment.duration_s < 0.3:
                     continue  # too short, likely noise
