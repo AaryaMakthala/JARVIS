@@ -31,7 +31,8 @@ from typing import Any
 
 import psutil
 
-from jarvis.config import Settings, daemon_runtime_file, load_settings
+from jarvis import logging_setup
+from jarvis.config import Settings, daemon_runtime_file, load_settings, log_file
 from jarvis.daemon.protocol import (
     MAX_MESSAGE_SIZE,
     AuthMessage,
@@ -74,6 +75,18 @@ STALE_CHECK_INTERVAL_S = 10
 #: IPC client socket; results are read back by the blocked voice thread
 #: directly (see :meth:`DaemonServer._voice_submit`).
 VOICE_OWNER = "__voice__"
+
+#: Poll slice used by the voice loop while waiting for the worker, and the
+#: cadence of the "still waiting" heartbeat (logged every 30 s).
+_VOICE_POLL_INTERVAL_S = 0.25
+
+#: Maximum wall time the voice-loop thread may block waiting for a worker to
+#: finish a voice task.  Without this bound a hung worker would wedge the
+#: voice loop on the first command and no further wake word would ever be
+#: answered (the old 30 s "still waiting" heartbeat only logged; it never
+#: returned).  A normal task finishes far sooner; on timeout the voice loop
+#: speaks a failure and re-arms instead of going deaf.
+VOICE_SUBMIT_TIMEOUT_S = 180.0
 
 
 # ── NDJSON framing ──────────────────────────────────────────────────────
@@ -249,6 +262,12 @@ class DaemonServer:
 
     def run(self) -> None:
         """Start the server and block until shutdown."""
+        # Attach the JSONL file handler unconditionally: the daemon is the long
+        # lived process that must prove the voice pipeline stage-by-stage, and
+        # the console script may bypass cli.main() (where logging is normally
+        # configured). configure_logging() is idempotent per log file.
+        logging_setup.configure_logging()
+        print(f"[DIAG] server.run(): log file -> {log_file()}", flush=True)
         print("[DIAG] server.run(): entered", flush=True)
         self._redirect_std()
         self._install_excepthooks()
@@ -514,7 +533,10 @@ class DaemonServer:
         stt = None
         tts = None
         focus = None
-        print(f"[DIAG] _build_voice_service(): entered (voice.enabled={self._settings.voice.enabled})", flush=True)
+        print(
+            f"[DIAG] _build_voice_service(): entered (voice.enabled={self._settings.voice.enabled})",
+            flush=True,
+        )
 
         try:
             from jarvis.voice.audio_input import create as create_audio_input
@@ -554,7 +576,10 @@ class DaemonServer:
             from jarvis.voice.tts import create as create_tts
 
             tts = create_tts(backend=self._settings.voice.tts_backend)
-            print(f"[DIAG] _build_voice_service(): tts={type(tts).__name__ if tts else None!r}", flush=True)
+            print(
+                f"[DIAG] _build_voice_service(): tts={type(tts).__name__ if tts else None!r}",
+                flush=True,
+            )
         except Exception:
             logger.debug("TTS unavailable", exc_info=True)
             print("[DIAG] _build_voice_service(): tts.create() RAISED", flush=True)
@@ -927,19 +952,50 @@ class DaemonServer:
         with self._lock:
             if self._active is not None and not self._active.done:
                 if len(self._queue) >= MAX_QUEUE_SIZE:
+                    logger.warning("voice task rejected: queue full (task_id=%s)", task_id)
                     return _VoiceOutcome(error="queue is full — try again later")
                 self._queue.append(slot)
+                logger.info(
+                    "voice task queued (task_id=%s, queue_len=%d)", task_id, len(self._queue)
+                )
             else:
                 slot.started_at = time.time()
                 self._active = slot
                 threading.Thread(target=self._worker_run, args=(slot,), daemon=True).start()
+                logger.info("voice task started (task_id=%s)", task_id)
 
+        deadline = time.monotonic() + VOICE_SUBMIT_TIMEOUT_S
+        waited = 0.0
         while not slot.done:
-            slot.event.wait(0.25)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # A hung worker must never wedge the voice loop: return a
+                # failure so the interaction speaks an error and re-arms.
+                logger.warning(
+                    "voice task timed out after %.0fs (task_id=%s); un-wedging the voice loop",
+                    VOICE_SUBMIT_TIMEOUT_S,
+                    task_id,
+                )
+                return _VoiceOutcome(error="command timed out — try again")
+            slot.event.wait(min(_VOICE_POLL_INTERVAL_S, max(remaining, 0.001)))
             slot.event.clear()
+            waited += _VOICE_POLL_INTERVAL_S
+            if waited >= 30.0:
+                logger.info(
+                    "voice task still waiting (task_id=%s, elapsed=%.1fs)",
+                    task_id,
+                    time.monotonic() - (deadline - VOICE_SUBMIT_TIMEOUT_S),
+                )
+                waited = 0.0
 
         if slot.error:
+            logger.warning("voice task errored (task_id=%s, error=%s)", task_id, slot.error)
             return _VoiceOutcome(error=slot.error)
+        logger.info(
+            "voice task finished (task_id=%s, final_answer_chars=%d)",
+            task_id,
+            len(slot.result_text or ""),
+        )
         return _VoiceOutcome(final_answer=slot.result_text)
 
     def _ctx_voice_loop(self) -> Any | None:

@@ -311,6 +311,134 @@ class TestVoiceSourceGuard:
         assert slot.resume_answer == {"approved": True, "action_hash": "h" * 64}
 
 
+# ── daemon resilience: a bad message / broken worker never kills it ─────
+
+
+class _LineReader:
+    """StreamReader stand-in returning pre-loaded NDJSON lines, then EOF."""
+
+    def __init__(self, lines: list[bytes]) -> None:
+        self._lines = iter(lines)
+
+    async def readline(self) -> bytes:
+        try:
+            return next(self._lines)
+        except StopIteration:
+            return b""
+
+
+class _RecordingWriter:
+    """StreamWriter stand-in capturing sent NDJSON messages."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+        self._buf = b""
+
+    def get_extra_info(self, name: str) -> Any:
+        return ("127.0.0.1", 1)
+
+    def write(self, data: bytes) -> None:
+        self._buf += data
+
+    async def drain(self) -> None:
+        line = self._buf.decode("utf-8").strip()
+        self._buf = b""
+        if line:
+            self.sent.append(json.loads(line))
+
+    def close(self) -> None:
+        pass
+
+
+class _FlakyStatusServer(DaemonServer):
+    """Server whose first status call fails; later ones work."""
+
+    def __init__(self) -> None:
+        super().__init__(settings=Settings(voice=VoiceSettings(enabled=False)), store=_FakeStore())
+        self.status_calls = 0
+
+    async def _handle_status(self, conn: Any) -> None:
+        self.status_calls += 1
+        if self.status_calls == 1:
+            raise RuntimeError("wired status failure")
+        await super()._handle_status(conn)
+
+
+class TestHandleClientResilience:
+    def test_one_bad_message_does_not_end_the_session(self) -> None:
+        """A handler exception sends an error reply and keeps the session open."""
+        server = _FlakyStatusServer()
+        lines = [
+            json.dumps({"type": "auth", "token": TEST_TOKEN}).encode() + b"\n",
+            b'{"type": "status"}\n',  # first status → wired RuntimeError
+            b'{"type": "status"}\n',  # second status → must still work
+            b"",
+        ]
+        writer = _RecordingWriter()
+        asyncio.run(server._handle_client(_LineReader(lines), writer))
+        assert server.status_calls == 2  # the session survived the bad message
+        types = [m["type"] for m in writer.sent]
+        assert "auth_ok" in types
+        assert "error" in types  # the failed status got an isolated error reply
+        assert "status_response" in types  # and the next status was still answered
+
+
+class TestDispatchLoopResilience:
+    def test_dispatch_loop_survives_bad_iteration_and_keeps_serving(self) -> None:
+        """An unexpected exception in one dispatch pass must not kill the loop."""
+        from jarvis.daemon.protocol import FinalMessage
+
+        server = DaemonServer(
+            settings=Settings(voice=VoiceSettings(enabled=False)), store=_FakeStore()
+        )
+
+        class _FailingConn:
+            def __init__(self) -> None:
+                self.sent: list[Any] = []
+
+            async def send(self, msg: Any) -> None:
+                self.sent.append(msg)
+                raise RuntimeError("wired send failure")
+
+        bad_conn = _FailingConn()
+        bad_conn.conn_id = "bad"  # type: ignore[attr-defined]
+        bad_conn.authenticated = True  # type: ignore[attr-defined]
+        server._clients["bad"] = bad_conn  # type: ignore[assignment]
+
+        bad_slot = TaskSlot(task_id="t1", text="x", source="chat", owner_id="bad")
+        bad_slot.result_text = "boom"
+        bad_slot.done = True
+        server._active = bad_slot
+
+        good_conn = _FakeConn()
+        good_conn.conn_id = "good"  # type: ignore[attr-defined]
+        good_conn.authenticated = True  # type: ignore[attr-defined]
+        server._clients["good"] = good_conn  # type: ignore[assignment]
+
+        async def scenario() -> None:
+            task = asyncio.ensure_future(server._dispatch_loop())
+            # Bad iteration: owner.send raises — the loop must recover + live.
+            server._task_event.set()
+            for _ in range(20):
+                await asyncio.sleep(0.001)
+            assert server._active is None or server._active.done
+            # Good iteration afterwards: the result must still be delivered.
+            good_slot = TaskSlot(task_id="t2", text="y", source="chat", owner_id="good")
+            good_slot.result_text = "hello"
+            good_slot.done = True
+            server._active = good_slot
+            server._task_event.set()
+            for _ in range(200):
+                await asyncio.sleep(0.001)
+                if good_conn.sent:
+                    break
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(scenario())
+        assert any(isinstance(m, FinalMessage) and m.task_id == "t2" for m in good_conn.sent)
+
+
 # ── F8: voice task bridge (worker-side confirmation) ────────────────────
 
 
@@ -420,7 +548,51 @@ class TestVoiceWorkerBridge:
         server._active = None
 
 
-# ── F7: chat still works while voice queue helpers exist ────────────────
+class TestWorkerResilience:
+    def test_checkpointer_failure_cannot_wedge_voice_queue(self, monkeypatch: Any) -> None:
+        """A broken checkpointer fails the slot; _voice_submit must return."""
+
+        import jarvis.agent
+
+        def boom(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("checkpoint db locked")
+
+        monkeypatch.setattr(jarvis.agent, "open_sqlite_checkpointer", boom)
+
+        server = DaemonServer(
+            settings=Settings(voice=VoiceSettings(enabled=False)), store=_FakeStore()
+        )
+        # Would previously hang forever: the worker died before touching the
+        # slot, so _voice_submit kept waiting on slot.event.
+        outcome = server._voice_submit("hello", "voice")
+        assert outcome.error and "locked" in outcome.error
+        assert server._active is None or server._active.done
+
+    def test_voice_submit_times_out_when_worker_never_completes(self, monkeypatch: Any) -> None:
+        """A worker that never marks the slot done must not wedge the voice
+        loop forever: _voice_submit gives up after VOICE_SUBMIT_TIMEOUT_S."""
+
+        import jarvis.daemon.server as server_mod
+
+        class _HungWorkerServer(DaemonServer):
+            """Worker spawns but never completes the slot (a real wedge)."""
+
+            def __init__(self) -> None:
+                super().__init__(
+                    settings=Settings(voice=VoiceSettings(enabled=False)), store=_FakeStore()
+                )
+
+            def _worker_run(self, slot: TaskSlot) -> None:  # type: ignore[override]
+                time.sleep(5.0)  # never sets slot.done / slot.event
+
+        monkeypatch.setattr(server_mod, "VOICE_SUBMIT_TIMEOUT_S", 0.2)
+        server = _HungWorkerServer()
+        start = time.monotonic()
+        outcome = server._voice_submit("hello", "voice")
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0  # bounded, not forever
+        assert outcome.error and "timed out" in outcome.error
+        server._active = None
 
 
 # ── F7: chat still works while voice queue helpers exist ────────────────

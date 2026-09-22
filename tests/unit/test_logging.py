@@ -82,3 +82,22 @@ def test_configure_logging_is_idempotent(tmp_path: Path) -> None:
         if isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == path
     ]
     assert len(matching) == 1
+
+
+def test_voice_loop_info_diagnostics_reach_configured_file(tmp_path: Path) -> None:
+    """The voice pipeline's INFO boundary diagnostics must land in the
+    configured JSONL file — the regression behind the daemon running deaf
+    (cli-main-only configure_logging meant the console-script daemon never
+    attached the file handler, so no INFO ever reached jarvis.jsonl)."""
+    logging_setup.configure_logging(log_dir=tmp_path)
+    logger = logging.getLogger("jarvis.voice.loop")
+    logger.info("voice boundary: interaction start")
+    logger.info("voice boundary: wake ack speech starting")
+    logger.info("voice boundary: re-armed for next wake")
+    log_path = tmp_path / "jarvis.jsonl"
+    assert log_path.is_file()
+    content = log_path.read_text(encoding="utf-8")
+    assert '"logger": "jarvis.voice.loop"' in content
+    assert "voice boundary: interaction start" in content
+    assert "voice boundary: wake ack speech starting" in content
+    assert "voice boundary: re-armed for next wake" in content

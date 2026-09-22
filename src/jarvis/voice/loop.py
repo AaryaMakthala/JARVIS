@@ -26,6 +26,7 @@ from typing import Any
 from jarvis.logging_setup import redact
 from jarvis.voice.interfaces import (
     AudioInput,
+    AudioSegment,
     SpeechToText,
     TextToSpeech,
     WakeWordDetector,
@@ -45,6 +46,26 @@ _YES_WORDS = {"yes", "y", "approve", "approved", "confirm", "go", "ok", "sure"}
 #: Session limits enforced by the loop (defaults, overridable per instance).
 DEFAULT_MAX_SESSION_S = 1800.0
 DEFAULT_MAX_DICTATION_CHARS = 20000
+
+#: Longest single command window captured before STT (30 s, as in config.toml).
+DEFAULT_MAX_SEGMENT_S = 30.0
+
+#: Capture chunk length (100 ms at 16 kHz) read for silence detection.
+_CAPTURE_CHUNK_FRAMES = 1600
+
+#: RMS (float samples in [-1, 1]) below which a chunk counts as silence.
+_SILENCE_RMS = 0.01
+
+
+def _chunk_is_speech(segment: AudioSegment) -> bool:
+    """Return True when ``segment`` carries voice-level energy."""
+    samples = segment.samples
+    if not samples:
+        return False
+    acc = 0.0
+    for sample in samples:
+        acc += sample * sample
+    return (acc / len(samples)) ** 0.5 >= _SILENCE_RMS
 
 
 class VoiceLoop:
@@ -71,6 +92,8 @@ class VoiceLoop:
         idle_timeout_s: float = 120.0,
         max_session_s: float = DEFAULT_MAX_SESSION_S,
         max_dictation_chars: int = DEFAULT_MAX_DICTATION_CHARS,
+        silence_timeout_s: float = 0.7,
+        max_segment_s: float = DEFAULT_MAX_SEGMENT_S,
     ) -> None:
         self._audio = audio
         self._wake_detector = wake_detector
@@ -86,6 +109,8 @@ class VoiceLoop:
         self._idle_timeout_s = idle_timeout_s
         self._max_session_s = max_session_s
         self._max_dictation_chars = max_dictation_chars
+        self._silence_timeout_s = max(silence_timeout_s, 0.0)
+        self._max_segment_s = max_segment_s
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -98,6 +123,7 @@ class VoiceLoop:
         self._stop_event = threading.Event()
         self._stopped = threading.Event()
         self._audio_opened = False
+        self._wake_frames_read = 0
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -112,6 +138,7 @@ class VoiceLoop:
         self._thread = threading.Thread(target=self._run, daemon=True, name="voice-loop")
         self._thread.start()
         logger.info("voice loop started")
+        print("[DIAG] voice.loop.start(): thread 'voice-loop' launched", flush=True)
 
     def stop(self) -> None:
         """Stop the voice loop and wait for the thread to finish.
@@ -205,10 +232,11 @@ class VoiceLoop:
             return "No response received. Action cancelled."
 
         self._tts.speak(f"{summary}. Please say yes or no.")
+        logger.info("voice boundary: confirmation listening for yes/no")
         # Discard audio captured before the prompt: stale ambient audio must
         # never be used to approve an action.
         self._audio.flush()
-        seg = self._audio.read(int(self._listen_timeout_s * 16_000))
+        seg = self._read_command(int(self._listen_timeout_s * 16_000))
         if seg.duration_s < 0.3:
             if callback is not None:
                 callback({"approved": False, "action_hash": action_hash})
@@ -250,35 +278,17 @@ class VoiceLoop:
                         break
                     continue
 
-                # Phase 2: Acknowledge wake
-                self._tts.speak("Yes?")
-                logger.info("wake acknowledged — listening for command")
+                self._run_interaction()
 
-                # Phase 3: Capture speech
-                # Discard audio buffered before/during the acknowledgement so
-                # the spoken command is read fresh and TTS output is never
-                # mistaken for a follow-up command.
-                self._audio.flush()
-                segment = self._audio.read(int(self._listen_timeout_s * 16_000))
-                if segment.duration_s < 0.3:
-                    continue  # too short, likely noise
-
-                # Phase 4: Transcribe
-                result = self._stt.transcribe(segment)
-                text = result.text.strip()
-                if not text:
-                    continue
-
-                # Command transcripts are logged only at DEBUG, through the
-                # redaction filter.  INFO carries a character count only so
-                # possible sensitive wording never reaches the log (docs/03 §10).
-                logger.info("voice transcript: %d chars", len(text))
-                logger.debug("voice transcript: %r", redact(text))
-
-                # Phase 5: Route
-                response = self._route(text)
-                if response is not None:
-                    self._tts.speak(response)
+                # Re-arm for the next wake: reset the wake-word model's rolling
+                # buffer and discard audio captured while the response was
+                # spoken, so a second "hey jarvis" is detected fresh and late
+                # TTS output is never mistaken for a follow-up command.  A
+                # failure here must not kill the loop.
+                try:
+                    self._rearm()
+                except Exception:
+                    logger.exception("voice re-arm failed after interaction; continuing to wait")
 
         except Exception:
             logger.exception("voice loop crashed")
@@ -304,29 +314,192 @@ class VoiceLoop:
         stop (idle timeout or stop request).  The idle deadline is measured
         with ``time.monotonic()`` and re-checked on a cancellable poll loop so
         a stop request is never delayed by a long sleep.
+
+        A transient exception from the wake detector itself is logged and the
+        detector re-armed, never allowed to kill the loop: model hiccups must
+        not disable voice.  A failure of the underlying microphone read still
+        surfaces as ``loop-crashed``.
         """
         if self._wake_detector is None:
             # No wake-word model; use a simple voice-activity gate.
             segment = self._audio.read(4800)  # 300 ms
             return segment.duration_s > 0 and not self._stop_event.is_set()
 
+        wait_start = time.monotonic()
         deadline: float | None = None
         if self._idle_timeout_s > 0:
-            deadline = time.monotonic() + self._idle_timeout_s
+            deadline = wait_start + self._idle_timeout_s
 
         # Read chunks and feed to the wake-word model.
         chunk_frames = 1280  # 80 ms at 16 kHz
+        last_heartbeat = wait_start
         while self._running and not self._stop_event.is_set():
             if deadline is not None and time.monotonic() >= deadline:
                 self._idle_timed_out = True
                 return False
             segment = self._audio.read(chunk_frames)
             if segment.duration_s < 0.05:
+                logger.debug(
+                    "voice boundary: wake read too short (duration_s=%.3f)",
+                    segment.duration_s,
+                )
                 continue
-            result = self._wake_detector.detect(segment)
+            self._wake_frames_read += len(segment.samples)
+            logger.debug(
+                "voice boundary: wake frame (frames=%d duration_s=%.3f)",
+                len(segment.samples),
+                segment.duration_s,
+            )
+            if time.monotonic() - last_heartbeat >= 3.0:
+                last_heartbeat = time.monotonic()
+                logger.info(
+                    "voice boundary: waiting for wake word (frames_read=%d elapsed_s=%.1f)",
+                    self._wake_frames_read,
+                    time.monotonic() - wait_start,
+                )
+            try:
+                result = self._wake_detector.detect(segment)
+            except Exception:
+                logger.exception("voice boundary: wake detector error; re-arming and continuing")
+                self._rearm()
+                continue
             if result.detected:
+                logger.info("voice boundary: wake trigger; entering interaction")
                 return True
         return False
+
+    def _run_interaction(self) -> None:
+        """Run one wake-activated interaction (ack → capture → STT → route → TTS).
+
+        Any ``return`` here falls back to :meth:`_rearm` in the caller, so
+        the loop always returns to wake-listening after a wake, even when the
+        utterance was noise, empty, or routed to a dead command.
+
+        Each phase is individually guarded: a failure inside one interaction
+        (TTS, capture, STT, routing, or response TTS) is logged and swallowed
+        so the loop keeps listening for the next wake word.  A transient
+        backend error must never permanently disable voice; only exceptions
+        outside an interaction (device open, wake detector, stop) kill the
+        loop.
+        """
+        logger.info("voice boundary: interaction start")
+
+        # Phase 2: Acknowledge wake
+        logger.info("voice boundary: wake ack speech starting")
+        try:
+            self._tts.speak("Yes?")
+        except Exception:
+            logger.exception("voice interaction failed at wake-ack; continuing to listen")
+            return
+        logger.info("wake acknowledged — listening for command")
+
+        # Phase 3: Capture speech.  Discard audio buffered before/during the
+        # acknowledgement so the spoken command is read fresh and TTS output is
+        # never mistaken for a follow-up command.
+        try:
+            self._audio.flush()
+        except Exception:
+            logger.exception("voice interaction failed at capture-flush; continuing to listen")
+            return
+        logger.info("voice boundary: capture start (max_segment_s=%.1f)", self._max_segment_s)
+        try:
+            segment = self._read_command(int(self._max_segment_s * 16_000))
+        except Exception:
+            logger.exception("voice interaction failed at capture; continuing to listen")
+            return
+        logger.info(
+            "voice boundary: capture done (duration_s=%.3f samples=%d)",
+            segment.duration_s,
+            len(segment.samples),
+        )
+        if segment.duration_s < 0.3:
+            logger.info("voice boundary: capture too short — returning to wake")
+            return  # too short, likely noise
+
+        # Phase 4: Transcribe
+        logger.info("voice boundary: stt start (audio_s=%.3f)", segment.duration_s)
+        try:
+            result = self._stt.transcribe(segment)
+        except Exception:
+            logger.exception("voice interaction failed at stt; continuing to listen")
+            return
+
+        # Command transcripts are logged only at DEBUG, through the
+        # redaction filter.  INFO carries a character count only so
+        # possible sensitive wording never reaches the log (docs/03 §10).
+        text = result.text.strip()
+        logger.info("voice boundary: stt done (chars=%d language=%s)", len(text), result.language)
+        logger.info("voice transcript: %d chars", len(text))
+        logger.debug("voice transcript: %r", redact(text))
+        if not text:
+            logger.info("voice boundary: stt empty — no command; returning to wake")
+            return
+
+        # Phase 5: Route
+        logger.info("voice boundary: routing command")
+        try:
+            response = self._route(text)
+        except Exception:
+            logger.exception("voice interaction failed at route; continuing to listen")
+            return
+        if response is None:
+            logger.info("voice boundary: route returned no response; returning to wake")
+            return
+        logger.info("voice boundary: response ready (chars=%d)", len(response))
+
+        try:
+            logger.info("voice boundary: tts response speech starting")
+            self._tts.speak(response)
+            logger.info("voice boundary: tts response speech done")
+        except Exception:
+            logger.exception("voice interaction failed at tts-response; continuing to listen")
+            return
+        logger.info("voice boundary: interaction completed")
+
+    def _rearm(self) -> None:
+        """Re-arm the wake word after an interaction has finished.
+
+        Resets the wake-word model's rolling buffer and discards any audio
+        captured while the response was spoken, so a second wake word is
+        detected fresh and late TTS audio is never heard as a command.
+        """
+        if self._wake_detector is not None:
+            self._wake_detector.reset()
+        self._audio.flush()
+        logger.info("voice boundary: re-armed for next wake")
+
+    def _read_command(self, max_samples: int) -> AudioSegment:
+        """Capture speech until trailing silence, bounded by ``max_samples``.
+
+        Reads short chunks so the loop is never deaf for a whole
+        ``listen_timeout_s`` window: capture ends once :attr:`_silence_timeout_s`
+        of trailing silence has accumulated after speech (or right away when
+        nothing was spoken), so the loop returns to wake-listening promptly
+        enough for a second wake word to be detected.
+        """
+        collected: list[float] = []
+        total = 0
+        trailing = 0.0
+        sample_rate = 16_000
+        while not self._stop_event.is_set() and total < max_samples:
+            segment = self._audio.read(_CAPTURE_CHUNK_FRAMES)
+            samples = segment.samples
+            if len(samples) <= 0:
+                break
+            if total == 0:
+                sample_rate = segment.sample_rate or 16_000
+            collected.extend(samples)
+            total += len(samples)
+            if _chunk_is_speech(segment):
+                trailing = 0.0
+            else:
+                trailing += segment.duration_s
+                if self._silence_timeout_s > 0 and trailing >= self._silence_timeout_s:
+                    break  # end of utterance (or no utterance at all)
+        return AudioSegment(
+            samples=collected,
+            sample_rate=sample_rate,
+        )
 
     def _rearm_wake_for_confirmation(self, timeout_s: float | None = None) -> bool:
         """Require the wake word again before a voice approval.

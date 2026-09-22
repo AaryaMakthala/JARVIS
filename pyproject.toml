@@ -46,7 +46,7 @@ ml = ["onnxruntime", "tokenizers", "optimum"]
 dev = ["pytest", "pytest-asyncio", "pytest-cov", "hypothesis", "ruff", "mypy", "types-PyYAML"]
 
 [project.scripts]
-jarvis = "jarvis.cli:app"
+jarvis = "jarvis.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

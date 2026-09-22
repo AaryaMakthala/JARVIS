@@ -117,6 +117,11 @@ def configure_logging(
         if isinstance(handler, logging.FileHandler) and getattr(
             handler, "baseFilename", None
         ) == str(log_path):
+            root.info(
+                "logging configured: file=%s level=%s",
+                log_path,
+                logging.getLevelName(level),
+            )
             return root
 
     handler = logging.handlers.RotatingFileHandler(
@@ -128,6 +133,12 @@ def configure_logging(
     handler.setFormatter(JsonLinesFormatter())
     handler.setLevel(level)
     root.addHandler(handler)
+    root.info(
+        "logging configured: file=%s level=%s handler=%s",
+        log_path,
+        logging.getLevelName(level),
+        type(handler).__name__,
+    )
     return root
 
 

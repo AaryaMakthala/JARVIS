@@ -24,6 +24,134 @@ No real LLM provider/key is configured, so voice→LLM→TTS end-to-end is
 implementations lazy-import gracefully and return `None` from their `create()`
 factory functions.
 
+## Session: console-script daemon wrote no INFO + voice-loop wedge proof (bug fix, no commit)
+
+Follow-up to the two-session voice/daemon work. Two concrete defects found and fixed.
+
+### Root cause A — missing INFO in jarvis.jsonl (the daemon ran "deaf" to diagnostics)
+- The console script is `jarvis = "jarvis.cli:app"` in `pyproject.toml`, but
+  `logging_setup.configure_logging()` was **only** called inside `cli.main()` (cli.py
+  line 1041). `main()` runs only via `python -m jarvis` / autostart `pythonw -m jarvis`;
+  the installed `jarvis.exe` invokes the Typer `app()` object directly, so **no root file
+  handler was ever attached** and every `logger.info(...)` from `jarvis.voice.*` was
+  dropped at the inherited WARNING level. Old file entries came from `python -m jarvis` runs.
+- **Fix**: (a) `pyproject.toml` script → `jarvis = "jarvis.cli:main"` (so `.exe` reaches
+  `main()`); (b) `DaemonServer.run()` now calls `logging_setup.configure_logging()` up front
+  (idempotent; takes effect immediately even without a reinstall) and prints
+  `[DIAG] server.run(): log file -> <path>` — the daemon always writes INFO no matter the
+  entry point; (c) `configure_logging()` logs a self-proof INFO `logging configured: file=...`
+  on both the fresh-attach and idempotent paths. Tests never call `.run()`, and the `_main`
+  Typer callback was left alone so `CliRunner` tests stay pointed at `cli.app` (no test
+  pollution of the real log dir). New test proves a `jarvis.voice.loop` INFO record lands in
+  the configured `jarvis.jsonl`.
+
+### Root cause B — two candidate wedges in the voice loop
+- `loop.py`: `self._audio.flush()` after the wake ack and `_rearm()` were **unguarded** — a
+  mic failure there killed the loop outright (or, worse, left it unable to re-arm, matching a
+  single-"Yes?"-then-silence run). Now both are wrapped: a capture-flush failure logs
+  `voice interaction failed at capture-flush` and returns to wake-listening; `_rearm()`
+  failure is logged and the loop keeps waiting; `_rearm()` emits INFO
+  `voice boundary: re-armed for next wake`.
+- `server.py` `_voice_submit`: unbounded `while not slot.done` wait (heartbeat only logged, never
+  returned) → a single hung worker wedged the voice loop forever. Added `VOICE_SUBMIT_TIMEOUT_S
+  = 180.0` deadline (returns `command timed out — try again` → loop speaks an error and re-arms),
+  30 s heartbeat now reports real elapsed time.
+
+Per-phase isolation is now *proven* by tests (deterministic fakes, no hardware): first-wake enters
+`_run_interaction`, ack speaks before capture starts (event ordering), capture/STT/routing
+failures each leave the loop re-armed and answering the NEXT wake, and every boundary INFO marker
+is emitted through the `jarvis.voice.loop` logger (caplog-asserted). Transcript wording stays out
+of INFO (char count only).
+
+**Status (WSL)**: `ruff check .` clean; hermetically in `/tmp` venv `pytest tests/unit` =
+**598 passed, 4 skipped, 1 failed** (the 1 failure is the pre-existing NTFS-ADS/Windows-only
+`test_paths.py` test, which only passes on real Windows). `mypy` not runnable under WSL Python 3.14
+(numpy stubs) — run on the dev PC. NOT committed.
+**REAL-HARDWARE VERIFICATION PENDING — same blocker**: run on Windows `jarvis daemon --foreground`,
+do 3 consecutive interactions, then read the log tail. The INFO `logging configured: file=...` line
+at daemon start now proves file logging is attached; look for `voice boundary: re-armed for next
+wake` between the three interactions. Do NOT claim fixed until 3 consecutive interactions produce
+audible speech without a daemon restart.
+
+Manual smoke test (native PowerShell):
+1. `pip install -e .` once (so the `jarvis.exe` entry point is `cli.main`), then
+   `.venv\Scripts\jarvis.exe daemon --foreground`.
+2. Check the first console lines print `[DIAG] server.run(): log file -> ...`.
+3. Say "hey jarvis" → expect "Yes?", then speak the command after the ack (one phrase like
+   "hey jarvis, open notepad" is fine on a quiet mic but the command audio is flushed with the
+   ack buffer — prefer wake → wait for "Yes?" → command).
+4. Repeat the interaction 2 more times without restarting the daemon.
+5. `Get-Content "$env:LOCALAPPDATA\jarvis\jarvis\logs\jarvis.jsonl" -Tail 300 | Select-String "voice"`
+
+## Session: second-wake-not-detected + foreground daemon exit (bug fix, no commit)
+
+Two user-reported runtime bugfixes, implemented and regression-tested together.
+
+### Root cause 1 — voice: second "Hey Jarvis" never detected
+- The wake detector was **never re-armed** after an interaction (only at loop
+  start / before confirmations), and command capture read a **fixed
+  `listen_timeout_s` (30 s) window**, so the loop was deaf to a second wake
+  while capturing after the first command (evidence: the user's two v-task ids
+  are ~33 s apart, matching 30 s capture + STT).
+- **Fix** (`voice/loop.py`): (a) wake detector is `reset()` + mic `flush()`ed
+  after every interaction via new `_rearm()` (called after the extracted
+  `_run_interaction()`, so even empty/noise/failed utterances return to
+  wake-listening); (b) new `_read_command(max_samples)` captures in 100 ms
+  chunks and **ends on `silence_timeout_s` of trailing silence** (RMS gate,
+  bounded by `max_segment_s`) instead of a full 30 s window — the loop is never
+  deaf for longer than the spoken utterance ~+0.7 s.  Used for both Phase 3
+  commands and voice confirmations.  `silence_timeout_s` / `max_segment_s`
+  (already in `VoiceSettings`) are wired `settings → VoiceService → VoiceLoop`.
+
+### Root cause 2 — daemon: foreground daemon exits / voice queue wedges
+- `_worker_run` created the SQLite checkpointer **outside** its `try`: any
+  failure there (locked DB, OneDrive sync on the path) killed the worker
+  without marking `slot.done`, so `_voice_submit()` blocked **forever** and the
+  voice-loop thread wedged on the first interaction.  `_dispatch_loop` /
+  `_stale_confirmation_loop` / `_handle_client` / `_serve` had no per-iteration
+  isolation, so one unexpected exception could kill a background task and
+  surface as a process exit from `cli.py`.
+- **Fix** (`daemon/server.py`): checkpointer moved inside the worker `try`
+  (failure → slot failed + voice thread woken); dispatch loop refactored into
+  crash-proof `_dispatch_loop` + `_dispatch_once` with a `try/except` per pass
+  and `_recover_dispatch_after_error()`; stale-confirmation loop and
+  `_handle_client` per-message handling isolated; `_serve` shutdown path wrapped
+  in `try/finally` (nothing escapes `asyncio.run`); `cli.py daemon()` now logs
+  and exits(1) on any crash instead of a silent exit.
+
+### Verification
+- `pytest tests/unit tests/integration`: **607 passed, 1 skipped** (pre-existing
+  skip), no failures.  New regression tests: two-consecutive-wakes both submit
+  (`test_two_consecutive_wakes_both_process_commands`), empty-utterance returns
+  to wake, silence-terminated / max-bounded / immediate capture units, dispatch
+  loop survives a bad iteration, bad IPC message doesn't kill the session,
+  checkpointer failure cannot wedge `_voice_submit`, and the G1 ordering test
+  rewritten for chunked capture (flush immediately precedes the first 1600-frame
+  capture read). `ruff check` / `ruff format --check` clean, `mypy
+  src/jarvis/policy` green, `git diff --check` clean.
+- **Live fix NOT yet proven on real hardware** (no mic/voice deps on this
+  machine; probe harnesses with fakes could not reproduce the daemon exit at
+  all).  Needs the user's Windows manual smoke tests (below).  Scratch probe
+  files removed.
+
+### Manual smoke tests to run on the Windows PC
+1. `pip install -e ".[voice]"` if voice deps are not yet installed; reboot the
+   daemon: `.venv\Scripts\jarvis daemon --foreground`.
+2. **Second-wake**: in another prompt run `jarvis chat`, say/toggle voice on
+   (`jarvis on`), then say *"hey jarvis — open notepad"*, wait for the full
+   response, then *"hey jarvis — what time is it"* (or any 2nd task).  Both must
+   execute; the old 30 s dead window + missing re-arm should be gone.  Repeat a
+   third time.
+3. Say *"hey jarvis"* then stop talking: the loop must say "Yes?" and return to
+   listening within ~1-2 s (capture cut short by trailing silence), NOT a 30 s
+   silence.
+4. **Daemon stays up**: from `jarvis chat`, submit a task and Ctrl+C out of the
+   client mid-task; the daemon must print "result … dropped: client
+   disconnected" (normal) and keep running — `jarvis status` must answer.
+5. Watch the log file (`%LOCALAPPDATA%\jarvis\logs\jarvis.log`) for
+   "dispatch loop iteration failed" / "daemon crashed" — should be absent in
+   normal use.
+
 ## Phase 5 security review — findings fixed (F1–F13)
 
 - **F1** `tools/keyboard.py`: `type_text` now re-verifies the *foreground*
@@ -463,3 +591,137 @@ error (the old "voice-activity gate" fallback is gone — voice refuses to start
 src/jarvis/policy` clean. voice+daemon mypy = 21 pre-existing errors (no new ones from this
 stage; service/protocol/cli are clean). NOT verified on real mic hardware — manual smoke
 tests below.
+
+---
+
+## Daemon self-exit crash (stale Windows PID) — FIXED (WSL run)
+
+**Root cause**: `os.kill(old_pid, 0)` on Windows for a stale pid raised `SystemError:
+<class 'OSError'> returned a result with an exception set`, which is NOT caught by
+`except OSError` → `_check_single_instance()` threw → daemon self-exited in ~1-2s.
+Rechecked with a stale pid: `os.kill(pid,0)` raises `SystemError` (not `OSError`/`ProcessLookupError`).
+
+**Fix** (`src/jarvis/daemon/server.py`):
+- `_check_single_instance()` now uses `psutil.pid_exists()` (already a dependency).
+- Stale pid file (pid not alive) → `_take_stale_pid_file()`: log warning, unlink daemon.json,
+  start fresh.
+- Reconciler `_check_foreign_pid()` for a *live* pid: `NoSuchProcess` → stale+delete;
+  `AccessDenied` → refuse to start (keep file); `_looks_like_jarvis_daemon(name, cmdline)` →
+  refuse; anything else (pid reuse by a non-JARVIS process) → treat as stale+delete.
+- New module helper `_looks_like_jarvis_daemon` (python/jarvis name + "jarvis"+"daemon" in cmdline,
+  matches autostart's `pythonw -m jarvis daemon`).
+- New `tests/unit/test_daemon_single_instance.py` — 10 tests (no pid file / corrupt / own pid /
+  dead pid → stale+delete / live JARVIS → refused / NoSuchProcess race / AccessDenied / non-python
+  reused pid → stale). All pass. Nothing committed; NOT re-verified on real hardware.
+- Re-checking pid 10820 (the stale value that crashed the daemon) now yields "stale, deleted".
+
+---
+
+## Voice interaction not audible during normal use — DIAGNOSTICS ADDED, root cause pending (WSL run)
+
+**User-verified facts**: `jarvis status` = daemon running / voice on / unlocked False / queue 0;
+`audio.open()` succeeds; "voice loop started" appears; direct SAPI test is audible (command below);
+`stt_model` = `C:\Users\aarya\models\faster-whisper-base`; `tts_backend = "piper"` with no
+model_path → SAPI fallback (correct). Piper warning is not the issue. Do NOT replace SAPI /
+install Piper / revert the single-instance fix.
+
+**Call-graph traced** (reading notes kept; each file read once):
+- `loop.py`: `_run` → `_wait_for_wake` → `_run_interaction` (ack "Yes?" → flush → `_read_command`
+  → STT → `_route` → `tts.speak(response)`) → `_rearm`. `_route` → stop/dictation/confirmation or
+  `_submit_task` (blocking).
+- `server.py`: `_voice_submit` (queue or immediate worker thread; blocks loop thread on
+  `slot.event` until `done`) → `_worker_run` → `run_task`/`resume_task`; Tier-1 confirmations
+  driven voice-side via `_run_voice_confirmation` → `loop.confirm_by_voice` on the **worker** thread.
+- `tts.py`: `create()` piper→SAPI fallback; `SapiTTSEngine.speak` = `pyttsx3` `say`+`runAndWait`
+  (lazy init on first use — first call happens on the **voice-loop thread**, not the main thread).
+- `stt.py` faster-whisper (`int8`, beam 1, VAD off — our own VAD); `audio_input.py` bounded-queue
+  mic (single stream owner); `wake.py` int16-scaled openWakeWord; `service.py` `off|starting|on|error`
+  state machine, synchronous `audio.open()` in `start()`.
+
+**Changes made this session** (all uncommitted, alongside the older DIAG instrumentation):
+- `loop.py`: per-iteration exception isolation in `_run_interaction` — each phase (wake-ack,
+  capture, STT, route, response-TTS) is individually guarded; a failure is `logger.exception`ed
+  and the loop keeps listening instead of crashing the whole service (`loop-crashed`). Previously
+  any STT/TTS/route error killed voice until `jarvis on` again. Boundary diagnostics added:
+  interaction start / ack starting+spoken / capture start+done / capture too short / STT start+done
+  (chars+language) / STT empty / routing / response ready / TTS speaking+dones / interaction
+  completed (marker `voice boundary:`). Kept the INFO char-count + DEBUG redacted transcript lines
+  (redaction invariant). Added `voice boundary: confirmation listening for yes/no` in
+  `confirm_by_voice`.
+- `server.py`: `_voice_submit` now logs submit/queued/rejected/errored/finished (chars) + a
+  30s "still waiting" heartbeat so a wedged worker is visible in `jarvis.jsonl`.
+- `cli.py` + `voice/service.py`: fixed 2 pre-existing `UP031` %-format DIAG prints → f-strings.
+- Tests: replaced `test_exception_in_loop_does_not_crash` with
+  `test_transient_stt_error_keeps_loop_listening` (STT boom → logged "voice interaction failed
+  at stt", loop STILL active, re-armed, ack spoken); `test_mid_loop_crash_reports_loop_crashed`
+  now crashes the **wake detector** (keeps `loop-crashed` reporting path covered);
+  `test_successful_interaction_speaks_and_keeps_listening` (new: ack + response spoken, loop alive,
+  re-armed).
+
+### Wake-detection stage: diagnostics added; root cause pending one real run
+
+**Real-hardware finding (2nd run, user)**: daemon starts, mic opens, `voice-loop` thread launches,
+but the log contains ONLY `microphone open` + `voice loop started` + `voice auto-start: voice
+activated`. There are NO wake/interaction/ack/capture/STT/TTS logs at all → failure is in the
+**wake path** (before STT). The old wake code only logged when a wake was DETECTED, so it could not
+distinguish "no frames reach the detector" from "frames reach it but scores are silently low".
+
+**Verified against installed openwakeword 0.6.0 source** (why the pipeline SHOULD work):
+- Audio: `sd.InputStream` 16 kHz / mono / int16 / blocksize 1280 → float ÷32768 in client →
+  detect() scales back to int16 (near-lossless round-trip) → `AudioFeatures` mel pipeline
+  (`raw_data_buffer`, melspectrogram, 96-d embedding `feature_buffer`); 1280-sample chunks are the
+  documented exact batch size (model input = last `model_inputs` embedding rows).
+- `Model.predict` zeroes the first 5 frames after init/reset (~400 ms warm-up — transient, not a bug).
+- Model/name key: `wakeword_models=["hey_jarvis"]` → predictions dict key `hey_jarvis` matches
+  `model_name` AND `create()` config default. `reset()` clears preprocessor + prediction buffer.
+- Config has **no** wake-threshold setting; wake.py hardcodes `_DEFAULT_THRESHOLD = 0.5`
+  (settings only expose `wake_word`; no threshold field). Threshold NOT changed pending real scores.
+
+**Changes (uncommitted)**:
+- `wake.py`: detector now tracks `frames_seen` / `last_score` / `max_score`; a per-frame DEBUG
+  "wake detector invoked" line + a throttled (2 s) INFO "wake detector sample (... last_score=
+  ... max_score=... threshold=0.50)" so the log proves whether frames AND scores are flowing
+  before any threshold change is made; "wake word detected" now includes threshold; `reset()`
+  logs at INFO ("wake detector reset") — also serves as re-arm evidence after every interaction.
+- `loop.py` `_wait_for_wake()`: throttled (3 s) INFO heartbeat "voice boundary: waiting for wake
+  word (frames_read=... elapsed_s=...)" + DEBUG per-frame "wake frame" lines + "wake trigger;
+  entering interaction" on success. **Transient wake-detector exceptions are now caught, logged
+  ("voice boundary: wake detector error; re-arming and continuing"), the detector re-armed, and
+  the loop keeps listening** (previously any detector exception killed the loop). Mic `read()`
+  failures still surface as `loop-crashed`.
+- `audio_input.py`: callback increments `_blocks_fed` (bytes never logged — counters only);
+  `read()` emits a throttled (5 s) INFO "microphone stream status: blocks_fed=... blocks_dropped=
+  ... open=..." (proves the callback→queue→reader path at runtime); `open()` now logs the actual
+  stream `samplerate/channels/blocksize/dtype`.
+- Tests (all focused on wake path): wake unit tests `test_silence_never_triggers`,
+  `test_last_max_and_frames_seen_track_predictions`, `test_reset_clears_last_score_and_forwards_to_model`,
+  `test_detector_usable_after_reset`; loop tests `test_frames_reach_detector_but_quiet_audio_never_triggers`
+  (exact 1280-frame chunks verified, quiet audio → no wake), `test_transient_detector_error_then_recovers`
+  (1st detect raises → re-armed → 2nd detect drives a full interaction, loop stays active, logged).
+  `test_mid_loop_crash_reports_loop_crashed` crash source moved from the (now-isolated) wake detector
+  to a device `read()` failure.
+
+**Status (WSL)**: `ruff check .` clean; `mypy src/jarvis/policy` clean; full suite =
+**629 passed, 1 skipped** (pre-existing WSL symlink skip). NOT committed.
+**BLOCKER — one native-Windows run decides the root cause**: the INFO heartbeats above will show
+one of (a) `blocks_fed` climbing → queue healthy, (b) `frames_read` climbing but `last_score`≈0 →
+frames reach the model but it scores ~0 on real-mic audio (privacy-silence vs low gain vs model),
+or (c) neither feeding nor reading → stream/callback problem. Then pick the minimal fix from
+evidence (e.g. an explicit score, mic-level check, or a *small justified* threshold step — NOT a
+dramatic lowering). Do not claim fixed until 3 consecutive interactions work without a daemon restart.
+
+**Status (WSL)**: `ruff check .` clean; full suite = **623 passed, 1 skipped** (pre-existing WSL
+symlink skip in `test_tools_dictation.py:222`). NOT committed. `mypy src/jarvis/policy` unchanged.
+**REAL-HARDWARE VERIFICATION PENDING = THE BLOCKER**: need the native PowerShell session to run
+`jarvis daemon --foreground`, then 3 consecutive real voice interactions, then read
+`%LOCALAPPDATA%\jarvis\jarvis\logs\jarvis.jsonl` for the sequence
+wake detected → voice boundary interaction start → ack → capture → STT → routing → response ready
+→ TTS speaking → interaction completed → rearm, for each of the 3 utterances. That will pinpoint
+the exact stage where TTS is not reached. Do NOT claim fixed until 3 consecutive interactions
+produce audible speech without a daemon restart.
+
+Manual smoke test (native PowerShell):
+1. `.venv\Scripts\jarvis.exe daemon --foreground`
+2. Say "hey jarvis, open notepad" (watch for "Yes?" then the response).
+3. Say "hey jarvis, what time is it" twice more without restarting the daemon.
+4. `Get-Content "$env:LOCALAPPDATA\jarvis\jarvis\logs\jarvis.jsonl" -Tail 200 | Select-String "voice"`
