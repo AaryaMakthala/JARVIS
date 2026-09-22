@@ -24,8 +24,12 @@ import signal
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+import psutil
 
 from jarvis.config import Settings, daemon_runtime_file, load_settings
 from jarvis.daemon.protocol import (
@@ -194,6 +198,21 @@ class _VoiceOutcome:
 # ── Server ───────────────────────────────────────────────────────────────
 
 
+def _looks_like_jarvis_daemon(name: str, cmdline: list[str]) -> bool:
+    """Return True if a process name + cmdline match a JARVIS daemon.
+
+    The daemon is launched as ``python -m jarvis daemon`` (or the ``jarvis``
+    console script).  We look for a python interpreter name plus an explicit
+    ``jarvis`` + ``daemon`` marker on the command line.  This guards the
+    single-instance check against pid reuse: a recycled pid owned by an
+    unrelated process must not be mistaken for a running daemon.
+    """
+    if "python" not in name and "jarvis" not in name:
+        return False
+    text = " ".join(cmdline)
+    return "jarvis" in text and "daemon" in text
+
+
 class DaemonServer:
     """The main daemon.  Construct with settings, then call :meth:`run`."""
 
@@ -230,16 +249,27 @@ class DaemonServer:
 
     def run(self) -> None:
         """Start the server and block until shutdown."""
+        print("[DIAG] server.run(): entered", flush=True)
         self._redirect_std()
         self._install_excepthooks()
         if not self._check_single_instance():
+            print("[DIAG] server.run(): another daemon alive — returning (exit path A)", flush=True)
             return
         self._pid_file = daemon_runtime_file()
         self._pid_file.parent.mkdir(parents=True, exist_ok=True)
         try:
             asyncio.run(self._serve())
+        except KeyboardInterrupt:
+            print("[DIAG] server.run(): KeyboardInterrupt from asyncio.run", flush=True)
+            traceback.print_exc()
+            raise
+        except BaseException:
+            print("[DIAG] server.run(): exception from asyncio.run", flush=True)
+            traceback.print_exc()
+            raise
         finally:
             self._cleanup_pid_file()
+        print("[DIAG] server.run(): asyncio.run returned cleanly (exit path B)", flush=True)
 
     # ── stdio redirect for pythonw ─────────────────────────────────────
 
@@ -286,11 +316,65 @@ class DaemonServer:
         if old_pid <= 0 or old_pid == os.getpid():
             return True
         try:
-            os.kill(old_pid, 0)
+            if not psutil.pid_exists(old_pid):
+                return self._take_stale_pid_file(pid_file, old_pid)
+            # pid is alive — but is it really a JARVIS daemon, or a recycled pid
+            # now owned by an unrelated process after reboot?
+            return self._check_foreign_pid(old_pid, pid_file)
+        except OSError as exc:  # pragma: no cover - defensive; unlink may race
+            logger.debug("could not clean stale daemon.json: %s", exc, exc_info=True)
+            return True
+
+    def _take_stale_pid_file(self, pid_file: Path, old_pid: int) -> bool:
+        """Dead/reused pid: remove the stale runtime file and allow startup."""
+        logger.warning(
+            "stale daemon.json: pid %d is not alive; removing stale runtime file",
+            old_pid,
+        )
+        try:
+            pid_file.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug("could not remove stale daemon.json: %s", exc, exc_info=True)
+        return True
+
+    def _check_foreign_pid(self, old_pid: int, pid_file: Path) -> bool:
+        """Decide whether an alive pid is a live JARVIS daemon.
+
+        Confirms the pid belongs to a JARVIS process (name + cmdline marker) to
+        avoid mistaking pid reuse after reboot for a running daemon.
+
+        - pid confirmed as a JARVIS daemon -> refuse (return ``False``)
+        - pid died in the race between ``pid_exists`` and ``Process`` -> stale (``True``)
+        - pid is alive but its identity cannot be read -> fail closed (``False``)
+        - pid is alive but is *not* JARVIS (pid reuse) -> stale (``True``)
+        """
+        try:
+            proc = psutil.Process(old_pid)
+            name = proc.name().lower()
+            cmdline = [c.lower() for c in proc.cmdline()]
+        except psutil.NoSuchProcess:
+            # Race: died between pid_exists() and Process().
+            return self._take_stale_pid_file(pid_file, old_pid)
+        except psutil.AccessDenied:
+            # Elevated / other-user process: we cannot confirm it is a JARVIS
+            # daemon, so do not assume it is safe to start a second one.
+            logger.error(
+                "pid %d is alive but its identity cannot be read; "
+                "assuming another daemon is running",
+                old_pid,
+            )
+            return False
+
+        if _looks_like_jarvis_daemon(name, cmdline):
             logger.error("another daemon is running (pid %d); exiting", old_pid)
             return False
-        except OSError:
-            return True
+
+        # Alive but not a JARVIS daemon: pid reuse after reboot.
+        logger.warning(
+            "daemon.json pid %d is not a JARVIS daemon process; treating as stale",
+            old_pid,
+        )
+        return self._take_stale_pid_file(pid_file, old_pid)
 
     def _write_pid_file(self, port: int) -> None:
         data = {"pid": os.getpid(), "port": port, "started_at": time.time()}
@@ -309,12 +393,15 @@ class DaemonServer:
 
     async def _serve(self) -> None:
         """Accept connections, manage the task queue, clean up stale confirmations."""
+        print("[DIAG] _serve: entered", flush=True)
         # Initialise the voice service first so the agent context can be wired
         # to its live loop (dictation tools need ``ctx.voice``).
         self._bootstrap_voice()
+        print("[DIAG] _serve: _bootstrap_voice() returned", flush=True)
 
         if self._ctx is None:
             self._ctx = self._build_default_context()
+        print("[DIAG] _serve: default context built", flush=True)
 
         server = await asyncio.start_server(
             self._handle_client,
@@ -337,16 +424,29 @@ class DaemonServer:
                 loop.add_signal_handler(sig, self._shutdown_event.set)
             except NotImplementedError:
                 pass
+        print(
+            "[DIAG] _serve: signal handlers installed — waiting on shutdown_event",
+            flush=True,
+        )
 
-        await self._shutdown_event.wait()
-        stale_task.cancel()
-        dispatch_task.cancel()
-        server.close()
-        await server.wait_closed()
-        for conn in list(self._clients.values()):
-            conn.close()
-        self._stop_voice()
-        logger.info("daemon shut down cleanly")
+        try:
+            await self._shutdown_event.wait()
+        finally:
+            # Guaranteed cleanup: a client disconnect or worker failure must
+            # never stop the daemon.  The shutdown path is isolated so no
+            # exception can escape ``asyncio.run`` and kill the process.
+            for task in (stale_task, dispatch_task):
+                task.cancel()
+            try:
+                await asyncio.gather(stale_task, dispatch_task, return_exceptions=True)
+            except Exception:
+                logger.debug("background tasks did not cancel cleanly", exc_info=True)
+            server.close()
+            await server.wait_closed()
+            for conn in list(self._clients.values()):
+                conn.close()
+            self._stop_voice()
+            logger.info("daemon shut down cleanly")
 
     def _bootstrap_voice(self) -> None:
         """Initialise the VoiceService and honour ``[voice] enabled`` (boot).
@@ -357,15 +457,24 @@ class DaemonServer:
         stops the daemon — text/CLI operation continues.
         """
         self._voice_service = None
+        print(
+            f"[DIAG] _bootstrap_voice(): entered; voice.enabled={self._settings.voice.enabled}, "
+            f"VoiceService={bool(VoiceService)}",
+            flush=True,
+        )
         if self._settings.voice.enabled and VoiceService is not None:
             try:
                 self._voice_service = self._build_voice_service()
+                print("[DIAG] _bootstrap_voice(): _build_voice_service() OK", flush=True)
             except Exception:
                 logger.warning("could not initialise voice service", exc_info=True)
+                print("[DIAG] _bootstrap_voice(): _build_voice_service() RAISED", flush=True)
+                traceback.print_exc()
 
         if self._voice_service is not None:
             try:
                 msg = self._voice_service.start()
+                print(f"[DIAG] _bootstrap_voice(): service.start() -> {msg!r}", flush=True)
                 if self._service_state(self._voice_service) == "error":
                     code = self._service_error_code(self._voice_service) or "loop-crashed"
                     logger.warning("voice auto-start failed: %s (%s)", code, msg)
@@ -373,6 +482,8 @@ class DaemonServer:
                     logger.info("voice auto-start: %s", msg)
             except Exception:
                 logger.warning("failed to auto-start voice", exc_info=True)
+                print("[DIAG] _bootstrap_voice(): service.start() RAISED", flush=True)
+                traceback.print_exc()
 
     def _build_default_context(self) -> Any:
         """Build an AppContext with the current settings."""
@@ -403,6 +514,7 @@ class DaemonServer:
         stt = None
         tts = None
         focus = None
+        print(f"[DIAG] _build_voice_service(): entered (voice.enabled={self._settings.voice.enabled})", flush=True)
 
         try:
             from jarvis.voice.audio_input import create as create_audio_input
@@ -412,36 +524,58 @@ class DaemonServer:
                 channels=1,
                 input_device=self._settings.voice.input_device,
             )
+            print(f"[DIAG] _build_voice_service(): audio={audio!r}", flush=True)
         except Exception:
             logger.debug("microphone audio unavailable", exc_info=True)
+            print("[DIAG] _build_voice_service(): audio_input.create() RAISED", flush=True)
+            traceback.print_exc()
 
         try:
             from jarvis.voice.wake import create as create_wake
 
             wake = create_wake(model_name=self._settings.voice.wake_word)
+            print(f"[DIAG] _build_voice_service(): wake={wake!r}", flush=True)
         except Exception:
             logger.debug("wake-word unavailable", exc_info=True)
+            print("[DIAG] _build_voice_service(): wake.create() RAISED", flush=True)
+            traceback.print_exc()
 
         try:
             from jarvis.voice.stt import create as create_stt
 
             stt = create_stt(model_size=self._settings.voice.stt_model)
+            print(f"[DIAG] _build_voice_service(): stt={stt!r}", flush=True)
         except Exception:
             logger.debug("STT unavailable", exc_info=True)
+            print("[DIAG] _build_voice_service(): stt.create() RAISED", flush=True)
+            traceback.print_exc()
 
         try:
             from jarvis.voice.tts import create as create_tts
 
             tts = create_tts(backend=self._settings.voice.tts_backend)
+            print(f"[DIAG] _build_voice_service(): tts={type(tts).__name__ if tts else None!r}", flush=True)
         except Exception:
             logger.debug("TTS unavailable", exc_info=True)
+            print("[DIAG] _build_voice_service(): tts.create() RAISED", flush=True)
+            traceback.print_exc()
 
         try:
             from jarvis.voice.focus import WindowFocusChecker
 
             focus = WindowFocusChecker()
+            print(f"[DIAG] _build_voice_service(): focus={focus!r}", flush=True)
         except Exception:
             logger.debug("focus checker unavailable", exc_info=True)
+            print("[DIAG] _build_voice_service(): focus.create() RAISED", flush=True)
+            traceback.print_exc()
+
+        print(
+            "[DIAG] _build_voice_service(): building VoiceService "
+            f"(silence_timeout_s={self._settings.voice.silence_timeout_s} "
+            f"max_segment_s={self._settings.voice.max_segment_s})",
+            flush=True,
+        )
 
         return VoiceService(
             audio=audio,
@@ -455,6 +589,8 @@ class DaemonServer:
             idle_timeout_s=self._settings.voice.idle_timeout_s,
             max_session_s=self._settings.voice.max_session_s,
             max_dictation_chars=self._settings.voice.max_dictation_chars,
+            silence_timeout_s=self._settings.voice.silence_timeout_s,
+            max_segment_s=self._settings.voice.max_segment_s,
         )
 
     def _stop_voice(self) -> None:
@@ -497,54 +633,73 @@ class DaemonServer:
     # ── dispatch loop: monitors the worker thread ──────────────────────
 
     async def _dispatch_loop(self) -> None:
-        """Watch ``_active`` for state changes and forward to the right client."""
+        """Watch ``_active`` for state changes and forward to the right client.
+
+        Each iteration is isolated: an unexpected exception must never kill
+        the background task (that would silently stop all task delivery and,
+        once ``_serve`` cancels the task at shutdown, could even surface as a
+        daemon crash).  On failure the loop logs, recovers the queue, and
+        keeps serving.
+        """
         while True:
             await self._task_event.wait()
             self._task_event.clear()
+            try:
+                await self._dispatch_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # never let a bad iteration kill the loop
+                logger.exception("dispatch loop iteration failed")
+                self._recover_dispatch_after_error()
 
-            slot = self._active
-            if slot is None:
-                continue
+    async def _dispatch_once(self) -> None:
+        """Handle one dispatch event; ``return`` where the loop used to ``continue``."""
+        slot = self._active
+        if slot is None:
+            return
 
-            # Find the client that owns this task
-            owner = self._find_owner(slot.task_id)
-            if owner is None:
-                if slot.done:
-                    # The submitting client is gone; the result can never be
-                    # delivered.  Drop it (logged) instead of stalling the
-                    # whole queue behind an undeliverable task.
-                    logger.warning("result for %s dropped: client disconnected", slot.task_id)
-                    self._promote_next()
-                # Not done yet: wait for the worker/confirm flow to progress
-                continue
-
-            if slot.confirm_payload is not None and not slot.done:
-                # Forward confirmation to the client
-                req = ConfirmRequest(
-                    task_id=slot.task_id,
-                    tier=slot.confirm_payload.get("tier", 0),
-                    summary=slot.confirm_payload.get("summary", ""),
-                    needs_password=slot.confirm_payload.get("needs_unlock", False),
-                    typed_confirmation=slot.confirm_payload.get("typed_confirmation"),
-                    action_hash=slot.confirm_payload.get("action_hash", ""),
-                    untrusted=slot.confirm_payload.get("untrusted", False),
-                )
-                await owner.send(req)
-                slot.confirm_sent_at = time.time()
-                slot.confirm_payload = None  # consumed
-
-            elif slot.done:
-                if slot.error:
-                    await owner.send(
-                        FinalMessage(task_id=slot.task_id, text=f"Error: {slot.error}")
-                    )
-                elif slot.result_text:
-                    await owner.send(FinalMessage(task_id=slot.task_id, text=slot.result_text))
-                else:
-                    await owner.send(FinalMessage(task_id=slot.task_id, text="(no answer)"))
-                # Promote next queued task
+        # Find the client that owns this task
+        owner = self._find_owner(slot.task_id)
+        if owner is None:
+            if slot.done:
+                # The submitting client is gone; the result can never be
+                # delivered.  Drop it (logged) instead of stalling the
+                # whole queue behind an undeliverable task.
+                logger.warning("result for %s dropped: client disconnected", slot.task_id)
                 self._promote_next()
-                owner.active_task = None
+            # Not done yet: wait for the worker/confirm flow to progress
+            return
+
+        if slot.confirm_payload is not None and not slot.done:
+            # Forward confirmation to the client
+            req = ConfirmRequest(
+                task_id=slot.task_id,
+                tier=slot.confirm_payload.get("tier", 0),
+                summary=slot.confirm_payload.get("summary", ""),
+                needs_password=slot.confirm_payload.get("needs_unlock", False),
+                typed_confirmation=slot.confirm_payload.get("typed_confirmation"),
+                action_hash=slot.confirm_payload.get("action_hash", ""),
+                untrusted=slot.confirm_payload.get("untrusted", False),
+            )
+            await owner.send(req)
+            slot.confirm_sent_at = time.time()
+            slot.confirm_payload = None  # consumed
+
+        elif slot.done:
+            if slot.error:
+                await owner.send(FinalMessage(task_id=slot.task_id, text=f"Error: {slot.error}"))
+            elif slot.result_text:
+                await owner.send(FinalMessage(task_id=slot.task_id, text=slot.result_text))
+            else:
+                await owner.send(FinalMessage(task_id=slot.task_id, text="(no answer)"))
+            # Promote next queued task
+            self._promote_next()
+            owner.active_task = None
+
+    def _recover_dispatch_after_error(self) -> None:
+        """After a failed dispatch iteration, unblock the queue if possible."""
+        if self._active is not None and self._active.done:
+            self._promote_next()
 
     def _find_owner(self, task_id: str) -> ClientConnection | None:
         """Find the authenticated client that owns ``task_id``.
@@ -632,7 +787,18 @@ class DaemonServer:
                 msg = await conn.recv()
                 if msg is None:
                     break
-                await self._dispatch(msg, conn)
+                try:
+                    await self._dispatch(msg, conn)
+                except (ConnectionError, OSError):
+                    break
+                except Exception:  # one bad message never kills the session
+                    logger.exception("error handling message from %s", conn_id)
+                    try:
+                        await conn.send(
+                            ErrorMessage(code="internal_error", message="internal error")
+                        )
+                    except Exception:
+                        logger.debug("error sending error reply", exc_info=True)
         except (ConnectionError, OSError):
             pass
         finally:
@@ -849,10 +1015,10 @@ class DaemonServer:
         from jarvis.agent import open_sqlite_checkpointer, resume_task, run_task
         from jarvis.config import checkpoints_db
 
-        saver = open_sqlite_checkpointer(str(checkpoints_db()))
         task_id = slot.task_id
 
         try:
+            saver = open_sqlite_checkpointer(str(checkpoints_db()))
             outcome = run_task(
                 self._ctx,
                 saver,
@@ -1046,18 +1212,23 @@ class DaemonServer:
     async def _stale_confirmation_loop(self) -> None:
         """Periodically expire confirmations waiting too long."""
         while True:
-            await asyncio.sleep(STALE_CHECK_INTERVAL_S)
-            now = time.time()
-            slot = self._active
-            if (
-                slot is not None
-                and slot.confirm_payload is not None
-                and not slot.done
-                and slot.confirm_sent_at > 0
-                and (now - slot.confirm_sent_at) > CONFIRMATION_TIMEOUT_S
-            ):
-                logger.warning("confirmation for %s expired", slot.task_id)
-                slot.error = "confirmation timed out"
-                slot.done = True
-                slot.event.set()
-                self._task_event.set()
+            try:
+                await asyncio.sleep(STALE_CHECK_INTERVAL_S)
+                now = time.time()
+                slot = self._active
+                if (
+                    slot is not None
+                    and slot.confirm_payload is not None
+                    and not slot.done
+                    and slot.confirm_sent_at > 0
+                    and (now - slot.confirm_sent_at) > CONFIRMATION_TIMEOUT_S
+                ):
+                    logger.warning("confirmation for %s expired", slot.task_id)
+                    slot.error = "confirmation timed out"
+                    slot.done = True
+                    slot.event.set()
+                    self._task_event.set()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # this housekeeping loop must never die
+                logger.exception("stale-confirmation loop iteration failed")
