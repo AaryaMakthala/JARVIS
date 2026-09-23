@@ -17,12 +17,11 @@ import pytest
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import build_graph, open_sqlite_checkpointer
 from jarvis.agent.runner import resume_task, run_task
-from jarvis.agent.state import Plan, Step
 from jarvis.config import AgentSettings, PolicySettings, Settings
 from jarvis.llm.client import FakeLLM
 from jarvis.policy.unlock import UnlockManager
 from jarvis.tools.files import make_delete_path_spec
-from support import FakeDirTrash, approve, registry_with
+from support import FakeDirTrash, approve, brain_delete, registry_with
 
 PW = "correct-horse-battery-staple"
 
@@ -63,18 +62,8 @@ def _make_ctx(ws: Path, tmp_path: Path, plans: list[Any], manager: UnlockManager
     )
 
 
-def _delete_plan(targets: list[str]) -> Plan:
-    return Plan(
-        goal="delete files",
-        steps=[
-            Step(
-                id="s1",
-                tool="delete_path",
-                args={"paths": targets},
-                rationale="delete them",
-            ),
-        ],
-    )
+def _delete_plan(targets: list[str]) -> Any:
+    return brain_delete(targets)
 
 
 @pytest.fixture

@@ -13,17 +13,24 @@ Windows logon ──► Task Scheduler (At log on) ──► pythonw -m jarvis d
               └────────────────────────────────────────►│
                                                         ▼
                                      LangGraph agent (SQLite checkpointer)
-     intake → memory_retrieve → plan → validate → policy_gate ⇄ (interrupt: confirm)
-                                                        │
-                                                        ▼
-                                  act → verify ─┬─► next step ─► act …
-                                                ├─► retry
-                                                ├─► replan → validate → policy_gate …
-                                                └─► respond (text + TTS) → memory_save
+     intake → memory_retrieve → brain ─┬─(tool)→ validate → policy_gate ⇄ (interrupt: confirm)
+                                       │                          │
+                                       ├─(conversation)→ respond  ▼
+                                       └─(clarification)→ clarify  act → verify ─┬─► next step ─► act …
+                       (interrupt: clarification) ──┬──► brain (re-run)           ├─► retry
+                                        ─────────────┘                            ├─► replan → validate → policy_gate …
+                                                                                  └─► respond (text + TTS) → memory_save
 ```
 
 Why a **daemon** and not a Windows Service: services run in session 0 and cannot control the user's desktop,
 mouse, windows, or audio. A Task Scheduler "At log on" task runs inside the user's session.
+
+**One LLM call per planning round.** The `brain` node is the single
+classification/planning stage: one structured LLM call returns a transient
+`BrainDecision` that the deterministic routers split — `tool` actions run
+through validate/policy_gate/act, a `conversation` answer is final, a
+`clarification` request pauses at the `clarify` interrupt and re-runs `brain`
+with the human's answer, and `unsupported` fails closed.
 
 ## 2. Repository layout (authoritative)
 
@@ -40,13 +47,14 @@ jarvis/
 │  ├─ platform_guard.py      # is_windows(), require_windows(), lazy imports
 │  ├─ llm/
 │  │   ├─ client.py          # LLMClient protocol, GroqClient, GeminiClient, FakeLLM (tests)
-│  │   └─ prompts.py         # planner/replanner/answer prompts (templates)
+│  │   └─ prompts.py         # brain/replan prompts (templates)
 │  ├─ agent/
-│  │   ├─ state.py           # AgentState + Pydantic models (Plan, Step, StepResult, Decision)
+│  │   ├─ state.py           # AgentState + checkpointable models (Plan, Step, StepResult, Decision)
+│  │   ├─ schemas.py         # transient LLM schemas (BrainDecision, ActionIntent, …)
 │  │   ├─ graph.py           # build_graph(ctx) → compiled graph
 │  │   ├─ runner.py          # run_task(), resume_task(), cancel_task()
-│  │   └─ nodes/             # intake.py memory_retrieve.py plan.py validate.py policy_gate.py
-│  │                         # act.py verify.py replan.py respond.py memory_save.py
+│  │   └─ nodes/             # intake.py memory_retrieve.py brain.py clarify.py validate.py
+│  │                         # policy_gate.py act.py verify.py replan.py respond.py util.py
 │  ├─ policy/
 │  │   ├─ tiers.py           # Tier enum, Decision model
 │  │   ├─ engine.py          # PolicyEngine.decide(step, ctx) → Decision
@@ -65,7 +73,8 @@ jarvis/
 │  │   └─ system.py          # lock_computer, system_info, audit tools
 │  ├─ daemon/
 │  │   ├─ protocol.py        # Pydantic message models (client↔server)
-│  │   ├─ server.py          # asyncio TCP server, auth, task queue
+│  │   ├─ task_runtime.py    # the single answer window (TaskRuntime, TimeoutSink, timeout_answer)
+│  │   ├─ server.py          # asyncio TCP server, auth, task queue, worker thread
 │  │   ├─ client.py          # DaemonClient used by CLI
 │  │   └─ autostart.py       # Task Scheduler create/delete/status
 │  ├─ voice/                 # wake.py stt.py tts.py vad.py loop.py
@@ -106,17 +115,17 @@ class Step(BaseModel):
     tool: str  # must exist in registry
     args: dict[str, Any]  # validated against the tool's args model in `validate`
     rationale: str  # short, user-visible
-    expect: str = ""  # human-readable success condition (used by verify + LLM replan)
-    depends_on_untrusted: bool = False  # set by the plan node if args derive from web/file text
+    expect: str = ""  # human-readable success condition (used by verify + replan)
+    depends_on_untrusted: bool = False  # set when args derive from web/file text
 
 
 class Plan(BaseModel):
+    kind: Literal["tool", "conversation"] = "tool"  # tool = run steps; conversation = answer only
     goal: str
     steps: list[Step] = Field(default_factory=list)
     needs_clarification: bool = False
     clarification_question: str | None = None
-    kind: Literal["tool", "conversation"] = "tool"  # LLM classifies; routing is code
-    dialog_answer: str | None = None  # direct answer the planner may write (converse honours it)
+    dialog_answer: str | None = None  # written for conversation plans; respond passes it through
 
 
 class Decision(BaseModel):
@@ -126,9 +135,11 @@ class Decision(BaseModel):
     needs_confirm: bool
     needs_unlock: bool
     needs_typed_confirmation: str | None = None  # e.g. folder name to type
-    reasons: list[str]
+    resolved_paths: list[str] = Field(default_factory=list)  # real paths the gate saw
+    reasons: list[str] = Field(default_factory=list)
     summary: str  # exact text shown to the user
     action_hash: str  # sha256(tool + canonical(args)); binds confirmation to this action
+    warn_untrusted: bool = False  # args overlap with tainted text (deterministic)
 
 
 class StepResult(BaseModel):
@@ -146,7 +157,6 @@ class AgentState(TypedDict, total=False):
     task_id: str
     source: Literal["terminal", "voice", "benchmark"]
     user_input: str
-    request_kind: Literal["tool", "conversation"]  # set by understand_request
     memory_context: list[dict]  # retrieved skills/failures/preferences (examples only)
     plan: Plan | None
     step_index: int
@@ -158,7 +168,7 @@ class AgentState(TypedDict, total=False):
     replan_count: int
     replan_now: bool  # a fresh plan is needed (set by verify / validate)
     pending_replan: bool  # the current plan came from replan (drives preserve/repair)
-    replan_decision: ReplanDecision | None  # last replanner output (observability)
+    replan_decision: Any | None  # last ReplanDecision (observability)
     validate_attempts: int  # plan rejections before the task halts (max 1 repair)
     api_calls: int
     tokens: int
@@ -166,12 +176,18 @@ class AgentState(TypedDict, total=False):
     final_answer: str | None
     halted_reason: str | None  # fail-closed message; respond() turns it into the answer
     error: str | None
+    # operational
+    request_kind: str  # tool | conversation | clarification | unsupported (set by brain)
+    gated_resolved_paths: dict[str, list[str]]  # step_id → pre-interrupt paths (TOCTOU)
+    clarification_question: str | None  # brain → clarify loop
+    clarification_answer: str | None  # the human's validated free-text answer (consumed on re-run)
+    clarification_count: int  # questions asked, bounded in code
 ```
 
-> Note: `Plan.kind` is **LLM-proposed, not trusted**. The deterministic
-> `understand_request` node is the only place that decides which branch a task
-> takes, and only `kind == "tool"` may ever reach `validate`/`act`. A
-> `conversation` plan can never execute a tool.
+> **BrainDecision / ActionIntent are transient.** They exist only inside the
+> `brain` node's single LLM call result and are immediately projected into the
+> checkpointable `Plan`/`Step` models above. They are **not** on the checkpoint
+> serializer allowlist and never enter `AgentState`.
 
 **Never** add password, API keys, or raw audio to state. State is checkpointed to SQLite in plaintext.
 
@@ -181,50 +197,73 @@ class AgentState(TypedDict, total=False):
 |------|----------------|-------|
 | `intake` | Normalise text, assign `task_id`, handle meta-commands ("cancel", "stop") | Cheap; no LLM |
 | `memory_retrieve` | Query the `MemoryBackend` for similar examples (capped by `[memory] retrieval_limit`, default 3) | Examples only, never executed directly; empty when no backend |
-| `plan` | LLM call → `Plan` (structured output, one repair retry). The LLM also classifies `kind` (`tool`/`conversation`) | Prompt includes tool catalogue (no tiers) + memory examples |
-| `understand_request` | Records `request_kind` and routes conversation vs tool **in code** | Never an LLM call; preserves an existing halt; only `tool` reaches `validate` |
-| `converse` | Plain-text answer for conversational requests (fast LLM `text()` call) | Honours `dialog_answer` if the planner already wrote one (no second LLM call) |
-| `validate` | Check tools exist, args validate against Pydantic models, step count ≤ max (default 12) | Initial-plan rejection → `plan` once; replacement-plan rejection → `replan` once; replanned plans re-snapshot TOCTOU paths and preserve completed results |
-| `policy_gate` | For **next step only**: `PolicyEngine.decide()`; if Tier 3 → skip with refusal; if confirm needed → `interrupt(payload)`; on resume re-check unlock state and hash | **No side effects before `interrupt()`** |
+| `brain` | **Single structured LLM call** → transient `BrainDecision` (`tool` / `conversation` / `clarification` / `unsupported`); projects onto `Plan`/`Step`/`final_answer`/`halted_reason`; handles the re-run after a clarification and the repair re-run after plan rejection | Routing is deterministic code; failures map to fixed honest messages; a blank conversation answer halts (`LLM_NO_ANSWER`) |
+| `clarify` | Interrupts with a `ClarificationRequest`; validates the human's free text (non-blank, not a cancel word); bounds questions at `MAX_CLARIFICATIONS` (2) | No side effects before `interrupt()`; blank AI answer/resume → "No clarification received." |
+| `validate` | Check tools exist, args validate against Pydantic models, step count ≤ max (default 12) | Initial rejection → `brain` once (repair cue); replacement rejection → `replan` once; replanned plans re-snapshot TOCTOU paths and preserve completed results |
+| `policy_gate` | For **next step only**: `PolicyEngine.decide()`; if Tier 3 → skip with refusal; if confirm needed → `interrupt(payload)`; on resume re-check unlock state and hash; a `timed_out` answer halts with the honest timeout message | **No side effects before `interrupt()`** |
 | `act` | Verify `action_hash ∈ approved_hashes` (or Tier 0), run tool via registry (respect `--dry-run`, timeout, cancel flag) | Appends `StepResult` |
 | `verify` | Tool-specific `verify()` + generic checks; decide `next` / `retry` (max 2) / `replan` / `fail` | Retries exhausted + replan budget left → `replan_now`; otherwise fail closed |
 | `replan` | LLM call with completed steps, failing step + error, remaining catalogue → `ReplanDecision` (`continue` + new plan, or `stop` + message) | Budget (`max_replans`, default 2) checked **in code**, never by prompt; `continue` keeps completed successes, drops failed attempts, resets step bookkeeping; `stop` halts honestly |
-| `respond` | Compose final text; passes through `final_answer` from `converse`; halted/refused/cancelled → honest message; TTS if voice; task_log row | For `web_answer`, includes sources |
+| `respond` | Compose final text; passes through `final_answer` from a conversation `brain` result; halted/refused/cancelled → honest message; TTS if voice; task_log row | For `web_answer`, includes sources |
 | `memory_save` | If all steps ok and verified → save/update skill; bump counters | Skip if any step tainted-and-sensitive |
 
 Flow (routers are all deterministic, no LLM):
 
 ```
-START → intake → memory_retrieve → plan → understand_request
-                                              ├─(conversation)→ converse → respond
-                                              ├─(needs clarification)→ respond
-                                              └─(tool)→ validate →(reject, initial)→ plan
-                                                              →(reject, replacement)→ replan
-                                                              → policy_gate → act → verify
-                                                                     ↑                ↓
-                                                                     └─(next step)   ├─(retry)→ act
-                                                                                     ├─(replan_now)→ replan
-                                                                                     ├─(fail closed)→ respond
-                                                                                     └─(done)→ respond
+START → intake → memory_retrieve → brain
+                                      ├─(conversation)→ respond
+                                      ├─(clarification)→ clarify →(answered, re-run)→ brain
+                                      │                  └─(limit reached / blank)→ respond
+                                      ├─(unsupported / no LLM / LLM failure)→ respond
+                                      └─(tool)→ validate →(reject, initial)→ brain (repair)
+                                                         →(reject, replacement)→ replan
+                                                         → policy_gate → act → verify
+                                                                ↑                ↓
+                                                                └─(next step)   ├─(retry)→ act
+                                                                                ├─(replan_now)→ replan
+                                                                                ├─(fail closed)→ respond
+                                                                                └─(done)→ respond
 replan ─(continue)→ validate   replan/stop, budget-exhausted, LLM failure → respond (fail closed)
 ```
 
 ### Interrupt / resume contract
 
+Two interrupts exist; both pause the graph (checkpoint saved), and the daemon
+resumes it through the same single answer window (`TaskRuntime`).
+
 ```python
-# in policy_gate node
+# policy_gate → confirmation interrupt
 payload = {"type": "confirm", "step_id": d.step_id, "tier": d.tier, "summary": d.summary,
            "needs_unlock": d.needs_unlock, "typed_confirmation": d.needs_typed_confirmation,
            "action_hash": d.action_hash}
 answer = interrupt(payload)          # blocks; graph pauses; checkpoint saved
-# answer = {"approved": bool, "action_hash": str}   <- NO password here
+# answer = {"approved": bool, "action_hash": str, "timed_out": bool?}  <- NO password here
+if answer.get("timed_out"):          # D1: honest timeout refusal, never a crash
+    halt("Confirmation timed out. I did not perform the action.")
 if not answer["approved"] or answer["action_hash"] != d.action_hash: → refuse step
 if d.needs_unlock and not ctx.unlock.is_unlocked(): → refuse step ("locked")
 ```
 
+```python
+# clarify → clarification interrupt
+answer = interrupt({"type": "clarification", "question": state["clarification_question"]})
+# answer is free text; the node validates it and re-runs brain with it in context.
+```
+
+**D1 — one window, fail closed:** `TaskRuntime` (`daemon/task_runtime.py`) owns
+the single answer window (`CONFIRMATION_TIMEOUT_S = 30.0`) for *both* confirm
+and clarify. `wait_for_response` is the only place the worker blocks on a
+slot's event; a `timeout_answer` (`{"approved": False, "action_hash": …,
+"timed_out": True}`) RESUMES the graph — the task finishes with an honest
+message and the checkpoint closes cleanly instead of being abandoned/expired.
+The `ResponseSink` protocol is how the worker offers an interrupt: the
+`TerminalSink` waits only on the IPC dialogue the dispatch loop already
+published; the `VoiceSink` routes to the voice loop.
+
 The **daemon** (not the graph) collects the password, verifies it with `UnlockManager.unlock(password)`, and only
-then resumes the graph with `Command(resume={"approved": True, "action_hash": ...})`. Resume with
-`graph.invoke(Command(resume=...), config={"configurable": {"thread_id": task_id}})`.
+then resumes the graph with `Command(resume={"approved": True, "action_hash": …})`. The password never reaches the
+resume payload, logs, or state (invariant 8). Resume with
+`graph.invoke(Command(resume=…), config={"configurable": {"thread_id": task_id}})`.
 Verify the exact LangGraph API in the installed version before coding (it has changed across releases).
 
 ## 6. Daemon and IPC protocol (`daemon/protocol.py`)
@@ -239,9 +278,9 @@ Client → server:
 {"type":"auth","token":"…"}
 {"type":"chat","id":"c1","text":"open notepad","source":"terminal"}
 {"type":"confirm_response","task_id":"t1","approved":true,"action_hash":"…","password":"…optional…"}
+{"type":"clarification_response","task_id":"t1","answer":"the report"}   // empty answer legal on the wire
 {"type":"cancel","task_id":"t1"}
-{"type":"voice","enabled":true}
-{"type":"lock"}
+{"type":"voice_toggle","state":true}
 {"type":"status"}
 {"type":"shutdown"}
 ```
@@ -250,13 +289,16 @@ Server → client:
 {"type":"auth_ok","version":"0.1.0"}
 {"type":"event","task_id":"t1","kind":"plan|step_start|step_result|log","data":{…}}
 {"type":"confirm_request","task_id":"t1","tier":2,"summary":"Delete 3 files …","needs_password":true,"typed_confirmation":null,"action_hash":"…"}
+{"type":"clarification_request","task_id":"t1","question":"Which file?"}
 {"type":"final","task_id":"t1","text":"Done. …"}
 {"type":"error","code":"…","message":"…"}
 {"type":"status","daemon":"running","voice":"on","unlocked":false,"queue":0,"active_task":null}
 ```
-Rules: password field is used once and discarded; never logged; never forwarded to the graph.
-Only one active task at a time; further `chat` messages are queued (max 5). Voice-initiated confirmations
-that need a password open a small tkinter dialog on the user's desktop (topmost) and never accept spoken passwords.
+Rules: the password field is used once and discarded; never logged; never forwarded to the graph. A `clarification_response`
+is free text only (the clarify node fails closed on empty). Only one active task at a time; further `chat` messages are
+queued (max 5). Voice-sourced Tier-2+ confirmations are refused at the server boundary (`tier_requires_terminal`).
+Voice-initiated confirmations that need a password open a small tkinter dialog on the user's desktop (topmost) and
+never accept spoken passwords.
 
 ## 7. LLM abstraction (`llm/client.py`, `llm/provider.py`)
 
@@ -278,18 +320,31 @@ class LLMClient(Protocol):
 - Structured output: try the provider's JSON-schema mode first. Support is **per model** and an unsupported model returns
   HTTP 400, so on that error fall back to plain JSON mode ("respond with JSON only") + Pydantic parse + **one** repair
   retry, and log which mode was used. Cache the per-model result for the session.
+- `brain` runs one structured call with `temperature=0.0`; any exception maps to a fixed honest message via
+  `_llm_halted_reason` (rate-limit → "I couldn't reach the AI service.", timeout → "…in time.",
+  malformed → "I couldn't safely understand that request.", else provider error).
 - Usage (calls, tokens) is returned and accumulated in state for the benchmark.
 - Timeouts (30 s), retries with backoff for 429/5xx (max 3), provider fallback Groq → Gemini if configured.
-- `FakeLLM` returns scripted responses keyed by test scenario; all graph tests use it.
+- `FakeLLM` returns scripted responses keyed by test scenario; all graph tests use it (a plain `str` in a script
+  acts as an injected `LLMClient` exception).
 
 ## 8. Concurrency model
 
 - Daemon: `asyncio` event loop for IPC. The LangGraph run and blocking tool calls execute in a worker thread
-  (`asyncio.to_thread`) so the loop stays responsive to `cancel` and `status`.
-- A `CancelToken` (threading.Event) is checked between steps and inside long tools (dictation, audit).
+  so the loop stays responsive to `cancel`, `status`, and interrupt answers.
+- The worker pauses at an interrupt by stashing the payload on the slot (`confirm_payload`) and waking the dispatch
+  loop, which forwards a `confirm_request`/`clarification_request` to the owning connection. The worker then enters
+  the single answer window (`TerminalSink.confirm/clarify → TaskRuntime.wait_for_response`) and resumes the graph
+  with the human's answer — an answer that arrives between the signal and the window can never be lost because the
+  slot event is cleared *before* waking dispatch.
+- A `CancelToken` (threading.Event) is checked between steps and inside long tools (dictation, audit); cancelling
+  while an interrupt waits finishes the slot ("cancelled by user") and the worker returns without touching it.
 - Voice loop runs in its own thread, pushes recognised text onto the same task queue with `source="voice"`.
 - PyAutoGUI `FAILSAFE = True` (mouse to top-left corner aborts). Add small `PAUSE` (0.05–0.1 s) for reliability.
-- **Stale confirmations:** LangGraph does not expire paused threads. The daemon marks tasks waiting on a confirmation longer than the timeout as `expired` (never resumed), on start and periodically; on version change all pending checkpoints are discarded.
+- **No stale/orphaned confirmations:** the graph is never left paused past the window. `TaskRuntime` synthesizes
+  the D1 `timeout_answer`, and the `_stale_confirmation_loop` sweeper produces the identical refusal for confirmations
+  whose window elapsed while the dispatch loop was otherwise occupied — both resume the graph with a fail-closed
+  refusal so the checkpoint finishes cleanly (D1).
 - **Hidden daemon (`pythonw`)** has no console (`sys.stdout`/`sys.stderr` are `None`): redirect both to the log file at startup, install excepthooks, enforce a single instance. Details in `11_DEPLOYMENT_AND_PACKAGING.md §4`.
 
 ## 9. Memory schema (`memory/base.py`, `memory/db.py`)
@@ -377,6 +432,7 @@ tts_backend = "piper"       # piper|sapi
 ## 11. Error handling philosophy
 
 - Tools never raise into the graph; they return `ToolResult(ok=False, error=…)`.
+- A LLM/brain failure halts with a fixed, honest message (never the raw exception text); `FakeLLM` tests pin each mapping.
 - Verify decides retry vs replan. After max retries/replans → `respond` with an honest failure summary and the
   log path. Never claim success without verification.
 - Unhandled exceptions in a task are caught at the runner, logged with traceback, and reported as `error` to the client;

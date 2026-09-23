@@ -6,13 +6,14 @@ pure functions directly with a fake context.
 
 Routers (all deterministic, no LLM):
 
-* ``route_after_intake``     -> memory_retrieve | respond
-* ``route_after_understand`` -> converse | validate | respond   (request kind)
-* ``route_after_validate``   -> plan | replan | policy_gate | respond
-* ``route_after_policy_gate``-> act | respond
-* ``route_after_act``        -> verify | respond
-* ``route_after_verify``     -> act | replan | policy_gate | respond
-* ``route_after_replan``     -> validate | respond
+* ``route_after_intake``  -> memory_retrieve | respond
+* ``route_after_brain``   -> clarify | validate | respond   (BrainDecision)
+* ``route_after_clarify`` -> brain | respond               (answer or cancel)
+* ``route_after_validate``-> brain | replan | policy_gate | respond
+* ``route_after_policy_gate`` -> act | respond
+* ``route_after_act``     -> verify | respond
+* ``route_after_verify``  -> act | replan | policy_gate | respond
+* ``route_after_replan``  -> validate | respond
 """
 
 from __future__ import annotations
@@ -21,34 +22,33 @@ from collections.abc import Callable
 from typing import Any
 
 from jarvis.agent.nodes.act import act
-from jarvis.agent.nodes.converse import converse
+from jarvis.agent.nodes.brain import brain
+from jarvis.agent.nodes.clarify import clarify
 from jarvis.agent.nodes.intake import intake
 from jarvis.agent.nodes.memory_retrieve import memory_retrieve
-from jarvis.agent.nodes.plan import plan
 from jarvis.agent.nodes.policy_gate import policy_gate
 from jarvis.agent.nodes.replan import replan
 from jarvis.agent.nodes.respond import respond
-from jarvis.agent.nodes.understand import understand_request
 from jarvis.agent.nodes.validate import validate
 from jarvis.agent.nodes.verify import verify
 
 __all__ = [
     "act",
-    "converse",
+    "brain",
+    "clarify",
     "intake",
     "memory_retrieve",
-    "plan",
     "policy_gate",
     "replan",
     "respond",
     "route_after_act",
+    "route_after_brain",
+    "route_after_clarify",
     "route_after_intake",
     "route_after_policy_gate",
     "route_after_replan",
-    "route_after_understand",
     "route_after_validate",
     "route_after_verify",
-    "understand_request",
     "validate",
     "verify",
     "wrap",
@@ -69,29 +69,42 @@ def route_after_intake(state: dict[str, Any]) -> str:
     return "memory_retrieve"
 
 
-def route_after_understand(state: dict[str, Any]) -> str:
-    """understand_request -> (converse | validate | respond)."""
+def route_after_brain(state: dict[str, Any]) -> str:
+    """brain -> (clarify | validate | respond).
+
+    The human-facing routes are decided here, in code, from the *projected*
+    Plan produced by the brain node: clarification goes to the ``clarify``
+    interrupt, conversation straight to ``respond``, anything else through the
+    deterministic validate / policy_gate / act pipeline.
+    """
     if state.get("halted_reason"):
         return "respond"
     plan_obj = state.get("plan")
     if plan_obj is None:
         return "respond"
     if plan_obj.needs_clarification:
-        return "respond"
+        return "clarify"
     if plan_obj.kind == "conversation":
-        return "converse"
+        return "respond"
     return "validate"
 
 
+def route_after_clarify(state: dict[str, Any]) -> str:
+    """clarify -> (brain | respond)."""
+    if state.get("cancelled") or state.get("halted_reason"):
+        return "respond"
+    return "brain"
+
+
 def route_after_validate(state: dict[str, Any]) -> str:
-    """validate -> (plan | replan | policy_gate | respond)."""
+    """validate -> (brain | replan | policy_gate | respond)."""
     if state.get("halted_reason"):
         return "respond"
     plan_obj = state.get("plan")
     if plan_obj is not None and plan_obj.needs_clarification:
         return "respond"
     if state.get("error"):
-        return "replan" if state.get("pending_replan") else "plan"
+        return "replan" if state.get("pending_replan") else "brain"
     return "policy_gate"
 
 

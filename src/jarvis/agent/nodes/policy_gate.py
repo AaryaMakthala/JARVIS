@@ -92,6 +92,15 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     approved = _answer_matches(answer, decision.action_hash)
     if not approved:
+        if isinstance(answer, dict) and answer.get("timed_out") is True:
+            # The daemon resumed us with a timeout refusal (D1): the window
+            # elapsed with no answer.  Honest, distinct message, and the
+            # action is not performed either way.
+            return {
+                "decisions": decisions,
+                "gated_resolved_paths": gated,
+                "halted_reason": "Confirmation timed out. I did not perform the action.",
+            }
         return {
             "decisions": decisions,
             "gated_resolved_paths": gated,

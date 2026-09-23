@@ -1,15 +1,20 @@
 """Typed boundary schemas for the agent layer (docs/02_ARCHITECTURE.md).
 
 These models describe the structured data that crosses the *edges* of the
-lane-graph agent: what the human asks (:class:`UserRequest`), what the
-replanner proposes (:class:`ReplanDecision`), the payload shown at a
-confirmation interrupt (:class:`ConfirmationRequest`), and the final answer
-(:class:`AgentResponse`).  :class:`PlanStep`, :class:`PolicyDecision` and
-:class:`ToolCall` are the narrower documents used inside the nodes / prompts.
+lane-graph agent: what the human asks (:class:`UserRequest`), what the brain
+proposes (:class:`BrainDecision`), what the replanner proposes
+(:class:`ReplanDecision`), the payloads shown at confirmation /
+clarification interrupts (:class:`ConfirmationRequest`,
+:class:`ClarificationRequest`), and the final answer (:class:`AgentResponse`).
+:class:`PlanStep`, :class:`PolicyDecision` and :class:`ToolCall` are the
+narrower documents used inside the nodes / prompts.
 
-Invariant: these models never carry passwords or API keys, and any model that
-is stored in the checkpointed state (currently only :class:`ReplanDecision`)
-must be on the serializer allowlist in :mod:`jarvis.agent.graph`.
+Invariant: these models never carry passwords or API keys.  Models that are
+stored in the checkpointed state (currently only :class:`ReplanDecision`) must
+be on the serializer allowlist in :mod:`jarvis.agent.graph`.
+:class:`BrainDecision` and :class:`ActionIntent` are **transient** - the brain
+node projects them into the checkpointed :class:`Plan` / :class:`Step` shape
+before anything touches AgentState, so they are deliberately *not* allowlisted.
 """
 
 from __future__ import annotations
@@ -21,7 +26,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from jarvis.agent.state import Decision, Plan, Step
 
 __all__ = [
+    "ActionIntent",
     "AgentResponse",
+    "BrainDecision",
+    "ClarificationRequest",
     "ConfirmationRequest",
     "PlanStep",
     "PolicyDecision",
@@ -74,6 +82,68 @@ class ToolCall(BaseModel):
     tainted: bool = False
 
 
+class ActionIntent(BaseModel):
+    """One action the brain proposes, before the policy engine decides.
+
+    Mirrors :class:`~jarvis.agent.state.Step` minus the ``id`` (the brain node
+    assigns ``s1...`` and projects each intent into a :class:`Step`).  This is
+    the single source of tool names, arguments and rationale passed to the
+    deterministic validate / policy_gate / act pipeline.
+
+    **Transient**: produced only inside the ``brain`` node's LLM result and
+    never written to AgentState or the checkpoint store (not allowlisted).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool: str
+    args: dict = Field(default_factory=dict)
+    rationale: str = ""
+    expect: str = ""
+    depends_on_untrusted: bool = False
+
+
+class BrainDecision(BaseModel):
+    """The single structured output of the ``brain`` LLM call (transient).
+
+    Replaces the Phase-7 three-call split (``plan`` + ``understand_request`` +
+    ``converse``) with one call.  ``request_type`` routes the graph
+    deterministically after ``brain``:
+
+    * ``conversation`` - the answer is ``response_text``; the brain node
+      projects a ``Plan(kind="conversation", dialog_answer=...)`` and sets
+      ``final_answer`` so ``respond`` works unchanged;
+    * ``action`` - ``actions`` are projected into a multi-step
+      ``Plan(kind="tool", ...)`` and run through validate / policy_gate / act;
+    * ``clarification`` - the graph must ask ``clarification_question`` via the
+      ``clarify`` node before doing anything else;
+    * ``unsupported`` - anything out of scope or that needs a human.
+
+    Like :class:`ActionIntent`, this object is request-scoped and **never
+    checkpointed**: not on the serializer allowlist, never stored in AgentState.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_type: Literal["conversation", "action", "clarification", "unsupported"]
+    goal: str = ""
+    actions: list[ActionIntent] = Field(default_factory=list)
+    response_text: str = ""
+    clarification_question: str | None = None
+    response_hint: str = ""
+    conversation_context: str = ""
+
+    @model_validator(mode="after")
+    def _direction_requires_field(self) -> BrainDecision:
+        if self.request_type == "clarification" and not (self.clarification_question or "").strip():
+            raise ValueError(
+                "request_type='clarification' requires a non-blank clarification_question"
+            )
+        if self.request_type == "action" and not self.actions:
+            raise ValueError("request_type='action' requires at least one action")
+        return self
+
+
 class ReplanDecision(BaseModel):
     """Structured output of the ``replan`` LLM call.
 
@@ -114,6 +184,28 @@ class ConfirmationRequest(BaseModel):
     resolved_paths: list[str] = Field(default_factory=list)
     action_hash: str
     untrusted: bool = False
+
+
+class ClarificationRequest(BaseModel):
+    """Payload surfaced at a clarification interrupt.
+
+    Mirrors :class:`ConfirmationRequest` for the ``clarify`` node: the daemon,
+    CLI and voice layers read ``question`` and reply with a free-text answer
+    that resumes the graph.  The answer itself travels as a plain string on the
+    interrupt resume - nothing secret ever rides in this payload.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["clarification"] = "clarification"
+    question: str = Field(min_length=1, description="question to ask the human")
+
+    @field_validator("question")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("clarification question must not be blank")
+        return value
 
 
 class AgentResponse(BaseModel):

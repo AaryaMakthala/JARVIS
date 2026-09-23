@@ -20,7 +20,7 @@ from jarvis.agent.runner import resume_task, run_task
 from jarvis.agent.state import Decision, Plan, Step, StepResult
 from jarvis.config import Settings
 from jarvis.llm.client import FakeLLM
-from support import approve, echo_plan, make_spec, registry_with
+from support import approve, brain_action, make_spec, registry_with
 
 # ---------------------------------------------------------------------------
 # Decision schema (typed confirmation must stay a str | None)
@@ -63,12 +63,14 @@ def test_nodes_package_is_a_flat_import_bundle() -> None:
     import importlib
 
     act_mod = importlib.import_module("jarvis.agent.nodes.act")
-    plan_mod = importlib.import_module("jarvis.agent.nodes.plan")
+    brain_mod = importlib.import_module("jarvis.agent.nodes.brain")
+    clarify_mod = importlib.import_module("jarvis.agent.nodes.clarify")
     validate_mod = importlib.import_module("jarvis.agent.nodes.validate")
     verify_mod = importlib.import_module("jarvis.agent.nodes.verify")
 
     assert nodes.act is act_mod.act
-    assert nodes.plan is plan_mod.plan
+    assert nodes.brain is brain_mod.brain
+    assert nodes.clarify is clarify_mod.clarify
     assert nodes.validate is validate_mod.validate
     assert nodes.verify is verify_mod.verify
     for name in ("wrap", "route_after_policy_gate", "route_after_verify"):
@@ -96,7 +98,7 @@ def test_runner_reads_state_via_graph_not_checkpointer(tmp_path: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([echo_plan()]),
+        llm=FakeLLM([brain_action("fake_echo", {"text": "hi"})]),
         registry=registry_with(make_spec("fake_echo", base_tier=1, record=record)),
     )
     conn = sqlite3.connect(tmp_path / "c.db", check_same_thread=False)
@@ -126,7 +128,7 @@ def test_runner_state_has_no_password_residue(tmp_path: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([echo_plan()]),
+        llm=FakeLLM([brain_action("fake_echo", {"text": "hi"})]),
         registry=registry_with(make_spec("fake_echo", base_tier=1, record=record)),
     )
     saver = NoGetStateSaver(

@@ -28,7 +28,7 @@ def respond(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         return {"final_answer": state["halted_reason"]}
 
     if state.get("final_answer"):
-        # Set by the converse node for conversational (no-tool) requests.
+        # Set by the brain node for conversational (no-tool) requests.
         return {"final_answer": state["final_answer"]}
 
     results: list[StepResult] = list(state.get("results") or [])

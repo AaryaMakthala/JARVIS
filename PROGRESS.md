@@ -25,6 +25,119 @@ No real LLM provider/key is configured, so voice→LLM→TTS end-to-end is
 implementations lazy-import gracefully and return `None` from their `create()`
 factory functions.
 
+## Session 2026-09-23 (later, same day) — Brain/ResponseSink refactor DONE (no commit)
+
+Supercedes the deferred entry below. All three locked decisions (D1/D2/D3) implemented and green.
+
+**Unit suite: 831 passed, 4 skipped, 0 failed** (`pytest tests/unit`). Integration: `tests/integration -q`
+green. `scripts/phase3_verify_confirm.py`: ALL CHECK-11 SCENARIOS PASS (incl. new Scenario G — timeout resumes
+with the honest message). WSL env; run ruff/pytest natively for the final pass.
+
+What changed:
+- **Brain node** (`agent/nodes/brain.py`): the single structured LLM classification. One `BrainDecision` call
+  (temp 0.0) splits: `action` → projected `Plan`/`Step`; `conversation` → `Plan(kind=conversation)+final_answer`
+  (no fast-LLM second call; blank answer halts with "I couldn't produce an answer."); `clarification` → clarify
+  interrupt; `unsupported` → honest halt. `plan`/`understand_request`/`converse` retired. LLM failures map to
+  fixed messages (`_llm_halted_reason`); `ctx.llm is None` → "…AI backend is not configured yet…".
+- **Clarify node** (`agent/nodes/clarify.py`): `interrupt(ClarificationRequest)`; free-text validation (non-blank,
+  not a `_CANCEL_RE` word); `MAX_CLARIFICATIONS = 2`; answer consumed + brain re-runs with question+answer.
+- **D3**: `BrainDecision`/`ActionIntent` transient — projected before state, never on the checkpoint allowlist
+  (stays {Plan, Step, Decision, StepResult, ReplanDecision}). `test_serializer.py` asserts the closed exact set.
+- **D1** (`daemon/task_runtime.py`): `CONFIRMATION_TIMEOUT_S = 30.0` single-sourced (server.py's 60s constant
+  deleted). `TaskRuntime.wait_for_response` is the only worker wait; `timeout_answer` resumes the graph
+  (`timed_out: True`) → `policy_gate` halts "Confirmation timed out. I did not perform the action." (checkpoint
+  finishes cleanly). `TerminalSink` is wait-only (no publish adapter). `_stale_confirmation_loop` synthesizes the
+  same refusal.
+- **D2** (`voice/loop.py`): `_YES_WORDS` split → `_LOOSE_YES_WORDS` {yes,y,approve,approved,confirm,go,ok,sure}
+  for ordinary Tier-1 payloads; `_STRICT_YES_WORDS` {yes,confirm,proceed} when `typed_confirmation` present or
+  `tier >= 2`. Voice still fails closed (`can_confirm_by_voice`) before words match; strict set tested directly.
+- **Daemon protocol**: `ClarificationRequest`/`ClarificationResponse` messages; server `_handle_clarification`
+  stashes the answer + wakes the slot; client `wait_for_event` returns both request types; voice
+  `capture_free_text` for clarification answers (empty → "" fail-closed).
+- **New/updated tests**: `tests/support.py` brain helpers; `test_replan.py` (28, incl. `_ExplodingLLM`
+  failure-mapping), `test_agent_architecture.py` (19, incl. clarify round-trip resume), `test_invariants.py`,
+  `test_agent.py`, `test_freeonly.py`, integration confirm/tier2/toctou updated; new `test_task_runtime.py`,
+  `test_daemon_client.py`, daemon protocol/server clarification tests, D2 + voice-clarification tests.
+- **Docs**: `docs/02_ARCHITECTURE.md` §1/§2/§4/§5/§6/§8 rewritten to the brain/TaskRuntime design;
+  stale "Set by the converse node" comment fixed in `respond.py`.
+
+Known/fragile: pre-existing async-mock "coroutine was never awaited" warnings in `test_daemon_server.py`
+(not failures). 4 skips = pre-existing voice/windows guards. `src/jarvis/llm/` untouched.
+
+Manual smoke tests for the dev PC (native PowerShell):
+1. `.venv\Scripts\python.exe scripts/phase3_verify_confirm.py` → ALL CHECK-11 SCENARIOS PASS.
+2. `jarvis daemon --foreground` then `jarvis chat "open notepad"` → approve → runs; refuse → "Refused…".
+3. Ask something ambiguous (e.g. "summarise the file") → CLI gets `clarification_request`, inline free-text
+   answer resumes; blank answer → "No clarification received."
+4. `ruff check . ; ruff format --check .` and `mypy src/jarvis/policy` green on the dev PC.
+
+## Session 2026-09-23 — Brain/ResponseSink refactor: pre-read done, implementation DEFERRED (no code changed)
+
+**Environment**: this session ran under WSL at `/mnt/c/Users/aarya/OneDrive/Desktop/Jarvis`
+(OneDrive-synced). Per past WSL+OneDrive sync issues, the human asked to restart natively
+(PowerShell) and RE-VERIFY the four findings against the native filesystem before any
+implementation. **No source under `src/` or `tests/` was modified this session.**
+
+**Four pre-read findings (verified against current code; must be re-confirmed natively):**
+1. Confirmation = `interrupt(payload)` in `policy_gate.py` (`ConfirmationRequest` json payload);
+   `resume_task` uses `Command(resume=answer)`; node re-runs from the top and re-derives the
+   decision + `action_hash`; TOCTOU via `gated_resolved_paths` (stashed in `validate.py`,
+   re-checked in `policy_gate` and `act`). Already implemented + tested.
+2. Voice fixes to make: bridge = `TaskSlot.owner_id`; voice tasks use `VOICE_OWNER` sentinel
+   (no socket); `_voice_submit` blocks the voice-loop thread on `slot.event`; Tier-1
+   confirmations driven worker-side via `_run_voice_confirmation`/`loop.confirm_by_voice`;
+   Tier-2+ voice = fail closed (`tier_requires_terminal`).
+3. `intake` is thin/deterministic (trim + `UserRequest` + `_CANCEL_RE`, no LLM). The single
+   LLM classification today is the `plan` node → `Plan(kind, goal, steps, needs_clarification,
+   clarification_question, dialog_answer)`; `understand_request` just records `request_kind`;
+   `converse` makes a SECOND `text()` call (or uses `dialog_answer`). Brain single-call design
+   replaces `plan`+`understand_request`+`converse`.
+4. Checkpoints: `open_sqlite_checkpointer` = `SqliteSaver` + `JsonPlusSerializer` strict
+   allowlist of EXACTLY {Plan, Step, Decision, StepResult, ReplanDecision}, no pickle.
+   Restart: `_active=None`, worker always fresh `run_task`, no auto-resume. Confirmation expiry
+   is in-memory only today (worker 60s wait + `_stale_confirmation_loop`) and marks the slot
+   errored — it does NOT resume the graph with a deterministic answer.
+
+**Three decisions locked by the human (binding constraints for the refactor):**
+- **D1 — One confirmation timeout.** Remove `CONFIRMATION_TIMEOUT_S = 60` in `server.py`
+  entirely. Exactly ONE timeout constant in the codebase afterwards, set to 30, owned by
+  `daemon/task_runtime.py`. The timeout path must RESUME the graph with a deterministic
+  "Confirmation timed out. I did not perform the action." answer (not merely mark the slot
+  errored, which is today's behaviour).
+- **D2 — Voice approval wordsets.** Destructive/high-risk confirmations (the tier boundary the
+  PolicyEngine already uses to mean destructive) require EXACTLY "yes" — "go"/"ok"/"sure" must
+  NOT approve a destructive action; "confirm"/"proceed" MAY stay as synonyms. Lower-tier
+  confirmations may keep the looser existing set. Final report must state explicitly which
+  tiers use strict vs loose set. (`voice/loop.py:44` `_YES_WORDS` currently includes
+  go/ok/sure → must be split.)
+- **D3 — Checkpoint allowlist (REVISED 2026-09-23 by human: do NOT widen the allowlist).**
+  `BrainDecision`/`ActionIntent` are TRANSIENT, request-scoped objects only: the brain node
+  projects `actions` into the existing `Plan`/`Step` shape BEFORE anything is written to
+  AgentState/checkpoints, so neither type ever appears in checkpointed state. The allowlist in
+  `build_secure_serde` therefore stays exactly {Plan, Step, Decision, StepResult,
+  ReplanDecision} with `pickle_fallback=False` — no new types added, nothing opened generally.
+  Instead of widening it, add a test asserting BrainDecision/ActionIntent are NEVER present in
+  checkpointed state (inspect the serialized bytes / allowlist-checked object graph) and that
+  the allowlist remains a closed exact set. `test_serializer.py` updated accordingly.
+
+**Explicit design ruling (must be stated in the architecture doc, not ambiguous in the diff):**
+`BrainDecision` is the single NEW **LLM-facing** schema. For the ACTION path, its `actions`
+are projected into the existing `Plan`/`Step` shape BEFORE anything touches AgentState (D3:
+projection happens first; `BrainDecision` itself is never persisted), then
+`validate`/`policy_gate`/`act` run unchanged — there is exactly ONE action representation at
+the engine boundary, not two competing ones.
+
+**Planned implementation order (WSL session approved 2026-09-23 after OneDrive confirmed not
+syncing):**
+schemas (D3 revised — transient BrainDecision, projection-before-state) → `brain.py` node +
+`clarify.py` node + graph rewiring (retire
+`understand_request`/`converse`, one-call conversation via `response_text`, deterministic
+LLM-failure mapping, action→Plan projection) → `daemon/task_runtime.py` (D1: ResponseSink +
+30s timer + timeout resume) + `DaemonServer` delegation + `_YES_WORDS` split (D2) + protocol
+clarification messages + client/CLI free-text + voice clarification capture → ~28 FakeLLM
+tests → rewrite `docs/02_ARCHITECTURE.md` → dated PROGRESS.md entry → ruff + pytest.
+`src/jarvis/llm/` stays untouched (git baseline preserved).
+
 ## Session: LLM-driver architecture (understand/converse/replan) + provider factory, memory, catalogue — DONE (no commit)
 
 `pytest --ignore=tests/windows_only` = **707 passed, 8 skipped, 1 failed** (the

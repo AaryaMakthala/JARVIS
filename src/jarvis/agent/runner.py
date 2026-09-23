@@ -36,17 +36,31 @@ class TaskOutcome:
     state: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def interrupt_kind(self) -> str:
+        """``"confirm"``, ``"clarification"`` or ``""`` for this outcome.
+
+        Read from the pending interrupt payload's ``type`` field; no payload
+        means no interruption happened.
+        """
+        if not self.confirmation:
+            return ""
+        kind = self.confirmation.get("type")
+        return kind if isinstance(kind, str) and kind in ("confirm", "clarification") else ""
+
+    @property
     def agent_response(self) -> AgentResponse:
         """The typed boundary response for this outcome.
 
-        Kind is derived from the planner's classification (conversation vs.
+        Kind is derived from the brain's classification (conversation vs.
         tool) and falls back to ``text`` being either the final answer or an
-        honest pending-confirmation/error message.
+        honest pending-confirmation / pending-clarification / error message.
         """
         plan = self.state.get("plan")
         kind = "conversation" if getattr(plan, "kind", None) == "conversation" else "tool"
         if self.final_answer:
             text = self.final_answer
+        elif self.interrupt_kind == "clarification":
+            text = f"Clarification needed: {self.confirmation.get('question') or '...'}"
         elif self.confirmation:
             text = f"Pending confirmation: {self.confirmation.get('summary') or '...'}"
         else:

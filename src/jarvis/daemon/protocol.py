@@ -5,12 +5,13 @@ Max message size: 64 KB.  First message must be ``auth`` with the token
 from keyring (constant-time compare via ``hmac.compare_digest``).
 
 Client → server: :class:`AuthMessage`, :class:`ChatMessage`,
-:class:`ConfirmResponse`, :class:`CancelMessage`, :class:`StatusRequest`,
-:class:`ShutdownMessage`, :class:`VoiceToggleMessage`.
+:class:`ConfirmResponse`, :class:`ClarificationResponse`,
+:class:`CancelMessage`, :class:`StatusRequest`, :class:`ShutdownMessage`,
+:class:`VoiceToggleMessage`.
 
 Server → client: :class:`AuthOk`, :class:`EventMessage`,
-:class:`ConfirmRequest`, :class:`FinalMessage`, :class:`ErrorMessage`,
-:class:`StatusResponse`.
+:class:`ConfirmRequest`, :class:`ClarificationRequest`,
+:class:`FinalMessage`, :class:`ErrorMessage`, :class:`StatusResponse`.
 
 The daemon stores passwords only transiently (in ``confirm_response``) and
 never forwards them to the graph (docs/03 invariant 8).
@@ -27,6 +28,8 @@ __all__ = [
     "AuthOk",
     "CancelMessage",
     "ChatMessage",
+    "ClarificationRequest",
+    "ClarificationResponse",
     "ConfirmRequest",
     "ConfirmResponse",
     "DaemonMessage",
@@ -94,6 +97,19 @@ class CancelMessage(BaseModel):
     task_id: str
 
 
+class ClarificationResponse(BaseModel):
+    """User's answer to a clarification request.
+
+    The answer is free text (never a password or confirmation flag).  An empty
+    string is valid on the wire but fails closed in the agent's clarify node
+    ("No clarification received.").
+    """
+
+    type: Literal["clarification_response"] = "clarification_response"
+    task_id: str
+    answer: str = ""
+
+
 class StatusRequest(BaseModel):
     """Request daemon status."""
 
@@ -148,6 +164,19 @@ class ConfirmRequest(BaseModel):
     untrusted: bool = False
 
 
+class ClarificationRequest(BaseModel):
+    """Daemon asks the client for a clarification while a task is suspended.
+
+    Forwarded from the clarify node's ``interrupt()`` payload by the daemon.
+    The client replies with :class:`ClarificationResponse`; the answer is
+    resumed into the clarify node (empty answer fails closed).
+    """
+
+    type: Literal["clarification_request"] = "clarification_request"
+    task_id: str
+    question: str = ""
+
+
 class FinalMessage(BaseModel):
     """Task completed; includes the agent's final answer."""
 
@@ -192,6 +221,7 @@ DaemonMessage = (
     AuthMessage
     | ChatMessage
     | ConfirmResponse
+    | ClarificationResponse
     | CancelMessage
     | StatusRequest
     | ShutdownMessage

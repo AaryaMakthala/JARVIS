@@ -18,12 +18,11 @@ import pytest
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import open_sqlite_checkpointer
 from jarvis.agent.runner import resume_task, run_task
-from jarvis.agent.state import Plan, Step
 from jarvis.config import PolicySettings, Settings
 from jarvis.llm.client import FakeLLM
 from jarvis.policy.unlock import UnlockManager
 from jarvis.tools.files import make_delete_path_spec, make_undo_last_delete_spec
-from support import FakeDirTrash, approve, approve_typed, registry_with
+from support import FakeDirTrash, approve, approve_typed, brain_action, brain_delete, registry_with
 
 PW = "correct-horse-battery-staple"
 
@@ -64,20 +63,12 @@ def _make_ctx(ws: Path, tmp_path: Path, plans: list[Any], manager: UnlockManager
     )
 
 
-def _delete_plan(targets: list[str]) -> Plan:
-    return Plan(
-        goal="delete files",
-        steps=[
-            Step(id="s1", tool="delete_path", args={"paths": targets}, rationale="delete them"),
-        ],
-    )
+def _delete_plan(targets: list[str]) -> Any:
+    return brain_delete(targets)
 
 
-def _undo_plan() -> Plan:
-    return Plan(
-        goal="undo last delete",
-        steps=[Step(id="u1", tool="undo_last_delete", args={}, rationale="restore it")],
-    )
+def _undo_plan() -> Any:
+    return brain_action("undo_last_delete", {})
 
 
 @pytest.fixture

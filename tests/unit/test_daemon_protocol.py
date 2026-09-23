@@ -18,6 +18,8 @@ from jarvis.daemon.protocol import (
     AuthOk,
     CancelMessage,
     ChatMessage,
+    ClarificationRequest,
+    ClarificationResponse,
     ConfirmRequest,
     ConfirmResponse,
     ErrorMessage,
@@ -49,6 +51,8 @@ class TestSerializationRoundTrip:
                 password="secret",
                 typed_confirmation="MyFolder",
             ),
+            ClarificationResponse(task_id="t1", answer="the report"),
+            ClarificationResponse(task_id="t1"),  # empty answer valid on the wire
             CancelMessage(task_id="t1"),
             StatusRequest(),
             ShutdownMessage(),
@@ -73,6 +77,8 @@ class TestSerializationRoundTrip:
                 needs_password=True,
                 action_hash="abc123",
             ),
+            ClarificationRequest(task_id="t1", question="Which file?"),
+            ClarificationRequest(task_id="t1"),  # blank question on the wire
             FinalMessage(task_id="t1", text="Done!"),
             ErrorMessage(code="queue_full", message="queue is full"),
             StatusResponse(daemon="running", voice="off", unlocked=False, queue=0),
@@ -85,6 +91,8 @@ class TestSerializationRoundTrip:
         # Server messages are parsed via their respective constructors
         if msg.type == "confirm_request":
             parsed = ConfirmRequest.model_validate(data)
+        elif msg.type == "clarification_request":
+            parsed = ClarificationRequest.model_validate(data)
         else:
             parsed = type(msg).model_validate(data)
         assert parsed.model_dump() == msg.model_dump()
@@ -182,6 +190,19 @@ class TestParseMessage:
         result = _parse_message(json.dumps({"type": "chat", "text": "hello"}))
         assert isinstance(result, ChatMessage)
         assert result.text == "hello"
+
+    def test_clarification_response_parsed(self) -> None:
+        result = _parse_message(
+            json.dumps({"type": "clarification_response", "task_id": "t1", "answer": "the report"})
+        )
+        assert isinstance(result, ClarificationResponse)
+        assert result.task_id == "t1"
+        assert result.answer == "the report"
+
+    def test_clarification_response_blank_answer_parsed(self) -> None:
+        result = _parse_message(json.dumps({"type": "clarification_response", "task_id": "t1"}))
+        assert isinstance(result, ClarificationResponse)
+        assert result.answer == ""  # fails closed in the clarify node, not here
 
     def test_missing_required_field_returns_none(self) -> None:
         result = _parse_message(json.dumps({"type": "chat"}))

@@ -29,7 +29,8 @@ import pytest
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import build_graph, open_sqlite_checkpointer
 from jarvis.agent.runner import resume_task, run_task
-from jarvis.agent.state import Plan, Step
+from jarvis.agent.schemas import BrainDecision
+from jarvis.agent.state import Step
 from jarvis.config import AgentSettings, PolicySettings, Settings
 from jarvis.llm.client import FakeLLM
 from jarvis.policy.unlock import UnlockManager
@@ -39,6 +40,7 @@ from jarvis.voice.fakes import make_speech
 from support import (
     FakeDirTrash,
     approve,
+    brain_action,
     deny,
     echo_plan,
     make_spec,
@@ -55,7 +57,7 @@ def test_invariant_1_unknown_tool_is_rejected_without_execution(tmp_path: Any) -
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_plan("no_such_tool", {"x": 1}), _plan("no_such_tool", {"x": 1})]),
+        llm=FakeLLM([_brain("no_such_tool", {"x": 1}), _brain("no_such_tool", {"x": 1})]),
         registry=registry_with(make_spec("fake_echo", base_tier=1, record=record)),
     )
     saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
@@ -102,7 +104,7 @@ def test_invariant_3_hard_blocked_tool_never_runs(tmp_path: Any) -> None:
     defender = make_spec("disable_defender_x", base_tier=0, record=record)
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_plan("disable_defender_x", {"text": "on"})]),
+        llm=FakeLLM([_brain("disable_defender_x", {"text": "on"})]),
         registry=registry_with(defender),
     )
     saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
@@ -123,7 +125,7 @@ def test_invariant_3_hard_blocked_tool_never_runs(tmp_path: Any) -> None:
 def _echo_context(record: list[tuple[str, dict[str, Any]]]) -> Any:
     return make_app_context(
         Settings(),
-        llm=FakeLLM([echo_plan()]),
+        llm=FakeLLM([brain_action("fake_echo", {"text": "hi"})]),
         registry=registry_with(make_spec("fake_echo", base_tier=1, record=record)),
     )
 
@@ -298,7 +300,7 @@ def test_invariant_9_verification_failure_fails_closed(tmp_path: Any) -> None:
     settings = Settings(agent=AgentSettings(max_retries_per_step=1, max_replans=0))
     ctx = make_app_context(
         settings,
-        llm=FakeLLM([_plan("fake_auto", {"text": "x"})]),
+        llm=FakeLLM([_brain("fake_auto", {"text": "x"})]),
         registry=registry_with(auto),
     )
     saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
@@ -363,7 +365,7 @@ def test_invariant_11_tier2_refuses_without_unlocked_session(tmp_path: Any) -> N
     t2 = make_spec("fake_tier2", base_tier=2, record=record)
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_plan("fake_tier2", {"text": "x"})]),
+        llm=FakeLLM([_brain("fake_tier2", {"text": "x"})]),
         registry=registry_with(t2),
         unlock=None,
     )
@@ -389,7 +391,7 @@ def test_invariant_11_tier2_approval_with_unlock_still_needs_confirm() -> None:
 
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_plan("fake_tier2", {"text": "x"})]),
+        llm=FakeLLM([_brain("fake_tier2", {"text": "x"})]),
         registry=registry_with(make_spec("fake_tier2", base_tier=2, record=record)),
         unlock=Unlocked(),
     )
@@ -414,13 +416,10 @@ def test_invariant_12_llm_cannot_lower_tier(tmp_path: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     # The step args smuggle a "tier": 0 claim; the real base_tier is 1 and the
     # engine ignores the extra key entirely.
-    claim_plan = Plan(
-        goal="echo hi",
-        steps=[Step(id="s1", tool="fake_echo", args={"text": "hi", "tier": 0}, rationale="r")],
-    )
+    claim = brain_action("fake_echo", {"text": "hi", "tier": 0})
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([claim_plan]),
+        llm=FakeLLM([claim]),
         registry=registry_with(make_spec("fake_echo", base_tier=1, record=record)),
     )
     saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
@@ -439,7 +438,7 @@ def test_invariant_12_llm_cannot_lower_tier(tmp_path: Any) -> None:
 
 def test_invariant_13_no_side_effects_before_interrupt(tmp_path: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
-    llm = FakeLLM([echo_plan()])
+    llm = FakeLLM([brain_action("fake_echo", {"text": "hi"})])
     ctx = make_app_context(
         Settings(),
         llm=llm,
@@ -461,7 +460,7 @@ def test_invariant_13_no_side_effects_before_interrupt(tmp_path: Any) -> None:
 def test_no_blocked_deserialization_warnings_through_full_flow(tmp_path: Any, caplog: Any) -> None:
     """The whole checkpoint path uses the allowlist; nothing is blocked silently."""
     record: list[tuple[str, dict[str, Any]]] = []
-    llm = FakeLLM([echo_plan()])
+    llm = FakeLLM([brain_action("fake_echo", {"text": "hi"})])
     ctx = make_app_context(
         Settings(),
         llm=llm,
@@ -570,7 +569,7 @@ def test_invariant_7_and_14_jarvis_password_lives_only_as_a_hash_outside_the_gra
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_plan("fake_tier2", {"text": "x"})]),
+        llm=FakeLLM([_brain("fake_tier2", {"text": "x"})]),
         registry=registry_with(make_spec("fake_tier2", base_tier=2, record=record)),
         unlock=manager,
     )
@@ -790,8 +789,8 @@ def test_invariant_16_voice_error_codes_are_a_closed_set() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _plan(tool: str, args: dict[str, Any]) -> Plan:
-    return Plan(goal=f"run {tool}", steps=[Step(id="s1", tool=tool, args=args, rationale="r")])
+def _brain(tool: str, args: dict[str, Any]) -> BrainDecision:
+    return brain_action(tool, args, rationale="r")
 
 
 def _step(tool: str, args: dict[str, Any]) -> Step:

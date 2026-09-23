@@ -16,6 +16,9 @@ from jarvis.daemon.protocol import (
     AuthOk,
     CancelMessage,
     ChatMessage,
+    ClarificationRequest,
+    ClarificationResponse,
+    ConfirmRequest,
     ConfirmResponse,
     DaemonMessage,
     ErrorMessage,
@@ -158,6 +161,13 @@ class DaemonClient:
         if isinstance(resp, ErrorMessage):
             raise DaemonError(code=resp.code, message=resp.message)
 
+    def send_clarification(self, task_id: str, *, answer: str) -> None:
+        """Send the answered clarification text for a suspended task."""
+        msg = ClarificationResponse(task_id=task_id, answer=answer or "")
+        resp = self._send_recv_sync(msg)
+        if isinstance(resp, ErrorMessage):
+            raise DaemonError(code=resp.code, message=resp.message)
+
     def send_cancel(self, task_id: str) -> None:
         """Cancel a task."""
         msg = CancelMessage(task_id=task_id)
@@ -190,14 +200,22 @@ class DaemonClient:
 
     def wait_for_event(
         self, *, timeout: float = 300.0
-    ) -> EventMessage | FinalMessage | ErrorMessage | None:
-        """Block until the next event, final message, or error from the daemon."""
+    ) -> EventMessage | FinalMessage | ErrorMessage | ConfirmRequest | ClarificationRequest | None:
+        """Block until the next event, request, or error from the daemon.
+
+        Requests (:class:`ConfirmRequest` / :class:`ClarificationRequest`)
+        are returned to the caller so the CLI can answer them inline; they are
+        matched by ``type`` here (not in the protocol union, which only covers
+        client→server messages).
+        """
         loop = _get_or_create_loop()
         try:
             msg = loop.run_until_complete(asyncio.wait_for(self._recv(), timeout=timeout))
         except TimeoutError:
             return None
-        if isinstance(msg, (EventMessage, FinalMessage, ErrorMessage)):
+        if isinstance(
+            msg, (EventMessage, FinalMessage, ErrorMessage, ConfirmRequest, ClarificationRequest)
+        ):
             return msg
         return None
 
@@ -272,6 +290,13 @@ def _parse_server_message(text: str) -> DaemonMessage | None:
             from jarvis.daemon.protocol import ConfirmRequest
 
             return ConfirmRequest.model_validate(data)
+        except Exception:  # noqa: BLE001
+            return None
+    if msg_type == "clarification_request":
+        try:
+            from jarvis.daemon.protocol import ClarificationRequest
+
+            return ClarificationRequest.model_validate(data)
         except Exception:  # noqa: BLE001
             return None
     dispatch: dict[str, type] = {

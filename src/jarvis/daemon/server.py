@@ -39,6 +39,8 @@ from jarvis.daemon.protocol import (
     AuthOk,
     CancelMessage,
     ChatMessage,
+    ClarificationRequest,
+    ClarificationResponse,
     ConfirmRequest,
     ConfirmResponse,
     DaemonMessage,
@@ -50,6 +52,7 @@ from jarvis.daemon.protocol import (
     StatusResponse,
     VoiceToggleMessage,
 )
+from jarvis.daemon.task_runtime import TaskRuntime, TerminalSink, VoiceSink, timeout_answer
 from jarvis.logging_setup import get_logger
 from jarvis.policy.unlock import UnlockManager
 from jarvis.secrets import SecretStore
@@ -65,10 +68,10 @@ logger = get_logger("daemon.server")
 #: Maximum tasks waiting in the queue (not counting the active one).
 MAX_QUEUE_SIZE = 5
 
-#: Stale confirmation timeout (seconds).
-CONFIRMATION_TIMEOUT_S = 60
-
-#: How often to check for stale confirmations (seconds).
+#: How often to check for stale confirmations (seconds).  The timeout value
+#: itself is owned by ``jarvis.daemon.task_runtime`` (D1): the worker and this
+#: sweeper both drain through ``self._task_runtime`` so there is exactly one
+#: window.
 STALE_CHECK_INTERVAL_S = 10
 
 #: Sentinel owner id for tasks submitted by the voice pipeline.  These have no
@@ -105,6 +108,7 @@ def _parse_message(text: str) -> DaemonMessage | None:
         "auth": AuthMessage,
         "chat": ChatMessage,
         "confirm_response": ConfirmResponse,
+        "clarification_response": ClarificationResponse,
         "cancel": CancelMessage,
         "status": StatusRequest,
         "shutdown": ShutdownMessage,
@@ -245,6 +249,7 @@ class DaemonServer:
         self._port = port or self._settings.daemon.port
         self._token = self._store.get("ipc_token") or ""
         self._unlock = UnlockManager(self._store, settings=self._settings)
+        self._task_runtime = TaskRuntime()
         self._clients: dict[str, ClientConnection] = {}
         self._queue: list[TaskSlot] = []
         self._active: TaskSlot | None = None
@@ -699,16 +704,22 @@ class DaemonServer:
             return
 
         if slot.confirm_payload is not None and not slot.done:
-            # Forward confirmation to the client
-            req = ConfirmRequest(
-                task_id=slot.task_id,
-                tier=slot.confirm_payload.get("tier", 0),
-                summary=slot.confirm_payload.get("summary", ""),
-                needs_password=slot.confirm_payload.get("needs_unlock", False),
-                typed_confirmation=slot.confirm_payload.get("typed_confirmation"),
-                action_hash=slot.confirm_payload.get("action_hash", ""),
-                untrusted=slot.confirm_payload.get("untrusted", False),
-            )
+            payload = slot.confirm_payload
+            if payload.get("type") == "clarification":
+                req: ConfirmRequest | ClarificationRequest = ClarificationRequest(
+                    task_id=slot.task_id,
+                    question=payload.get("question") or "",
+                )
+            else:
+                req = ConfirmRequest(
+                    task_id=slot.task_id,
+                    tier=payload.get("tier", 0),
+                    summary=payload.get("summary", ""),
+                    needs_password=payload.get("needs_unlock", False),
+                    typed_confirmation=payload.get("typed_confirmation"),
+                    action_hash=payload.get("action_hash", ""),
+                    untrusted=payload.get("untrusted", False),
+                )
             await owner.send(req)
             slot.confirm_sent_at = time.time()
             slot.confirm_payload = None  # consumed
@@ -840,6 +851,8 @@ class DaemonServer:
                 await self._handle_chat(chat, conn)
             case ConfirmResponse() as conf:
                 await self._handle_confirm(conf, conn)
+            case ClarificationResponse() as clar:
+                await self._handle_clarification(clar, conn)
             case CancelMessage() as cancel:
                 await self._handle_cancel(cancel, conn)
             case StatusRequest():
@@ -1059,6 +1072,57 @@ class DaemonServer:
             slot.confirm_payload = None
             slot.event.set()
 
+    def _run_voice_clarification(self, slot: TaskSlot, payload: dict[str, Any]) -> None:
+        """Capture a clarification answer by voice from the worker thread.
+
+        Mirror of :meth:`_run_voice_confirmation` for the clarify interrupt:
+        the audio dialogue runs on the worker thread while the voice-loop
+        thread waits inside ``_voice_submit``, and the captured free text is
+        stashed on ``slot.resume_answer``.  Fails closed: an empty answer (no
+        live loop, no utterance, or no ``capture_free_text`` support) is
+        resumed into the clarify node, which reports a clean "No clarification
+        received." refusal.
+        """
+        loop = self._ctx_voice_loop()
+        if loop is None or not getattr(loop, "is_active", lambda: True)():
+            logger.warning("voice clarification dropped: no active voice loop")
+            slot.resume_answer = ""
+            slot.confirm_payload = None
+            slot.event.set()
+            return
+
+        capture = getattr(loop, "capture_free_text", None)
+        if capture is None:
+            logger.warning("voice clarification dropped: loop cannot capture free text")
+            slot.resume_answer = ""
+            slot.event.set()
+            return
+
+        try:
+            answer = capture(payload.get("question") or "Please clarify.")
+            slot.resume_answer = answer if isinstance(answer, str) else ""
+        except Exception:
+            logger.exception("voice clarification failed; answering empty (fail closed)")
+            slot.resume_answer = ""
+        finally:
+            slot.confirm_payload = None
+            slot.event.set()
+
+    def _sink_for(self, slot: TaskSlot) -> TerminalSink | VoiceSink:
+        """The response sink that offers this task's interrupts to the user.
+
+        Voice-sourced tasks are answered on the audio device (Tier-1 voice
+        only for confirmations); everything else goes over IPC to the owner
+        connection and is answered by the CLI/dialog client.
+        """
+        if slot.source == "voice":
+            return VoiceSink(
+                runtime=self._task_runtime,
+                confirm=self._run_voice_confirmation,
+                clarify=self._run_voice_clarification,
+            )
+        return TerminalSink(runtime=self._task_runtime)
+
     # ── worker thread ──────────────────────────────────────────────────
 
     def _worker_run(self, slot: TaskSlot) -> None:
@@ -1066,10 +1130,15 @@ class DaemonServer:
 
         The flow is:
         1. Call ``run_task`` → blocks until graph pauses at ``interrupt()`` or finishes.
-        2. If paused → store the confirmation payload and signal the event loop.
-        3. Wait for the event loop to deliver the user's answer.
+        2. If paused → store the interrupt payload and signal the event loop.
+        3. Offer it through the task's response sink (terminal IPC or voice)
+           and wait (bounded by ``TaskRuntime``) for the user's answer.
         4. Call ``resume_task`` → blocks until the graph pauses again or finishes.
         5. Repeat until done.
+
+        A timeout is **not** an abandoned task: the graph is resumed with a
+        timed-out refusal (D1) and finishes with an honest message, instead of
+        the worker dropping the slot and leaving the checkpoint orphaned.
         """
         from jarvis.agent import open_sqlite_checkpointer, resume_task, run_task
         from jarvis.config import checkpoints_db
@@ -1104,44 +1173,34 @@ class DaemonServer:
                     return
 
                 if outcome.confirmation:
-                    if slot.source == "voice":
-                        # Voice confirmations are driven here, on the worker
-                        # thread, while the voice-loop thread waits on
-                        # ``slot.event`` inside _voice_submit().
-                        self._run_voice_confirmation(slot, outcome.confirmation)
-                        slot.event.clear()
-                        answer = slot.resume_answer
-                        slot.resume_answer = None
-                        if answer is None:
-                            answer = {
-                                "approved": False,
-                                "action_hash": outcome.confirmation.get("action_hash", ""),
-                            }
-                        outcome = resume_task(self._ctx, saver, task_id, answer)
-                        continue
-
-                    # Signal the loop: "here's a confirmation request"
-                    slot.confirm_payload = outcome.confirmation
-                    slot.confirm_tier = int(outcome.confirmation.get("tier", 0) or 0)
+                    payload = dict(outcome.confirmation)
+                    kind = outcome.interrupt_kind  # "confirm" | "clarification"
+                    # Signal the loop: "here's an interrupt for the client".
+                    slot.confirm_payload = payload
+                    slot.confirm_tier = int(payload.get("tier", 0) or 0)
+                    # Clear the answer event BEFORE waking dispatch so a reply
+                    # that lands right after the signal can never be missed.
                     slot.event.clear()
                     self._wake_dispatch()
 
-                    # Wait for the event loop to deliver the answer
-                    slot.event.wait(timeout=CONFIRMATION_TIMEOUT_S)
-
-                    if slot.event.is_set() and slot.resume_answer is not None:
-                        answer = slot.resume_answer
-                        slot.resume_answer = None
+                    sink = self._sink_for(slot)
+                    if kind == "clarification":
+                        answer_value = sink.clarify(slot, payload)
                         slot.confirm_payload = None
-                        outcome = resume_task(self._ctx, saver, task_id, answer)
+                        if slot.done:
+                            return  # cancelled while waiting (slot already finished)
+                        # Fail closed: a timed-out / missing answer resumes as
+                        # empty text and the clarify node reports a clean
+                        # "No clarification received." refusal.
+                        resume_value: Any = answer_value if isinstance(answer_value, str) else ""
                     else:
-                        # Timeout or cancelled
-                        slot.error = "confirmation timed out"
-                        slot.done = True
-                        self._wake_dispatch()
-                        if slot.owner_id == VOICE_OWNER:
-                            slot.event.set()
-                        return
+                        answer_value = sink.confirm(slot, payload)
+                        slot.confirm_payload = None
+                        if slot.done:
+                            return  # cancelled while waiting (slot already finished)
+                        resume_value = answer_value
+                    outcome = resume_task(self._ctx, saver, task_id, resume_value)
+                    continue
                 else:
                     # No confirmation and no final answer — shouldn't happen, but be safe
                     slot.done = True
@@ -1204,6 +1263,27 @@ class DaemonServer:
             answer["typed_confirmation"] = msg.typed_confirmation
 
         slot.resume_answer = answer
+        slot.event.set()  # wake the worker thread
+
+    async def _handle_clarification(
+        self, msg: ClarificationResponse, conn: ClientConnection
+    ) -> None:
+        """Deliver the user's clarification answer to the waiting worker."""
+        slot = self._active
+        if slot is None or slot.task_id != msg.task_id or slot.done:
+            await conn.send(
+                ErrorMessage(
+                    code="no_such_task",
+                    message=f"no active task awaiting clarification: {msg.task_id!r}",
+                    task_id=msg.task_id,
+                )
+            )
+            return
+
+        # Empty answers are legal on the wire; the clarify node turns a
+        # non-string / empty resume into "No clarification received." (fail
+        # closed).  Never the password, never a confirmation flag.
+        slot.resume_answer = msg.answer if isinstance(msg.answer, str) else ""
         slot.event.set()  # wake the worker thread
 
     # ── cancel ─────────────────────────────────────────────────────────
@@ -1280,11 +1360,12 @@ class DaemonServer:
                     and slot.confirm_payload is not None
                     and not slot.done
                     and slot.confirm_sent_at > 0
-                    and (now - slot.confirm_sent_at) > CONFIRMATION_TIMEOUT_S
+                    and (now - slot.confirm_sent_at) > self._task_runtime.confirm_timeout_s
                 ):
                     logger.warning("confirmation for %s expired", slot.task_id)
-                    slot.error = "confirmation timed out"
-                    slot.done = True
+                    # Never abandon the task: resume the graph with a timed-out
+                    # refusal so the checkpoint finishes cleanly (D1).
+                    slot.resume_answer = timeout_answer(slot.confirm_payload)
                     slot.event.set()
                     self._task_event.set()
             except asyncio.CancelledError:

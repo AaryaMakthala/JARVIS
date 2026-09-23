@@ -13,7 +13,10 @@ import pytest
 from pydantic import ValidationError
 
 from jarvis.agent.schemas import (
+    ActionIntent,
     AgentResponse,
+    BrainDecision,
+    ClarificationRequest,
     ConfirmationRequest,
     ReplanDecision,
     ToolCall,
@@ -101,3 +104,99 @@ def test_plan_allows_conversation_without_steps() -> None:
 def test_plan_rejects_unknown_kind() -> None:
     with pytest.raises(ValidationError):
         Plan(kind="monologue", goal="g")  # type: ignore[arg-type]
+
+
+def test_action_intent_defaults_and_extra_forbid() -> None:
+    a = ActionIntent(tool="app_launch", args={"name": "notepad"})
+    assert a.rationale == ""
+    assert a.expect == ""
+    assert a.depends_on_untrusted is False
+    assert set(a.model_dump()) == {
+        "tool",
+        "args",
+        "rationale",
+        "expect",
+        "depends_on_untrusted",
+    }
+    with pytest.raises(ValidationError):
+        ActionIntent(tool="app_launch", args={}, action_hash="x")  # type: ignore[call-arg]
+
+
+def test_brain_decision_conversation_shape() -> None:
+    d = BrainDecision(request_type="conversation", response_text="hi", goal="answer")
+    assert d.actions == []
+    assert d.clarification_question is None
+    # round-trips through plain JSON
+    assert BrainDecision.model_validate(d.model_dump(mode="json")) == d
+
+
+def test_brain_decision_action_requires_actions() -> None:
+    with pytest.raises(ValidationError):
+        BrainDecision(request_type="action", goal="do something")
+    d = BrainDecision(
+        request_type="action",
+        goal="open notepad",
+        actions=[ActionIntent(tool="app_launch", args={"name": "notepad"}, rationale="r")],
+    )
+    assert d.actions[0].tool == "app_launch"
+
+
+def test_brain_decision_clarification_requires_question() -> None:
+    with pytest.raises(ValidationError):
+        BrainDecision(request_type="clarification", goal="?")
+
+    with pytest.raises(ValidationError):
+        BrainDecision(request_type="clarification", clarification_question="   ", goal="?")
+
+    d = BrainDecision(request_type="clarification", clarification_question="which file?", goal="?")
+    assert d.clarification_question == "which file?"
+
+
+def test_brain_decision_unknown_request_type_and_extra_fields_rejected() -> None:
+    with pytest.raises(ValidationError):
+        BrainDecision(request_type="shell")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        BrainDecision(request_type="conversation", response_text="hi", tier=3)  # type: ignore[call-arg]
+
+
+def test_brain_decision_and_action_intent_are_transient_by_contract() -> None:
+    # Serialization-side contract: the checkpoint serde must NOT revive a
+    # BrainDecision/ActionIntent as a typed object.  The brain node projects
+    # into the allowlisted Plan/Step shape before anything touches AgentState,
+    # so these LLM-only types round-trip as plain data (never resurrected).
+    from jarvis.agent.graph import build_secure_serde
+
+    serde = build_secure_serde()
+
+    brain = BrainDecision(
+        request_type="action",
+        actions=[ActionIntent(tool="app_launch", args={"name": "notepad"}, rationale="r")],
+    )
+    out = serde.loads_typed(serde.dumps_typed(brain))
+    assert type(out) is dict
+    assert out["request_type"] == "action"
+
+    intent = ActionIntent(tool="app_launch", args={"name": "notepad"})
+    out2 = serde.loads_typed(serde.dumps_typed(intent))
+    assert type(out2) is dict
+    assert out2["tool"] == "app_launch"
+
+    # the checkpointed representation is the Plan/Step pair, revived as types
+    plan = Plan(
+        goal="g",
+        steps=[Step(id="s1", tool="app_launch", args={"name": "notepad"}, rationale="r")],
+    )
+    out3 = serde.loads_typed(serde.dumps_typed(plan))
+    assert type(out3) is Plan
+
+
+def test_clarification_request_json_round_trip() -> None:
+    c = ClarificationRequest(question="which file should I edit?")
+    assert c.type == "clarification"
+    data = c.model_dump(mode="json")
+    assert data["question"] == "which file should I edit?"
+    assert ClarificationRequest.model_validate(data) == c
+    with pytest.raises(ValidationError):
+        ClarificationRequest(question="   ")
+    with pytest.raises(ValidationError):
+        ClarificationRequest(question="x", confirmed=True)  # type: ignore[call-arg]

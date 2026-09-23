@@ -15,7 +15,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from jarvis.agent.schemas import ReplanDecision
+from jarvis.agent.schemas import ActionIntent, BrainDecision, ReplanDecision
 from jarvis.agent.state import Plan, Step
 from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
 from jarvis.tools.files import TrashRecord
@@ -84,6 +84,73 @@ def conversation_plan(answer: str = "That is a great question!") -> Plan:
         goal="answer the user directly",
         steps=[],
         dialog_answer=answer,
+    )
+
+
+# ── Brain-decision helpers ──────────────────────────────────────────────
+#
+# The graph now classifies via one structured ``brain`` call; these helpers
+# build the transient :class:`BrainDecision` the FakeLLM script returns.
+# ``brain_action`` targets a single tool; ``brain_steps`` lets a test hand a
+# batch of intents back; the *_variances produce the other request types.
+
+
+def brain_action(
+    tool: str,
+    args: dict[str, Any],
+    *,
+    rationale: str = "do it",
+    expect: str = "",
+    depends_on_untrusted: bool = False,
+) -> BrainDecision:
+    """A brain decision that proposes a single-tool action plan."""
+    return BrainDecision(
+        request_type="action",
+        goal=f"act on the request with {tool}",
+        actions=[
+            ActionIntent(
+                tool=tool,
+                args=args,
+                rationale=rationale,
+                expect=expect,
+                depends_on_untrusted=depends_on_untrusted,
+            )
+        ],
+    )
+
+
+def brain_steps(actions: list[ActionIntent]) -> BrainDecision:
+    """A brain decision whose plan is exactly the given action intents."""
+    return BrainDecision(request_type="action", goal="act on the request", actions=actions)
+
+
+def brain_conversation(response: str = "That is a great question!") -> BrainDecision:
+    """A brain decision that answers the user directly (no tools)."""
+    return BrainDecision(request_type="conversation", response_text=response)
+
+
+def brain_clarify(question: str) -> BrainDecision:
+    """A brain decision that must ask the human ``question`` first."""
+    return BrainDecision(request_type="clarification", clarification_question=question)
+
+
+def brain_unsupported(message: str = "I can't do that.") -> BrainDecision:
+    """A brain decision that halts: the request is out of scope."""
+    return BrainDecision(request_type="unsupported", response_text=message)
+
+
+def brain_delete(paths: list[str]) -> BrainDecision:
+    """An action decision that calls the real ``delete_path`` tool."""
+    return BrainDecision(
+        request_type="action",
+        goal="delete the given paths to the Recycle Bin",
+        actions=[
+            ActionIntent(
+                tool="delete_path",
+                args={"paths": list(paths)},
+                rationale="delete the given paths (reversible)",
+            )
+        ],
     )
 
 

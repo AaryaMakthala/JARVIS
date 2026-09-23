@@ -23,7 +23,13 @@ from jarvis.voice.interfaces import (
     STTResult,
     WakeWordResult,
 )
-from jarvis.voice.loop import _CAPTURE_CHUNK_FRAMES, VoiceLoop
+from jarvis.voice.loop import (
+    _CAPTURE_CHUNK_FRAMES,
+    _LOOSE_YES_WORDS,
+    _STRICT_YES_WORDS,
+    VoiceLoop,
+    _approval_words,
+)
 
 # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -1155,6 +1161,125 @@ class TestVoiceConfirmationFailClosed:
         )
         assert response == "Cancelled."
         assert answers == [{"approved": False, "action_hash": "h"}]
+
+
+# ── D2: the approval-word split is code, not prompt ─────────────────────
+
+
+class TestApprovalWordsD2:
+    """D2: a destructive/high-risk confirmation demands the strict word set.
+
+    ``can_confirm_by_voice`` already fails closed before the words match, so
+    the strict bucket is a defensive second boundary.  These tests pin the
+    split so a future "loosen the words" edit breaks tests, not a demo.
+    """
+
+    def test_loose_set_serves_ordinary_tier1_payloads(self) -> None:
+        assert _approval_words({"tier": 1}) == _LOOSE_YES_WORDS
+        assert _approval_words({}) == _LOOSE_YES_WORDS
+
+    def test_typed_folder_name_demands_the_strict_set(self) -> None:
+        assert _approval_words({"tier": 1, "typed_confirmation": "Reports"}) == _STRICT_YES_WORDS
+
+    def test_tier2_demands_the_strict_set(self) -> None:
+        assert _approval_words({"tier": 2}) == _STRICT_YES_WORDS
+        assert _approval_words({"tier": "3"}) == _STRICT_YES_WORDS
+
+    def test_unparsable_tier_falls_back_to_loose_but_voice_is_still_blocked(self) -> None:
+        # A junk tier can never reach the matcher: can_confirm_by_voice fails
+        # first.  The word fallback only widens the loose set, never the strict.
+        assert _approval_words({"tier": "nope"}) == _LOOSE_YES_WORDS
+        loop, _, _, _, _ = _make_loop(stt_results=[STTResult(text="yes")])
+        pushed: list[dict[str, Any]] = []
+        response = loop.confirm_by_voice(
+            {"tier": "nope", "summary": "x", "action_hash": "h"},
+            on_confirmation=pushed.append,
+            rearm_timeout_s=1.0,
+        )
+        assert response == "Action requires terminal confirmation: x"
+        assert pushed == [{"approved": False, "action_hash": "h"}]
+
+    def test_go_ok_sure_approve_an_ordinary_confirmation(self) -> None:
+        for word in ("go", "ok", "sure"):
+            pushed: list[dict[str, Any]] = []
+            loop, _, _, _, _ = _make_loop(stt_results=[STTResult(text=word)])
+            loop.confirm_by_voice(
+                {"tier": 1, "summary": "open notepad", "action_hash": "h"},
+                on_confirmation=pushed.append,
+                rearm_timeout_s=1.0,
+            )
+            assert pushed == [{"approved": True, "action_hash": "h"}], word
+
+    def test_go_ok_sure_cannot_approve_a_typed_payload(self) -> None:
+        # Even if a strict payload slipped past can_confirm_by_voice, the word
+        # matcher must refuse the colloquial approvals.  The match expression in
+        # confirm_by_voice is exactly ``answer in _approval_words(payload)``,
+        # so pin the membership directly.
+        strict = _approval_words({"typed_confirmation": "Reports"})
+        for word in ("go", "ok", "sure"):
+            assert word not in strict, word
+        assert "yes" in strict
+        # And the payload still fails closed at the whole-function boundary.
+        pushed: list[dict[str, Any]] = []
+        loop, _, _, _, _ = _make_loop(stt_results=[STTResult(text="go")])
+        loop.confirm_by_voice(
+            {"tier": 1, "typed_confirmation": "Reports", "summary": "wipe", "action_hash": "h"},
+            on_confirmation=pushed.append,
+            rearm_timeout_s=1.0,
+        )
+        assert pushed == [{"approved": False, "action_hash": "h"}]
+
+    def test_go_ok_sure_cannot_approve_a_tier2_payload(self) -> None:
+        strict = _approval_words({"tier": 2})
+        for word in ("go", "ok", "sure"):
+            assert word not in strict, word
+        pushed: list[dict[str, Any]] = []
+        loop, _, _, _, _ = _make_loop(stt_results=[STTResult(text="ok")])
+        loop.confirm_by_voice(
+            {"tier": 2, "summary": "delete", "action_hash": "h"},
+            on_confirmation=pushed.append,
+            rearm_timeout_s=1.0,
+        )
+        assert pushed == [{"approved": False, "action_hash": "h"}]
+
+    def test_yes_never_a_casualty_of_the_strict_split(self) -> None:
+        # The unambiguous words must still match under the strict bucket.
+        strict = _approval_words({"typed_confirmation": "Reports"})
+        assert strict == _STRICT_YES_WORDS
+        for word in _STRICT_YES_WORDS:
+            assert word in strict, word
+
+
+# ── voice clarification: capture_free_text ───────────────────────────────
+
+
+class TestVoiceClarificationCapture:
+    def test_returns_the_spoken_transcript(self) -> None:
+        answers: list[str] = []
+        loop, _, _, _, _ = _make_loop(
+            stt_results=[STTResult(text="the report")],
+            audio_segments=[make_speech("fake", duration_s=0.5)] * 50,
+        )
+        text = loop.capture_free_text("Which file?", on_answer=answers.append, rearm_timeout_s=1.0)
+        assert text == "the report"
+        assert answers == ["the report"]
+
+    def test_empty_utterance_fails_closed(self) -> None:
+        loop, _, _, _, _ = _make_loop(
+            audio_segments=[make_silence(0.01)] * 2,
+            wake_results=[WakeWordResult(detected=True)],
+        )
+        assert loop.capture_free_text("Which file?", rearm_timeout_s=1.0) == ""
+
+    def test_empty_transcript_fails_closed(self) -> None:
+        answers: list[str] = []
+        loop, _, _, _, _ = _make_loop(
+            stt_results=[STTResult(text="  ")],
+            audio_segments=[make_speech("fake", duration_s=0.5)] * 50,
+        )
+        text = loop.capture_free_text("Which file?", on_answer=answers.append, rearm_timeout_s=1.0)
+        assert text == ""
+        assert answers == [""]  # stripped utterance → empty resume
 
 
 # ── F10: stop() waits for the thread and closes audio ───────────────────

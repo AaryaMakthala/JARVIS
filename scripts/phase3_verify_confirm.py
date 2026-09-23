@@ -29,6 +29,7 @@ from jarvis.daemon.protocol import (
     ConfirmResponse,
 )
 from jarvis.daemon.server import DaemonServer
+from jarvis.daemon.task_runtime import TaskRuntime
 
 TOKEN = "confirm-token-" + uuid.uuid4().hex
 FAILURES: list[str] = []
@@ -75,33 +76,41 @@ class ConfirmServer(DaemonServer):
         slot.event.clear()
         self._wake_dispatch()  # thread-safe wake (same mechanism as the real worker)
 
-        # Wait for the event loop to deliver the answer (same as real worker)
-        slot.event.wait(timeout=10)
+        # Single answer window (D1): mirrors the real worker — the user answer
+        # (or a timed-out refusal) is produced by TaskRuntime and never dropped.
+        answer = self._task_runtime.wait_for_response(slot, slot.confirm_payload)
 
-        if slot.event.is_set() and slot.resume_answer is not None:
-            answer = slot.resume_answer
-            # Mirror the real act-node contract: a mismatched action_hash is
-            # refused exactly like tests/integration/
-            # test_confirmation_resume.py::test_tampered_hash_never_executes
-            # proves for the real graph.
-            if answer.get("action_hash") == expected_hash:
-                slot.result_text = (
-                    f"executed after approval (hash={answer['action_hash'][:8]})"
-                    if answer.get("approved")
-                    else "Refused by you (confirmation answered with 'no')"
-                )
-            else:
-                slot.result_text = (
-                    "Refused by you (confirmation answered with 'no' or a mismatched action)."
-                )
+        if slot.done:
+            return  # cancelled while waiting; dispatch already finished the slot
+
+        if answer.get("timed_out"):
+            # The graph-level policy would resume with this timed-out refusal
+            # and finish with the honest message (policy_gate timed_out branch).
+            slot.result_text = "Confirmation timed out. I did not perform the action."
             slot.resume_answer = None
             slot.confirm_payload = None
             slot.done = True
             self._wake_dispatch()
+            return
+
+        # Mirror the real act-node contract: a mismatched action_hash is
+        # refused exactly like tests/integration/
+        # test_confirmation_resume.py::test_tampered_hash_never_executes
+        # proves for the real graph.
+        if answer.get("action_hash") == expected_hash:
+            slot.result_text = (
+                f"executed after approval (hash={answer['action_hash'][:8]})"
+                if answer.get("approved")
+                else "Refused by you (confirmation answered with 'no')"
+            )
         else:
-            slot.error = "confirmation timed out"
-            slot.done = True
-            self._wake_dispatch()
+            slot.result_text = (
+                "Refused by you (confirmation answered with 'no' or a mismatched action)."
+            )
+        slot.resume_answer = None
+        slot.confirm_payload = None
+        slot.done = True
+        self._wake_dispatch()
 
 
 class Client:
@@ -291,6 +300,35 @@ def main() -> None:
         check(
             "E2: cancelled task never executes (error/final, no execution)",
             final is not None and final["type"] == "final" and "Error" in final.get("text", ""),
+            f"got {final!r}",
+        )
+        c.close()
+    finally:
+        h.stop()
+
+    # ── Scenario G: no answer within the window → honest timed-out refusal ──
+    h = Harness()
+    h.server._task_runtime = TaskRuntime(confirm_timeout_s=1.0)  # fast window
+    h.start()
+    try:
+        c = Client(h.port)
+        c.send(AuthMessage(token=TOKEN))
+        c.recv_json()
+        c.send(ChatMessage(text="echo hi", id="tG"))
+        req = c.recv_json()
+        check(
+            "G: confirm_request is delivered before the window starts",
+            req is not None and req["type"] == "confirm_request",
+            f"got {req!r}",
+        )
+        # Never reply.  TaskRuntime's window expires and RESUMES the task with
+        # a fail-closed refusal instead of abandoning it (D1).
+        final = c.recv_json(timeout=8)
+        check(
+            "G: unanswered confirmation reports the honest timeout message",
+            final is not None
+            and final["type"] == "final"
+            and final["text"] == "Confirmation timed out. I did not perform the action.",
             f"got {final!r}",
         )
         c.close()

@@ -17,14 +17,17 @@ import pytest
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import open_sqlite_checkpointer
 from jarvis.agent.runner import resume_task, run_task
+from jarvis.agent.schemas import ActionIntent, BrainDecision
 from jarvis.agent.state import Plan, Step
 from jarvis.config import AgentSettings, Settings
 from jarvis.llm.client import FakeLLM
 from support import (
     approve,
-    conversation_plan,
+    brain_action,
+    brain_clarify,
+    brain_conversation,
+    brain_steps,
     deny,
-    echo_plan,
     make_spec,
     registry_with,
     replan_continue,
@@ -48,11 +51,9 @@ def _confirmed_spec(name: str, record: list[tuple[str, dict[str, Any]]]) -> Any:
     return make_spec(name, base_tier=1, record=record)
 
 
-def _echo_plan_tool0() -> Plan:
-    return Plan(
-        goal="echo hi",
-        steps=[Step(id="s1", tool="fake_echo", args={"text": "hi"}, rationale="echo it")],
-    )
+def _echo_decision() -> BrainDecision:
+    """A single eager step: echo hi through the fake Tier-0 tool."""
+    return brain_action("fake_echo", {"text": "hi"})
 
 
 def _failing_echo_spec(record: list[tuple[str, dict[str, Any]]]) -> Any:
@@ -60,13 +61,13 @@ def _failing_echo_spec(record: list[tuple[str, dict[str, Any]]]) -> Any:
     return make_spec("fake_echo", base_tier=0, record=record, run_ok=False)
 
 
-def _two_step_plan() -> Plan:
-    return Plan(
-        goal="ab",
-        steps=[
-            Step(id="s1", tool="fake_a", args={"text": "A"}, rationale="first"),
-            Step(id="s2", tool="fake_b", args={"text": "B"}, rationale="second"),
-        ],
+def _two_step_decision() -> BrainDecision:
+    """A two-step eager plan (fake_a then fake_b)."""
+    return brain_steps(
+        [
+            ActionIntent(tool="fake_a", args={"text": "A"}, rationale="first"),
+            ActionIntent(tool="fake_b", args={"text": "B"}, rationale="second"),
+        ]
     )
 
 
@@ -77,29 +78,26 @@ def _replacement_plan() -> Plan:
     )
 
 
-def _clarification_plan() -> Plan:
-    return Plan(
-        goal="clarify",
-        steps=[],
-        needs_clarification=True,
-        clarification_question="Which file did you mean?",
-    )
+def _bad_tool_decision() -> BrainDecision:
+    """A plan validate must reject: the tool does not exist."""
+    return brain_action("no_such_tool", {})
 
 
-def _conv_no_answer() -> Plan:
-    return Plan(kind="conversation", goal="answer", steps=[], dialog_answer=None)
+def _bad_args_decision() -> BrainDecision:
+    """A plan validate must reject: the args fail the tool's model."""
+    return brain_action("fake_echo", {"text": ""})
 
 
 # ── conversation vs. tool routing ──────────────────────────────────────────
 
 
-def test_conversation_answer_written_by_planner_skips_llm_and_runs_no_tools(
+def test_conversation_answer_written_by_brain_skips_llm_and_runs_no_tools(
     saver: Any,
 ) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([conversation_plan("Hi there!")]),
+        llm=FakeLLM([brain_conversation("Hi there!")]),
         registry=registry_with(_eager_spec("fake_echo", record)),
     )
     out = run_task(ctx, saver, "hello jarvis")
@@ -111,18 +109,19 @@ def test_conversation_answer_written_by_planner_skips_llm_and_runs_no_tools(
     assert out.agent_response.interrupted is False
 
 
-def test_conversation_answer_via_fast_model_when_planner_wrote_none(saver: Any) -> None:
+def test_conversation_blank_answer_halts_without_calling_fast_model(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
-    llm = FakeLLM([_conv_no_answer(), "Sure, I can help!"])
+    llm = FakeLLM([brain_conversation("   ")])
     ctx = make_app_context(
         Settings(),
         llm=llm,
         registry=registry_with(_eager_spec("fake_echo", record)),
     )
     out = run_task(ctx, saver, "tell me a joke")
-    assert out.final_answer == "Sure, I can help!"
+    assert out.final_answer == "I couldn't produce an answer."
     assert record == []
-    assert ("text", "fast", "str") in llm.calls
+    # the single-call design must not fall back to a second LLM call
+    assert llm.calls == [("structured", "planner", "BrainDecision")]
 
 
 def test_no_llm_backend_halts_cleanly(saver: Any) -> None:
@@ -133,7 +132,10 @@ def test_no_llm_backend_halts_cleanly(saver: Any) -> None:
         registry=registry_with(_eager_spec("fake_echo", record)),
     )
     out = run_task(ctx, saver, "do something")
-    assert out.final_answer == "No LLM backend configured (run `jarvis init`)."
+    assert (
+        out.final_answer == "JARVIS's AI backend is not configured yet. "
+        "Configure an LLM provider before asking me to reason about tasks."
+    )
     assert record == []
 
 
@@ -144,7 +146,7 @@ def test_single_eager_tool_executes(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_echo_plan_tool0()]),
+        llm=FakeLLM([_echo_decision()]),
         registry=registry_with(_eager_spec("fake_echo", record)),
     )
     out = run_task(ctx, saver, "echo hi")
@@ -158,7 +160,7 @@ def test_multi_step_eager_plan_runs_in_order(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_two_step_plan()]),
+        llm=FakeLLM([_two_step_decision()]),
         registry=registry_with(_eager_spec("fake_a", record), _eager_spec("fake_b", record)),
     )
     out = run_task(ctx, saver, "a then b")
@@ -171,7 +173,7 @@ def test_confirmation_required_suspends_then_approval_executes(saver: Any) -> No
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([echo_plan()]),
+        llm=FakeLLM([_echo_decision()]),
         registry=registry_with(_confirmed_spec("fake_echo", record)),
     )
     first = run_task(ctx, saver, "echo hi")
@@ -189,7 +191,7 @@ def test_confirmation_rejected_never_runs(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([echo_plan()]),
+        llm=FakeLLM([_echo_decision()]),
         registry=registry_with(_confirmed_spec("fake_echo", record)),
     )
     first = run_task(ctx, saver, "echo hi")
@@ -202,7 +204,7 @@ def test_tampered_confirmation_hash_is_refused(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([echo_plan()]),
+        llm=FakeLLM([_echo_decision()]),
         registry=registry_with(_confirmed_spec("fake_echo", record)),
     )
     first = run_task(ctx, saver, "echo hi")
@@ -211,16 +213,40 @@ def test_tampered_confirmation_hash_is_refused(saver: Any) -> None:
     assert "Refused" in (resumed.final_answer or "")
 
 
-def test_clarification_plan_does_not_route_to_tools(saver: Any) -> None:
+def test_clarification_plan_interrupts_instead_of_routing_to_tools(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_clarification_plan()]),
+        llm=FakeLLM([brain_clarify("Which file did you mean?")]),
         registry=registry_with(_eager_spec("fake_echo", record)),
     )
     out = run_task(ctx, saver, "open the file")
     assert record == []
-    assert "Clarification needed: Which file did you mean?" in (out.final_answer or "")
+    assert out.interrupted is True
+    assert out.interrupt_kind == "clarification"
+    assert (
+        out.confirmation is not None and out.confirmation["question"] == "Which file did you mean?"
+    )
+    assert out.final_answer is None  # nothing answered yet
+    assert "Clarification needed: Which file did you mean?" in out.agent_response.text
+
+
+def test_clarification_answer_resumes_and_executes(saver: Any) -> None:
+    record: list[tuple[str, dict[str, Any]]] = []
+    ctx = make_app_context(
+        Settings(),
+        llm=FakeLLM([brain_clarify("Which file did you mean?"), _echo_decision()]),
+        registry=registry_with(_eager_spec("fake_echo", record)),
+    )
+    first = run_task(ctx, saver, "open the file")
+    assert first.interrupt_kind == "clarification"
+    resumed = resume_task(ctx, saver, first.task_id, "the report")
+    assert resumed.interrupted is False
+    assert record == [("fake_echo", {"text": "hi"})]
+    assert resumed.final_answer == "fake_echo ran hi"
+    # the answer fed the re-run and was then consumed from the checkpoint state
+    assert resumed.state["clarification_count"] == 1
+    assert resumed.state["clarification_answer"] is None
 
 
 # ── planner repair and failure handling ────────────────────────────────────
@@ -228,13 +254,9 @@ def test_clarification_plan_does_not_route_to_tools(saver: Any) -> None:
 
 def test_unknown_tool_plan_is_rejected_then_repaired(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
-    bad = Plan(
-        goal="x",
-        steps=[Step(id="s1", tool="no_such_tool", args={}, rationale="nope")],
-    )
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([bad, echo_plan()]),
+        llm=FakeLLM([_bad_tool_decision(), _echo_decision()]),
         registry=registry_with(_eager_spec("fake_echo", record)),
     )
     out = run_task(ctx, saver, "echo hi")
@@ -244,13 +266,9 @@ def test_unknown_tool_plan_is_rejected_then_repaired(saver: Any) -> None:
 
 def test_invalid_args_plan_is_rejected_then_repaired(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
-    bad = Plan(
-        goal="x",
-        steps=[Step(id="s1", tool="fake_echo", args={"text": ""}, rationale="empty")],
-    )
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([bad, echo_plan()]),
+        llm=FakeLLM([_bad_args_decision(), _echo_decision()]),
         registry=registry_with(_eager_spec("fake_echo", record)),
     )
     out = run_task(ctx, saver, "echo hi")
@@ -265,7 +283,7 @@ def test_malformed_planner_output_halts_honestly(saver: Any) -> None:
         registry=registry_with(_eager_spec("fake_echo", [])),
     )
     out = run_task(ctx, saver, "echo hi")
-    assert "Planner error" in (out.final_answer or "")
+    assert out.final_answer == "I couldn't safely understand that request."
     assert out.error is None  # a halt, not a crash
 
 
@@ -276,7 +294,7 @@ def test_tool_failure_replans_then_stops_with_honest_answer(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_echo_plan_tool0(), replan_stop("that approach will not work")]),
+        llm=FakeLLM([_echo_decision(), replan_stop("that approach will not work")]),
         registry=registry_with(_failing_echo_spec(record)),
     )
     out = run_task(ctx, saver, "echo hi")
@@ -291,7 +309,7 @@ def test_replan_continue_executes_replacement(saver: Any) -> None:
     fix = _eager_spec("fake_fix", record)
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_echo_plan_tool0(), replan_continue(_replacement_plan())]),
+        llm=FakeLLM([_echo_decision(), replan_continue(_replacement_plan())]),
         registry=registry_with(_failing_echo_spec(record), fix),
     )
     out = run_task(ctx, saver, "echo hi")
@@ -312,7 +330,7 @@ def test_replan_budget_exhaustion_stops_fail_closed(saver: Any) -> None:
     )
     ctx = make_app_context(
         settings,
-        llm=FakeLLM([_echo_plan_tool0(), replan_continue(bad_replacement)]),
+        llm=FakeLLM([_echo_decision(), replan_continue(bad_replacement)]),
         registry=registry_with(_failing_echo_spec(record)),
     )
     out = run_task(ctx, saver, "echo hi")
@@ -326,7 +344,7 @@ def test_replan_keeps_completed_successes_in_final_state(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_two_step_plan(), replan_stop("giving up")]),
+        llm=FakeLLM([_two_step_decision(), replan_stop("giving up")]),
         registry=registry_with(
             _eager_spec("fake_a", record),
             make_spec("fake_b", base_tier=0, record=record, run_ok=False),
@@ -348,7 +366,7 @@ def test_failure_does_not_kill_the_worker(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([_echo_plan_tool0(), replan_stop("nope")]),
+        llm=FakeLLM([_echo_decision(), replan_stop("nope")]),
         registry=registry_with(_failing_echo_spec(record)),
     )
     first = run_task(ctx, saver, "echo hi")
@@ -357,7 +375,7 @@ def test_failure_does_not_kill_the_worker(saver: Any) -> None:
     # is a normal terminal state, not a worker crash.
     ctx2 = make_app_context(
         Settings(),
-        llm=FakeLLM([_echo_plan_tool0()]),
+        llm=FakeLLM([_echo_decision()]),
         registry=registry_with(_eager_spec("fake_echo", record)),
     )
     happy = run_task(ctx2, saver, "echo hi", thread_id="t2")
@@ -368,7 +386,7 @@ def test_voice_source_flows_through_conversation_path(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([conversation_plan("hi back")]),
+        llm=FakeLLM([brain_conversation("hi back")]),
         registry=registry_with(_eager_spec("fake_echo", record)),
     )
     out = run_task(ctx, saver, "hello", source="voice")

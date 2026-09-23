@@ -16,6 +16,7 @@ from jarvis.daemon.protocol import (
 )
 from jarvis.daemon.server import (
     ClientConnection,
+    DaemonServer,
     TaskSlot,
     _parse_message,
 )
@@ -53,6 +54,15 @@ class TestServerMessageParsing:
 
         assert isinstance(msg, ConfirmResponse)
         assert msg.approved is True
+
+    def test_parse_clarification(self) -> None:
+        msg = _parse_message(
+            json.dumps({"type": "clarification_response", "task_id": "t1", "answer": "the report"})
+        )
+        from jarvis.daemon.protocol import ClarificationResponse
+
+        assert isinstance(msg, ClarificationResponse)
+        assert msg.answer == "the report"
 
     def test_parse_status(self) -> None:
         msg = _parse_message(json.dumps({"type": "status"}))
@@ -187,3 +197,110 @@ class TestClientConnection:
         conn.close()
         conn.close()  # second close should not raise
         assert conn.closed is True
+
+
+# ── Clarification handling (ClarificationResponse → worker answer) ────────
+
+
+class _FakeStore:
+    def __init__(self) -> None:
+        self._kv: dict[str, str] = {"ipc_token": "test-token-123"}
+
+    def get(self, name: str) -> str | None:
+        return self._kv.get(name)
+
+    def set(self, name: str, value: str) -> None:
+        self._kv[name] = value
+
+    def has(self, name: str) -> bool:
+        return name in self._kv
+
+    def check_store_access(self) -> str:
+        return "FakeStore"
+
+
+def _server() -> DaemonServer:
+    from jarvis.config import Settings, VoiceSettings
+
+    return DaemonServer(settings=Settings(voice=VoiceSettings(enabled=False)), store=_FakeStore())
+
+
+class TestHandleClarification:
+    def test_delivers_answer_to_active_slot(self) -> None:
+        from jarvis.daemon.protocol import ClarificationResponse
+
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="setup", source="chat", owner_id="oid")
+        server._active = slot
+        conn = ClientConnection(writer=AsyncMock(), reader=AsyncMock())
+
+        asyncio.run(
+            server._handle_clarification(
+                ClarificationResponse(task_id="t1", answer="the report"), conn
+            )
+        )
+        assert slot.resume_answer == "the report"
+        assert slot.event.is_set() is True
+        assert slot.done is False
+
+    def test_blank_answer_is_delivered_and_fails_closed_later(self) -> None:
+        from jarvis.daemon.protocol import ClarificationResponse
+
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="setup", source="chat", owner_id="oid")
+        server._active = slot
+        conn = ClientConnection(writer=AsyncMock(), reader=AsyncMock())
+
+        asyncio.run(server._handle_clarification(ClarificationResponse(task_id="t1"), conn))
+        # Valid on the wire; the clarify node decides it is "no clarification".
+        assert slot.resume_answer == ""
+        assert slot.event.is_set() is True
+
+    def test_unknown_task_receives_error(self) -> None:
+        from jarvis.daemon.protocol import ClarificationResponse
+
+        server = _server()
+        server._active = None
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+
+        asyncio.run(
+            server._handle_clarification(ClarificationResponse(task_id="t9", answer="x"), conn)
+        )
+        written = writer.write.call_args[0][0].decode("utf-8")
+        data = json.loads(written)
+        assert data["type"] == "error"
+        assert data["code"] == "no_such_task"
+
+    def test_mismatched_task_id_receives_error(self) -> None:
+        from jarvis.daemon.protocol import ClarificationResponse
+
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="setup", source="chat", owner_id="oid")
+        server._active = slot
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+
+        asyncio.run(
+            server._handle_clarification(ClarificationResponse(task_id="t2", answer="x"), conn)
+        )
+        data = json.loads(writer.write.call_args[0][0].decode("utf-8"))
+        assert data["code"] == "no_such_task"
+        assert slot.resume_answer is None  # nothing was delivered
+
+    def test_done_slot_receives_error(self) -> None:
+        from jarvis.daemon.protocol import ClarificationResponse
+
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="setup", source="chat", owner_id="oid")
+        slot.done = True
+        server._active = slot
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+
+        asyncio.run(
+            server._handle_clarification(ClarificationResponse(task_id="t1", answer="x"), conn)
+        )
+        data = json.loads(writer.write.call_args[0][0].decode("utf-8"))
+        assert data["code"] == "no_such_task"
+        assert slot.resume_answer is None

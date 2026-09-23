@@ -13,16 +13,16 @@ from typing import Any
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import build_graph, open_sqlite_checkpointer
 from jarvis.agent.runner import resume_task, run_task
-from jarvis.agent.state import Decision, Plan, Step, StepResult
+from jarvis.agent.state import Decision, Plan, StepResult
 from jarvis.config import AgentSettings, Settings
 from jarvis.llm.client import FakeLLM
-from support import approve, deny, echo_plan, make_spec, registry_with
+from support import approve, brain_action, deny, echo_plan, make_spec, registry_with
 
 
 def _ctx(record: list[tuple[str, dict[str, Any]]], settings: Settings | None = None) -> Any:
     return make_app_context(
         settings or Settings(),
-        llm=FakeLLM([echo_plan()]),
+        llm=FakeLLM([brain_action("fake_echo", {"text": "hi"})]),
         registry=registry_with(make_spec("fake_echo", base_tier=1, record=record)),
     )
 
@@ -98,6 +98,28 @@ def test_tampered_hash_never_executes(tmp_path: Any) -> None:
         saver.conn.close()
 
 
+def test_timeout_resume_reports_honest_refusal(tmp_path: Any) -> None:
+    """D1: a timed-out confirmation RESUMES the graph with a fail-closed
+    refusal instead of abandoning the task, and the user sees a distinct,
+    honest message."""
+    from jarvis.daemon.task_runtime import timeout_answer
+
+    record: list[tuple[str, dict[str, Any]]] = []
+    ctx = _ctx(record)
+    saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
+    try:
+        first = run_task(ctx, saver, "echo hi")
+        answer = timeout_answer(first.confirmation)
+        result = resume_task(ctx, saver, first.task_id, answer)
+        assert record == []  # the step never ran
+        assert result.halted_reason == "Confirmation timed out. I did not perform the action."
+        assert result.final_answer == "Confirmation timed out. I did not perform the action."
+        assert result.error is None  # a normal halt, not a crash
+        assert result.interrupted is False
+    finally:
+        saver.conn.close()
+
+
 def test_modify_plan_after_approval_never_executes(tmp_path: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     ctx = _ctx(record)
@@ -121,13 +143,10 @@ def test_modify_plan_after_approval_never_executes(tmp_path: Any) -> None:
 
 def test_unknown_tool_plan_is_rejected_end_to_end(tmp_path: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
-    bad_plan = Plan(
-        goal="do the thing",
-        steps=[Step(id="s1", tool="no_such_tool", args={}, rationale="r")],
-    )
+    bad = brain_action("no_such_tool", {})
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([bad_plan, bad_plan]),
+        llm=FakeLLM([bad, bad]),
         registry=registry_with(make_spec("fake_echo", base_tier=1, record=record)),
     )
     saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
@@ -146,13 +165,9 @@ def test_unknown_tool_plan_is_rejected_end_to_end(tmp_path: Any) -> None:
 def test_tier3_hard_block_reaches_respond_end_to_end(tmp_path: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     defender = make_spec("disable_defender_x", base_tier=0, record=record)
-    plan = Plan(
-        goal="disable the thing",
-        steps=[Step(id="s1", tool="disable_defender_x", args={"text": "on"}, rationale="r")],
-    )
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([plan]),
+        llm=FakeLLM([brain_action("disable_defender_x", {"text": "on"})]),
         registry=registry_with(defender),
     )
     saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
@@ -170,11 +185,11 @@ def test_tier3_hard_block_reaches_respond_end_to_end(tmp_path: Any) -> None:
 def test_tier0_step_skips_confirmation_and_is_verified(tmp_path: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     auto = make_spec("fake_auto", base_tier=0, record=record)
-    plan = Plan(
-        goal="run auto",
-        steps=[Step(id="s1", tool="fake_auto", args={"text": "x"}, rationale="r")],
+    ctx = make_app_context(
+        Settings(),
+        llm=FakeLLM([brain_action("fake_auto", {"text": "x"})]),
+        registry=registry_with(auto),
     )
-    ctx = make_app_context(Settings(), llm=FakeLLM([plan]), registry=registry_with(auto))
     saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
     try:
         result = run_task(ctx, saver, "run auto")
@@ -188,14 +203,14 @@ def test_tier0_step_skips_confirmation_and_is_verified(tmp_path: Any) -> None:
 def test_verification_failure_is_reported_honestly_end_to_end(tmp_path: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     auto = make_spec("fake_auto", base_tier=0, record=record, verify_ok=False)
-    plan = Plan(
-        goal="run auto",
-        steps=[Step(id="s1", tool="fake_auto", args={"text": "x"}, rationale="r")],
-    )
     # max_replans=0 keeps this focused on honest verification reporting; the
     # replan path is covered in test_agent_architecture.py.
     settings = Settings(agent=AgentSettings(max_retries_per_step=1, max_replans=0))
-    ctx = make_app_context(settings, llm=FakeLLM([plan]), registry=registry_with(auto))
+    ctx = make_app_context(
+        settings,
+        llm=FakeLLM([brain_action("fake_auto", {"text": "x"})]),
+        registry=registry_with(auto),
+    )
     saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
     try:
         result = run_task(ctx, saver, "run auto")

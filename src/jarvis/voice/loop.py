@@ -40,8 +40,38 @@ _STOP_LISTENING = {"stop listening", "stop", "turn off", "go to sleep"}
 _STOP_DICTATION = {"stop dictation", "stop dictating"}
 _RESUME_DICTATION = {"resume", "resume dictation"}
 
-#: Spoken words accepted as an approval to a confirmation prompt.
-_YES_WORDS = {"yes", "y", "approve", "approved", "confirm", "go", "ok", "sure"}
+#: Spoken words accepted as an approval to a low-risk confirmation prompt
+#: (Tier 1, no typed folder-name requirement).  Colloquial "go"/"ok"/"sure"
+#: are allowed here because nothing destructive or sensitive can reach this
+#: bucket (docs/03 §7.8 + D2): ``can_confirm_by_voice`` fails closed before
+#: these ever match.
+_LOOSE_YES_WORDS = {"yes", "y", "approve", "approved", "confirm", "go", "ok", "sure"}
+
+#: Spoken words that may approve a destructive/high-risk confirmation.  D2:
+#: such an action requires EXACTLY "yes" (plus the unambiguous "confirm" /
+#: "proceed"); "go", "ok" and "sure" must never approve one.  Today the voice
+#: path cannot reach these (see above), so the strict bucket is a defensive
+#: boundary enforced in code and tested directly.
+_STRICT_YES_WORDS = {"yes", "confirm", "proceed"}
+
+
+def _approval_words(payload: dict[str, Any]) -> frozenset[str]:
+    """The words that count as "yes" for ``payload``'s confirmation.
+
+    A payload is treated as destructive/high-risk when it demands a typed
+    folder-name confirmation or carries a Tier 2+ step.  Anything that reaches
+    the voice matcher is normally Tier 1 + untagged, so the loose set applies;
+    the strict set is the defensive fallback that can never loosen a refusal.
+    """
+    if payload.get("typed_confirmation") is not None:
+        return _STRICT_YES_WORDS
+    try:
+        if int(payload.get("tier", 0)) >= 2:
+            return _STRICT_YES_WORDS
+    except (TypeError, ValueError):
+        pass
+    return _LOOSE_YES_WORDS
+
 
 #: Session limits enforced by the loop (defaults, overridable per instance).
 DEFAULT_MAX_SESSION_S = 1800.0
@@ -276,7 +306,7 @@ class VoiceLoop:
             return "No response received. Action cancelled."
         result = self._stt.transcribe(seg)
         answer = result.text.lower().strip()
-        approved = answer in _YES_WORDS
+        approved = answer in _approval_words(payload)
         if callback is not None:
             callback({"approved": approved, "action_hash": action_hash})
         if approved:
@@ -284,6 +314,40 @@ class VoiceLoop:
             return "Approved."
         logger.info("voice confirmation refused by user")
         return "Cancelled."
+
+    def capture_free_text(
+        self,
+        prompt: str,
+        *,
+        on_answer: Callable[[str], Any] | None = None,
+        rearm_timeout_s: float | None = None,
+    ) -> str:
+        """Ask a question and capture a spoken free-text answer.
+
+        Used for clarification interrupts.  Re-arms the wake word first so an
+        ambient utterance cannot be mistaken for an answer.  Fails closed:
+        a missing detector, timeout, or an empty transcript returns ``""`` —
+        the caller resumes the graph with empty text and the clarify node
+        reports "No clarification received.".
+
+        ``on_answer`` (defaults to nothing) receives the transcript once.
+        """
+        if not self._rearm_wake_for_confirmation(timeout_s=rearm_timeout_s):
+            return ""
+
+        self._tts.speak(prompt)
+        logger.info("voice boundary: clarification listening for free text")
+        self._audio.flush()
+        seg = self._read_command(int(self._listen_timeout_s * 16_000))
+        if seg.duration_s < 0.3:
+            return ""
+        result = self._stt.transcribe(seg)
+        answer = result.text.strip()
+        if on_answer is not None:
+            on_answer(answer)
+        if not answer:
+            logger.info("voice clarification dropped: no speech captured")
+        return answer
 
     # ── main loop (runs in background thread) ───────────────────────────
 

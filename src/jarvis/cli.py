@@ -487,7 +487,18 @@ def chat_loop(ctx: AppContext, saver: SqliteSaver) -> None:
             continue
 
         outcome = run_task(ctx, saver, line)
-        while outcome.confirmation:
+        # Answer any pending clarification / confirmation interrupts.  Each
+        # answer resumes the graph, which may surface the other kind in turn.
+        while True:
+            if outcome.interrupt_kind == "clarification":
+                req = outcome.confirmation
+                console.print("[yellow]clarification needed[/yellow]")
+                console.print(req.get("question") or "(no question)")
+                answer = _chat_prompt("Your answer:")
+                outcome = resume_task(ctx, saver, outcome.task_id, answer or "")
+                continue
+            if not outcome.confirmation:
+                break
             req = outcome.confirmation
             console.print(
                 "".join(
@@ -532,6 +543,7 @@ def _daemon_chat_loop(client: Any) -> None:
     """Interactive REPL that talks to the daemon over IPC."""
     from jarvis.daemon.client import DaemonError
     from jarvis.daemon.protocol import (
+        ClarificationRequest,
         ConfirmRequest,
         ErrorMessage,
         EventMessage,
@@ -597,6 +609,13 @@ def _daemon_chat_loop(client: Any) -> None:
                         password=password,
                         typed_confirmation=typed,
                     )
+                except DaemonError as exc:
+                    console.print(f"[red]{exc.message}[/red]")
+            elif isinstance(msg, ClarificationRequest):
+                console.print(f"[yellow]clarification needed: {msg.question}[/yellow]")
+                answer = _chat_prompt("Your answer:")
+                try:
+                    client.send_clarification(task_id, answer=answer or "")
                 except DaemonError as exc:
                     console.print(f"[red]{exc.message}[/red]")
             elif isinstance(msg, ErrorMessage):

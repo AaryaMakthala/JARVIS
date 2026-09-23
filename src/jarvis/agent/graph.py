@@ -2,18 +2,23 @@
 
 Topology (docs/02_ARCHITECTURE.md sec. 4):
 
-    START -> intake -> memory_retrieve -> plan -> understand_request
-                 |                                        |
-                 v                             (conversation | tool)
-              respond <- converse <--------------+         |
-                                                           v
-     validate <- replan <--------- verify <- act <- policy_gate
-        |  ^                        |
-        v  +------ (reject)         +---- (retry -> act / replan)
-      policy_gate -> act -> verify -------> policy_gate (next step) | respond
+    START -> intake -> memory_retrieve -> brain
+                                             |
+                 +---------------------------+--------------------------+
+                 | (conversation)           | (action)                 | (clarification)
+                 v                           v                         v
+              respond                    validate                   clarify
+                                            |  ^        (answer)        |
+                                            v  +- replan<-...           +----> brain
+                       policy_gate <--------+      (validate rejected)
 
-Confirmations suspend inside ``policy_gate`` via ``interrupt``; resume
-re-enters that node deterministically.
+                       policy_gate -> act -> verify -> policy_gate (next step) | respond
+
+Confirmations suspend inside ``policy_gate`` via ``interrupt`` and
+clarifications suspend inside ``clarify``; resume re-enters that node
+deterministically.  ``brain`` is the only LLM classification step and projects
+its transient :class:`BrainDecision` onto the checkpointed Plan/Step shape
+before anything else sees the state.
 """
 
 from __future__ import annotations
@@ -28,21 +33,21 @@ from langgraph.graph import END, START, StateGraph
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes import (
     act,
-    converse,
+    brain,
+    clarify,
     intake,
     memory_retrieve,
-    plan,
     policy_gate,
     replan,
     respond,
     route_after_act,
+    route_after_brain,
+    route_after_clarify,
     route_after_intake,
     route_after_policy_gate,
     route_after_replan,
-    route_after_understand,
     route_after_validate,
     route_after_verify,
-    understand_request,
     validate,
     verify,
     wrap,
@@ -106,9 +111,8 @@ def build_graph(ctx: AppContext, checkpointer: Any = None) -> Any:
     g = StateGraph(AgentState)
     g.add_node("intake", wrap(intake, ctx))
     g.add_node("memory_retrieve", wrap(memory_retrieve, ctx))
-    g.add_node("plan", wrap(plan, ctx))
-    g.add_node("understand_request", wrap(understand_request, ctx))
-    g.add_node("converse", wrap(converse, ctx))
+    g.add_node("brain", wrap(brain, ctx))
+    g.add_node("clarify", wrap(clarify, ctx))
     g.add_node("validate", wrap(validate, ctx))
     g.add_node("policy_gate", wrap(policy_gate, ctx))
     g.add_node("act", wrap(act, ctx))
@@ -121,20 +125,21 @@ def build_graph(ctx: AppContext, checkpointer: Any = None) -> Any:
         "intake", route_after_intake, {"memory_retrieve": "memory_retrieve", "respond": "respond"}
     )
 
-    g.add_edge("memory_retrieve", "plan")
-    g.add_edge("plan", "understand_request")
+    g.add_edge("memory_retrieve", "brain")
     g.add_conditional_edges(
-        "understand_request",
-        route_after_understand,
-        {"converse": "converse", "validate": "validate", "respond": "respond"},
+        "brain",
+        route_after_brain,
+        {"clarify": "clarify", "validate": "validate", "respond": "respond"},
     )
-    g.add_edge("converse", "respond")
+    g.add_conditional_edges(
+        "clarify", route_after_clarify, {"brain": "brain", "respond": "respond"}
+    )
 
     g.add_conditional_edges(
         "validate",
         route_after_validate,
         {
-            "plan": "plan",
+            "brain": "brain",
             "replan": "replan",
             "policy_gate": "policy_gate",
             "respond": "respond",

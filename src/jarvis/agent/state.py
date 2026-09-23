@@ -82,9 +82,12 @@ class AgentState(TypedDict, total=False):
     repair retries), ``halted_reason`` (immediate stop signal for respond),
     ``retry_now`` (verify -> retry the same step) and - Phase 7 - ``replan_now``
     (verify -> try a fresh plan), ``pending_replan`` (validate ran for a
-    replanned plan), ``request_kind`` (the classified request, set by the
-    understand_request node) and ``replan_decision`` (the last ReplanDecision,
-    stored so the final answer can stay honest).
+    replanned plan), ``request_kind`` (the classified request, set by the brain
+    node) and ``replan_decision`` (the last ReplanDecision, stored so the final
+    answer can stay honest).  ``clarification_question`` /
+    ``clarification_answer`` / ``clarification_count`` belong to the ``brain``
+    -> ``clarify`` loop: the question the brain asked, the human's validated
+    free-text answer, and how many questions were asked (bounded in code).
     """
 
     task_id: str
@@ -113,6 +116,10 @@ class AgentState(TypedDict, total=False):
     pending_replan: bool
     replan_now: bool | None
     replan_decision: Any | None  # jarvis.agent.schemas.ReplanDecision (allowlisted)
+    # operational (brain -> clarify loop)
+    clarification_question: str | None
+    clarification_answer: str | None
+    clarification_count: int
 
 
 class Profile(BaseModel):
