@@ -1,17 +1,16 @@
-"""LangGraph assembly for the Phase 1 agent.
+"""LangGraph assembly for the agent.
 
 Topology (docs/02_ARCHITECTURE.md sec. 4):
 
-    START -> intake -> memory_retrieve -> plan -> validate
-                 |                                    |
-                 v                                    v
-              respond <--------- policy_gate <- policy_gate <-+
-                 ^            |            |                  |
-                 |            v            v                  |
-                 +---- policy_gate -> act -> verify ----------+
-                             |               |
-                             v               v
-                          respond         (act retry / next step)
+    START -> intake -> memory_retrieve -> plan -> understand_request
+                 |                                        |
+                 v                             (conversation | tool)
+              respond <- converse <--------------+         |
+                                                           v
+     validate <- replan <--------- verify <- act <- policy_gate
+        |  ^                        |
+        v  +------ (reject)         +---- (retry -> act / replan)
+      policy_gate -> act -> verify -------> policy_gate (next step) | respond
 
 Confirmations suspend inside ``policy_gate`` via ``interrupt``; resume
 re-enters that node deterministically.
@@ -29,16 +28,21 @@ from langgraph.graph import END, START, StateGraph
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes import (
     act,
+    converse,
     intake,
     memory_retrieve,
     plan,
     policy_gate,
+    replan,
     respond,
     route_after_act,
     route_after_intake,
     route_after_policy_gate,
+    route_after_replan,
+    route_after_understand,
     route_after_validate,
     route_after_verify,
+    understand_request,
     validate,
     verify,
     wrap,
@@ -50,7 +54,8 @@ __all__ = ["build_graph", "build_secure_serde", "open_sqlite_checkpointer"]
 #: The ONLY first-party types the checkpoint serializer is allowed to revive.
 #: Everything else in a checkpoint is refused at the msgpack layer (returned as
 #: plain data, never imported/instantiated).  ``Step`` is listed because it is
-#: nested inside ``Plan``; ``Profile`` is never stored in state.  See
+#: nested inside ``Plan``; ``ReplanDecision`` is stored by the replan node;
+#: ``Profile`` is never stored in state.  See
 #: docs/03_SECURITY_AND_POLICY.md section 5 (secrets) and the checkpoint
 #: serializer notes in docs/02_ARCHITECTURE.md section 4.
 _ALLOWED_MSGPACK_TYPES: tuple[tuple[str, str], ...] = (
@@ -58,6 +63,7 @@ _ALLOWED_MSGPACK_TYPES: tuple[tuple[str, str], ...] = (
     ("jarvis.agent.state", "Step"),
     ("jarvis.agent.state", "Decision"),
     ("jarvis.agent.state", "StepResult"),
+    ("jarvis.agent.schemas", "ReplanDecision"),
 )
 
 
@@ -101,10 +107,13 @@ def build_graph(ctx: AppContext, checkpointer: Any = None) -> Any:
     g.add_node("intake", wrap(intake, ctx))
     g.add_node("memory_retrieve", wrap(memory_retrieve, ctx))
     g.add_node("plan", wrap(plan, ctx))
+    g.add_node("understand_request", wrap(understand_request, ctx))
+    g.add_node("converse", wrap(converse, ctx))
     g.add_node("validate", wrap(validate, ctx))
     g.add_node("policy_gate", wrap(policy_gate, ctx))
     g.add_node("act", wrap(act, ctx))
     g.add_node("verify", wrap(verify, ctx))
+    g.add_node("replan", wrap(replan, ctx))
     g.add_node("respond", wrap(respond, ctx))
 
     g.add_edge(START, "intake")
@@ -113,11 +122,23 @@ def build_graph(ctx: AppContext, checkpointer: Any = None) -> Any:
     )
 
     g.add_edge("memory_retrieve", "plan")
-    g.add_edge("plan", "validate")
+    g.add_edge("plan", "understand_request")
+    g.add_conditional_edges(
+        "understand_request",
+        route_after_understand,
+        {"converse": "converse", "validate": "validate", "respond": "respond"},
+    )
+    g.add_edge("converse", "respond")
+
     g.add_conditional_edges(
         "validate",
         route_after_validate,
-        {"plan": "plan", "policy_gate": "policy_gate", "respond": "respond"},
+        {
+            "plan": "plan",
+            "replan": "replan",
+            "policy_gate": "policy_gate",
+            "respond": "respond",
+        },
     )
 
     g.add_conditional_edges(
@@ -127,7 +148,10 @@ def build_graph(ctx: AppContext, checkpointer: Any = None) -> Any:
     g.add_conditional_edges(
         "verify",
         route_after_verify,
-        {"act": "act", "policy_gate": "policy_gate", "respond": "respond"},
+        {"act": "act", "replan": "replan", "policy_gate": "policy_gate", "respond": "respond"},
+    )
+    g.add_conditional_edges(
+        "replan", route_after_replan, {"validate": "validate", "respond": "respond"}
     )
     g.add_edge("respond", END)
 

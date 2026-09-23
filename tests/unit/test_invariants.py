@@ -293,7 +293,9 @@ def test_invariant_8_untrusted_content_flagged() -> None:
 def test_invariant_9_verification_failure_fails_closed(tmp_path: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     auto = make_spec("fake_auto", base_tier=0, record=record, verify_ok=False)
-    settings = Settings(agent=AgentSettings(max_retries_per_step=1))
+    # max_replans=0 keeps this test about the verifier failing closed; the
+    # replan path is exercised by test_agent_architecture.py instead.
+    settings = Settings(agent=AgentSettings(max_retries_per_step=1, max_replans=0))
     ctx = make_app_context(
         settings,
         llm=FakeLLM([_plan("fake_auto", {"text": "x"})]),

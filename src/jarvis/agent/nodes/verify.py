@@ -55,12 +55,26 @@ def verify(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     if not last.ok or verified is False:
         if retry_count < max_retries:
             return {"results": results, "retry_count": retry_count + 1, "retry_now": True}
-        # fail closed: exhausted retries never move to the next step
-        return {"results": results, "retry_count": max_retries, "retry_now": False}
+        # Retries exhausted: try a fresh plan while the replan budget allows it,
+        # otherwise fail closed (never move to the next step on a failure).
+        if int(state.get("replan_count") or 0) < ctx.settings.agent.max_replans:
+            return {
+                "results": results,
+                "retry_count": max_retries,
+                "retry_now": False,
+                "replan_now": True,
+            }
+        return {
+            "results": results,
+            "retry_count": max_retries,
+            "retry_now": False,
+            "replan_now": False,
+        }
 
     return {
         "results": results,
         "step_index": int(state.get("step_index") or 0) + 1,
         "retry_count": 0,
         "retry_now": False,
+        "replan_now": False,
     }

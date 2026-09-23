@@ -96,6 +96,58 @@ class TestThreshold:
         assert not result.detected
         assert result.confidence == 0.0
 
+    def test_silence_never_triggers(self) -> None:
+        detector = OpenWakeWordDetector(_RecordingModel({"hey_jarvis": 0.0}), threshold=0.5)
+        result = detector.detect(AudioSegment(samples=[0.0] * 1280))
+        assert not result.detected
+        assert result.confidence == 0.0
+        assert detector.max_score == 0.0
+
+
+class TestScoreMetadata:
+    def test_last_max_and_frames_seen_track_predictions(self) -> None:
+        detector = OpenWakeWordDetector(
+            _RecordingModel({"hey_jarvis": 0.9}), model_name="hey_jarvis"
+        )
+        for samples, score in (([1.0] * 1280, 0.9), ([0.5] * 1280, 0.4)):
+            model = detector._model  # type: ignore[attr-defined]
+            model._result = {"hey_jarvis": score}
+            detector.detect(AudioSegment(samples=samples))
+        assert detector.last_score == 0.4
+        assert detector.max_score == 0.9
+        assert detector.frames_seen == 2560
+
+    def test_sample_info_line_carries_audio_rms(self, caplog: object) -> None:
+        """The rate-limited INFO sample proves BOTH signal level (audio_rms)
+        and model score reach the log — the diagnostic that distinguishes
+        'mic content is silent/quiet' from 'model is not scoring'."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="jarvis.voice.wake")  # type: ignore[attr-defined]
+        detector = OpenWakeWordDetector(
+            _RecordingModel({"hey_jarvis": 0.9}), model_name="hey_jarvis"
+        )
+        detector.detect(AudioSegment(samples=[0.5] * 1280))
+        text = caplog.text  # type: ignore[attr-defined]
+        assert "audio_rms=0.5000" in text
+
+    def test_reset_clears_last_score_and_forwards_to_model(self) -> None:
+        model = _RecordingModel({"hey_jarvis": 0.9})
+        detector = OpenWakeWordDetector(model, model_name="hey_jarvis")
+        detector.detect(AudioSegment(samples=[1.0]))
+        assert detector.last_score == 0.9
+        detector.reset()
+        assert detector.last_score == 0.0
+        assert model.reset_calls == 1
+
+    def test_detector_usable_after_reset(self) -> None:
+        """A reset (re-arm) must not leave the detector in a dead state."""
+        model = _RecordingModel({"hey_jarvis": 0.9})
+        detector = OpenWakeWordDetector(model, model_name="hey_jarvis")
+        assert detector.detect(AudioSegment(samples=[1.0])).detected
+        detector.reset()
+        assert detector.detect(AudioSegment(samples=[1.0])).detected
+
 
 class TestReset:
     def test_reset_forwards_to_model(self) -> None:

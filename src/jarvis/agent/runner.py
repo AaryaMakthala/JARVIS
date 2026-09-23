@@ -15,6 +15,7 @@ from langgraph.types import Command
 
 from jarvis.agent.context import AppContext
 from jarvis.agent.graph import build_graph
+from jarvis.agent.schemas import AgentResponse
 from jarvis.agent.state import Decision, StepResult
 
 __all__ = ["TaskOutcome", "extract_interrupt", "resume_task", "run_task"]
@@ -33,6 +34,29 @@ class TaskOutcome:
     decisions: dict[str, Decision]
     results: list[StepResult]
     state: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def agent_response(self) -> AgentResponse:
+        """The typed boundary response for this outcome.
+
+        Kind is derived from the planner's classification (conversation vs.
+        tool) and falls back to ``text`` being either the final answer or an
+        honest pending-confirmation/error message.
+        """
+        plan = self.state.get("plan")
+        kind = "conversation" if getattr(plan, "kind", None) == "conversation" else "tool"
+        if self.final_answer:
+            text = self.final_answer
+        elif self.confirmation:
+            text = f"Pending confirmation: {self.confirmation.get('summary') or '...'}"
+        else:
+            text = self.error or self.halted_reason or "No answer."
+        return AgentResponse(
+            task_id=self.task_id,
+            kind=kind,
+            interrupted=self.interrupted,
+            text=text,
+        )
 
 
 def run_task(

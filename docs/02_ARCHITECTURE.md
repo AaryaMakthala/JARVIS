@@ -115,6 +115,8 @@ class Plan(BaseModel):
     steps: list[Step] = Field(default_factory=list)
     needs_clarification: bool = False
     clarification_question: str | None = None
+    kind: Literal["tool", "conversation"] = "tool"  # LLM classifies; routing is code
+    dialog_answer: str | None = None  # direct answer the planner may write (converse honours it)
 
 
 class Decision(BaseModel):
@@ -144,6 +146,7 @@ class AgentState(TypedDict, total=False):
     task_id: str
     source: Literal["terminal", "voice", "benchmark"]
     user_input: str
+    request_kind: Literal["tool", "conversation"]  # set by understand_request
     memory_context: list[dict]  # retrieved skills/failures/preferences (examples only)
     plan: Plan | None
     step_index: int
@@ -151,13 +154,24 @@ class AgentState(TypedDict, total=False):
     approved_hashes: list[str]  # action hashes the user approved (this task only)
     results: list[StepResult]
     retry_count: int  # for current step
+    retry_now: bool  # re-run the same step (set by verify)
     replan_count: int
+    replan_now: bool  # a fresh plan is needed (set by verify / validate)
+    pending_replan: bool  # the current plan came from replan (drives preserve/repair)
+    replan_decision: ReplanDecision | None  # last replanner output (observability)
+    validate_attempts: int  # plan rejections before the task halts (max 1 repair)
     api_calls: int
     tokens: int
     cancelled: bool
     final_answer: str | None
+    halted_reason: str | None  # fail-closed message; respond() turns it into the answer
     error: str | None
 ```
+
+> Note: `Plan.kind` is **LLM-proposed, not trusted**. The deterministic
+> `understand_request` node is the only place that decides which branch a task
+> takes, and only `kind == "tool"` may ever reach `validate`/`act`. A
+> `conversation` plan can never execute a tool.
 
 **Never** add password, API keys, or raw audio to state. State is checkpointed to SQLite in plaintext.
 
@@ -166,17 +180,34 @@ class AgentState(TypedDict, total=False):
 | Node | Responsibility | Notes |
 |------|----------------|-------|
 | `intake` | Normalise text, assign `task_id`, handle meta-commands ("cancel", "stop") | Cheap; no LLM |
-| `memory_retrieve` | Embed request, fetch top-k similar skills + recent failures + preferences | Examples only, never executed directly |
-| `plan` | LLM call → `Plan` (structured output, one repair retry) | Prompt includes tool catalogue + memory examples |
-| `validate` | Check tools exist, args validate against Pydantic models, step count ≤ max (default 12), no duplicates of Tier 3 | Failure → back to `plan` once with error text |
+| `memory_retrieve` | Query the `MemoryBackend` for similar examples (capped by `[memory] retrieval_limit`, default 3) | Examples only, never executed directly; empty when no backend |
+| `plan` | LLM call → `Plan` (structured output, one repair retry). The LLM also classifies `kind` (`tool`/`conversation`) | Prompt includes tool catalogue (no tiers) + memory examples |
+| `understand_request` | Records `request_kind` and routes conversation vs tool **in code** | Never an LLM call; preserves an existing halt; only `tool` reaches `validate` |
+| `converse` | Plain-text answer for conversational requests (fast LLM `text()` call) | Honours `dialog_answer` if the planner already wrote one (no second LLM call) |
+| `validate` | Check tools exist, args validate against Pydantic models, step count ≤ max (default 12) | Initial-plan rejection → `plan` once; replacement-plan rejection → `replan` once; replanned plans re-snapshot TOCTOU paths and preserve completed results |
 | `policy_gate` | For **next step only**: `PolicyEngine.decide()`; if Tier 3 → skip with refusal; if confirm needed → `interrupt(payload)`; on resume re-check unlock state and hash | **No side effects before `interrupt()`** |
 | `act` | Verify `action_hash ∈ approved_hashes` (or Tier 0), run tool via registry (respect `--dry-run`, timeout, cancel flag) | Appends `StepResult` |
-| `verify` | Tool-specific `verify()` + generic checks; decide `next` / `retry` (max 2) / `replan` (max 2) / `fail` | Failures → `failures` table |
-| `replan` | LLM call with plan so far, results, error; produce remaining steps | Goes through `validate` + `policy_gate` again |
-| `respond` | Compose final text; TTS if voice; task_log row | For `web_answer`, includes sources |
+| `verify` | Tool-specific `verify()` + generic checks; decide `next` / `retry` (max 2) / `replan` / `fail` | Retries exhausted + replan budget left → `replan_now`; otherwise fail closed |
+| `replan` | LLM call with completed steps, failing step + error, remaining catalogue → `ReplanDecision` (`continue` + new plan, or `stop` + message) | Budget (`max_replans`, default 2) checked **in code**, never by prompt; `continue` keeps completed successes, drops failed attempts, resets step bookkeeping; `stop` halts honestly |
+| `respond` | Compose final text; passes through `final_answer` from `converse`; halted/refused/cancelled → honest message; TTS if voice; task_log row | For `web_answer`, includes sources |
 | `memory_save` | If all steps ok and verified → save/update skill; bump counters | Skip if any step tainted-and-sensitive |
 
-Conditional edges: `policy_gate → act | respond(refused) | plan(clarify)`; `verify → act(next) | act(retry) | replan | respond`.
+Flow (routers are all deterministic, no LLM):
+
+```
+START → intake → memory_retrieve → plan → understand_request
+                                              ├─(conversation)→ converse → respond
+                                              ├─(needs clarification)→ respond
+                                              └─(tool)→ validate →(reject, initial)→ plan
+                                                              →(reject, replacement)→ replan
+                                                              → policy_gate → act → verify
+                                                                     ↑                ↓
+                                                                     └─(next step)   ├─(retry)→ act
+                                                                                     ├─(replan_now)→ replan
+                                                                                     ├─(fail closed)→ respond
+                                                                                     └─(done)→ respond
+replan ─(continue)→ validate   replan/stop, budget-exhausted, LLM failure → respond (fail closed)
+```
 
 ### Interrupt / resume contract
 
@@ -227,7 +258,7 @@ Rules: password field is used once and discarded; never logged; never forwarded 
 Only one active task at a time; further `chat` messages are queued (max 5). Voice-initiated confirmations
 that need a password open a small tkinter dialog on the user's desktop (topmost) and never accept spoken passwords.
 
-## 7. LLM abstraction (`llm/client.py`)
+## 7. LLM abstraction (`llm/client.py`, `llm/provider.py`)
 
 ```python
 class LLMClient(Protocol):
@@ -236,8 +267,17 @@ class LLMClient(Protocol):
     ) -> tuple[BaseModel, Usage]: ...
     def text(self, *, system: str, user: str, model_role: str = "fast") -> tuple[str, Usage]: ...
 ```
+
+- `llm/provider.py` is the **factory**: it walks `llm.provider_order` (default `groq`, `gemini`) and returns the
+  first client that can actually be built — `build_llm_client(settings, store) -> ProviderSelection(client, info, reasons)`.
+  A provider that is unconfigured/unavailable is skipped with a human-safe `reason`; when nothing is configured the
+  selector returns `client=None` and the graph halts cleanly ("No LLM backend configured (run `jarvis init`).")
+  instead of crashing. **Keys are read from keyring and never appear in logs, state, or the returned selection.**
+  `provider_status()` gives `jarvis doctor` a per-provider "what is missing" view without building a client.
 - Roles map to model names in `config.toml` (`planner`, `fast`, `vision`). Defaults must be verified against current provider docs.
-- Structured output: try the provider's JSON-schema mode first. Support is **per model** and an unsupported model returns HTTP 400, so on that error fall back to plain JSON mode ("respond with JSON only") + Pydantic parse + **one** repair retry, and log which mode was used. Cache the per-model result for the session.
+- Structured output: try the provider's JSON-schema mode first. Support is **per model** and an unsupported model returns
+  HTTP 400, so on that error fall back to plain JSON mode ("respond with JSON only") + Pydantic parse + **one** repair
+  retry, and log which mode was used. Cache the per-model result for the session.
 - Usage (calls, tokens) is returned and accumulated in state for the benchmark.
 - Timeouts (30 s), retries with backoff for 429/5xx (max 3), provider fallback Groq → Gemini if configured.
 - `FakeLLM` returns scripted responses keyed by test scenario; all graph tests use it.
@@ -252,7 +292,24 @@ class LLMClient(Protocol):
 - **Stale confirmations:** LangGraph does not expire paused threads. The daemon marks tasks waiting on a confirmation longer than the timeout as `expired` (never resumed), on start and periodically; on version change all pending checkpoints are discarded.
 - **Hidden daemon (`pythonw`)** has no console (`sys.stdout`/`sys.stderr` are `None`): redirect both to the log file at startup, install excepthooks, enforce a single instance. Details in `11_DEPLOYMENT_AND_PACKAGING.md §4`.
 
-## 9. Memory schema (`memory/db.py`)
+## 9. Memory schema (`memory/base.py`, `memory/db.py`)
+
+Since Phase 8 embeds and stores skills, the graph runs against the small
+`MemoryBackend` boundary in `memory/base.py`:
+
+```python
+class MemoryBackend(Protocol):
+    def retrieve(self, query: str, limit: int = 3) -> list[MemoryRecord]: ...
+    def remember(self, record: MemoryRecord) -> None: ...
+```
+
+`MemoryRecord` is a validated Pydantic model (`kind ∈ session|episodic|preference`,
+`text`, `meta`) and **never carries secrets**. `NullMemory` is the deterministic
+no-op used until a real backend is wired; the daemon/CLI pass a backend via
+`AppContext.memory`, and `memory_retrieve` caps results at
+`settings.memory.retrieval_limit` (default 3) so a prompt can never be flooded.
+
+The Phase 8 backing store is SQLite:
 
 ```sql
 CREATE TABLE IF NOT EXISTS skills (

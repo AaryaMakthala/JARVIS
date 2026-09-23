@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import getpass
 import logging
+import traceback
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -38,6 +39,7 @@ from jarvis.agent import (
 )
 from jarvis.checks import Check, _check
 from jarvis.llm.client import GroqClient, LLMError
+from jarvis.llm.provider import build_llm_client
 from jarvis.platform_guard import is_64bit, is_python_supported, is_windows
 from jarvis.policy import tiers
 from jarvis.policy.unlock import UnlockManager
@@ -351,11 +353,26 @@ def daemon(
     settings = config.load_settings()
     store = secret_module.SecretStore()
     server = DaemonServer(settings=settings, store=store)
+    print(
+        "[DIAG] daemon(): DaemonServer constructed "
+        f"(voice.enabled={settings.voice.enabled} tts_backend={settings.voice.tts_backend})",
+        flush=True,
+    )
     console.print("[dim]JARVIS daemon starting (Ctrl+C to stop)...[/dim]")
+    console.print(f"[dim]logs: {config.log_file()}[/dim]")
     try:
         server.run()
     except KeyboardInterrupt:
+        print("[DIAG] daemon(): server.run() raised KeyboardInterrupt", flush=True)
         console.print("[dim]daemon stopped[/dim]")
+    except Exception:
+        print("[DIAG] daemon(): server.run() raised Exception", flush=True)
+        traceback.print_exc()
+        # Logging is configured in main(); the full traceback goes to the log
+        # file so a daemon crash is always diagnosable (never a silent exit).
+        logging.getLogger(__name__).exception("daemon crashed")
+        console.print("[red]daemon crashed — see the log file for details[/red]")
+        raise typer.Exit(code=1) from None
 
 
 # ── autostart ────────────────────────────────────────────────────────────
@@ -608,20 +625,16 @@ def _chat_no_daemon() -> None:
     """Run the agent in-process (Phase 1 mode)."""
     settings = config.load_settings()
     store = secret_module.SecretStore()
-    groq_key = store.get("groq_api_key")
-    if not groq_key:
-        console.print("[red]no Groq API key found - run `jarvis init` first.[/red]")
-        raise typer.Exit(code=1)
-    if not settings.llm.planner_model:
-        console.print(
-            "[red]llm.planner_model is unset - pick a model and set it in config.toml.[/red]"
-        )
+    selection = build_llm_client(settings, store, logger=logging.getLogger("jarvis.cli"))
+    if selection.client is None:
+        detail = "; ".join(selection.reasons) or "no LLM provider is configured"
+        console.print(f"[red]No LLM backend configured: {detail}[/red]")
+        console.print("[dim]run `jarvis init` to set up a provider.[/dim]")
         raise typer.Exit(code=1)
 
     try:
-        llm = GroqClient(groq_key, settings)
         unlock_manager = UnlockManager(store, settings=settings)
-        ctx = make_app_context(settings, llm=llm, unlock=unlock_manager)
+        ctx = make_app_context(settings, llm=selection.client, unlock=unlock_manager)
         saver = open_sqlite_checkpointer(str(config.checkpoints_db()))
     except LLMError as exc:
         console.print(f"[red]{exc}[/red]")

@@ -507,16 +507,18 @@ class DaemonServer:
     def _build_default_context(self) -> Any:
         """Build an AppContext with the current settings."""
         from jarvis.agent.context import VoiceToolsFacade, make_app_context
+        from jarvis.llm.provider import build_llm_client
 
-        groq_key = self._store.get("groq_api_key") or ""
-        llm = None
-        if groq_key:
-            try:
-                from jarvis.llm.client import GroqClient
-
-                llm = GroqClient(groq_key, self._settings)
-            except Exception:  # noqa: BLE001
-                logger.warning("could not create GroqClient")
+        selection = build_llm_client(self._settings, self._store, logger=logger)
+        llm = selection.client
+        if llm is None:
+            logger.warning("no LLM provider available: %s", "; ".join(selection.reasons))
+        elif selection.reasons:
+            logger.info(
+                "LLM provider %s selected (skipped: %s)",
+                selection.info.name if selection.info else "unknown",
+                "; ".join(selection.reasons),
+            )
         return make_app_context(
             self._settings,
             llm=llm,
@@ -616,6 +618,7 @@ class DaemonServer:
             max_dictation_chars=self._settings.voice.max_dictation_chars,
             silence_timeout_s=self._settings.voice.silence_timeout_s,
             max_segment_s=self._settings.voice.max_segment_s,
+            silence_threshold=self._settings.voice.silence_threshold,
         )
 
     def _stop_voice(self) -> None:

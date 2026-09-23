@@ -462,6 +462,32 @@ class TestVoiceLoopRearmAndCapture:
         assert wake.reset_calls >= 2
         assert audio.flush_calls >= 2
 
+    def test_three_consecutive_wakes_process_all_commands(self) -> None:
+        """Three wake→command cycles run end-to-end without any restart.
+
+        Each interaction must speak ack + response and re-arm so the NEXT
+        wake word is heard; no cycle may swallow or drop its successor."
+        """
+        submitted: list[str] = []
+        audio = FakeAudioInput(segments=[make_speech("x", duration_s=0.5)] * 250)
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, True, True, False, False]))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(transcribe_fn=lambda _seg: STTResult(text="open notepad")),
+            tts=FakeTTS(),
+            submit_task=self._submit(submitted),
+            idle_timeout_s=0.3,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        assert not loop.is_active()
+        assert submitted == ["open notepad", "open notepad", "open notepad"]
+        assert loop._tts.spoken == ["Yes?", "ok", "Yes?", "ok", "Yes?", "ok"]
+        assert audio.close_calls >= 1  # clean shutdown after all three cycles
+        assert wake.reset_calls >= 3  # re-armed between every interaction
+
     def test_empty_utterance_returns_to_wake_listening(self) -> None:
         """A wake with no speech (or an STT miss) never wedges the loop."""
         submitted: list[str] = []
@@ -473,6 +499,7 @@ class TestVoiceLoopRearmAndCapture:
             stt=FakeSTT(),  # transcribes "" (no text)
             tts=FakeTTS(),
             submit_task=self._submit(submitted),
+            listen_timeout_s=0.2,  # short command window: nothing said → give up
             idle_timeout_s=0.3,
         )
         loop.start()
@@ -508,18 +535,57 @@ class TestVoiceLoopRearmAndCapture:
         assert seg.duration_s == 1.0
         assert len(audio.read_calls) == 2
 
-    def test_no_speech_capture_ends_immediately(self) -> None:
-        """A command-less wake stops capturing in one read, not 30 s later."""
+    def test_no_speech_capture_waits_for_speech_then_gives_up(self) -> None:
+        """A command-less wake waits for speech, then returns empty — never deaf.
+
+        Regression for the reported bug: the old capture treated the pause
+        right after the "Yes?" ack as "end of utterance" and returned an empty
+        segment instantly, so a user speaking a beat late was never heard
+        ("Yes?" then nothing).  New capture waits up to ``listen_timeout_s``
+        for the first speech chunk; if none arrives it returns an empty
+        segment and the loop re-arms instead of wedging.
+        """
         audio = FakeAudioInput(segments=[make_silence(3.0)])
         loop = VoiceLoop(
             audio=audio,
             stt=FakeSTT(),
             tts=FakeTTS(),
             silence_timeout_s=0.5,
+            listen_timeout_s=0.2,
         )
         seg = loop._read_command(int(loop._max_segment_s * 16_000))
-        assert len(audio.read_calls) == 1
-        assert seg.duration_s == 3.0
+        assert len(seg.samples) == 0  # no speech within the command window
+        assert seg.duration_s == 0.0
+        assert audio.read_calls  # we did wait and probe for speech
+
+    def test_late_command_after_ack_pause_is_captured(self) -> None:
+        """Speech arriving AFTER a post-ack pause is still captured.
+
+        The core fix: pre-speech silence (the user's normal pause after
+        "Yes?") is discarded, not treated as "the command ended".  The
+        discarded silence is bounded by ``_CAPTURE_PREROLL_FRAMES`` and the
+        command window is bounded by ``listen_timeout_s``.
+        """
+        submitted: list[str] = []
+        audio = FakeAudioInput(
+            segments=[make_silence(1.0), *[make_speech("x", duration_s=0.5)] * 12]
+        )
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, False, False, False]))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(results=[STTResult(text="open notepad")]),
+            tts=FakeTTS(),
+            submit_task=self._submit(submitted),
+            listen_timeout_s=5.0,
+            idle_timeout_s=0.3,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        assert submitted == ["open notepad"]  # the pause did not eat the command
+        assert loop._tts.spoken == ["Yes?", "ok"]
+        assert wake.reset_calls >= 1
 
 
 # ── TASK 8 regressions: lifecycle, per-interaction failure isolation ────
@@ -724,6 +790,75 @@ class TestInteractionLifecycleHardening:
         assert submitted == ["open notepad"]
         assert wake.reset_calls >= 2
 
+    def test_tts_response_failure_does_not_wedge_loop(self, caplog: object) -> None:
+        """A failing response-speech (TTS down) skips only that phase."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")  # type: ignore[attr-defined]
+        submitted: list[str] = []
+        state = {"calls": 0}
+
+        def flaky_speak(text: str) -> None:
+            if text != "Yes?":
+                state["calls"] += 1
+                if state["calls"] == 1:
+                    raise RuntimeError("piper down")
+
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, True, False, False]))
+        loop = VoiceLoop(
+            audio=FakeAudioInput(segments=[make_speech("x", duration_s=0.5)] * 100),
+            wake_detector=wake,
+            stt=FakeSTT(transcribe_fn=lambda _seg: STTResult(text="open notepad")),
+            tts=FakeTTS(speak_fn=flaky_speak),
+            submit_task=self._submit(submitted),
+            idle_timeout_s=0.5,
+        )
+        loop.start()
+        self._run_to_idle(loop)
+        # First interaction: the command WAS processed and its response text
+        # was enqueued, but the spoken response failed; the loop re-armed and
+        # the SECOND wake completed fully.
+        assert loop._tts.spoken == ["Yes?", "ok", "Yes?", "ok"]
+        assert submitted == ["open notepad", "open notepad"]
+        assert wake.reset_calls >= 2
+        assert "voice interaction failed at tts-response" in caplog.text  # type: ignore[attr-defined]
+
+    def test_unexpected_interaction_exception_is_contained(self, caplog: object) -> None:
+        """An exception escaping every per-phase guard still keeps voice on.
+
+        The boundary in ``_run`` catches it, resets to wake-listening, and the
+        NEXT wake works — one malformed interaction can never disable voice.
+        """
+        import logging
+
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")  # type: ignore[attr-defined]
+        submitted: list[str] = []
+        state = {"calls": 0}
+
+        def corrupt_stt(_seg: AudioSegment) -> STTResult:
+            state["calls"] += 1
+            # First call returns a malformed result (no .text) which blows up
+            # in _run_interaction OUTSIDE the per-phase try/except guards.
+            if state["calls"] == 1:
+                return "not-a-result"  # type: ignore[return-value]
+            return STTResult(text="open notepad")
+
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, True, False, False]))
+        loop = VoiceLoop(
+            audio=FakeAudioInput(segments=[make_speech("x", duration_s=0.5)] * 100),
+            wake_detector=wake,
+            stt=FakeSTT(transcribe_fn=corrupt_stt),
+            tts=FakeTTS(),
+            submit_task=self._submit(submitted),
+            idle_timeout_s=0.5,
+        )
+        loop.start()
+        self._run_to_idle(loop)
+        assert loop._tts.spoken == ["Yes?", "Yes?", "ok"]
+        assert submitted == ["open notepad"]
+        assert wake.reset_calls >= 2  # reset even though the interaction blew up
+        assert "voice interaction failed; resetting and continuing to listen" in caplog.text  # type: ignore[attr-defined]
+
     def test_info_diagnostics_emitted_via_production_logger(self, caplog: object) -> None:
         """The per-phase INFO boundary markers the diagnostics rely on are
         emitted through jarvis.voice.loop at INFO, so they reach the root
@@ -746,6 +881,17 @@ class TestInteractionLifecycleHardening:
         assert submitted == ["open notepad"]
         text = caplog.text  # type: ignore[attr-defined]
         for marker in (
+            "VOICE state=LISTENING",
+            "VOICE state=WAKE_DETECTED",
+            "VOICE state=CAPTURING",
+            "VOICE state=TRANSCRIBING",
+            "VOICE state=PROCESSING",
+            "VOICE state=SPEAKING",
+            "VOICE state=RESETTING",
+            "VOICE wake_detected",
+            "VOICE capture_started",
+            "VOICE capture_finished",
+            "VOICE transcript=",
             "voice boundary: interaction start",
             "voice boundary: wake ack speech starting",
             "wake acknowledged — listening for command",
@@ -835,8 +981,8 @@ class TestWakeDetectorFrameDelivery:
             idle_timeout_s=5.0,
         )
         loop.start()
-        for _ in range(100):
-            if submitted:
+        for _ in range(200):
+            if loop._tts.spoken == ["Yes?", "ok"]:
                 break
             time.sleep(0.05)
         assert submitted == ["open notepad"]  # the SECOND detection drove the interaction
@@ -1110,3 +1256,204 @@ class TestVoiceLoopOnExit:
         )
         self._run_to_exit(loop)
         assert reasons == [None]
+
+
+# ── Exactly-once re-arm + full state machine (TASK: voice hardening) ─────
+
+
+class TestStateMachineAndRearm:
+    """The wake detector is re-armed exactly once after every interaction
+    (success or failure), never on per-frame basis, and the INFO state
+    sequence matches LISTENING → WAKE_DETECTED → CAPTURING → TRANSCRIBING →
+    PROCESSING → SPEAKING → RESETTING → LISTENING."""
+
+    def _submit(self, submitted: list[str]) -> Any:
+        def submit(text: str, source: str) -> Any:
+            submitted.append(text)
+            return type(
+                "Outcome", (), {"final_answer": "ok", "confirmation": None, "error": None}
+            )()
+
+        return submit
+
+    def test_state_sequence_for_one_interaction(self, caplog: object) -> None:
+        """Full cycle logs exactly the 8 required phase states, in order."""
+        import logging
+        import re
+
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")  # type: ignore[attr-defined]
+        submitted: list[str] = []
+        audio = FakeAudioInput(segments=[make_speech("x", duration_s=0.2)] * 40)
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, False]))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(results=[STTResult(text="open notepad")]),
+            tts=FakeTTS(),
+            submit_task=self._submit(submitted),
+            idle_timeout_s=0.3,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        assert submitted == ["open notepad"]
+        states = re.findall(r"VOICE state=(\w+)", caplog.text)  # type: ignore[arg-type]
+        assert states == [
+            "LISTENING",
+            "WAKE_DETECTED",
+            "CAPTURING",
+            "TRANSCRIBING",
+            "PROCESSING",
+            "SPEAKING",
+            "RESETTING",
+            "LISTENING",
+        ]
+
+    def test_wake_detector_rearmed_exactly_once_per_interaction(self) -> None:
+        """Two interactions share the startup reset plus ONE re-arm each."""
+        submitted: list[str] = []
+        audio = FakeAudioInput(segments=[make_speech("x", duration_s=0.5)] * 250)
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, True, False, False]))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(transcribe_fn=lambda _seg: STTResult(text="open notepad")),
+            tts=FakeTTS(),
+            submit_task=self._submit(submitted),
+            idle_timeout_s=0.3,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        assert submitted == ["open notepad", "open notepad"]
+        # 1 (startup) + 1 per interaction — no extra resets.
+        assert wake.reset_calls == 3
+
+    def test_wake_detector_rearmed_exactly_once_even_on_failure(self) -> None:
+        """A failed interaction still re-arms exactly once (no double reset)."""
+        submitted: list[str] = []
+        state = {"calls": 0}
+
+        def flaky_stt(_seg: AudioSegment) -> STTResult:
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise RuntimeError("whisper down")
+            return STTResult(text="open notepad")
+
+        audio = FakeAudioInput(segments=[make_speech("x", duration_s=0.5)] * 250)
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, True, False, False]))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(transcribe_fn=flaky_stt),
+            tts=FakeTTS(),
+            submit_task=self._submit(submitted),
+            idle_timeout_s=0.3,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        assert submitted == ["open notepad"]  # only the second interaction routed
+        # Startup reset + one re-arm per interaction (failed + success) = 3.
+        assert wake.reset_calls == 3
+
+    def test_no_per_frame_reset_while_waiting(self) -> None:
+        """While listening for the wake word the detector is reset only at
+        startup — never on every audio frame."""
+        audio = FakeAudioInput(segments=[make_speech("x", duration_s=0.2)] * 60)
+        wake = FakeWakeWord(results=[WakeWordResult(detected=False)])
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(),
+            tts=FakeTTS(),
+            idle_timeout_s=0.2,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        assert len(wake.detect_calls) >= 5  # frames were actually fed
+        assert wake.reset_calls == 1  # startup only, no per-frame resets
+
+    def test_capture_waits_for_speech_then_ends_on_trailing_silence(self) -> None:
+        """End of utterance = trailing silence, never a fixed 30 s window."""
+        submitted: list[str] = []
+        # Initial silence (the pause after "Yes?") then a short command then
+        # trailing silence; the loop must capture all three correctly.
+        audio = FakeAudioInput(
+            segments=[make_silence(0.5), make_speech("x", duration_s=0.3), make_silence(1.5)]
+        )
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, False]))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(results=[STTResult(text="open notepad")]),
+            tts=FakeTTS(),
+            submit_task=self._submit(submitted),
+            listen_timeout_s=5.0,
+            silence_timeout_s=0.4,
+            idle_timeout_s=0.3,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        assert submitted == ["open notepad"]
+        assert loop._tts.spoken == ["Yes?", "ok"]
+
+
+# ── Rate-limited RMS diagnostics (loop + wake detector) ──────────────────
+
+
+class TestVoiceLevelDiagnostics:
+    def test_wake_heartbeat_includes_audio_level(self, caplog: object, monkeypatch: object) -> None:
+        """The wake-listening heartbeat carries an audio_rms field."""
+        import logging
+
+        import jarvis.voice.loop as loop_mod
+
+        monkeypatch.setattr(loop_mod, "_WAKE_HEARTBEAT_S", 0.0)  # type: ignore[attr-defined]
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")  # type: ignore[attr-defined]
+        audio = FakeAudioInput(segments=[make_speech("x", duration_s=0.2)] * 60)
+        wake = FakeWakeWord(results=[WakeWordResult(detected=False)])
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(),
+            tts=FakeTTS(),
+            idle_timeout_s=0.2,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        text = caplog.text  # type: ignore[attr-defined]
+        assert "audio_rms=" in text
+        assert "waiting for wake word" in text
+        assert wake.reset_calls == 1
+
+    def test_wake_heartbeat_is_rate_limited(self, caplog: object) -> None:
+        """Heartbeat (and its audio_rms) is logged at ~3 s cadence, not per frame."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")  # type: ignore[attr-defined]
+        audio = FakeAudioInput(segments=[make_speech("x", duration_s=0.01)] * 300)
+        wake = FakeWakeWord(results=[WakeWordResult(detected=False)])
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(),
+            tts=FakeTTS(),
+            idle_timeout_s=0.2,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        heartbeat_lines = [
+            line
+            for line in caplog.text.splitlines()  # type: ignore[attr-defined]
+            if "waiting for wake word" in line
+        ]
+        # Many frames processed but far fewer (at most a handful in 0.2 s of
+        # listening) heartbeat lines: the cadence gate kept it rate-limited.
+        assert len(wake.detect_calls) > len(heartbeat_lines) or not heartbeat_lines
+        assert len(wake.detect_calls) >= 20
+        assert all("audio_rms=" in line or "elapsed_s=" in line for line in heartbeat_lines)

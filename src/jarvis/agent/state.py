@@ -29,12 +29,21 @@ class Step(BaseModel):
 
 
 class Plan(BaseModel):
-    """The planner's proposed sequence of steps."""
+    """The planner's proposed sequence of steps.
 
+    ``kind`` records *what* the request is (docs/02_ARCHITECTURE.md request
+    classification): ``"tool"`` requests run desktop tools, ``"conversation"``
+    requests only need an answer.  ``dialog_answer`` is optional and ignored by
+    the dedicated ``converse`` node; the planner prompt keeps the catalogue
+    focused on tools.  Defaults keep old checkpoints and test fixtures valid.
+    """
+
+    kind: Literal["tool", "conversation"] = "tool"
     goal: str
     steps: list[Step] = Field(default_factory=list)
     needs_clarification: bool = False
     clarification_question: str | None = None
+    dialog_answer: str | None = None
 
 
 class Decision(BaseModel):
@@ -70,8 +79,12 @@ class AgentState(TypedDict, total=False):
     """The shared graph state (all keys optional).
 
     Operational keys added in Phase 1: ``validate_attempts`` (counts plan
-    repair retries), ``halted_reason`` (immediate stop signal for respond).
-    ``retry_now`` is written by the verify node to route back to act.
+    repair retries), ``halted_reason`` (immediate stop signal for respond),
+    ``retry_now`` (verify -> retry the same step) and - Phase 7 - ``replan_now``
+    (verify -> try a fresh plan), ``pending_replan`` (validate ran for a
+    replanned plan), ``request_kind`` (the classified request, set by the
+    understand_request node) and ``replan_decision`` (the last ReplanDecision,
+    stored so the final answer can stay honest).
     """
 
     task_id: str
@@ -95,6 +108,11 @@ class AgentState(TypedDict, total=False):
     gated_resolved_paths: dict[str, list[str]]  # step_id -> pre-interrupt resolved paths (TOCTOU)
     halted_reason: str | None
     retry_now: bool | None
+    # operational (Phase 7: classification, replanning)
+    request_kind: str
+    pending_replan: bool
+    replan_now: bool | None
+    replan_decision: Any | None  # jarvis.agent.schemas.ReplanDecision (allowlisted)
 
 
 class Profile(BaseModel):

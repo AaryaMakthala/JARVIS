@@ -27,6 +27,10 @@ def respond(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     if state.get("halted_reason"):
         return {"final_answer": state["halted_reason"]}
 
+    if state.get("final_answer"):
+        # Set by the converse node for conversational (no-tool) requests.
+        return {"final_answer": state["final_answer"]}
+
     results: list[StepResult] = list(state.get("results") or [])
     if not results:
         return {"final_answer": "No task performed."}

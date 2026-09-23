@@ -34,6 +34,7 @@ class FakeAudioInput:
         self.open_calls: list[dict[str, Any]] = []
         self.read_calls: list[int] = []
         self.close_calls: int = 0
+        self.flush_calls: int = 0
 
     def open(self, sample_rate: int = 16_000, channels: int = 1) -> None:
         self._open = True
@@ -53,6 +54,9 @@ class FakeAudioInput:
 
     def is_open(self) -> bool:
         return self._open
+
+    def flush(self) -> None:
+        self.flush_calls += 1
 
 
 class FakeWakeWord:

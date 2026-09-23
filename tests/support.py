@@ -15,6 +15,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from jarvis.agent.schemas import ReplanDecision
 from jarvis.agent.state import Plan, Step
 from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
 from jarvis.tools.files import TrashRecord
@@ -31,11 +32,19 @@ def make_spec(
     base_tier: int,
     record: list[tuple[str, dict[str, Any]]],
     verify_ok: bool = True,
+    run_ok: bool = True,
 ) -> ToolSpec:
-    """Build a fake tool that records every call into ``record``."""
+    """Build a fake tool that records every call into ``record``.
+
+    ``run_ok=False`` simulates a tool whose *action* fails (the replan path);
+    ``verify_ok=False`` simulates a post-condition check that fails while the
+    action itself "succeeded".
+    """
 
     def run(args: TextArgs, ctx: ToolContext) -> ToolResult:
         record.append((name, args.model_dump()))
+        if not run_ok:
+            return ToolResult(ok=False, error=f"{name} could not run {args.text}")
         return ToolResult(ok=True, output=f"{name} ran {args.text}", data={"text": args.text})
 
     def verify_always(args: TextArgs, result: ToolResult, ctx: ToolContext) -> ToolResult:
@@ -66,6 +75,26 @@ def echo_plan(text: str = "hi") -> Plan:
         goal=f"echo {text}",
         steps=[Step(id="s1", tool="fake_echo", args={"text": text}, rationale="echo it")],
     )
+
+
+def conversation_plan(answer: str = "That is a great question!") -> Plan:
+    """A plan classified as ``conversation`` (no tools, nothing to gate)."""
+    return Plan(
+        kind="conversation",
+        goal="answer the user directly",
+        steps=[],
+        dialog_answer=answer,
+    )
+
+
+def replan_continue(plan: Plan) -> ReplanDecision:
+    """A replanner decision that continues with a replacement plan."""
+    return ReplanDecision(action="continue", plan=plan)
+
+
+def replan_stop(message: str = "the approach is not working") -> ReplanDecision:
+    """A replanner decision that stops with an honest message."""
+    return ReplanDecision(action="stop", message=message)
 
 
 def approve(confirmation: dict[str, Any]) -> dict[str, Any]:

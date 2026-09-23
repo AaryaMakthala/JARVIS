@@ -110,6 +110,10 @@ class AudioInput(Protocol):
         """Return True if the stream is currently open."""
         ...
 
+    def flush(self) -> None:
+        """Discard all buffered audio (e.g. stale pre-prompt mic data)."""
+        ...
+
 
 @runtime_checkable
 class WakeWordDetector(Protocol):

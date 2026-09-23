@@ -4,6 +4,7 @@
 
 ## Current phase
 Phase 6 — DONE (WhatsApp contacts + whatsapp_send, verification-before-send, rate limits; fail-closed invariant #9).
+Phase 2 LLM-driver — DONE this session (see "LLM-driver architecture" below).
 Native Windows suite: **601 tests, 0 errors, 0 failures, 1 skipped** (`pytest tests
 -m "not slow and not voice"`, includes the 5 windows_only tests and the NTFS ADS path
 test). `scripts/check.ps1` green (29 pass, 0 fail). WSL hermetic run: 596 collected,
@@ -23,6 +24,126 @@ No real LLM provider/key is configured, so voice→LLM→TTS end-to-end is
 `piper-tts`, `pyttsx3`, `sounddevice`) are installed in this env — all real
 implementations lazy-import gracefully and return `None` from their `create()`
 factory functions.
+
+## Session: LLM-driver architecture (understand/converse/replan) + provider factory, memory, catalogue — DONE (no commit)
+
+`pytest --ignore=tests/windows_only` = **707 passed, 8 skipped, 1 failed** (the
+1 failure is the pre-existing NTFS-ADS Windows-only `test_paths.py`).  `ruff
+check`/`format` clean.  `mypy src/jarvis/policy` still not runnable under WSL
+Python 3.14 (numpy stubs reject 3.12-only `type` syntax — env artifact; run on
+the dev PC).  Baseline was 596 collected; +110 collected, all green.
+
+### What changed (target architecture, docs/02 §5)
+- **Request routing**: `plan` node now also classifies `Plan.kind`
+  (`tool`|`conversation`, default `tool` — zero churn for existing tests).  New
+  deterministic `understand_request` node records `request_kind` and routes:
+  `conversation → converse → respond`; `needs_clarification → respond`;
+  `tool → validate`.  Only `kind=="tool"` can ever reach `validate`/`act`.
+  `understand_request` never clobbers an existing halt.  `converse` node asks
+  the fast LLM for the spoken answer, or honours a `dialog_answer` the planner
+  already wrote (no redundant call).
+- **Replanning** (`replan` node): budget (`agent.max_replans`, default 2) is
+  enforced **in code**, never by prompt.  LLM returns a structured
+  `ReplanDecision` (`continue`+replacement `Plan` | `stop`+message);
+  `continue` resets step bookkeeping, keeps completed successes, drops the
+  failed attempt, goes back through `validate`+`policy_gate`; `stop`/budget/LLM
+  failure halts fail-closed with an honest message.  `verify` sets `replan_now`
+  when retries are exhausted (only if budget remains), else fails closed.
+  `validate` on a *replacement* plan preserves results/approved hashes and
+  re-snapshots TOCTOU paths; rejections route initial→`plan` (1 repair),
+  replacement→`replan` (1 repair).
+- **Boundary schemas** (`agent/schemas.py`, all `extra="forbid"`): `UserRequest`,
+  `ToolCall`, `ReplanDecision` (`continue` requires a `plan`), `ConfirmationRequest`,
+  `AgentResponse` (`kind` mirrors `Plan.kind`), plus `PlanStep`/`PolicyDecision`
+  aliases.  `ReplanDecision` is stored in state → added to the msgpack
+  allowlist (serializer tests updated to the 5-entry list).
+- **Provider factory** (`llm/provider.py`): `build_llm_client(settings,
+  store)` walks `llm.provider_order` (groq→gemini; gemini "not implemented yet")
+  returning the first buildable client or `client=None` + human-safe `reasons`
+  — the graph then halts cleanly with "No LLM backend configured (run `jarvis
+  init`)." instead of crashing.  Keys never leave keyring, never logged/returned.
+  `provider_status()` feeds `doctor`.  Wired into `cli._chat_no_daemon` and
+  `daemon._build_default_context`.
+- **Memory light integration** (`memory/base.py`): `MemoryBackend` protocol +
+  `MemoryRecord` + deterministic `NullMemory`; `AppContext.memory` flows to
+  `memory_retrieve`; results capped at `[memory] retrieval_limit` (default 3)
+  and truncated.  A memory failure never blocks a task.  Real embeddings stay
+  Phase 8.
+- **Registry**: `catalogue_with_policy()` (internal tier/windows_only view;
+  never sent to the LLM).
+- `TaskOutcome.agent_response` → typed `AgentResponse` for the daemon.
+
+### New tests (5 files, ~60 tests)
+`test_agent_architecture.py` (18 graph scenarios: conversation/tool routing,
+no-LLM halt, eager + confirmed + multi-step execution, deny, tampered hash,
+clarification, unknown-tool/invalid-args repair, malformed planner, replan
+stop/continue/budget/keep-successes, worker resilience, voice source),
+`test_replan.py`, `test_provider.py`, `test_schemas.py`, `test_memory.py`.
+Three existing tests gained `max_replans=0` to stay focused on their original
+claim (verification fail-closed; the replan path is covered by the new suite).
+
+### Fragile / known
+- Budget-exhaustion message surfaces when a *replacement* plan is rejected by
+  `validate` and there is no budget left; a tool failure after budget is spent
+  fails closed directly in `verify` (different, equally honest message).  Both
+  are tested.
+- `converse` with no LLM and no planner `dialog_answer` halts; with a written
+  `dialog_answer` it answers without any LLM call.
+- No real LLM key in this env: provider selection paths are unit-tested with a
+  memory key store; nothing hits a live Groq/Gemini API.
+
+## Session: "Yes?" then nothing — capture never waits for the command (bug fix, no commit)
+
+User-reported: after wake + "Yes?" the loop stops; no command → STT → response.
+Code trace (no hardware here) found the final wedge: `_read_command` only
+detected **trailing** silence.  After the "Yes?" ack + mic flush it treated a
+normal 1–3 s pause as "utterance ended" → returned ~0.7 s of silence → STT
+empty → silent re-arm.  Inverse bug: a noisy room (RMS ≥ threshold) made every
+chunk "speech", so capture ran the full `max_segment_s` (30 s), deaf to the
+next wake.  Both produce the same visible "Yes?" then nothing / deaf for 30 s.
+
+### Fix (all in `voice/loop.py` unless noted)
+1. `_read_command(max_samples)` is now **wait-for-speech → capture**:
+   - Phase A waits (bounded by `listen_timeout_s`) for the first speech-energy
+     chunk, discarding pre-speech silence but keeping a ~200 ms pre-roll
+     (`_CAPTURE_PREROLL_FRAMES`) so whisper still sees the utterance onset.
+     No speech by the deadline → returns an empty segment → "no command
+     detected; returning to wake".
+   - Phase B accumulates chunks until `silence_timeout_s` of trailing silence
+     or the `max_segment_s` cap.  `silence_threshold` (config `[voice]`) is now
+     wired `config → DaemonServer._build_voice_service → VoiceService →
+     VoiceLoop`; `_chunk_is_speech` takes the threshold (was a hardcoded 0.01).
+2. Explicit `VOICE state=` INFO transitions (LISTENING/CAPTURING/TRANSCRIBING/
+   PROCESSING/SPEAKING/RESETTING) + `VOICE wake_detected`, `VOICE capture_started`,
+   `VOICE capture_finished`, `VOICE transcript=N chars` — transcript wording still
+   redacted (char count only).
+3. New idempotent `_reset_voice_state()` (flush + wake-detector reset + clear
+   counters + state logs); `_rearm()` delegates to it.  `_safe_reset()` for
+   exception paths.
+4. `_run` now wraps each interaction in its own `try/except`: an exception
+   escaping every per-phase guard is logged
+   (`voice interaction failed; resetting and continuing to listen`), reset, and
+   the worker keeps running.
+
+### Tests (`tests/unit/test_voice_loop.py`)
+- Updated `test_no_speech_capture_ends_immediately` → `test_no_speech_capture_waits_for_speech_then_gives_up`;
+  updated `test_empty_utterance_returns_to_wake_listening` with a short `listen_timeout_s`.
+- New: `test_late_command_after_ack_pause_is_captured` (THE regression proof:
+  pause after "Yes?" no longer eats the command), `test_three_consecutive_wakes_process_all_commands`,
+  `test_tts_response_failure_does_not_wedge_loop`, `test_unexpected_interaction_exception_is_contained`
+  (corrupt STT result escapes the per-phase guards — outer `_run` boundary catches it),
+  extended INFO-marker test to assert all `VOICE state=` transitions.
+- Existing STT/route/capture-failure isolation tests already covered those phases.
+
+**Status (WSL)**: `ruff check .` clean. `pytest tests/unit -m "not slow and not voice"` =
+**602 passed, 3 skipped, 1 failed** (the 1 failure is the pre-existing NTFS-ADS/Windows-only
+`test_paths.py` test — passes only on real Windows). `mypy` still not runnable under WSL Python 3.14
+(numpy stubs) — run on the dev PC. NOT committed.
+**REAL-HARDWARE VERIFICATION PENDING** — the acceptance test cannot be reproduced without
+microphone/voice deps: on Windows, `jarvis daemon --foreground`, then 3×
+"hey jarvis" → "Yes?" → PAUSE one beat → command → audible response, no restart. Also run once with
+the command window unused (~`listen_timeout_s`=30 s default) and verify it returns to wake-listening
+(tune down `silence_timeout_s` as needed on a noisy mic). Do NOT claim fixed until that passes.
 
 ## Session: console-script daemon wrote no INFO + voice-loop wedge proof (bug fix, no commit)
 
@@ -443,6 +564,8 @@ jarvis off                          # Stop voice listening
 ## Next step
 Phase 7: audit (tools/audit) with hard-coded whitelisted commands, per-check timeouts,
 `jarvis audit` — read-only, graceful degradation without admin, fixtures-based unit tests.
+(After the LLM-driver session: also worth a real-provider smoke pass — configure one Groq
+key + planner/fast model names, then `jarvis chat` a conversational ask and a tool ask.)
 
 ---
 
@@ -725,3 +848,54 @@ Manual smoke test (native PowerShell):
 2. Say "hey jarvis, open notepad" (watch for "Yes?" then the response).
 3. Say "hey jarvis, what time is it" twice more without restarting the daemon.
 4. `Get-Content "$env:LOCALAPPDATA\jarvis\jarvis\logs\jarvis.jsonl" -Tail 200 | Select-String "voice"`
+
+## Voice state machine hardening — coding complete, hardware verification still pending (WSL run)
+
+**Task** (new user requirement list): make the voice loop converge to LISTENING/STOPPED after every
+wake (incl. empty/STT/processing/TTS/unexpected-exception failures and initial trailing silence),
+re-arm the wake detector **exactly once per interaction**, never per frame, and expose rate-limited
+**audio-level diagnostics** (RMS) in the JSONL log so "mic content is quiet" is distinguishable from
+"model is not scoring" at runtime.
+
+**Root-cause decided (do not re-open)**: the historical "wake once-only" behaviour is NOT a reset
+bug — evidence in `%LOCALAPPDATA%\jarvis\jarvis\logs\jarvis.jsonl`:
+- single 0.910 detection (03:39:49.059) → capture 1.900 s/30400 samples → STT 16 chars → task
+  `v1790134794950` started 03:39:54.951 and errored 03:39:55.005 → 36-char speech → re-arm →
+  flatline: `last_score` <= 0.017 for 36 s while `blocks_fed`/`frames_read` climbed (audio streamed).
+- openwakeword `reset()` cost is <= ~2 s (5 frame warm-up), so the 36 s flatline is mic content /
+  room sensitivity (`hey_jarvis` @ threshold 0.5), not a post-reset bug.
+- SEPARATE pre-existing issue: "user command produced no response" = agent **planner failure**
+  (`validate.py:21` "The planner produced no plan."); runtime `config.toml` has empty `[llm]`
+  models. Out of scope here — remains its own fix.
+
+**Changes (uncommitted)**:
+- `loop.py`: `_set_state` fixed set now includes `WAKE_DETECTED`; full cycle order is now
+  LISTENING → WAKE_DETECTED → "Yes?" (state still WAKE_DETECTED) → CAPTURING → TRANSCRIBING →
+  PROCESSING → SPEAKING → RESETTING → LISTENING. `_run` failure path now logs only and relies on
+  a **single `_rearm()`** as the one-and-only re-arm point (previously the exception path double
+  re-armed via `_safe_reset()` + `_rearm()`; `_safe_reset()` deleted — no test referenced it).
+  `_wait_for_wake` sets `WAKE_DETECTED` on detection; its ~3 s heartbeat (new `_WAKE_HEARTBEAT_S`)
+  now logs `audio_rms=%.4f`; `_read_command` "waiting for command" heartbeat same. Added
+  `_segment_rms()` helper (used by `_chunk_is_speech` for the RMS-threshold comparison).
+- `wake.py`: `detect()` computes `audio_rms` from float32 samples and includes `audio_rms=%.4f`
+  in the throttled "wake detector sample" INFO line — the distinguishing diagnostic.
+- `cli.py`: `jarvis daemon` now prints `logs: <jsonl path>` on start so the JSONL location is
+  obvious in the foreground console.
+- Tests (`test_voice_loop.py`): full 8-state INFO marker sequence test; exactly-once re-arm
+  (startup 1 + one per interaction = 3 for two interactions) on success AND on a failed-then-
+  successful interaction; no-per-frame-reset while waiting; capture ends on trailing silence
+  (initial silence after "Yes?" does NOT terminate capture, `listen_timeout_s` only caps);
+  heartbeat carries `audio_rms`; heartbeat is rate-limited (many frames, few lines).
+  (`test_voice_wake.py`): detector sample line includes `audio_rms=0.5000`.
+
+**Status (WSL)**: full suite = **614 passed, 1 skipped** (pre-existing WSL symlink skip in
+`test_tools_dictation.py:222`). NOT committed. `ruff`: not available under the WSL-side python3.14;
+`ruff check .` stayed clean from the prior native run; `mypy src/jarvis/policy` unchanged (blocked
+on numpy stubs under WSL). A flaky pre-existing timing race was found and fixed during this run:
+`test_transient_detector_error_then_recovers` asserted `spoken == ["Yes?", "ok"]` as soon as
+`submitted` became non-empty, but the response TTS happens on the loop thread a moment later, so
+under full-suite load the assert occasionally ran too early; the test now polls for the full
+completion signal (`spoken == ["Yes?", "ok"]`). Full suite green after the fix.
+**REAL-HARDWARE VERIFICATION STILL PENDING = THE BLOCKER** (unchanged, do not claim fixed): run the
+manual smoke test above and read the JSONL for the 8-state sequence + `audio_rms` lines (wake flatline
+`audio_rms` ≈ 0 → mic/privacy; `audio_rms` normal but `last_score` ≈ 0 → model sensitivity).

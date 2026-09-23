@@ -18,7 +18,7 @@ from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import build_graph, open_sqlite_checkpointer
 from jarvis.agent.runner import resume_task, run_task
 from jarvis.agent.state import Plan, Step
-from jarvis.config import PolicySettings, Settings
+from jarvis.config import AgentSettings, PolicySettings, Settings
 from jarvis.llm.client import FakeLLM
 from jarvis.policy.unlock import UnlockManager
 from jarvis.tools.files import make_delete_path_spec
@@ -161,7 +161,20 @@ def test_toctou_file_removed_before_resume_reported_honestly(tmp_path: Path, ws:
     """
     target = _write(ws, "gone.txt", "vanish")
     manager = _make_manager()
-    ctx = _make_ctx(ws, tmp_path, [_delete_plan([str(target)])], manager)
+    # max_replans=0 keeps the tool's honest 'no longer exists' report as the
+    # final answer (the replan path is covered in test_agent_architecture.py).
+    settings = Settings(
+        policy=PolicySettings(allowed_roots=[str(ws.resolve())]),
+        agent=AgentSettings(max_replans=0),
+    )
+    ctx = make_app_context(
+        settings,
+        llm=FakeLLM([_delete_plan([str(target)])]),
+        registry=registry_with(make_delete_path_spec()),
+        unlock=manager,
+        trash=FakeDirTrash(tmp_path / "trash"),
+        undo_log=tmp_path / "undo.jsonl",
+    )
     saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
     try:
         first = run_task(ctx, saver, "delete gone.txt")

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import traceback
 from typing import Any, Literal
 
 from jarvis.voice.interfaces import (
@@ -101,6 +102,9 @@ class VoiceService:
         listen_timeout_s: float = 30.0,
         max_session_s: float = DEFAULT_MAX_SESSION_S,
         max_dictation_chars: int = DEFAULT_MAX_DICTATION_CHARS,
+        silence_timeout_s: float = 0.7,
+        max_segment_s: float = 30.0,
+        silence_threshold: float = 0.01,
     ) -> None:
         self._audio = audio
         self._wake_detector = wake_detector
@@ -115,6 +119,9 @@ class VoiceService:
         self._listen_timeout_s = listen_timeout_s
         self._max_session_s = max_session_s
         self._max_dictation_chars = max_dictation_chars
+        self._silence_timeout_s = silence_timeout_s
+        self._max_segment_s = max_segment_s
+        self._silence_threshold = silence_threshold
         self._state: VoiceState = "off"
         self._error_code: str | None = None
         self._loop: VoiceLoop | None = None
@@ -148,18 +155,22 @@ class VoiceService:
 
     def _start_locked(self) -> str:
         self._state = "starting"
+        print("[DIAG] voice.service._start_locked(): state=starting", flush=True)
         if self._loop is not None and self._loop.is_active():
             self._state = "on"
             return "voice is already active"
 
         error = self._missing_component_code()
+        print(f"[DIAG] voice.service._start_locked(): missing_component={error!r}", flush=True)
         if error is None and self._audio is not None:
             # Open the microphone synchronously so a broken device is
             # reported here (mic-open-failed), not silently in the thread.
             try:
                 self._audio.open()
+                print("[DIAG] voice.service._start_locked(): audio.open() OK", flush=True)
             except Exception:
                 logger.warning("voice audio could not be opened", exc_info=True)
+                print("[DIAG] voice.service._start_locked(): audio.open() FAILED", flush=True)
                 error = "mic-open-failed"
 
         if error is not None:
@@ -185,11 +196,16 @@ class VoiceService:
                 idle_timeout_s=self._idle_timeout_s,
                 max_session_s=self._max_session_s,
                 max_dictation_chars=self._max_dictation_chars,
+                silence_timeout_s=self._silence_timeout_s,
+                max_segment_s=self._max_segment_s,
+                silence_threshold=self._silence_threshold,
                 on_exit=self._on_loop_exit,
             )
             self._loop.start()
         except Exception:
             logger.exception("voice loop failed to start")
+            print("[DIAG] voice.service._start_locked(): VoiceLoop.start() RAISED", flush=True)
+            traceback.print_exc()
             if self._audio is not None:
                 try:
                     self._audio.close()

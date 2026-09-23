@@ -192,7 +192,9 @@ def test_verification_failure_is_reported_honestly_end_to_end(tmp_path: Any) -> 
         goal="run auto",
         steps=[Step(id="s1", tool="fake_auto", args={"text": "x"}, rationale="r")],
     )
-    settings = Settings(agent=AgentSettings(max_retries_per_step=1))
+    # max_replans=0 keeps this focused on honest verification reporting; the
+    # replan path is covered in test_agent_architecture.py.
+    settings = Settings(agent=AgentSettings(max_retries_per_step=1, max_replans=0))
     ctx = make_app_context(settings, llm=FakeLLM([plan]), registry=registry_with(auto))
     saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
     try:

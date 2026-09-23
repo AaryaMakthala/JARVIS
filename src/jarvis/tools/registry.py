@@ -85,6 +85,26 @@ class ToolRegistry:
             )
         return entries
 
+    def catalogue_with_policy(self) -> list[dict[str, object]]:
+        """Internal observability catalogue (name, tier, windows-only).
+
+        Never sent to the LLM (docs/04_TOOLS_SPEC.md section 1: the planner
+        must not reason about permissions).  Used for logs, auditing and the
+        report tooling; tiers here are the *declared* base tiers.
+        """
+        entries: list[dict[str, object]] = []
+        for spec in self.iter_all():
+            entries.append(
+                {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "base_tier": spec.base_tier,
+                    "windows_only": spec.windows_only,
+                    "timeout_s": spec.timeout_s,
+                }
+            )
+        return entries
+
 
 def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     """Register the Phase 2 minimum tool set.

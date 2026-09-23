@@ -16,6 +16,7 @@ from typing import Any
 from langgraph.types import interrupt
 
 from jarvis.agent.context import AppContext
+from jarvis.agent.schemas import ConfirmationRequest
 from jarvis.agent.state import Decision, StepResult
 
 
@@ -119,17 +120,17 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
 def confirmation_payload(decision: Decision, untrusted: bool) -> dict[str, Any]:
     """The interrupt payload the daemon/CLI forwards to the user."""
-    return {
-        "type": "confirm",
-        "step_id": decision.step_id,
-        "tier": decision.tier,
-        "summary": decision.summary,
-        "needs_unlock": decision.needs_unlock,
-        "typed_confirmation": decision.needs_typed_confirmation,
-        "resolved_paths": list(decision.resolved_paths),
-        "action_hash": decision.action_hash,
-        "untrusted": bool(untrusted),
-    }
+    payload = ConfirmationRequest(
+        step_id=decision.step_id,
+        tier=decision.tier,
+        summary=decision.summary,
+        needs_unlock=decision.needs_unlock,
+        typed_confirmation=decision.needs_typed_confirmation,
+        resolved_paths=list(decision.resolved_paths),
+        action_hash=decision.action_hash,
+        untrusted=bool(untrusted),
+    )
+    return payload.model_dump(mode="json")
 
 
 def _answer_matches(answer: Any, expected_hash: str) -> bool:

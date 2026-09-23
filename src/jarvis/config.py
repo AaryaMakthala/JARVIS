@@ -76,6 +76,9 @@ app_name = "WhatsApp"
 max_per_hour = 10
 min_interval_s = 5.0
 window_timeout_s = 10.0
+
+[memory]
+retrieval_limit = 3
 """
 
 
@@ -166,6 +169,16 @@ class WhatsAppSettings(BaseModel):
     window_timeout_s: float = 10.0
 
 
+class MemorySettings(BaseModel):
+    """Agent memory bounds (retrieval is always short and capped).
+
+    ``retrieval_limit`` caps how many records the memory_retrieve node hands
+    the planner, so a single prompt can never be flooded by stored memory.
+    """
+
+    retrieval_limit: int = 3
+
+
 class Settings(BaseSettings):
     """Top-level application settings.
 
@@ -188,6 +201,7 @@ class Settings(BaseSettings):
     daemon: DaemonSettings = DaemonSettings()
     voice: VoiceSettings = VoiceSettings()
     whatsapp: WhatsAppSettings = WhatsAppSettings()
+    memory: MemorySettings = MemorySettings()
     config_version: int = 1
 
     @classmethod

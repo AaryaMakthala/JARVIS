@@ -1,11 +1,13 @@
 """Checkpoint serializer security tests.
 
-The SQLite checkpointer must only ever revive the four State models that
-:func:`jarvis.agent.graph.build_secure_serde` explicitly allowlists, must never
-fall back to pickle, and must never enable the permissive "warn but allow"
-``allowed_msgpack_modules=True`` mode.  ``tests/conftest.py`` additionally turns
-on ``LANGGRAPH_STRICT_MSGPACK`` so any unmanaged (strict-mode) code path becomes
-loud instead of silently importing untrusted types.
+The SQLite checkpointer must only ever revive the state models that
+:func:`jarvis.agent.graph.build_secure_serde` explicitly allowlists (the four
+state models plus the ``ReplanDecision`` boundary model stored by the replan
+node), must never fall back to pickle, and must never enable the permissive
+"warn but allow" ``allowed_msgpack_modules=True`` mode.  ``tests/conftest.py``
+additionally turns on ``LANGGRAPH_STRICT_MSGPACK`` so any unmanaged
+(strict-mode) code path becomes loud instead of silently importing untrusted
+types.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ _ALLOWED = {
     ("jarvis.agent.state", "Step"),
     ("jarvis.agent.state", "Decision"),
     ("jarvis.agent.state", "StepResult"),
+    ("jarvis.agent.schemas", "ReplanDecision"),
 }
 
 

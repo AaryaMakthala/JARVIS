@@ -14,6 +14,7 @@ from typing import Any
 from jarvis.config import Settings, load_settings
 from jarvis.llm.client import LLMClient
 from jarvis.logging_setup import get_logger
+from jarvis.memory import MemoryBackend
 from jarvis.policy.engine import PolicyContext, PolicyEngine, RiskClassifier, UnlockManager
 from jarvis.tools.base import CancelToken, ToolContext
 from jarvis.tools.registry import ToolRegistry, build_default_registry
@@ -61,6 +62,7 @@ class AppContext:
     trash: Any | None = None  # TrashService | None (defaults to the real recycle bin)
     undo_log: Path | None = None  # override for the undo log path (tests)
     voice: VoiceToolsFacade | None = None  # live voice loop for dictation tools
+    memory: MemoryBackend | None = None  # bounded, secret-free memory store
 
     def tool_context(self) -> ToolContext:
         """Build a ToolContext for the current step (no secret leaks)."""
@@ -69,7 +71,7 @@ class AppContext:
             dry_run=self.dry_run,
             cancel=self.cancel,
             llm=self.llm,
-            memory=None,
+            memory=self.memory,
             logger=self.logger,
             trash=self.trash,
             unlock=self.unlock,
@@ -89,6 +91,7 @@ def make_app_context(
     trash: Any | None = None,
     undo_log: Path | None = None,
     voice: VoiceToolsFacade | None = None,
+    memory: MemoryBackend | None = None,
 ) -> AppContext:
     """Build a ready-to-use :class:`AppContext` with defaults."""
     settings = settings or load_settings()
@@ -109,4 +112,5 @@ def make_app_context(
         trash=trash,
         undo_log=undo_log,
         voice=voice,
+        memory=memory,
     )

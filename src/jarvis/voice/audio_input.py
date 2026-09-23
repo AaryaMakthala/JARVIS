@@ -77,8 +77,10 @@ class SoundDeviceAudioInput:
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=queue_maxsize)
         self._read_buffer: list[float] = []
         self._dropped_oldest = 0
+        self._blocks_fed = 0
         self._open = False
         self._last_status_log = 0.0
+        self._last_read_status_ts = 0.0
 
     # ── AudioInput protocol ──────────────────────────────────────────────
 
@@ -143,9 +145,13 @@ class SoundDeviceAudioInput:
                 "connected and enabled on Windows)"
             ) from None
         self._open = True
+        samplerate = getattr(self._stream, "samplerate", self._sample_rate)
         logger.info(
-            "microphone open (device=%s)",
+            "microphone open (device=%s samplerate=%s channels=%s blocksize=%s dtype=int16)",
             self._device_label(device),
+            samplerate,
+            self._channels,
+            self._block_size,
         )
 
     def read(self, num_frames: int) -> AudioSegment:
@@ -187,6 +193,15 @@ class SoundDeviceAudioInput:
             stall_deadline = time.monotonic() + self._read_timeout_s
         taken = self._read_buffer[:num_frames]
         self._read_buffer = self._read_buffer[num_frames:]
+        now = time.monotonic()
+        if now - self._last_read_status_ts >= 5.0:
+            self._last_read_status_ts = now
+            logger.info(
+                "microphone stream status: blocks_fed=%d blocks_dropped=%d open=%s",
+                self._blocks_fed,
+                self._dropped_oldest,
+                self._open,
+            )
         return AudioSegment(samples=taken, sample_rate=self._sample_rate)
 
     def close(self) -> None:
@@ -249,6 +264,7 @@ class SoundDeviceAudioInput:
                 except queue.Empty:
                     pass
             self._queue.put_nowait(block)
+            self._blocks_fed += 1
         except Exception:
             # Never let the callback thread crash; drop and count instead.
             logger.debug("audio callback dropped a block", exc_info=True)
