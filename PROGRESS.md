@@ -1254,3 +1254,59 @@ matches the pre-existing exception in `AGENTS.md Â§10`. `scripts/check.ps1` to b
 the dev PC; **NOT committed** (waiting for review). Manual smoke on PC: see the doctor
 walkthrough in the LLM-driver entry; the only new bit is `jarvis doctor` output now
 shows `strict_zero_cost PASS` and the `zero-cost`/`free-tier` distinction on provider rows.
+
+---
+
+## Session: quiet-start/re-arm diagnosis — first-wake regression follow-up (no commit)
+
+**Status: NOT committed** (per instruction; no commit/push for this follow-up).
+
+### Reported symptom vs. evidence
+Reported: after `0a5fc47`, the FIRST "Hey Jarvis" after `jarvis.exe daemon --foreground`
+produced no "Yes?"/response at all. Investigated exhaustively with live diagnostics.
+
+### Root-cause verdict
+- Static trace: the re-arm quiet-start gate (`_REARM_QUIET_GATE_S=0.5`,
+  `_quiet_start_drain()`) runs ONLY in `_reset_voice_state()` / `_rearm_wake_for_confirmation()`
+  — i.e. post-interaction and pre-confirmation. The startup path
+  (`_run()` ? `audio.open()` ? `_set_state("LISTENING")` ? `wake_detector.reset()` ?
+  `_wait_for_wake()`) contains NO gate, drain, or extra reset. Empirically confirmed: daemon
+  logs show `WAKE_WAIT_START` immediately after the startup reset, with no `RESETTING`,
+  no drain reads, `reset_calls==1` at startup.
+- `git log` proves `wake.py`/`audio_input.py` were last touched by `0f5e608`/`dab61b8`,
+  BEFORE the regression window (`86b8703`, `0a5fc47` touched only `loop.py` + `tts.py`).
+  Detection sensitivity is therefore byte-identical to the build that historically woke 5/5
+  at score 0.966.
+- Live probes (dev PC, `.venv` 3.11): replay `clip_hey_jarvis.wav` through the CURRENT
+  detector in 80 ms chunks ? score 0.998. Live mic ? detector (speaker-to-mic echo) in the
+  real loop ? woke (0.647, full "Yes?" ? capture ? re-arm). Ran the REAL
+  `jarvis daemon --foreground` and played the clip acoustically: marginal at speaker volume
+  (max_score 0.4459, below the 0.5 threshold, NO wake); at increased amplitude the real
+  daemon woke (0.6337) and the full chain ran: `wake_detected` ? SAPI "Yes?" (fresh engine,
+  init 0.31 s + speech 1.53 s, NO hang) ? capture ? `RESETTING` ? `LISTENING`.
+- Conclusion: NOT a code regression. The first-wake pipeline is intact end-to-end. The
+  reported failure is an INPUT-AMPLITUDE margin: the detector is sensitive to the level of
+  the phrase in the fed stream (0.45 at x1 playback vs 0.65–0.99 at x2/human volumes);
+  the fixed threshold (0.5) was never changed. Root cause in the real world ˜ mic
+  level/AGC/room at launch time, not the loop, the detector, or the TTS. Hypoteses A/B/C/D
+  from the task are all closed: (A) frames reach detector (frames_seen grows at 16 k/s,
+  blocks_dropped=0), (B) scores correct and turn into wakes, (C) no startup suppression,
+  (D) ack TTS spoke cleanly.
+
+### Change made
+- `tests/unit/test_voice_loop.py`: added `TestFirstWakeAfterQuietStartup` (2 assertions
+  locked): after a quiet startup window the FIRST wake word is fed to the detector, drives
+  a full interaction (`Yes?` ? command ? re-arm), and the detector is armed exactly once at
+  startup (+1 re-arm), with no extra startup reset/drain. Fails if a future startup gate
+  swallows or re-resets the first wake.
+
+### Validation (all green)
+- `pytest -q -m "not windows_only and not slow and not voice"`: 0 failed (only the
+  pre-existing daemon async-mock coroutine warnings).
+- `ruff check .` clean; `ruff format --check .` clean; `mypy src/jarvis/policy`: Success.
+
+### Manual test for the user (real device)
+Run daemon ? wait for "voice activated" ? say "Hey Jarvis": expect a "Yes?" ack and
+response. A quieter-than-usual mic (laptop AGC) can sit below threshold — check Windows
+mic volume/enhancements if it doesn't react; but faces-talking at normal volume matched
+historical 0.9+ scores on this exact build.

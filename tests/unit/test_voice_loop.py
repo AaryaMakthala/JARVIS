@@ -762,6 +762,79 @@ class TestRearmQuietStartGate:
         assert events == ["speak", "flush", "reset", "detect"]
 
 
+# ── first wake after a quiet startup (service starts → detector armed → wake) ──
+
+
+class TestFirstWakeAfterQuietStartup:
+    """The very first wake word after the loop starts is detected and drives a
+    full interaction even when the startup window was quiet.
+
+    Contract pinned after the reported regression ("daemon starts, says
+    nothing, first 'hey jarvis' gets no response"): the detector is armed
+    exactly once at startup, quiet startup audio is fed without triggering,
+    and the FIRST wake word that follows is never swallowed — neither by the
+    re-arm quiet-start gate (which owns re-arm only, never startup) nor by any
+    startup-only drain.  If that property is ever violated, this test fails.
+    """
+
+    @staticmethod
+    def _tone(fill: float, duration_s: float = 0.2) -> AudioSegment:
+        n = int(duration_s * 16_000)
+        return AudioSegment(samples=[fill] * n, sample_rate=16_000)
+
+    def _submit(self, submitted: list[str]) -> Any:
+        def submit(text: str, source: str) -> Any:
+            submitted.append(text)
+            return type(
+                "Outcome", (), {"final_answer": "ok", "confirmation": None, "error": None}
+            )()
+
+        return submit
+
+    def test_quiet_startup_then_first_wake_drives_the_interaction(self) -> None:
+        """Silence first, then the FIRST wake word: detected, acknowledged,
+        processed, and the detector re-armed — exactly once after startup.
+
+        Audio order models a realistic launch: the room is quiet while the
+        loop starts listening, the user's first "hey jarvis" arrives, the
+        command follows, capture ends on trailing silence, and the idle
+        timeout stops the loop after the single interaction.
+        """
+        submitted: list[str] = []
+        quiet = make_silence(0.4)  # startup window: microphone open, nothing said
+        wake_1 = self._tone(0.75)  # the FIRST wake word after startup
+        cmd_1 = [make_speech("x", duration_s=0.5), make_speech("x", duration_s=0.5)]
+        end_1 = make_silence(1.0)  # trailing silence ends capture
+        tail = [make_silence(0.1)] * 10  # idle timeout stops the loop
+
+        audio = FakeAudioInput(segments=[quiet, wake_1, *cmd_1, end_1, *tail])
+        # Silence is fed and scores False; the first wake word scores True.
+        wake = FakeWakeWord(detect_fn=_scripted_wake([False, True, False, False]))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(results=[STTResult(text="open notepad")]),
+            tts=FakeTTS(),
+            submit_task=self._submit(submitted),
+            idle_timeout_s=0.3,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        assert not loop.is_active()
+        # The first wake was honoured end-to-end.
+        assert submitted == ["open notepad"]
+        assert loop._tts.spoken == ["Yes?", "ok"]
+        # The wake word itself was fed to the detector (never skipped), and
+        # the quiet window produced nothing.
+        assert any(seg.samples[0] == 0.75 for seg in wake.detect_calls)
+        assert any(seg.samples[0] == 0.0 for seg in wake.detect_calls)
+        # Armed exactly once at startup, plus exactly one re-arm after the
+        # interaction — a startup-only quiet gate / drain would add resets or
+        # consume the wake chunks and fail the assertions above.
+        assert wake.reset_calls == 2
+
+
 # ── TASK 8 regressions: lifecycle, per-interaction failure isolation ────
 
 
