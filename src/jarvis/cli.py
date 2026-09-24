@@ -668,6 +668,73 @@ def status() -> None:
         raise typer.Exit(code=1)
 
 
+# ── audit ─────────────────────────────────────────────────────────────────
+
+
+def _run_audit_cli(sections: list[str] | None, out: Path | None) -> tuple[list[Any], Path]:
+    """Run read-only audit checks and write a Markdown report."""
+    from jarvis.audit import checks as audit_checks
+    from jarvis.audit.report import write_report
+    from jarvis.tools.audit import _SECTIONS
+
+    chosen = list(sections) if sections else list(_SECTIONS)
+    unknown = [s for s in chosen if s not in _SECTIONS]
+    if unknown:
+        raise typer.BadParameter(f"unknown audit section: {', '.join(unknown)}")
+    findings = audit_checks.run_checks(chosen)
+    target = out if out is not None else config.reports_dir()
+    report_path = write_report(findings, target)
+    return findings, report_path
+
+
+@app.command()
+def audit(
+    section: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--section",
+            "-s",
+            help="Audit section to run (repeatable): security, performance, "
+            "updates, self. Defaults to all.",
+        ),
+    ] = None,
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Directory for the report (default: user data reports)."),
+    ] = None,
+) -> None:
+    """Run a read-only system audit and write a Markdown report."""
+    from rich.table import Table
+
+    try:
+        findings, report_path = _run_audit_cli(section, out)
+    except typer.BadParameter:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]audit failed: {exc}[/red]")
+        raise typer.Exit(code=1)
+
+    count = {"critical": 0, "warning": 0, "info": 0, "ok": 0, "unknown": 0}
+    for finding in findings:
+        count[finding.severity] += 1
+    table = Table(show_header=False, box=None)
+    for severity in ("critical", "warning", "info", "ok", "unknown"):
+        label = {
+            "critical": "red",
+            "warning": "yellow",
+            "info": "cyan",
+            "ok": "green",
+            "unknown": "magenta",
+        }[severity]
+        if count[severity]:
+            table.add_row(f"[{label}]{severity}[/{label}]", str(count[severity]))
+    console.print("[bold]Audit summary[/bold]")
+    console.print(table)
+    console.print(f"[green]report:[/green] {report_path}")
+    if count["critical"]:
+        console.print("[red]Critical issues found - review the report.[/red]")
+
+
 # ── stop ─────────────────────────────────────────────────────────────────
 
 

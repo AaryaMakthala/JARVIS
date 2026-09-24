@@ -90,6 +90,13 @@ _CAPTURE_PREROLL_FRAMES = 2 * _CAPTURE_CHUNK_FRAMES
 #: Heartbeat cadence for the "still alive" / audio-level INFO line (~3 s).
 _WAKE_HEARTBEAT_S = 3.0
 
+#: Bounded drain applied after every interaction so the re-armed wake detector
+#: starts scoring from the same quiet baseline as the very first wake, instead
+#: of over the tail of the response still ringing in the room/mic.  Event-
+#: driven (the drain ends the moment a quiet chunk arrives) and capped so a
+#: persistently noisy room can never wedge the loop.
+_REARM_QUIET_GATE_S = 0.5
+
 #: RMS (float samples in [-1, 1]) below which a chunk counts as silence.
 _SILENCE_RMS = 0.01
 
@@ -143,6 +150,7 @@ class VoiceLoop:
         silence_timeout_s: float = 0.7,
         max_segment_s: float = DEFAULT_MAX_SEGMENT_S,
         silence_threshold: float = _SILENCE_RMS,
+        rearm_quiet_gate_s: float = _REARM_QUIET_GATE_S,
     ) -> None:
         self._audio = audio
         self._wake_detector = wake_detector
@@ -161,6 +169,8 @@ class VoiceLoop:
         self._silence_timeout_s = max(silence_timeout_s, 0.0)
         self._max_segment_s = max_segment_s
         self._silence_threshold = max(silence_threshold, 0.0)
+        #: Bounded quiet-start drain length, 0 disables it (see the constant).
+        self._rearm_quiet_gate_s = max(rearm_quiet_gate_s, 0.0)
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -594,16 +604,60 @@ class VoiceLoop:
         logger.info("VOICE INTERACTION_COMPLETE")
         logger.info("voice boundary: interaction completed")
 
+    def _quiet_start_drain(self) -> None:
+        """Discard non-quiet audio until the mic returns to its baseline.
+
+        After an interaction the speakers may still be ringing with the
+        response, so a re-armed wake detector would score its first windows
+        over that echo instead of the quiet a *first* wake always enjoys.
+        Reading-and-discarding until the room drops back below the silence
+        threshold restores identical input conditions for every re-arm,
+        which keeps the second wake as detectable as the first.
+
+        Bounded two ways so it can never wedge the loop: it stops once at most
+        ``_rearm_quiet_gate_s`` of *audio* has been drained, and also at an
+        absolute wall-clock deadline a little later, so a stalled microphone
+        (repeated short reads that carry no audio) cannot hold the loop open.
+        When a bound elapses with the room still non-quiet, detection simply
+        proceeds (equivalent to the pre-gate behaviour).  The detector is
+        not fed here — re-arm's ``wake_detector.reset()`` runs *after* this
+        drain so the model's window starts clean at the first quiet frame.
+        """
+        if self._rearm_quiet_gate_s <= 0.0:
+            return
+        chunk_frames = 1280
+        # On a live mic each read returns ~80 ms of audio, so ``rearm_quiet_gate_s``
+        # of audio is only a handful of reads.  Bounding by *audio seconds*
+        # (not wall time) keeps the drain event-driven AND bounded: the very
+        # first quiet chunk ends it, a non-quiet room ends it after gate_s, and
+        # the wall-clock deadline only guards against a wedged/stalled stream.
+        # On test fakes, whose reads return whole segments at once, the audio
+        # bound still caps how much scripted audio the drain can consume.
+        deadline = time.monotonic() + self._rearm_quiet_gate_s + 1.0
+        drained_s = 0.0
+        while not self._stop_event.is_set() and drained_s < self._rearm_quiet_gate_s:
+            if time.monotonic() >= deadline:
+                return
+            segment = self._audio.read(chunk_frames)
+            if segment.duration_s < 0.05:
+                continue
+            drained_s += segment.duration_s
+            if not _chunk_is_speech(segment, self._silence_threshold):
+                logger.debug("voice reset: re-arm quiet gate satisfied")
+                return
+
     def _reset_voice_state(self) -> None:
         """Return the loop to wake-listening after an interaction (idempotent).
 
         Discards any audio buffered while the response was spoken (so TTS
-        output is never heard as a follow-up command), re-arms the wake-word
-        model's rolling buffer, and clears transient per-interaction counters.
-        Safe to call after a success, an empty command, an STT/processing/TTS
-        failure, a timeout, or an unexpected exception.  Exceptions inside the
-        reset are swallowed per component so a partial reset can never kill
-        the loop.
+        output is never heard as a follow-up command), drains the mic back to
+        a quiet baseline so the next wake is detected under identical input
+        conditions to the first, re-arms the wake-word model's rolling buffer
+        *after* that drain so its window starts clean, and clears transient
+        per-interaction counters.  Safe to call after a success, an empty
+        command, an STT/processing/TTS failure, a timeout, or an unexpected
+        exception.  Exceptions inside the reset are swallowed per component so
+        a partial reset can never kill the loop.
         """
         self._set_state("RESETTING")
         try:
@@ -611,6 +665,10 @@ class VoiceLoop:
             logger.debug("voice reset: audio flushed")
         except Exception:
             logger.debug("voice reset: audio flush failed", exc_info=True)
+        try:
+            self._quiet_start_drain()
+        except Exception:
+            logger.debug("voice reset: re-arm quiet gate failed", exc_info=True)
         if self._wake_detector is not None:
             try:
                 self._wake_detector.reset()
@@ -716,6 +774,11 @@ class VoiceLoop:
             return False
         timeout = self._listen_timeout_s if timeout_s is None else timeout_s
         self._tts.speak(f"Say {self._wake_word} to confirm.")
+        # Discard the prompt's own acoustic echo from the mic, then reset the
+        # detector so its rolling window is clean when listening begins.  This
+        # must happen AFTER the prompt: resetting first would leave the prompt
+        # echo to fill the very windows the confirmation wake is scored in.
+        self._audio.flush()
         self._wake_detector.reset()
         deadline = time.monotonic() + timeout
         chunk_frames = 1280

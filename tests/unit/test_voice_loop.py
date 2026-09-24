@@ -594,6 +594,174 @@ class TestVoiceLoopRearmAndCapture:
         assert wake.reset_calls >= 1
 
 
+# ── Re-arm quiet-start: the response echo never reaches the detector ────
+
+
+class TestRearmQuietStartGate:
+    """After an interaction the response is still ringing in the room, so the
+    re-armed wake detector must not score its first windows over that echo.
+
+    The re-arm must drain the mic back to a quiet baseline BEFORE
+    ``wake_detector.reset()`` so every re-arm starts from the same input
+    conditions as the very first wake, and the drain must be bounded so a
+    room that never goes quiet can never wedge the loop.
+    """
+
+    @staticmethod
+    def _tone(fill: float, duration_s: float = 0.2) -> AudioSegment:
+        """Constant-fill segment so audio content can be identified by value."""
+        n = int(duration_s * 16_000)
+        return AudioSegment(samples=[fill] * n, sample_rate=16_000)
+
+    def _submit(self, submitted: list[str]) -> Any:
+        def submit(text: str, source: str) -> Any:
+            submitted.append(text)
+            return type(
+                "Outcome", (), {"final_answer": "ok", "confirmation": None, "error": None}
+            )()
+
+        return submit
+
+    def test_response_echo_drained_before_detector_reopens(self) -> None:
+        """The detector's post-reset window contains the quiet room and the
+        NEXT wake, never the response echo.
+
+        The audio stream models a real cycle: wake → command → the response
+        echoing in the room → the room going quiet → the next wake.  The
+        echo segments carry distinctive fills (0.3/0.15); if re-arm resets the
+        detector before draining, those echoes are fed straight into the
+        model's freshly reset window (the reported bug), which this test
+        fails on.
+        """
+        submitted: list[str] = []
+        wake_1 = self._tone(0.75)  # the first "hey jarvis"
+        cmd_1 = [self._tone(0.5), self._tone(0.5)]  # the command
+        end_1 = make_silence(1.0)  # trailing silence ends capture 1
+        echo = [self._tone(0.3), self._tone(0.15)]  # response ringing out
+        quiet = make_silence(0.4)  # the room returns to baseline
+        wake_2 = self._tone(0.75)  # the second "hey jarvis"
+        cmd_2 = [self._tone(0.5), self._tone(0.5)]
+        end_2 = make_silence(1.0)
+        tail = [make_silence(0.1)] * 10  # idle timeout stops the loop
+
+        audio = FakeAudioInput(
+            segments=[wake_1, *cmd_1, end_1, *echo, quiet, wake_2, *cmd_2, end_2, *tail]
+        )
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, True, False, False]))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(transcribe_fn=lambda _seg: STTResult(text="open notepad")),
+            tts=FakeTTS(),
+            submit_task=self._submit(submitted),
+            idle_timeout_s=0.3,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        assert not loop.is_active()
+        # Both cycles ran end-to-end.
+        assert submitted == ["open notepad", "open notepad"]
+        # The echo (fills 0.3 / 0.15) was drained during re-arm and never
+        # fed to the detector; the real wake words (fill 0.75) were.
+        assert all(seg.samples[0] not in (0.3, 0.15) for seg in wake.detect_calls)
+        assert any(seg.samples[0] == 0.75 for seg in wake.detect_calls)
+        # 1 startup reset + 1 re-arm per interaction — the quiet gate
+        # itself must not add extra resets.
+        assert wake.reset_calls == 3
+
+    def test_reset_drains_echo_before_rearming_the_detector(self) -> None:
+        """``_reset_voice_state`` order is flush → quiet drain → detector reset.
+
+        Resetting before the drain would put the echo into the window the
+        model starts scoring after the reset, so the reset must be the LAST
+        step, after the mic reads show a quiet baseline.
+        """
+        events: list[str] = []
+
+        class _EventAudio(FakeAudioInput):
+            def flush(self) -> None:
+                events.append("flush")
+                super().flush()
+
+            def read(self, num_frames: int) -> AudioSegment:
+                events.append("read")
+                return super().read(num_frames)
+
+        class _EventWake(FakeWakeWord):
+            def reset(self) -> None:
+                events.append("reset")
+                super().reset()
+
+        audio = _EventAudio(segments=[make_speech("echo", duration_s=0.2), make_silence(0.4)])
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=_EventWake(),
+            stt=FakeSTT(),
+            tts=FakeTTS(),
+        )
+        loop._reset_voice_state()
+        # flush, echo read (non-quiet → keep draining), quiet read (drain
+        # done → return), and only THEN the detector reset.
+        assert events == ["flush", "read", "read", "reset"]
+
+    def test_quiet_gate_bounded_when_room_never_goes_quiet(self) -> None:
+        """A room that stays loud must not wedge re-arm: the drain stops
+        after ``rearm_quiet_gate_s`` of audio and detection proceeds, so
+        repeated wakes keep being processed."""
+        submitted: list[str] = []
+        audio = FakeAudioInput(segments=[make_speech("x", duration_s=0.5)] * 250)
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, True, False, False]))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(transcribe_fn=lambda _seg: STTResult(text="open notepad")),
+            tts=FakeTTS(),
+            submit_task=self._submit(submitted),
+            idle_timeout_s=0.3,
+            rearm_quiet_gate_s=0.1,  # bound the drain per re-arm
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        assert not loop.is_active()
+        assert submitted == ["open notepad", "open notepad"]
+        assert wake.reset_calls == 3
+
+    def test_confirmation_rearm_flushes_prompt_echo_before_listening(self) -> None:
+        """Confirmation re-arm order is prompt → flush → reset → listen.
+
+        Resetting before the prompt was spoken would leave the prompt's own
+        "Say hey jarvis to confirm." echo in the very windows the user's
+        confirming wake word is scored in, so the flush and reset must happen
+        after the prompt, before any read.
+        """
+        events: list[str] = []
+
+        class _EventAudio(FakeAudioInput):
+            def flush(self) -> None:
+                events.append("flush")
+                super().flush()
+
+        class _EventWake(FakeWakeWord):
+            def reset(self) -> None:
+                events.append("reset")
+                super().reset()
+
+            def detect(self, segment: AudioSegment) -> WakeWordResult:
+                events.append("detect")
+                return super().detect(segment)
+
+        loop = VoiceLoop(
+            audio=_EventAudio(segments=[make_speech("x", duration_s=0.5)] * 10),
+            wake_detector=_EventWake(detect_fn=_scripted_wake([True])),
+            stt=FakeSTT(),
+            tts=FakeTTS(speak_fn=lambda _text: events.append("speak")),
+        )
+        assert loop._rearm_wake_for_confirmation(timeout_s=1.0)
+        assert events == ["speak", "flush", "reset", "detect"]
+
+
 # ── TASK 8 regressions: lifecycle, per-interaction failure isolation ────
 
 
@@ -623,13 +791,16 @@ class TestInteractionLifecycleRegression:
             idle_timeout_s=5.0,
         )
         loop.start()
-        for _ in range(100):
-            if submitted:
+        for _ in range(200):
+            if len(loop._tts.spoken) >= 2:
                 break
             time.sleep(0.05)
-        assert submitted == ["open notepad"]
         # The whole pipeline ran: wake ack, then the agent's spoken response.
+        # (Wait for len == 2 before asserting: ``submit_task`` appends to
+        # ``submitted`` just before the loop thread speaks the response, so
+        # asserting on ``submitted`` alone races the "ok" TTS.)
         assert loop._tts.spoken == ["Yes?", "ok"]
+        assert submitted == ["open notepad"]
         assert loop.is_active()  # still listening for the next wake word
         loop.stop()
         assert not loop.is_active()

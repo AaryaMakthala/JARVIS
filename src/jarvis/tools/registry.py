@@ -114,6 +114,11 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     """
     _ = settings
     from jarvis.tools.apps import make_open_app_spec
+    from jarvis.tools.audit import (
+        make_audit_run_spec,
+        make_defender_quick_scan_spec,
+        make_defender_status_spec,
+    )
     from jarvis.tools.dictation import (
         make_save_dictation_spec,
         make_start_dictation_spec,
@@ -140,6 +145,9 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_web_answer_spec(),
         make_system_info_spec(),
         make_lock_jarvis_spec(),
+        make_audit_run_spec(),
+        make_defender_status_spec(),
+        make_defender_quick_scan_spec(),
         make_create_file_spec(),
         make_append_file_spec(),
         make_list_dir_spec(),

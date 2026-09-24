@@ -2,6 +2,62 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-24 (later) — voice re-arm quiet-start gate + Phase 7 Audit DONE (no commit)
+
+Two unrelated work items, both green on the dev PC.
+
+### Part 1 — wake re-arm input-condition fix (completes the prior voice work)
+Root cause (proven from code + fakes, not hardware): the real loop and detectors are sound
+(real-loop 5/5 wakes); the defect was a **re-arm input-condition asymmetry** — after an
+interaction the wake detector was re-armed while the *response TTS echo* still rang in the
+mic, unlike the always-quiet first wake. So "Second interaction" hearings often lost with a
+real speaker.
+Fix (`voice/loop.py`): `_reset_voice_state()` order = `flush()` → **bounded quiet-start gate**
+(`_quiet_start_drain`) → `wake_detector.reset()` → counters → LISTENING;
+`_rearm_wake_for_confirmation()` order = speak → flush → reset → listen. The gate drains
+samples until the first below-threshold (silence) chunk, bounded by drained *audio-seconds*
+(`_REARM_QUIET_GATE_S=0.5`, constructor `rearm_quiet_gate_s`, 0 disables). Bounding by audio
+seconds (not wall clock) is essential: fake audio calls return whole segments, so a wall-time
+gate spins at CPU speed and consumes scripted feeds.
+Regression proof: 4 new tests in `TestRearmQuietStartGate`; verified 3/4 fail with the fix
+removed (temp backup at `%TEMP%\loop.py.fixed`, restored). Also de-flaked the pre-existing
+race in `test_successful_interaction_speaks_and_keeps_listening` (poll `len(spoken) >= 2`
+before asserting).
+
+### Part 2 — Phase 7 Audit (was stubs) — READ-ONLY by design
+- `audit/checks.py` (full): `Finding` dataclass + `Severity`; `SECTION_CHECKS` =
+  security/performance/updates/self; fixed PowerShell whitelist **module constants** run via
+  `subprocess.run([...], check=False)` — never `shell=True`, never interpolated; per-command
+  timeouts (`_PS_TIMEOUTS`, updates 60 s); `_exec_safe` maps timeout/OSError to an honest
+  `unknown` (fail closed — BitLocker needs admin → unknown, never a false ok). Checks:
+  defender, firewall, bitlocker, listening ports (psutil), startup entries (winreg),
+  scheduled tasks, performance, pending updates, self-review of the jarvis.jsonl
+  (repeated ERROR/WARNING lines). `run_checks()` is injectable (executor/os_name/psutil/
+  winreg) for any-OS fixture tests and **never writes to disk** (tested).
+- `audit/report.py`: `render_markdown` (severity rollup, sectioned, "unknown" note) +
+  `write_report` → timestamped `audit-YYYYMMDD-HHMMSS.md` in `config.reports_dir()` — the
+  audit package's ONLY disk write.
+- `tools/audit.py` + registry: `audit_run` (Tier 0, read-only), `defender_status` (Tier 0,
+  read-only), `defender_quick_scan` (Tier 1 — starts a background `Start-MpScan`, distinct
+  from the read-only audit; `CREATE_NO_WINDOW` via `getattr`, `_SPAWNED_SCANS` keeps Popen
+  refs). All commands come from the shared whitelist constants (tested).
+- CLI: `jarvis audit [--section/-s …] [--out DIR]` — rich severity table; exits 0 even with
+  critical findings (documented in report); exit 1 only on internal failure. Smoke-tested
+  for real on this PC: report written with real Defender/firewall/startup/tasks data, honest
+  `unknown` for BitLocker (needs admin) and the absent failure log.
+
+Validation (dev PC): `pytest tests/unit/test_audit.py` (26) + `test_package.py` green; full
+`pytest tests -m "not windows_only and not slow and not voice"` **exit 0** (only pre-existing
+daemon async-mock coroutine warnings); `ruff check .` clean; `ruff format` applied; `mypy
+src/jarvis/policy` Success. NOT committed.
+
+Manual smoke test for the PC:
+1. `.venv\Scripts\jarvis.exe audit` → rich table + report path under
+   `%LOCALAPPDATA%\jarvis\jarvis\reports\audit-*.md`; open and eyeball findings.
+2. `jarvis audit -s security -s performance` → subset run works.
+3. Voice: `jarvis daemon --foreground` → 3× "hey jarvis / command / response / hey jarvis …"
+   back-to-back on a real speaker — every re-arm must detect (the old echo-deaf re-arm).
+
 ## Session 2026-09-24 — ~7 s STT_RESULT→INTERACTION_COMPLETE delay — ROOT-CAUSED & FIXED (no commit)
 
 **Root cause (proven from the real `%LOCALAPPDATA%\jarvis\jarvis\logs\jarvis.jsonl`, not
