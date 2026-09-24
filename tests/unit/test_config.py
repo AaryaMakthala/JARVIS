@@ -20,7 +20,9 @@ def isolated_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_defaults_when_no_config(isolated_data_dir: Path) -> None:
     settings = config.load_settings()
     assert settings.llm.planner_model == ""
-    assert settings.llm.provider_order == ["groq", "gemini"]
+    assert settings.llm.provider_order == ["openrouter", "nvidia", "gemini", "groq"]
+    assert settings.llm.free_only is True
+    assert settings.llm.strict_zero_cost is True
     assert settings.agent.max_steps == 12
     assert settings.policy.unlock_ttl_seconds == 300
     assert settings.daemon.host == "127.0.0.1"
@@ -31,10 +33,26 @@ def test_default_config_toml_parses() -> None:
     data = tomllib.loads(config.DEFAULT_CONFIG_TOML)
     assert data["config_version"] == 1
     llm = data["llm"]
-    assert llm["planner_model"] == ""
-    assert llm["max_retries"] == 3
+    assert llm["provider_order"] == ["openrouter", "nvidia", "gemini", "groq"]
+    assert llm["free_only"] is True
+    assert llm["strict_zero_cost"] is True
+    assert llm["max_retries"] == 1
+    assert llm["models"]["groq"]["planner"] == "openai/gpt-oss-120b"
+    assert llm["models"]["groq"]["fast"] == "openai/gpt-oss-20b"
+    assert llm["models"]["openrouter"]["planner"] == "openrouter/free"
+    assert llm["models"]["gemini"]["planner"] == "gemini-3.8-flash"
+    assert llm["models"]["nvidia"]["planner"] == "nvidia/nemotron-3-super-120b-a12b"
     assert data["agent"]["max_steps"] == 12
     assert data["policy"]["unlock_ttl_seconds"] == 300
+
+
+def test_strict_zero_cost_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    toml = tmp_path / "config.toml"
+    toml.write_text(config.DEFAULT_CONFIG_TOML, encoding="utf-8")
+    monkeypatch.setenv("JARVIS_LLM__STRICT_ZERO_COST", "false")
+    settings = config.load_settings(toml)
+    assert settings.llm.strict_zero_cost is False
+    assert settings.llm.free_only is True
 
 
 def test_load_from_toml_file(tmp_path: Path) -> None:
@@ -42,6 +60,7 @@ def test_load_from_toml_file(tmp_path: Path) -> None:
     toml.write_text(config.DEFAULT_CONFIG_TOML, encoding="utf-8")
     settings = config.load_settings(toml)
     assert settings.llm.timeout_seconds == 30.0
+    assert settings.llm.models["groq"].planner == "openai/gpt-oss-120b"
     assert settings.agent.max_steps == 12
 
 

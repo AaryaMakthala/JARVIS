@@ -100,12 +100,34 @@ def test_secret_names_and_redactables_align() -> None:
     assert set(SECRET_NAMES) == set(REDACTABLE_NAMES)
     assert SET_OF_NORMAL_NAMES == {
         "groq_api_key",
+        "openrouter_api_key",
         "gemini_api_key",
+        "nvidia_api_key",
         "tavily_api_key",
         "ipc_token",
         "password_hash",
         "virustotal_api_key",
     }
+
+
+def test_provider_secret_map_matches_secret_names() -> None:
+    from jarvis.secrets import PROVIDER_SECRETS, SECRET_NAMES
+
+    assert set(PROVIDER_SECRETS.values()) <= set(SECRET_NAMES)
+    assert PROVIDER_SECRETS["groq"] == "groq_api_key"
+    assert PROVIDER_SECRETS["openrouter"] == "openrouter_api_key"
+    assert PROVIDER_SECRETS["gemini"] == "gemini_api_key"
+    assert PROVIDER_SECRETS["nvidia"] == "nvidia_api_key"
+    assert PROVIDER_SECRETS["tavily"] == "tavily_api_key"
+
+
+def test_secret_env_vars_mapping() -> None:
+    from jarvis.secrets import SECRET_ENV_VARS
+
+    assert SECRET_ENV_VARS["groq_api_key"] == ("GROQ_API_KEY",)
+    assert SECRET_ENV_VARS["gemini_api_key"] == ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    assert SECRET_ENV_VARS["nvidia_api_key"] == ("NVIDIA_API_KEY",)
+    assert "ipc_token" not in SECRET_ENV_VARS  # never from env
 
 
 SET_OF_NORMAL_NAMES = set(SECRET_NAMES)

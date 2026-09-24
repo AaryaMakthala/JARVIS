@@ -33,6 +33,14 @@ LLM_NOT_CONFIGURED = (
     "JARVIS's AI backend is not configured yet. "
     "Configure an LLM provider before asking me to reason about tasks."
 )
+
+#: Voice variant of the not-configured halt.  The full terminal message is
+#: read aloud through TTS, which costs several seconds of dead air after every
+#: conversational command while no LLM provider is configured (the agent path
+#: itself takes ~50 ms; the rest was SAPI speaking 108 characters).  The voice
+#: channel gets the same honest refusal in a speech-sized form; terminal keeps
+#: the actionable full text.
+LLM_NOT_CONFIGURED_VOICE = "My AI backend is not configured yet."
 LLM_TIMEOUT = "JARVIS couldn't get a response from the AI backend in time."
 LLM_RATE_LIMITED = "I couldn't reach the AI service."
 LLM_PROVIDER_ERROR = "I couldn't reach the AI service."
@@ -42,8 +50,23 @@ LLM_NO_ANSWER = "I couldn't produce an answer."
 
 def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     """Classify the request and propose actions via one structured LLM call."""
+    task_id = state.get("task_id")
     if ctx.llm is None:
+        # Fail immediately: there is nothing to wait for, so no retry, no
+        # timeout, no provider probing may happen on this path.
+        if (state.get("source") or "") == "voice":
+            ctx.logger.info(
+                "agent event=llm_skip task_id=%s reason=no_provider variant=voice",
+                task_id,
+            )
+            return {"halted_reason": LLM_NOT_CONFIGURED_VOICE}
+        ctx.logger.info(
+            "agent event=llm_skip task_id=%s reason=no_provider variant=terminal",
+            task_id,
+        )
         return {"halted_reason": LLM_NOT_CONFIGURED}
+
+    ctx.logger.info("agent event=llm_start task_id=%s", task_id)
 
     previous_error = state.get("error") if int(state.get("validate_attempts") or 0) > 0 else None
     catalogue = ctx.registry.catalogue_for_llm()
@@ -65,6 +88,8 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - a brain failure stops this task only
         ctx.logger.warning("brain call failed: %s", exc)
         return {"halted_reason": _llm_halted_reason(exc)}
+    finally:
+        ctx.logger.info("agent event=llm_complete task_id=%s", task_id)
     if not isinstance(model, BrainDecision):
         ctx.logger.warning("brain returned a non-BrainDecision: %s", type(model).__name__)
         return {"halted_reason": LLM_INVALID_OUTPUT}

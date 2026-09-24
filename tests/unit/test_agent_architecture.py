@@ -139,6 +139,25 @@ def test_no_llm_backend_halts_cleanly(saver: Any) -> None:
     assert record == []
 
 
+def test_no_llm_backend_voice_source_gets_short_spoken_answer(saver: Any) -> None:
+    """A voice-sourced task with no LLM halts with the speech-sized refusal.
+
+    Regression for the ~7 s dead-air between STT_RESULT and INTERACTION_COMPLETE:
+    the delay was SAPI TTS reading the 108-character terminal refusal aloud
+    (~15 chars/s).  The voice variant is short, and the halt still fires in the
+    brain node with no LLM call and no tool execution.
+    """
+    record: list[tuple[str, dict[str, Any]]] = []
+    ctx = make_app_context(
+        Settings(),
+        llm=None,
+        registry=registry_with(_eager_spec("fake_echo", record)),
+    )
+    out = run_task(ctx, saver, "do something", source="voice")
+    assert out.final_answer == "My AI backend is not configured yet."
+    assert record == []
+
+
 # ── tool execution paths ───────────────────────────────────────────────────
 
 

@@ -38,11 +38,23 @@ from jarvis.agent import (
     run_task,
 )
 from jarvis.checks import Check, _check
-from jarvis.llm.client import GroqClient, LLMError
-from jarvis.llm.provider import build_llm_client
+from jarvis.llm import models as llm_models
+from jarvis.llm.client import (
+    LLMAuthError,
+    LLMCapabilityError,
+    LLMError,
+    LLMModelError,
+    LLMTransientError,
+)
+from jarvis.llm.provider import (
+    build_llm_client,
+    build_provider_client,
+    provider_has_credential,
+)
 from jarvis.platform_guard import is_64bit, is_python_supported, is_windows
 from jarvis.policy import tiers
 from jarvis.policy.unlock import UnlockManager
+from jarvis.secrets import PROVIDER_SECRETS
 
 app = typer.Typer(
     name="jarvis",
@@ -61,6 +73,22 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 
+CREDENTIAL_PROVIDERS = ("groq", "openrouter", "gemini", "nvidia", "tavily")
+
+
+def _provider_label(short: str) -> str:
+    return llm_models.PROVIDER_LABELS.get(short, short.capitalize())
+
+
+def _validate_provider(short: str) -> str:
+    """Normalise a provider argument; raises ValueError for unknown names."""
+    if short not in PROVIDER_SECRETS:
+        raise ValueError(
+            f"unknown provider {short!r}; expected one of: {', '.join(PROVIDER_SECRETS)}"
+        )
+    return short
+
+
 def init_config(
     store: secret_module.SecretStore,
     *,
@@ -68,15 +96,21 @@ def init_config(
     interactive: bool = True,
     data_dir: Path | None = None,
     config_path: Path | None = None,
+    prompt_fn: Any = None,
 ) -> list[str]:
-    """Create the data directory, write ``config.toml``, store API keys.
+    """Create the data directory, write ``config.toml``, store provider keys.
 
-    Returns a list of human-readable status lines. Never prints secrets.
+    Each provider is prompted exactly once; pressing Enter (an empty value)
+    skips that optional provider, so there is never an infinite prompt loop.
+    If ``prompt_fn`` is given it is used instead of ``getpass.getpass``
+    (tests / non-console callers).  Returns a list of human-readable status
+    lines.  Never prints secrets.
     """
     messages: list[str] = []
     data_dir = data_dir or config.user_data_dir()
     config_path = config_path or config.config_file()
     store = store or secret_module.SecretStore()
+    prompt_fn = prompt_fn or getpass.getpass
 
     data_dir.mkdir(parents=True, exist_ok=True)
     if config_path.is_file():
@@ -88,24 +122,28 @@ def init_config(
             tomli_w.dump(tomllib.loads(config.DEFAULT_CONFIG_TOML), fh)
         messages.append(f"wrote default config: {config_path}")
 
-    provided = provided_keys or {}
-    for short, secret_name in (
-        ("groq", "groq_api_key"),
-        ("gemini", "gemini_api_key"),
-        ("tavily", "tavily_api_key"),
-    ):
-        if provided.get(short):
-            store.set(secret_name, provided[short])
+    provided = {k: (v or "").strip() for k, v in (provided_keys or {}).items()}
+    configured: dict[str, bool] = {}
+    for short in CREDENTIAL_PROVIDERS:
+        secret_name = PROVIDER_SECRETS[short]
+        label = _provider_label(short)
+        value = provided.get(short)
+        if not value and interactive:
+            try:
+                raw = prompt_fn(f"{label} API key [optional]: ")
+            except Exception:  # noqa: BLE001 - EOF/abort means "skip all"
+                value = ""
+            else:
+                value = (raw or "").strip()
+        if value:
+            store.set(secret_name, value)
+            configured[short] = True
             messages.append(f"{short}: API key stored in the OS credential store")
         elif interactive:
-            try:
-                value = typer.prompt(f"{secret_module.SECRET_NAMES[secret_name]}", hide_input=True)
-            except (typer.Abort, typer.BadParameter):
-                raise typer.Exit(code=1)
-            if value:
-                store.set(secret_name, value)
-                messages.append(f"{short}: API key stored in the OS credential store")
+            configured[short] = False
+            messages.append(f"{short}: key not provided (skipped)")
         else:
+            configured[short] = False
             messages.append(f"{short}: key not provided (skipped in non-interactive mode)")
 
     token = store.get("ipc_token")
@@ -115,25 +153,142 @@ def init_config(
         store.set("ipc_token", stdlib_secrets.token_urlsafe(32))
         messages.append("ipc_token: generated and stored (daemon auth)")
 
+    messages.append("Configured providers:")
+    for short in CREDENTIAL_PROVIDERS:
+        messages.append(f"{_provider_label(short)}: {'yes' if configured[short] else 'no'}")
+    messages.append("LLM free-only mode: enabled")
+    messages.append("LLM strict zero-cost mode: enabled")
     return messages
 
 
-def _live_groq_check(settings: config.Settings, store: secret_module.SecretStore) -> Check:
-    key = None
+# ── keys (credential management) ─────────────────────────────────────────
+
+
+def _clipboard_paste() -> str:
+    """Read the clipboard (Windows-safe via pyperclip). Never logged."""
+    import pyperclip
+
+    return pyperclip.paste() or ""
+
+
+def _clipboard_clear() -> None:
+    """Best-effort clipboard clear after a successful key import.
+
+    Documented behaviour: ``pyperclip.copy("")`` empties the pastable
+    clipboard, but Windows clipboard history may still retain the value -
+    users should clear history manually if that matters to them.
+    """
+    import pyperclip
+
     try:
-        key = store.get("groq_api_key")
-    except secret_module.SecretStoreError as exc:
-        return _check("live_groq", "FAIL", str(exc))
-    if not key:
-        return _check("live_groq", "FAIL", "groq_api_key is missing - run `jarvis init`")
-    if not settings.llm.fast_model:
-        return _check("live_groq", "WARN", "fast_model not configured - set it in config.toml")
+        pyperclip.copy("")
+    except Exception as exc:  # noqa: BLE001 - clipboard APIs differ per OS
+        logger.warning("could not clear the clipboard: %s", exc)
+
+
+def keys_set_command(
+    store: secret_module.SecretStore,
+    short: str,
+    *,
+    value: str | None = None,
+    interactive: bool = True,
+    prompt_fn: Any = None,
+) -> str:
+    """Securely store a provider API key (hidden input). Returns "saved"."""
+    _validate_provider(short)
+    if interactive:
+        prompt_fn = prompt_fn or getpass.getpass
+        value = prompt_fn(f"{_provider_label(short)} API key: ")
+    value = (value or "").strip()
+    if not value:
+        raise ValueError(f"empty API key rejected - nothing stored for {short}")
+    store.set(PROVIDER_SECRETS[short], value)
+    return "saved"
+
+
+def keys_paste_command(
+    store: secret_module.SecretStore,
+    short: str,
+    *,
+    clipboard_fn: Any = None,
+    clear_clipboard_fn: Any = None,
+) -> str:
+    """Import an API key from the clipboard. Returns "saved".
+
+    Strips whitespace, rejects empty values, stores in the keyring and then
+    best-effort clears the clipboard (documented in :func:`_clipboard_clear`).
+    The key itself is never printed.
+    """
+    _validate_provider(short)
+    clipboard_fn = clipboard_fn or _clipboard_paste
+    value = (clipboard_fn() or "").strip()
+    if not value:
+        raise ValueError(f"clipboard was empty - nothing stored for {short}")
+    store.set(PROVIDER_SECRETS[short], value)
+    if clear_clipboard_fn is not None:
+        clear_clipboard_fn()
+    return "saved"
+
+
+def keys_clear_command(store: secret_module.SecretStore, short: str) -> str:
+    """Remove a stored provider API key. Returns "cleared"."""
+
+    _validate_provider(short)
+    store.delete(PROVIDER_SECRETS[short])
+    return "cleared"
+
+
+def keys_status_lines(store: secret_module.SecretStore) -> list[str]:
+    """Render one line per provider: ``groq: configured`` / ``not configured``.
+
+    Presence is effective (keyring, then environment variable); no prefix,
+    suffix, length, hash or masked value is ever shown.
+    """
+    lines: list[str] = []
+    for short in CREDENTIAL_PROVIDERS:
+        present = provider_has_credential(store, short)
+        lines.append(f"{short}: {'configured' if present else 'not configured'}")
+    return lines
+
+
+def _live_provider_check(
+    settings: config.Settings, store: secret_module.SecretStore, name: str
+) -> Check:
+    """Probe one configured provider live (endpoint/auth/model/capabilities).
+
+    Does not call any API unless the provider has a credential.  Errors are
+    mapped to safe messages (never credentials).  Rate limits are a WARN,
+    model availability problems are a FAIL.
+    """
+    label = f"live_{name}"
     try:
-        client = GroqClient(key, settings)
-        client.text(system="You are a connectivity probe.", user="Reply with the single word: ok")
+        client = build_provider_client(settings, store, name)
+    except Exception as exc:  # noqa: BLE001 - LLMConfigError etc. are safe messages
+        return _check(label, "FAIL", str(exc))
+    try:
+        try:
+            client.text(
+                system="You are a connectivity probe.",
+                user="Reply with the single word: ok",
+                model_role="fast",
+                max_tokens=16,
+            )
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                close()
+    except LLMAuthError:
+        return _check(label, "FAIL", f"{name} rejected the API key (authentication failed)")
+    except LLMModelError as exc:
+        return _check(label, "FAIL", str(exc))
+    except LLMCapabilityError as exc:
+        return _check(label, "WARN", str(exc))
+    except LLMTransientError:
+        return _check(label, "WARN", f"{name} is rate limited or transiently unavailable")
     except LLMError as exc:
-        return _check("live_groq", "FAIL", str(exc))
-    return _check("live_groq", "PASS", "Groq API reachable")
+        return _check(label, "FAIL", str(exc))
+    model = settings.llm.model_for(name, "planner")
+    return _check(label, "PASS", f"{model} reachable ({name}, free-only)")
 
 
 def run_doctor(
@@ -142,7 +297,13 @@ def run_doctor(
     store: secret_module.SecretStore | None = None,
     live: bool = False,
 ) -> list[Check]:
-    """Produce environment checks without touching the console."""
+    """Produce environment checks without touching the console.
+
+    Plain ``doctor`` never calls any API: it reports credential presence
+    (keyring, then environment) and checks that every configured provider has
+    a free-eligible model.  ``live=True`` probes only providers that have a
+    credential.
+    """
     settings = settings or config.load_settings()
     store = store or secret_module.SecretStore()
     checks: list[Check] = []
@@ -165,22 +326,6 @@ def run_doctor(
     else:
         checks.append(_check("config", "WARN", "no config.toml - run `jarvis init`"))
 
-    missing_models = [
-        role for role in ("planner", "fast", "vision") if not getattr(settings.llm, f"{role}_model")
-    ]
-    if missing_models:
-        checks.append(
-            _check(
-                "models",
-                "WARN",
-                "unset model role(s): "
-                + ", ".join(missing_models)
-                + " (choose from provider docs, set in config.toml)",
-            )
-        )
-    else:
-        checks.append(_check("models", "PASS", "planner/fast/vision models are configured"))
-
     backend = store.check_store_access()
     if backend:
         checks.append(_check("keyring", "PASS", f"credential store reachable ({backend})"))
@@ -189,20 +334,135 @@ def run_doctor(
             _check("keyring", "FAIL", "credential store unreachable - secrets cannot be protected")
         )
 
-    for name, status_if_missing in (
-        ("groq_api_key", "FAIL"),
-        ("gemini_api_key", "WARN"),
-        ("tavily_api_key", "WARN"),
-    ):
-        if store.has(name):
-            checks.append(_check(name, "PASS", "present"))
+    providers = settings.llm.provider_order
+    present: dict[str, bool] = {name: provider_has_credential(store, name) for name in providers}
+    any_present = any(present.values())
+
+    for name in providers:
+        if present[name]:
+            checks.append(_check(f"{name}_api_key", "PASS", "present"))
+        elif any_present:
+            checks.append(
+                _check(
+                    f"{name}_api_key",
+                    "WARN",
+                    f"{name}_api_key missing - provide it with `jarvis keys set {name}`",
+                )
+            )
         else:
             checks.append(
-                _check(name, status_if_missing, f"{name} missing - provide it with `jarvis init`")
+                _check(
+                    f"{name}_api_key",
+                    "FAIL",
+                    f"{name}_api_key missing - provide it with `jarvis keys set {name}`",
+                )
             )
 
+    tavily_present = provider_has_credential(store, "tavily")
+    checks.append(
+        _check(
+            "tavily_api_key",
+            "PASS" if tavily_present else "WARN",
+            "present" if tavily_present else "tavily_api_key missing (optional web search)",
+        )
+    )
+
+    if settings.llm.free_only:
+        checks.append(_check("free_only", "PASS", "enabled - paid models are rejected"))
+    else:
+        checks.append(
+            _check("free_only", "WARN", "disabled - paid models could be selected; not recommended")
+        )
+
+    if settings.llm.strict_zero_cost:
+        checks.append(
+            _check(
+                "strict_zero_cost",
+                "PASS",
+                "enabled - only verified zero-cost endpoints are selectable",
+            )
+        )
+    else:
+        checks.append(
+            _check(
+                "strict_zero_cost",
+                "WARN",
+                "disabled - free-tier models are allowed; their billing state "
+                "cannot be verified, so this is not strictly zero-cost",
+            )
+        )
+
+    configured_providers: list[str] = []
+    for name in providers:
+        if not present[name]:
+            continue
+        planner = settings.llm.model_for(name, "planner")
+        fast = settings.llm.model_for(name, "fast")
+        if not planner and not fast:
+            checks.append(
+                _check(
+                    f"{name}_model", "WARN", f"no model configured for {name} - run `jarvis init`"
+                )
+            )
+            continue
+        allowed, spec, reason = llm_models.qualify(
+            name,
+            planner,
+            free_only=settings.llm.free_only,
+            strict_zero_cost=settings.llm.strict_zero_cost,
+        )
+        if allowed:
+            caps = spec.capabilities
+            checks.append(
+                _check(
+                    f"{name}_model",
+                    "PASS",
+                    f"{planner}: {llm_models.pricing_message(spec)} "
+                    f"(tools={caps.supports_tools}, structured={caps.supports_structured_output})",
+                )
+            )
+            configured_providers.append(name)
+        elif spec.pricing_mode == "free_tier":
+            checks.append(
+                _check(
+                    f"{name}_model",
+                    "WARN",
+                    f"{planner} is free-tier eligible, but account billing state cannot be "
+                    "verified under strict zero-cost mode (set strict_zero_cost=false to allow)",
+                )
+            )
+        else:
+            checks.append(_check(f"{name}_model", "FAIL", reason))
+
+    if configured_providers:
+        checks.append(
+            _check(
+                "llm_provider", "PASS", "free LLM provider(s): " + ", ".join(configured_providers)
+            )
+        )
+    else:
+        checks.append(_check("llm_provider", "FAIL", "No free LLM provider configured"))
+
+    checks.append(
+        _check(
+            "vision",
+            "WARN",
+            "vision is not wired into the graph yet; no vision capability is required",
+        )
+    )
+
     if live:
-        checks.append(_live_groq_check(settings, store))
+        live_ran = False
+        for name in providers:
+            if present[name]:
+                checks.append(_live_provider_check(settings, store, name))
+                live_ran = True
+        if not live_ran:
+            checks.append(
+                _check(
+                    "live_llm", "FAIL", "No free LLM provider configured - nothing to probe live"
+                )
+            )
     return checks
 
 
@@ -237,8 +497,15 @@ def init(
     groq_api_key: Annotated[
         str | None, typer.Option("--groq-api-key", help="Groq API key (omit to be prompted).")
     ] = None,
+    openrouter_api_key: Annotated[
+        str | None,
+        typer.Option("--openrouter-api-key", help="OpenRouter API key (optional)."),
+    ] = None,
     gemini_api_key: Annotated[
         str | None, typer.Option("--gemini-api-key", help="Gemini API key (optional).")
+    ] = None,
+    nvidia_api_key: Annotated[
+        str | None, typer.Option("--nvidia-api-key", help="NVIDIA API key (optional).")
     ] = None,
     tavily_api_key: Annotated[
         str | None, typer.Option("--tavily-api-key", help="Tavily API key (optional).")
@@ -247,19 +514,103 @@ def init(
         bool, typer.Option("--non-interactive", help="Never prompt; use flags/env only.")
     ] = False,
 ) -> None:
-    """Initialise JARVIS: config + store API keys in the OS credential store."""
+    """Initialise JARVIS: config + store free-provider API keys.
+
+    Each provider is prompted exactly once; pressing Enter skips it.  API
+    keys live only in the OS credential store - never in config.toml.
+    """
     provided: dict[str, str] = {}
-    if groq_api_key:
-        provided["groq"] = groq_api_key
-    if gemini_api_key:
-        provided["gemini"] = gemini_api_key
-    if tavily_api_key:
-        provided["tavily"] = tavily_api_key
+    for short, value in (
+        ("groq", groq_api_key),
+        ("openrouter", openrouter_api_key),
+        ("gemini", gemini_api_key),
+        ("nvidia", nvidia_api_key),
+        ("tavily", tavily_api_key),
+    ):
+        if value:
+            provided[short] = value
+    console.print("[bold]JARVIS LLM setup[/bold]")
     for line in init_config(
         secret_module.SecretStore(),
         provided_keys=provided,
         interactive=not non_interactive,
     ):
+        console.print(line)
+
+
+# ── keys subcommand ──────────────────────────────────────────────────────
+
+
+def _wait_for_enter() -> None:
+    """Single blocking read (no loop); EOF is treated as cancellation."""
+    try:
+        input("Press Enter when the API key is on the clipboard...")
+    except (EOFError, KeyboardInterrupt):
+        return
+
+
+keys_app = typer.Typer(
+    help="Manage provider API keys (OS credential store only).", no_args_is_help=True
+)
+app.add_typer(keys_app, name="keys")
+
+
+@keys_app.command("set")
+def keys_set(
+    provider: Annotated[str, typer.Argument(help="groq|openrouter|gemini|nvidia|tavily")],
+) -> None:
+    """Securely store a provider API key (hidden paste-friendly input)."""
+    try:
+        message = keys_set_command(secret_module.SecretStore(), provider)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]{message}[/green]")  # only ever says "saved"
+
+
+@keys_app.command("paste")
+def keys_paste(
+    provider: Annotated[str, typer.Argument(help="groq|openrouter|gemini|nvidia|tavily")],
+) -> None:
+    """Import an API key from the Windows clipboard (safe for pasting)."""
+    try:
+        _validate_provider(provider)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    console.print(
+        f"Copy the API key to the clipboard, then press Enter. ({_provider_label(provider)})"
+    )
+    _wait_for_enter()
+    try:
+        message = keys_paste_command(
+            secret_module.SecretStore(),
+            provider,
+            clear_clipboard_fn=_clipboard_clear,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]{message}[/green]")  # only ever says "saved"
+
+
+@keys_app.command("clear")
+def keys_clear(
+    provider: Annotated[str, typer.Argument(help="groq|openrouter|gemini|nvidia|tavily")],
+) -> None:
+    """Remove a stored provider API key from the credential store."""
+    try:
+        message = keys_clear_command(secret_module.SecretStore(), provider)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]{message}[/green]")
+
+
+@keys_app.command("status")
+def keys_status() -> None:
+    """Show which provider credentials are present (never the keys)."""
+    for line in keys_status_lines(secret_module.SecretStore()):
         console.print(line)
 
 
@@ -269,10 +620,14 @@ def init(
 @app.command()
 def doctor(
     live: Annotated[
-        bool, typer.Option("--live", help="Also make a real Groq API call with a configured key.")
+        bool,
+        typer.Option(
+            "--live",
+            help="Also probe configured providers with real API calls (never a paid model).",
+        ),
     ] = False,
 ) -> None:
-    """Verify the JARVIS environment."""
+    """Verify the JARVIS environment (free-only LLM setup)."""
     checks = run_doctor(live=live)
     table = Table(show_header=False, box=None)
     for check in checks:
@@ -646,9 +1001,11 @@ def _chat_no_daemon() -> None:
     store = secret_module.SecretStore()
     selection = build_llm_client(settings, store, logger=logging.getLogger("jarvis.cli"))
     if selection.client is None:
-        detail = "; ".join(selection.reasons) or "no LLM provider is configured"
-        console.print(f"[red]No LLM backend configured: {detail}[/red]")
-        console.print("[dim]run `jarvis init` to set up a provider.[/dim]")
+        detail = "; ".join(selection.reasons) or "no provider is configured"
+        console.print(f"[red]No free LLM provider configured: {detail}[/red]")
+        console.print(
+            "[dim]run `jarvis init` or `jarvis keys set <provider>` to set up a free provider.[/dim]"
+        )
         raise typer.Exit(code=1)
 
     try:

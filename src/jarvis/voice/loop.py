@@ -370,6 +370,7 @@ class VoiceLoop:
 
             while self._running and not self._stop_event.is_set():
                 # Phase 1: Wait for wake word (or voice activity)
+                logger.info("VOICE WAKE_WAIT_RESTART")
                 if not self._wait_for_wake():
                     if self._idle_timed_out:
                         logger.info("voice loop idle timeout reached; stopping")
@@ -427,6 +428,7 @@ class VoiceLoop:
         not disable voice.  A failure of the underlying microphone read still
         surfaces as ``loop-crashed``.
         """
+        logger.info("VOICE WAKE_WAIT_START")
         if self._wake_detector is None:
             # No wake-word model; use a simple voice-activity gate.
             segment = self._audio.read(4800)  # 300 ms
@@ -474,6 +476,7 @@ class VoiceLoop:
                 continue
             if result.detected:
                 logger.info("VOICE wake_detected")
+                logger.info("VOICE WAKE_DETECTED")
                 logger.info("voice boundary: wake trigger; entering interaction")
                 self._set_state("WAKE_DETECTED")
                 return True
@@ -493,6 +496,7 @@ class VoiceLoop:
         outside an interaction (device open, wake detector, stop) kill the
         loop.
         """
+        logger.info("VOICE INTERACTION_START")
         logger.info("voice boundary: interaction start")
 
         # Phase 2: Acknowledge wake.  The state is still WAKE_DETECTED so the
@@ -517,6 +521,7 @@ class VoiceLoop:
             logger.exception("voice interaction failed at capture-flush; continuing to listen")
             return
         logger.info("VOICE capture_started")
+        logger.info("VOICE COMMAND_CAPTURE_START")
         logger.info("voice boundary: capture start (max_segment_s=%.1f)", self._max_segment_s)
         try:
             segment = self._read_command(int(self._max_segment_s * 16_000))
@@ -524,6 +529,7 @@ class VoiceLoop:
             logger.exception("voice interaction failed at capture; continuing to listen")
             return
         logger.info("VOICE capture_finished")
+        logger.info("VOICE COMMAND_CAPTURE_END")
         logger.info(
             "voice boundary: capture done (duration_s=%.3f samples=%d)",
             segment.duration_s,
@@ -538,6 +544,7 @@ class VoiceLoop:
 
         # Phase 4: Transcribe
         self._set_state("TRANSCRIBING")
+        logger.info("VOICE STT_START")
         logger.info("voice boundary: stt start (audio_s=%.3f)", segment.duration_s)
         try:
             result = self._stt.transcribe(segment)
@@ -550,6 +557,7 @@ class VoiceLoop:
         # possible sensitive wording never reaches the log (docs/03 §10).
         text = result.text.strip()
         logger.info("VOICE transcript=%d chars", len(text))
+        logger.info("VOICE STT_RESULT")
         logger.info("voice boundary: stt done (chars=%d language=%s)", len(text), result.language)
         logger.info("voice transcript: %d chars", len(text))
         logger.debug("voice transcript: %r", redact(text))
@@ -559,25 +567,31 @@ class VoiceLoop:
 
         # Phase 5: Route
         self._set_state("PROCESSING")
+        logger.info("VOICE ROUTING_START")
         logger.info("voice boundary: routing command")
         try:
             response = self._route(text)
         except Exception:
             logger.exception("voice interaction failed at route; continuing to listen")
             return
+        logger.info("VOICE ROUTING_COMPLETE")
         if response is None:
             logger.info("voice boundary: route returned no response; returning to wake")
             return
+        logger.info("VOICE RESPONSE_START")
         logger.info("voice boundary: response ready (chars=%d)", len(response))
 
         self._set_state("SPEAKING")
         try:
+            logger.info("VOICE TTS_START")
             logger.info("voice boundary: tts response speech starting")
             self._tts.speak(response)
+            logger.info("VOICE TTS_COMPLETE")
             logger.info("voice boundary: tts response speech done")
         except Exception:
             logger.exception("voice interaction failed at tts-response; continuing to listen")
             return
+        logger.info("VOICE INTERACTION_COMPLETE")
         logger.info("voice boundary: interaction completed")
 
     def _reset_voice_state(self) -> None:
@@ -614,6 +628,7 @@ class VoiceLoop:
         the ``voice boundary: re-armed`` marker is the caller-visible proof
         that the next wake word will be picked up.
         """
+        logger.info("VOICE WAKE_REARM")
         self._reset_voice_state()
         logger.info("voice boundary: re-armed for next wake")
 

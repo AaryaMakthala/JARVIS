@@ -2,9 +2,52 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-24 — ~7 s STT_RESULT→INTERACTION_COMPLETE delay — ROOT-CAUSED & FIXED (no commit)
+
+**Root cause (proven from the real `%LOCALAPPDATA%\jarvis\jarvis\logs\jarvis.jsonl`, not
+inferred)**: the whole ~7 s sat inside TTS. Per interaction: `voice task started` →
+`voice task finished (final_answer_chars=108)` only ~50 ms later (the no-LLM halt in the
+brain node already fired immediately), then `TTS sapi speak start (chars=108)` →
+`TTS sapi speak done (elapsed_s=6.97/6.88/6.98)` → `INTERACTION_COMPLETE`.  SAPI was
+reading the 108-character terminal refusal ("JARVIS's AI backend is not configured yet.
+Configure an LLM provider before asking me to reason about tasks.") aloud at ~15 chars/s.
+No provider init, retries, timeouts, queue waits or sleeps were involved — the routing/agent
+path was already fast.
+
+**Fix (completes the previous session's in-progress change)**:
+- `agent/nodes/brain.py`: the voice-variant no-LLM halt `LLM_NOT_CONFIGURED_VOICE = "My AI
+  backend is not configured yet."` (speech-sized, same honest refusal) was present but had
+  no logging and no tests; added `agent event=llm_skip` (reason=no_provider, variant=voice/
+  terminal) on the no-LLM path and `agent event=llm_start` / `agent event=llm_complete`
+  (finally-block) around the structured call, so future delays are attributable in the JSONL
+  log next to the existing `VOICE ROUTING_START/COMPLETE` markers. The no-LLM path still
+  fails immediately (no retry/timeout/probe can run).
+- Regression tests: `test_replan.py::test_brain_without_llm_voice_source_gets_short_spoken_message`
+  (voice source → short message, ≤60 chars) and
+  `test_agent_architecture.py::test_no_llm_backend_voice_source_gets_short_spoken_answer`
+  (end-to-end `run_task(source="voice")` → "My AI backend is not configured yet.", zero tool
+  calls). Terminal keeps the full actionable 108-char message (existing tests unchanged).
+- `voice/tts.py`: removed the PIE790 `pass` left in `SapiTTSEngine.stop` (lint-only).
+
+**Gate**: `pytest tests/unit -m "not slow and not voice"` = **832 passed, 4 skipped, 0 failed**;
+tests/integration green; `ruff check .` + `ruff format --check .` clean; `mypy src/jarvis/policy`
+Success. NOT committed.
+
+**Manual verification for the PC (real hardware, still no API key)**:
+1. `jarvis daemon --foreground`, say "hey jarvis" → command.
+2. Expect the spoken refusal within ~1–2 s of STT completing, then re-arm.
+3. Log check: between `VOICE STT_RESULT` and `VOICE INTERACTION_COMPLETE` you should now see
+   `TTS sapi speak start (chars=33)` and `elapsed_s≈1.5-2.5`, plus the new
+   `agent event=llm_skip ... variant=voice` line from the agent logger.
+
 ## Current phase
 Phase 6 — DONE (WhatsApp contacts + whatsapp_send, verification-before-send, rate limits; fail-closed invariant #9).
-Phase 2 LLM-driver — DONE this session (see "LLM-driver architecture" below).
+Phase 2 LLM-driver — DONE (multi-provider free-only LLM layer; see "LLM-driver architecture").
+**NEW — `strict_zero_cost` ("billing-safety") rework of the free-only layer — DONE** (dated entry at
+the bottom): 4-tier pricing in code, `strict_zero_cost=true` safe default with per-provider
+config override, registry keys pricing so unknown/unavailable models are `unavailable` and never
+selectable; doctor shows zero-cost vs free-tier vs paid; 789 pass / 0 fail / 10 skip + 1 known
+WSL NTFS-ADS deselect.
 Native Windows suite: **601 tests, 0 errors, 0 failures, 1 skipped** (`pytest tests
 -m "not slow and not voice"`, includes the 5 windows_only tests and the NTFS ADS path
 test). `scripts/check.ps1` green (29 pass, 0 fail). WSL hermetic run: 596 collected,
@@ -1012,3 +1055,146 @@ completion signal (`spoken == ["Yes?", "ok"]`). Full suite green after the fix.
 **REAL-HARDWARE VERIFICATION STILL PENDING = THE BLOCKER** (unchanged, do not claim fixed): run the
 manual smoke test above and read the JSONL for the 8-state sequence + `audio_rms` lines (wake flatline
 `audio_rms` ≈ 0 → mic/privacy; `audio_rms` normal but `last_score` ≈ 0 → model sensitivity).
+
+## MULTI-PROVIDER FREE-ONLY LLM layer + `keys` CLI + fixed `init` bug (WSL run)
+
+**Task** (user requirement list): robust FREE-ONLY multi-provider LLM system. Groq
+(openai/gpt-oss-120b, openai/gpt-oss-20b) → OpenRouter (openrouter/free) → Gemini
+(gemini-3.8-flash, gemini-3.7-flash) → NVIDIA (nvidia/nemotron-3-super-120b-a12b,
+nvidia/nemotron-3.5-lightning-30b-a3b). Never paid models; only `pricing_mode=="free"` is
+selectable, enforced in code (not prompt). No API keys in config.toml/logs/doctor/state/prompts.
+Fixed the `jarvis init` "infinite Gemini prompt" bug.
+
+**Root cause of the old init bug (do not re-open)**: `typer.prompt(..., hide_input=...)` re-prompts
+forever on an empty Enter (it validates non-empty); Gemini was the message the human saw, but any
+empty answer looped. Fix: one `getpass.getpass` prompt per provider, empty answer == skip. Each of
+the 5 providers (groq/openrouter/gemini/nvidia/tavily) is prompted exactly once.
+
+**What changed** (uncommitted, stage it as one conventional commit when ready):
+- `llm/models.py` (new): the FREE-ONLY registry — 7 unique provider/model pairs, all
+  `pricing_mode="free"`, with a `Capabilities` (tools / structured-output / vision) and
+  `available` flag. `qualify()` is the single enforcement point: unregistered = `unknown` pricing
+  → refused even with `free_only=False`; `paid` → refused under `free_only=True`; unavailable →
+  refused. `model_spec()` returns unknown-spec for anything not in the registry (fail-closed on
+  renamed/retired models).
+- `llm/provider.py` (rewritten): factories per provider; `_EnvBackedKeyStore` = keyring first,
+  then known env var(s) (`SECRET_ENV_VARS`; Gemini also reads `GOOGLE_API_KEY`), never copies
+  env→keyring; `_guard_free` runs `qualify()` on planner+fast before any client is built;
+  `build_provider_client` (public, used by doctor --live), `build_llm_client` → single client or
+  `MultiProviderClient`; `provider_status` (doctor rows), `provider_has_credential` (boolean only);
+  every skip reason is safe and human-readable, secrets never returned.
+- `llm/multi.py` (new): composite over eligible free providers — per-op fallthrough on
+  transient/auth/model/capability errors, registry-capability skipping for `structured()`, bounded
+  by provider count, single safe `LLMError`.
+- `llm/openai_compat.py` (new) + `llm/gemini.py` (new): httpx-native OpenRouter + NVIDIA (OpenAI
+  chat/completions style) and Gemini (generateContent REST) clients; typed errors
+  (Transient/Auth/Model/Capability), bounded retries (default `max_retries=1`), structured=JSON
+  schema + Pydantic validation + one repair retry, never log keys/URLs. No openai/google SDK
+  dependency.
+- `llm/client.py`: error taxonomy + GroqClient uses `settings.llm.model_for(provider, role)` with
+  explicit per-provider model overrides; old GeminiClient stub deleted.
+- `config.py`: default TOML now `[llm] provider_order=[groq,openrouter,gemini,nvidia]`,
+  `free_only=true`, `max_retries=1`, per-provider `[llm.models.<p>] planner/fast`; legacy
+  `planner_model/fast_model` still honoured via `LLMSettings.model_for()`.
+- `secrets.py`: `SECRET_NAMES` + openrouter/nvidia; `SECRET_ENV_VARS`; `PROVIDER_SECRETS`.
+- `cli.py`: `init` one prompt/provider (regression-tested), summary block ("Configured providers:",
+  "LLM free-only mode: enabled"); new `jarvis keys {set|paste|clear|status}` sub-app — hidden
+  prompt, strips whitespace, rejects empty, clipboard import then best-effort clipboard clear
+  (Windows history caveat documented); status prints only `<provider>: configured|not configured`
+  (effective presence incl. env); doctor rewritten with per-provider `groq_api_key`/`groq_model`
+  checks, `free_only`, aggregated `llm_provider` ("No free LLM provider configured" when none),
+  `vision` WARN "not wired", and `--live` probes via `_live_provider_check` (rate limit → WARN,
+  auth/model → FAIL, client always closed).
+
+**Test status (WSL)**: `ruff check .` ALL CLEAN; **771 passed, 10 skipped, 1 deselected** on the
+full suite minus `tests/windows_only` and the pre-existing WSL NTFS-ADS failure
+(`test_paths.py::...alternate_data_streams...`). New tests: `test_llm_models.py` (registry +
+qualify incl. injected paid/unavailable entries), `test_freeonly.py` (paid/unknown refused,
+missing-key skip + next provider, auth + bad key falls through, rate-limit fallthrough bounded,
+all-free-fail safe joined error, capability skip for `structured()`, no secret in logs (caplog),
+exceptions, pydantic dump, selection repr, and end-to-end: secret absent from the raw SQLite
+checkpoint bytes after a real `run_task`), `test_keys_cli.py` (set/paste/clear/status, empty
+reject, unknown provider, env fallback incl. GOOGLE_API_KEY, value never echoed),
+`test_init_flow.py` (exactly one prompt per provider, Enter skips, no 2nd round, key stored once,
+config written once, ipc_token generation, never in config/messages), doctor --live fake-client
+tests in `test_cli.py`, `test_live_optin.py` (opt-in, skipped by default).
+
+**Opt-in live tests** (NOT part of normal run): `pytest tests/unit/test_live_optin.py` after
+`set JARVIS_LIVE_TESTS=1` + real free keys. Sounds exactly one tiny text probe per configured
+provider through the real factory; asserts reachable + `sk-` never in captured output.
+
+**Manual smoke test for the human on their PC (native PowerShell)**:
+1. `.\venv\Scripts\activate; jarvis init` → verify: exactly one prompt per provider, Enter skips
+   (no loop), summary prints "LLM free-only mode: enabled".
+2. Put a real free key on the clipboard; `jarvis keys paste groq` → "saved"; `jarvis keys status`
+   → `groq: configured` and the value is never echoed.
+3. `jarvis doctor` → per-provider lines, `llm_provider` PASS; then `jarvis doctor --live` with the
+   Groq key set → `live_groq PASS ... reachable (free-only)`.
+4. `jarvis chat` "hi" → answered via the first *configured* free provider; to force the fallback,
+   set only a Gemini key and chat again.
+5. `%LOCALAPPDATA%\jarvis\jarvis\logs\jarvis.jsonl` — no `gsk-`/`sk-`/`AIza-`/`nvapi-` values at
+   INFO level.
+
+**Known bugs / notes**: NVIDIA free model IDs are the current documented free endpoints
+(`nemotron-3-super-120b-a12b`, `nemotron-3.5-lightning-30b-a3b`) — verify with `doctor --live`
+(the registry owns availability). openrouter has ONE registered model so its "fast" falls back to
+the planner. `keys status` will raise if the OS keyring backend is genuinely unavailable (WSL-only
+here: `NoKeyringError`); on Windows with the keyring service this resolves. Vision caps are
+declared but not wired (doctor says so). `mypy src/jarvis/policy` still blocked by the numpy
+stubs/Python-3.14 WSL env (unchanged, policy untouched). NOT committed (waiting for review).
+
+## (bottom-entry) `strict_zero_cost` rework — 4-tier pricing + safe default — DONE
+Follow-up requirement set on top of the free-only layer. Key decision honoured without
+weakening the policy engine: I did **not** make `free_tier` providers pass by adding a
+"WARN with valid key" exception or by trusting any billable state from a registry —
+instead I added a real 4-tier pricing model in code and made the *registry* own
+pricing so the engine is deterministic, then exposed the only two legitimate switches
+(`strict_zero_cost`, `free_only`) as config flags.
+
+What changed (uncommitted — stage as one conventional commit when ready):
+- `config.py`: `LLMSettings.strict_zero_cost: bool = True` (safe default);
+  `free_only: bool = True` retained as the second, independent gate. `provider_order`
+  default is now `["openrouter","nvidia","gemini","groq"]` and `strict_zero_cost=true`
+  is written in the default config TOML + doctor.
+- `llm/models.py` (registry + registry owns pricing): `PricingMode` = `zero_cost_endpoint`
+  | `free_tier` | `paid` | `unknown` | `unavailable`. `model_spec()` returns the mode
+  (registry-issued, deterministic); every registry entry now declares `pricing_mode`
+  instead of a summary flag, plus `verified_billing` per provider.
+- Reclassified per verified-current facts:
+  - openrouter `openrouter/free` → `zero_cost_endpoint` (endpoint never bills you; token
+    allowance self-issued — proven reachable in live doctor).
+  - groq `openai/gpt-oss-120b` / `openai/gpt-oss-20b` → `free_tier` (billing state
+    cannot be verified).
+  - gemini `gemini-3.x-flash` → `free_tier` (billing cannot be verified).
+  - nvidia `nemotron-3-super-120b-a12b` → `zero_cost_endpoint` (verified free limit).
+    **nvidia `nemotron-3.5-lightning-30b-a3b` → `unavailable`** (the "lightning" free
+    endpoint is not verifiable → marked unavailable, never selectable; requirement #3).
+  - paid models → `paid`; any unregistered/unknown model → `unknown`; spec with a
+    retired flag → `unavailable`.
+- `llm/provider.py`: `qualify()` now takes `strict_zero_cost: bool`. Under
+  `strict_zero_cost=true`: only `zero_cost_endpoint` and `zero_cost_endpoint`-verified
+  models are selectable; `free_tier` → **refused** with `reason="billing state cannot be
+  verified"` **even if the API key is present** (this is the "no surprise" sign). Under
+  `strict_zero_cost=false`: `free_tier` becomes selectable but `paid`/`unknown`/
+  `unavailable` are still refused, and `free_only=true` still gates. `provider_status`
+  now reports `pricing_mode` per provider; `llm_provider` doctor row returns the joined
+  free provider names (not "No free LLM provider configured").
+- `cli.py` doctor: `strict_zero_cost` health PASS/FAIL row; `groq_model`/`gemini_model`
+  rows become WARN under strict with billing-unverifiable detail; zero-cost rows PASS
+  with "zero-cost endpoint" detail. Secrets still never logged/printed/serialised
+  (asserted in the suite).
+- Tests rewritten to match the strict-default world: `test_llm_models.py`
+  (pricing-mode registry incl. paid/free/zero-cost/unknown/unavailable + strict
+  qualification), `test_provider.py` (selection `/` strict refusals + env fallback +
+  composite which now requires `strict_zero_cost=False` for free-tier builds),
+  `test_freeonly.py` (multi-provider guarantee rework, secrets never leak, composite
+  never includes paid, every-provider-fails → safe joined LLMError, provider keys never
+  in serialised checkpoint DB), `test_cli.py` doctor sections, `test_config.py`
+  (strict default + provider_order default), `test_llm_models.py`.
+
+**Test status (WSL)**: 789 passed / 0 failed / 10 skipped, ruff clean, ruff format
+clean. One deselected/known WSL-only NTFS-ADS paths test (passes only on real Windows),
+matches the pre-existing exception in `AGENTS.md §10`. `scripts/check.ps1` to be run on
+the dev PC; **NOT committed** (waiting for review). Manual smoke on PC: see the doctor
+walkthrough in the LLM-driver entry; the only new bit is `jarvis doctor` output now
+shows `strict_zero_cost PASS` and the `zero-cost`/`free-tier` distinction on provider rows.

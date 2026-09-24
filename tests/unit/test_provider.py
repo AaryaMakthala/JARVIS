@@ -1,20 +1,25 @@
 """Provider factory: selection order, clean skip reasons, no key leaks.
 
 ``build_llm_client`` must never raise for the common bad-config cases - it
-returns ``None`` client plus safe reasons so the graph halts cleanly.  The key
-is read through the store protocol and never included in any return value.
+returns ``None`` client plus safe reasons so the graph halts cleanly.  The
+key is read through the store protocol (keyring first, then env) and never
+included in any return value.  Free-only enforcement is tested separately in
+``test_freeonly.py`` / ``test_llm_models.py``.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import typing
 
-from jarvis.config import LLMSettings, Settings
+from jarvis.config import LLMSettings, ProviderModels, Settings
 from jarvis.llm.provider import (
     LLMConfigError,
     build_llm_client,
     provider_status,
 )
+
+PLANNER = "openai/gpt-oss-120b"
+FAST = "openai/gpt-oss-20b"
 
 
 class MemoryKeyStore:
@@ -37,15 +42,31 @@ class ThrowingStore(MemoryKeyStore):
         raise RuntimeError("keyring unavailable")
 
 
-def _settings(provider_order: list[str], planner_model: str = "some-model") -> Settings:
-    return Settings(llm=LLMSettings(provider_order=provider_order, planner_model=planner_model))
+def _settings(
+    provider_order: list[str],
+    planner_model: str = PLANNER,
+    fast_model: str = FAST,
+    *,
+    strict_zero_cost: bool = False,
+) -> Settings:
+    # These tests exercise *selection mechanics*; they opt out of strict
+    # zero-cost mode so free-tier models (Groq) are usable.  The strict
+    # policy itself is covered in test_freeonly.py / test_llm_models.py.
+    return Settings(
+        llm=LLMSettings(
+            provider_order=provider_order,
+            planner_model=planner_model,
+            fast_model=fast_model,
+            strict_zero_cost=strict_zero_cost,
+        )
+    )
 
 
 def test_no_provider_configured_returns_none_cleanly() -> None:
     sel = build_llm_client(_settings([]), MemoryKeyStore())
     assert sel.client is None
     assert sel.info is None
-    assert sel.reasons == ()
+    assert sel.reasons == []
     assert provider_status(_settings([]), MemoryKeyStore()) == []
 
 
@@ -54,14 +75,10 @@ def test_unknown_provider_is_skipped_with_reason() -> None:
     assert sel.client is None
     assert "unknown provider" in sel.reasons[0]
     status = provider_status(_settings(["mystery"]), MemoryKeyStore())
-    assert status == [
-        {
-            "name": "mystery",
-            "label": "mystery",
-            "ok": False,
-            "reason": "unknown provider in provider_order",
-        }
-    ]
+    assert len(status) == 1
+    assert status[0]["name"] == "mystery"
+    assert status[0]["ok"] is False
+    assert "unknown provider" in status[0]["reason"]
 
 
 def test_missing_key_is_a_clean_skip_reason() -> None:
@@ -73,17 +90,17 @@ def test_missing_key_is_a_clean_skip_reason() -> None:
     assert "groq_api_key" in st["reason"]
 
 
-def test_gemini_skipped_as_not_implemented() -> None:
+def test_gemini_skipped_when_no_key() -> None:
     sel = build_llm_client(_settings(["groq", "gemini"]), MemoryKeyStore())
     assert sel.client is None
     assert "groq" in sel.reasons[0] and "key" in sel.reasons[0]
-    assert "not implemented" in sel.reasons[1]
+    assert "gemini" in sel.reasons[1] and "key" in sel.reasons[1]
 
 
 def test_throws_back_to_next_provider_then_none() -> None:
     sel = build_llm_client(_settings(["groq"]), ThrowingStore())
     assert sel.client is None
-    assert "keyring" in sel.reasons[0].lower() or "key" in sel.reasons[0].lower()
+    assert "key" in sel.reasons[0].lower()
 
 
 def test_selection_with_key_and_model_builds_groq() -> None:
@@ -91,8 +108,8 @@ def test_selection_with_key_and_model_builds_groq() -> None:
     sel = build_llm_client(_settings(["groq"]), store)
     assert sel.client is not None
     assert sel.info is not None and sel.info.name == "groq"
-    assert sel.reasons == ()
-    assert sel.info.model == "some-model"
+    assert sel.reasons == []
+    assert sel.info.model == PLANNER
 
 
 def test_no_secret_ever_in_selection() -> None:
@@ -101,6 +118,8 @@ def test_no_secret_ever_in_selection() -> None:
     blob = repr(sel)
     assert "hunter2" not in blob
     assert "sk-" not in blob
+    blob_reasons = repr(sel.reasons)
+    assert "sk-test" not in blob_reasons
 
 
 def test_bad_first_provider_falls_back_to_good_second() -> None:
@@ -109,32 +128,116 @@ def test_bad_first_provider_falls_back_to_good_second() -> None:
     assert sel.client is not None
     assert sel.info is not None and sel.info.name == "groq"
     assert len(sel.reasons) == 1
-    assert "Gemini" in sel.reasons[0]
+    assert "gemini" in sel.reasons[0].lower()
+    assert "key not found" in sel.reasons[0]
 
 
-def test_missing_planner_model_is_reported() -> None:
+def test_missing_models_are_reported() -> None:
     sel = build_llm_client(
-        _settings(["groq"], planner_model=""), MemoryKeyStore({"groq_api_key": "k"})
+        _settings(["groq"], planner_model="", fast_model=""),
+        MemoryKeyStore({"groq_api_key": "k"}),
     )
     assert sel.client is None
-    assert "planner_model" in sel.reasons[0]
+    assert "no model configured" in sel.reasons[0]
+
+
+def test_unregistered_model_is_blocked_by_free_only() -> None:
+    sel = build_llm_client(
+        _settings(["groq"], planner_model="some-model", fast_model="some-model"),
+        MemoryKeyStore({"groq_api_key": "k"}),
+    )
+    assert sel.client is None
+    assert "not registered" in sel.reasons[0]
+
+
+def test_env_key_is_used_but_not_copied_to_keyring(
+    monkeypatch: typing.Any,
+) -> None:
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-from-env")
+    store = MemoryKeyStore()  # keyring has nothing
+    sel = build_llm_client(_settings(["groq"]), store)
+    assert sel.client is not None
+    assert sel.info is not None and sel.info.name == "groq"
+    # env var read but never written into the credential store
+    assert store.has("groq_api_key") is False
+
+
+def test_gemini_env_google_fallback(monkeypatch: typing.Any) -> None:
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIza-env-key")
+    settings = Settings(
+        llm=LLMSettings(
+            provider_order=["gemini"],
+            strict_zero_cost=False,  # gemini is free-tier; not strict-eligible
+            models={"gemini": ProviderModels(planner="gemini-3.8-flash", fast="gemini-3.7-flash")},
+        )
+    )
+    sel = build_llm_client(settings, MemoryKeyStore())
+    assert sel.client is not None
+    assert sel.info is not None and sel.info.name == "gemini"
+
+
+def test_multiple_eligible_providers_make_a_composite() -> None:
+    store = MemoryKeyStore({"groq_api_key": "a", "openrouter_api_key": "b"})
+    settings = Settings(
+        llm=LLMSettings(
+            provider_order=["groq", "openrouter"],
+            strict_zero_cost=False,  # groq is free-tier; not strict-eligible
+            models={
+                "groq": ProviderModels(planner="openai/gpt-oss-120b", fast="openai/gpt-oss-20b"),
+                "openrouter": ProviderModels(planner="openrouter/free", fast="openrouter/free"),
+            },
+        )
+    )
+    sel = build_llm_client(settings, store)
+    assert sel.client is not None
+    assert sel.info is not None and sel.info.name == "groq"
+    # composite exposes the fallback order
+    assert sel.client.providers == ["groq", "openrouter"]
 
 
 def test_provider_status_report_shape() -> None:
     status = provider_status(_settings(["groq", "gemini"]), MemoryKeyStore({"groq_api_key": "k"}))
     assert status[0] == {
         "name": "groq",
-        "label": "Groq (primary)",
+        "label": "Groq",
+        "model": PLANNER,
+        "pricing_mode": "free_tier",
+        "supports_tools": True,
+        "supports_structured_output": True,
+        "available": True,
         "ok": True,
         "reason": "configured",
     }
+    assert status[1]["name"] == "gemini"
     assert status[1]["ok"] is False
-    assert "not implemented" in status[1]["reason"]
+    assert "api key" in status[1]["reason"].lower()
+
+
+def test_provider_status_marks_free_tier_not_ok_under_strict() -> None:
+    status = provider_status(
+        _settings(["groq"], strict_zero_cost=True), MemoryKeyStore({"groq_api_key": "k"})
+    )
+    assert status[0]["ok"] is False
+    assert "billing state cannot be verified" in status[0]["reason"]
 
 
 def test_llm_config_error_is_raiseable_and_safe() -> None:
     err = LLMConfigError("some problem for the user")
     assert isinstance(err, RuntimeError)
     assert str(err) == "some problem for the user"
-    # Convenience: factories raise this; a ProviderFactory typing guard.
-    _ = [Any for _ in ()]  # keep module-level import clean for stub typing tests
+
+
+def test_legacy_per_provider_models_resolve() -> None:
+    settings = Settings(
+        llm=LLMSettings(
+            provider_order=["groq"],
+            models={
+                "groq": ProviderModels(planner="openai/gpt-oss-120b", fast="openai/gpt-oss-20b")
+            },
+        )
+    )
+    assert settings.llm.model_for("groq", "planner") == "openai/gpt-oss-120b"
+    assert settings.llm.model_for("groq", "fast") == "openai/gpt-oss-20b"
+    # legacy fallback still works
+    legacy = Settings(llm=LLMSettings(planner_model="openai/gpt-oss-120b"))
+    assert legacy.llm.model_for("groq", "planner") == "openai/gpt-oss-120b"

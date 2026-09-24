@@ -161,41 +161,83 @@ def test_doctor_full_pass_directory() -> None:
     assert checks["keyring"].status == "PASS"
     assert checks["groq_api_key"].status == "PASS"
     assert checks["gemini_api_key"].status == "PASS"
+    assert checks["tavily_api_key"].status == "PASS"
     assert checks["platform"].status in ("PASS", "WARN")
+    assert checks["strict_zero_cost"].status == "PASS"
 
 
-def test_doctor_reports_missing_key_and_models(
+def test_doctor_reports_missing_key_and_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
     store = FakeStore()
     checks = {c.name: c for c in cli.run_doctor(settings=cli.config.load_settings(), store=store)}
     assert checks["groq_api_key"].status == "FAIL"
-    assert checks["gemini_api_key"].status == "WARN"
+    assert checks["gemini_api_key"].status == "FAIL"  # nothing configured -> gaps are FAILs
     assert checks["config"].status == "WARN"
-    assert checks["models"].status == "WARN"
+    assert checks["llm_provider"].status == "FAIL"
+    assert checks["llm_provider"].detail == "No free LLM provider configured"
+    assert checks["free_only"].status == "PASS"
+    assert checks["strict_zero_cost"].status == "PASS"
 
 
-def test_doctor_pass_with_configured_models(
+def test_doctor_free_tier_warned_under_strict_zero_cost(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
     settings = cli.config.load_settings()
-    settings.llm.planner_model = "p"
-    settings.llm.fast_model = "f"
-    settings.llm.vision_model = "v"
+    settings.llm.provider_order = ["groq"]
+    settings.llm.planner_model = "openai/gpt-oss-120b"
+    settings.llm.fast_model = "openai/gpt-oss-20b"
     store = FakeStore(groq_api_key="gsk-key-1234")
     checks = {c.name: c for c in cli.run_doctor(settings=settings, store=store)}
-    assert checks["models"].status == "PASS"
+    assert checks["groq_api_key"].status == "PASS"
+    # Groq is free-tier; under strict zero-cost it cannot be selected
+    assert checks["groq_model"].status == "WARN"
+    assert "billing state cannot be verified" in checks["groq_model"].detail
+    assert checks["llm_provider"].status == "FAIL"
 
 
-def test_doctor_live_requires_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_doctor_zero_cost_provider_passes_under_strict_zero_cost(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    settings = cli.config.load_settings()
+    settings.llm.provider_order = ["openrouter"]
+    settings.llm.planner_model = "openrouter/free"
+    settings.llm.fast_model = "openrouter/free"
+    store = FakeStore(openrouter_api_key="sk-or-v1-key")
+    checks = {c.name: c for c in cli.run_doctor(settings=settings, store=store)}
+    assert checks["openrouter_api_key"].status == "PASS"
+    assert checks["openrouter_model"].status == "PASS"
+    assert "zero-cost endpoint" in checks["openrouter_model"].detail
+    assert checks["llm_provider"].status == "PASS"
+    assert checks["llm_provider"].detail == "free LLM provider(s): openrouter"
+
+
+def test_doctor_paid_or_unregistered_model_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    settings = cli.config.load_settings()
+    settings.llm.planner_model = "some-paid-model"
+    settings.llm.fast_model = "some-paid-model"
+    store = FakeStore(groq_api_key="gsk-key-1234")
+    checks = {c.name: c for c in cli.run_doctor(settings=settings, store=store)}
+    assert checks["groq_model"].status == "FAIL"
+    assert checks["llm_provider"].status == "FAIL"
+
+
+def test_doctor_live_requires_a_configured_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
     checks = {
         c.name: c
         for c in cli.run_doctor(settings=cli.config.load_settings(), store=FakeStore(), live=True)
     }
-    assert checks["live_groq"].status == "FAIL"
+    assert checks["live_llm"].status == "FAIL"
+    assert "No free LLM provider configured" in checks["live_llm"].detail
 
 
 def test_init_config_writes_config_and_stores_key(tmp_path: Path) -> None:
@@ -212,9 +254,110 @@ def test_init_config_writes_config_and_stores_key(tmp_path: Path) -> None:
     assert data_dir.is_dir()
     assert config_path.is_file()
     parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    assert parsed["llm"]["planner_model"] == ""
+    assert parsed["llm"]["models"]["groq"]["planner"] == "openai/gpt-oss-120b"
+    assert parsed["llm"]["free_only"] is True
     assert store.get("groq_api_key") == "gsk-test-123"
     assert "groq" in " ".join(messages)
+
+
+# ── doctor --live (probe of configured providers, scripted fake client) ────
+
+
+class _FakeProbeClient:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.closed = False
+
+    def text(self, **kwargs: object) -> tuple[str, object]:
+        if self.error is not None:
+            raise self.error
+        return "ok", None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _doctor_settings() -> object:
+    settings = cli.config.load_settings()
+    settings.llm.provider_order = ["groq"]
+    settings.llm.planner_model = "openai/gpt-oss-120b"
+    settings.llm.fast_model = "openai/gpt-oss-20b"
+    return settings
+
+
+def test_doctor_live_pass(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(cli, "build_provider_client", lambda s, st, n: _FakeProbeClient())
+    checks = {
+        c.name: c
+        for c in cli.run_doctor(
+            settings=_doctor_settings(), store=FakeStore(groq_api_key="k"), live=True
+        )
+    }
+    assert checks["live_groq"].status == "PASS"
+
+
+def test_doctor_live_rate_limited_is_warn(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    from jarvis.llm.client import LLMTransientError
+
+    monkeypatch.setattr(
+        cli,
+        "build_provider_client",
+        lambda s, st, n: _FakeProbeClient(error=LLMTransientError("rate limit")),
+    )
+    checks = {
+        c.name: c
+        for c in cli.run_doctor(
+            settings=_doctor_settings(), store=FakeStore(groq_api_key="k"), live=True
+        )
+    }
+    assert checks["live_groq"].status == "WARN"
+
+
+def test_doctor_live_auth_failure_is_fail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    from jarvis.llm.client import LLMAuthError
+
+    monkeypatch.setattr(
+        cli,
+        "build_provider_client",
+        lambda s, st, n: _FakeProbeClient(error=LLMAuthError("bad key")),
+    )
+    checks = {
+        c.name: c
+        for c in cli.run_doctor(
+            settings=_doctor_settings(), store=FakeStore(groq_api_key="k"), live=True
+        )
+    }
+    assert checks["live_groq"].status == "FAIL"
+    assert "authentication" in checks["live_groq"].detail
+
+
+def test_doctor_live_model_retired_is_fail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    from jarvis.llm.client import LLMModelError
+
+    monkeypatch.setattr(
+        cli,
+        "build_provider_client",
+        lambda s, st, n: _FakeProbeClient(error=LLMModelError("model retired")),
+    )
+    checks = {
+        c.name: c
+        for c in cli.run_doctor(
+            settings=_doctor_settings(), store=FakeStore(groq_api_key="k"), live=True
+        )
+    }
+    assert checks["live_groq"].status == "FAIL"
+
+
+def test_doctor_live_closes_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    probe = _FakeProbeClient()
+    monkeypatch.setattr(cli, "build_provider_client", lambda s, st, n: probe)
+    cli.run_doctor(settings=_doctor_settings(), store=FakeStore(groq_api_key="k"), live=True)
+    assert probe.closed is True
 
 
 def test_init_config_non_interactive_skips_missing_keys(tmp_path: Path) -> None:

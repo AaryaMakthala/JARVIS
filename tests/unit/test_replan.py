@@ -260,6 +260,22 @@ def test_brain_without_llm_halts_cleanly() -> None:
     assert "final_answer" not in out
 
 
+def test_brain_without_llm_voice_source_gets_short_spoken_message() -> None:
+    """The no-LLM refusal is speech-sized for voice (7s SAPI dead-air regression).
+
+    The 108-character terminal message was being read aloud by SAPI at ~15
+    chars/s, so every no-LLM voice interaction spent ~7 s between STT_RESULT
+    and INTERACTION_COMPLETE while the agent path itself took ~50 ms.  The
+    voice channel must get the short variant; the terminal keeps the full
+    actionable text.
+    """
+    ctx = make_app_context(Settings())
+    out = brain({"user_input": "hi", "source": "voice"}, ctx)
+    assert out["halted_reason"] == "My AI backend is not configured yet."
+    assert len(out["halted_reason"]) <= 60
+    assert "final_answer" not in out
+
+
 def test_brain_llm_failure_maps_to_safe_messages() -> None:
     # wrong model type (e.g. an old Plan) is a malformed output
     out = brain({"user_input": "hi"}, _ctx([conversation_plan()]))

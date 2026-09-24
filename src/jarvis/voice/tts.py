@@ -6,11 +6,23 @@ SAPI5) is always available as a fallback.
 
 :func:`create` tries Piper first; if it fails, falls back to SAPI.
 If neither works, returns ``None``.
+
+SAPI5 / pyttsx3 note
+--------------------
+The Windows SAPI5 COM backend in ``pyttsx3`` has a well-documented bug
+where repeated ``runAndWait()`` calls on the **same engine instance**
+eventually deadlock the calling thread.  ``SapiTTSEngine`` therefore
+creates a **fresh** ``pyttsx3`` engine for every ``speak()`` call and
+tears it down immediately afterwards.  This is the recommended
+workaround from the pyttsx3 community and avoids the COM event-loop
+hang that would otherwise block the voice-loop thread permanently after
+the first voice interaction.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -37,12 +49,14 @@ class PiperTTSEngine:
         import sounddevice as sd
 
         self._ensure_loaded()
+        logger.info("TTS piper speak start (chars=%d)", len(text))
         # PiperVoice.synthesize_stream_raw returns raw PCM int16 chunks.
         audio_chunks: list[bytes] = list(self._synth.synthesize_stream_raw(text))
         raw = b"".join(audio_chunks)
         audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         sd.play(audio, self._synth.config.sample_rate)
         sd.wait()
+        logger.info("TTS piper speak done")
 
     def stop(self) -> None:
         """Stop any in-progress speech."""
@@ -55,31 +69,53 @@ class PiperTTSEngine:
 
 
 class SapiTTSEngine:
-    """TTS via Windows SAPI (pyttsx3)."""
+    """TTS via Windows SAPI (pyttsx3).
+
+    A **fresh** ``pyttsx3`` engine is created for every :meth:`speak`
+    call and torn down immediately afterwards.  Reusing a single
+    persistent engine causes the SAPI5 COM event loop inside
+    ``runAndWait()`` to deadlock after a small number of calls (a
+    well-documented pyttsx3 / Windows SAPI5 bug).  The per-call init
+    adds ~30 ms of overhead — negligible compared to the speech
+    synthesis itself — and guarantees the voice-loop thread is never
+    permanently blocked by a stale COM state.
+    """
 
     def __init__(self) -> None:
-        self._engine: Any = None
+        # Validate that pyttsx3 is importable at construction time so
+        # create() can report "tts-unavailable" early.  No persistent
+        # engine is stored.
+        import pyttsx3  # noqa: F401
 
-    def _ensure_loaded(self) -> None:
-        if self._engine is not None:
-            return
-        import pyttsx3
-
-        self._engine = pyttsx3.init()
+        logger.info("TTS sapi backend initialized (fresh engine per speak)")
 
     def speak(self, text: str) -> None:
-        """Speak *text* synchronously."""
-        self._ensure_loaded()
-        self._engine.say(text)
-        self._engine.runAndWait()
+        """Speak *text* synchronously with a fresh COM engine."""
+        import pyttsx3
+
+        logger.info("TTS sapi speak start (chars=%d)", len(text))
+        t0 = time.monotonic()
+        logger.info("TTS sapi init start")
+        engine = pyttsx3.init()
+        logger.info("TTS sapi engine initialized")
+        try:
+            logger.info("TTS sapi say start")
+            engine.say(text)
+            logger.info("TTS sapi runAndWait start")
+            engine.runAndWait()
+            logger.info("TTS sapi runAndWait done")
+        finally:
+            logger.info("TTS sapi cleanup start")
+            try:
+                engine.stop()
+            except Exception:
+                logger.debug("pyttsx3 engine.stop() failed", exc_info=True)
+            logger.info("TTS sapi speak done (elapsed_s=%.2f)", time.monotonic() - t0)
 
     def stop(self) -> None:
-        """Stop any in-progress speech."""
-        if self._engine is not None:
-            try:
-                self._engine.stop()
-            except Exception:
-                logger.debug("pyttsx3 stop failed", exc_info=True)
+        """Stop any in-progress speech (best-effort, no persistent engine)."""
+        # With per-call engines there is no persistent engine to stop.
+        # This method exists to satisfy the TextToSpeech protocol.
 
 
 def create(

@@ -34,7 +34,35 @@ class Usage:
 
 
 class LLMError(RuntimeError):
-    """Raised when an LLM call fails after retries or cannot be repaired."""
+    """Raised when an LLM call fails after retries or cannot be repaired.
+
+    Messages are safe for the user: they never contain API keys, prompts,
+    or raw provider payloads.
+    """
+
+
+class LLMTransientError(LLMError):
+    """Rate limit or 5xx server error.
+
+    The caller may retry (bounded) or fall through to the next free provider.
+    """
+
+
+class LLMAuthError(LLMError):
+    """The credential was rejected (HTTP 401/403).  Never retried."""
+
+
+class LLMModelError(LLMError):
+    """The model name is unknown/retired on the provider (HTTP 404)."""
+
+
+class LLMCapabilityError(LLMError):
+    """The selected model cannot satisfy the requested capability
+
+    (e.g. no JSON-schema support for structured output).  The receiving
+    provider is skipped for that operation and the next compatible free
+    provider is tried instead of silently degrading.
+    """
 
 
 @runtime_checkable
@@ -80,11 +108,16 @@ class GroqClient:
         settings: config.Settings,
         completer: Callable[..., Any] | None = None,
         logger: logging.Logger | None = None,
+        planner_model: str | None = None,
+        fast_model: str | None = None,
     ) -> None:
         import groq
 
         self._groq_module = groq
+        self._provider_name = "groq"
         self._settings = settings
+        self._planner_model_override = planner_model
+        self._fast_model_override = fast_model
         self._logger = logger or get_logger("llm.client")
         self._groq = groq.Groq(
             api_key=api_key,
@@ -102,10 +135,13 @@ class GroqClient:
     def _model_for(self, role: str) -> str:
         if role not in _MODEL_ROLES:
             raise LLMError(f"unknown model role {role!r}; expected one of {_MODEL_ROLES}")
-        name = getattr(self._settings.llm, f"{role}_model")
+        override = {"planner": self._planner_model_override, "fast": self._fast_model_override}
+        if override.get(role):
+            return str(override[role])
+        name = self._settings.llm.model_for(self._provider_name, role)
         if not name:
             raise LLMError(
-                f"no LLM model configured for role {role!r}"
+                f"no LLM model configured for role {role!r} on {self._provider_name}"
                 " - set it in config.toml [llm] after checking the provider docs"
             )
         return str(name)
@@ -118,10 +154,13 @@ class GroqClient:
         response_format: dict[str, Any] | None,
         temperature: float,
     ) -> tuple[str, int, int]:
-        """Run one completion; retry 429/5xx with backoff.
+        """Run one completion; bounded retry for transient 429/5xx errors.
 
-        Returns ``(content, prompt_tokens, completion_tokens)``. HTTP 400
-        "json_schema" errors propagate unwrapped so callers can fall back.
+        Returns ``(content, prompt_tokens, completion_tokens)``.  Invalid
+        credentials, unknown models and json_schema capability errors are
+        never retried; rate-limit/server errors retry up to ``max_retries``
+        and then raise :class:`LLMTransientError` so the composite client can
+        fall through to the next free provider.
         """
         backoff = 1.0
         attempts = 0
@@ -137,7 +176,9 @@ class GroqClient:
             except self._groq_module.RateLimitError as exc:
                 attempts += 1
                 if attempts > self._settings.llm.max_retries:
-                    raise LLMError(f"Groq rate limit persisted after {attempts} attempts") from exc
+                    raise LLMTransientError(
+                        f"Groq rate limit persisted after {attempts} attempts"
+                    ) from exc
                 self._logger.warning("Groq rate limited; retrying in %.1fs", backoff)
                 time.sleep(backoff)
                 backoff *= 2
@@ -145,13 +186,19 @@ class GroqClient:
             except self._groq_module.InternalServerError as exc:
                 attempts += 1
                 if attempts > self._settings.llm.max_retries:
-                    raise LLMError(
+                    raise LLMTransientError(
                         f"Groq server error persisted after {attempts} attempts"
                     ) from exc
                 self._logger.warning("Groq server error; retrying in %.1fs", backoff)
                 time.sleep(backoff)
                 backoff *= 2
                 continue
+            except self._groq_module.AuthenticationError as exc:
+                raise LLMAuthError("Groq rejected the API key (authentication failed)") from exc
+            except self._groq_module.NotFoundError as exc:
+                raise LLMModelError(
+                    f"Groq model {model!r} is not available (not found on the provider)"
+                ) from exc
             except self._groq_module.GroqError:
                 raise  # let structured()/text() decide how to handle
 
@@ -297,24 +344,6 @@ class GroqClient:
             prompt_tokens=self.usage.prompt_tokens,
             completion_tokens=self.usage.completion_tokens,
         )
-
-
-class GeminiClient:
-    """Gemini fallback provider (implemented in a later phase).
-
-    Kept behind the same :class:`LLMClient` interface so ``provider_order`` can
-    switch providers once implemented.
-    """
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self._init_args = args
-        self._init_kwargs = kwargs
-
-    def structured(self, **kwargs: Any) -> tuple[BaseModel, Usage]:
-        raise NotImplementedError("GeminiClient is a stub until the fallback provider phase")
-
-    def text(self, **kwargs: Any) -> tuple[str, Usage]:
-        raise NotImplementedError("GeminiClient is a stub until the fallback provider phase")
 
 
 class FakeLLM:
