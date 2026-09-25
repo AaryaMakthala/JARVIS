@@ -2,6 +2,47 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-25 — masked preview after `keys set` (no commit)
+
+**Status:** `jarvis keys set <provider>` keeps its hidden `getpass` input and the unchanged
+`SecretStore`/Windows Credential Manager path; after a successful store it now prints the receipt
+followed by a masked preview line, e.g. `Key: gsk_•••…KXYZ`.
+
+- New `masked_key_preview()` in `cli.py`: first 4 characters + one `•` per hidden character +
+  last 4; keys shorter than 9 characters are shown fully masked (`•`×len) so no meaningful
+  first/last split is revealed.
+- The preview is built only **after** `store.set()` succeeds: empty input and storage failures
+  return no fragment of the key, and no `Key:` line is printed. The complete key never appears in
+  output, logs, exceptions, or doctor; keyring errors/logs carry only the secret name and length
+  (unchanged). `keys status` stays presence-only.
+- Input UX intentionally unchanged (spec keeps the secret fully hidden while typing/pasting; the
+  earlier per-character masking idea was superseded by that requirement).
+- Validation: 43 focused keys/secrets/init-flow tests pass; full `pytest -q` = 934 passed,
+  6 skipped (pre-existing daemon async-mock warnings only); `ruff check .`,
+  `ruff format --check .`, `mypy src/jarvis/policy` all pass.
+- Manual smoke (user, PowerShell): `jarvis keys set groq` → paste a key + Enter → receipt then
+  `Key:` preview showing only first/last 4; `jarvis keys set groq` + Enter on empty prompt → exact
+  rejection, no `Key:` line; `jarvis keys status` → presence-only lines.
+
+## Session 2026-09-25 — secure API-key receipt feedback (no commit)
+
+**Status:** `jarvis keys set <provider>` now confirms receipt without exposing the value. Hidden
+input still uses `getpass.getpass`, storage still uses the existing `SecretStore`/Windows
+Credential Manager path, and no real credential was read, printed, or logged during validation.
+
+- Non-empty trimmed input is stored and followed only by `✓ API key received and saved securely.`.
+- Empty or whitespace-only input stores nothing and prints `✗ No API key entered. Nothing was saved.`.
+- Credential-store failures print a separate safe failure and never claim that saving succeeded.
+- Windows CRLF paste input is covered; command-level tests assert the entered value is absent from
+  CLI output. `jarvis keys status` remains exactly `<provider>: configured|not configured`; no
+  length, prefix, suffix, hash, or masked credential diagnostic was added.
+- Validation: 53 focused keys/secrets/CLI tests pass; full `pytest -q` exits 0 with five skips and
+  only the pre-existing daemon async-mock warnings. `ruff check .`, `ruff format --check .`, and
+  `mypy src/jarvis/policy` pass.
+- Manual PowerShell smoke: run `jarvis keys set groq`, paste a key and press Enter, verify only the
+  receipt message appears; press Enter on an empty prompt and verify the exact rejection; run
+  `jarvis keys status` and verify presence-only lines.
+
 ## Session 2026-09-25 — four-provider LLM fallback (no commit)
 
 **Status:** Groq → OpenRouter → NVIDIA → Gemini is implemented and covered with network-free

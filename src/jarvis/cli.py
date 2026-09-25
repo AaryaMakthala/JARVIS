@@ -164,6 +164,35 @@ def init_config(
 
 # ── keys (credential management) ─────────────────────────────────────────
 
+_KEYS_SET_SAVED_MESSAGE = "✓ API key received and saved securely."
+_KEYS_SET_EMPTY_MESSAGE = "✗ No API key entered. Nothing was saved."
+_KEYS_SET_PREVIEW_PREFIX = "Key: "
+#: Bullet character used to mask hidden parts of a secret in previews.
+_MASK_GLYPH = "•"
+#: Number of secret characters revealed at each end of a masked preview.
+_PREVIEW_EDGE = 4
+#: Shortest key that can be previewed safely: 4 revealed + 4 revealed + >=1 masked.
+_PREVIEW_MIN_LENGTH = 9
+
+
+def masked_key_preview(value: str) -> str:
+    """Return a print-safe preview of a secret: first 4 + bullets + last 4.
+
+    Only ``_PREVIEW_EDGE`` characters are revealed at each end; everything
+    between them becomes one ``_MASK_GLYPH`` per hidden character, so the key's
+    length - never its contents - stays visible.  Keys shorter than
+    ``_PREVIEW_MIN_LENGTH`` characters would expose a meaningful first/last
+    combination (first 4 + last 4 would cover nearly the whole value), so they
+    are shown fully masked instead.
+
+    The returned string never contains the complete secret, so it is safe to
+    print, return in a message, or include in a test assertion.
+    """
+    if len(value) < _PREVIEW_MIN_LENGTH:
+        return _MASK_GLYPH * len(value)
+    middle = _MASK_GLYPH * (len(value) - 2 * _PREVIEW_EDGE)
+    return f"{value[:_PREVIEW_EDGE]}{middle}{value[-_PREVIEW_EDGE:]}"
+
 
 def _clipboard_paste() -> str:
     """Read the clipboard (Windows-safe via pyperclip). Never logged."""
@@ -195,16 +224,25 @@ def keys_set_command(
     interactive: bool = True,
     prompt_fn: Any = None,
 ) -> str:
-    """Securely store a provider API key (hidden input). Returns "saved"."""
+    """Securely store a provider API key through hidden input.
+
+    Input stays completely hidden (``getpass``) while typing or pasting.  On
+    success the returned receipt is the saved confirmation line followed by a
+    masked preview line (``Key: <first4>•••…last4>``) built by
+    :func:`masked_key_preview` - the full value is never part of the return
+    value, any log, or any exception.  The preview is computed only *after*
+    the credential store accepted the value, so a storage failure returns no
+    fragment of the key at all.
+    """
     _validate_provider(short)
     if interactive:
         prompt_fn = prompt_fn or getpass.getpass
         value = prompt_fn(f"{_provider_label(short)} API key: ")
     value = (value or "").strip()
     if not value:
-        raise ValueError(f"empty API key rejected - nothing stored for {short}")
+        raise ValueError(_KEYS_SET_EMPTY_MESSAGE)
     store.set(PROVIDER_SECRETS[short], value)
-    return "saved"
+    return f"{_KEYS_SET_SAVED_MESSAGE}\n{_KEYS_SET_PREVIEW_PREFIX}{masked_key_preview(value)}"
 
 
 def keys_paste_command(
@@ -586,10 +624,13 @@ def keys_set(
     """Securely store a provider API key (hidden paste-friendly input)."""
     try:
         message = keys_set_command(secret_module.SecretStore(), provider)
+    except secret_module.SecretStoreError:
+        console.print("[red]✗ API key received, but secure storage failed.[/red]")
+        raise typer.Exit(code=1)
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
-    console.print(f"[green]{message}[/green]")  # only ever says "saved"
+    console.print(f"[green]{message}[/green]")
 
 
 @keys_app.command("paste")
