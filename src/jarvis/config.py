@@ -42,7 +42,7 @@ DEFAULT_CONFIG_TOML = """\
 config_version = 1
 
 [llm]
-provider_order = ["openrouter", "nvidia", "gemini", "groq"]
+provider_order = ["groq", "openrouter", "nvidia", "gemini"]
 free_only = true
 strict_zero_cost = true
 timeout_seconds = 30.0
@@ -56,13 +56,13 @@ fast = "openai/gpt-oss-20b"
 planner = "openrouter/free"
 fast = "openrouter/free"
 
-[llm.models.gemini]
-planner = "gemini-3.8-flash"
-fast = "gemini-3.7-flash"
-
 [llm.models.nvidia]
 planner = "nvidia/nemotron-3-super-120b-a12b"
 fast = "nvidia/nemotron-3.5-lightning-30b-a3b"
+
+[llm.models.gemini]
+planner = "gemini-3.8-flash"
+fast = "gemini-3.7-flash"
 
 [agent]
 max_steps = 12
@@ -149,7 +149,7 @@ class LLMSettings(BaseModel):
     planner_model: str = ""
     fast_model: str = ""
     vision_model: str = ""
-    provider_order: list[str] = ["openrouter", "nvidia", "gemini", "groq"]
+    provider_order: list[str] = ["groq", "openrouter", "nvidia", "gemini"]
     model_config = ConfigDict(extra="ignore")
     free_only: bool = True
     strict_zero_cost: bool = True

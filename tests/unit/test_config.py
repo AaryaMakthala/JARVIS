@@ -20,7 +20,7 @@ def isolated_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_defaults_when_no_config(isolated_data_dir: Path) -> None:
     settings = config.load_settings()
     assert settings.llm.planner_model == ""
-    assert settings.llm.provider_order == ["openrouter", "nvidia", "gemini", "groq"]
+    assert settings.llm.provider_order == ["groq", "openrouter", "nvidia", "gemini"]
     assert settings.llm.free_only is True
     assert settings.llm.strict_zero_cost is True
     assert settings.agent.max_steps == 12
@@ -33,15 +33,25 @@ def test_default_config_toml_parses() -> None:
     data = tomllib.loads(config.DEFAULT_CONFIG_TOML)
     assert data["config_version"] == 1
     llm = data["llm"]
-    assert llm["provider_order"] == ["openrouter", "nvidia", "gemini", "groq"]
+    assert llm["provider_order"] == ["groq", "openrouter", "nvidia", "gemini"]
     assert llm["free_only"] is True
     assert llm["strict_zero_cost"] is True
     assert llm["max_retries"] == 1
-    assert llm["models"]["groq"]["planner"] == "openai/gpt-oss-120b"
-    assert llm["models"]["groq"]["fast"] == "openai/gpt-oss-20b"
-    assert llm["models"]["openrouter"]["planner"] == "openrouter/free"
-    assert llm["models"]["gemini"]["planner"] == "gemini-3.8-flash"
-    assert llm["models"]["nvidia"]["planner"] == "nvidia/nemotron-3-super-120b-a12b"
+    assert llm["models"] == {
+        "groq": {
+            "planner": "openai/gpt-oss-120b",
+            "fast": "openai/gpt-oss-20b",
+        },
+        "openrouter": {"planner": "openrouter/free", "fast": "openrouter/free"},
+        "nvidia": {
+            "planner": "nvidia/nemotron-3-super-120b-a12b",
+            "fast": "nvidia/nemotron-3.5-lightning-30b-a3b",
+        },
+        "gemini": {
+            "planner": "gemini-3.8-flash",
+            "fast": "gemini-3.7-flash",
+        },
+    }
     assert data["agent"]["max_steps"] == 12
     assert data["policy"]["unlock_ttl_seconds"] == 300
 

@@ -73,7 +73,7 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 
-CREDENTIAL_PROVIDERS = ("groq", "openrouter", "gemini", "nvidia", "tavily")
+CREDENTIAL_PROVIDERS = ("groq", "openrouter", "nvidia", "gemini", "tavily")
 
 
 def _provider_label(short: str) -> str:
@@ -451,13 +451,11 @@ def run_doctor(
 
     configured_providers: list[str] = []
     for name in providers:
-        if not present[name]:
-            continue
         planner = settings.llm.model_for(name, "planner")
         fast = settings.llm.model_for(name, "fast")
         model_check, selectable = _provider_model_diagnostic(settings, name, planner, fast)
         checks.append(model_check)
-        if selectable:
+        if present[name] and selectable:
             configured_providers.append(name)
 
     if configured_providers:

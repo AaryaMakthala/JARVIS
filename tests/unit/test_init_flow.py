@@ -44,8 +44,8 @@ def test_enter_skips_every_optional_provider_in_one_round(tmp_path: Path) -> Non
     assert [p for p in prompts if "API key" in p] == [
         "Groq API key [optional]: ",
         "OpenRouter API key [optional]: ",
-        "Gemini API key [optional]: ",
         "NVIDIA API key [optional]: ",
+        "Gemini API key [optional]: ",
         "Tavily API key [optional]: ",
     ]
     assert len(prompts) == 5

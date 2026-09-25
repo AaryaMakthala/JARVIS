@@ -154,9 +154,12 @@ def test_confirmation_answer_never_carries_a_password() -> None:
     }
 
 
-def test_doctor_full_pass_directory() -> None:
+def test_doctor_full_pass_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
     store = FakeStore(
-        groq_api_key="gsk-key-1234", gemini_api_key="AIza-key", tavily_api_key="tvly-key"
+        groq_api_key="test-groq",
+        gemini_api_key="test-gemini",
+        tavily_api_key="test-tavily",
     )
     checks = {c.name: c for c in cli.run_doctor(settings=cli.config.load_settings(), store=store)}
     assert checks["keyring"].status == "PASS"
@@ -180,6 +183,30 @@ def test_doctor_reports_missing_key_and_provider(
     assert checks["llm_provider"].detail == "No free LLM provider configured"
     assert checks["free_only"].status == "PASS"
     assert checks["strict_zero_cost"].status == "PASS"
+
+
+def test_doctor_validates_all_four_models_when_credentials_are_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    settings = cli.config.load_settings()
+    settings.llm.strict_zero_cost = False
+    settings.llm.models = {
+        "groq": ProviderModels(planner="openai/gpt-oss-120b", fast="openai/gpt-oss-20b"),
+        "openrouter": ProviderModels(planner="openrouter/free", fast="openrouter/free"),
+        "nvidia": ProviderModels(
+            planner="nvidia/nemotron-3-super-120b-a12b",
+            fast="nvidia/nemotron-3.5-lightning-30b-a3b",
+        ),
+        "gemini": ProviderModels(planner="gemini-3.8-flash", fast="gemini-3.7-flash"),
+    }
+    store = FakeStore(groq_api_key="test-groq", gemini_api_key="test-gemini")
+    checks = {c.name: c for c in cli.run_doctor(settings=settings, store=store)}
+    assert checks["openrouter_api_key"].status == "WARN"
+    assert checks["nvidia_api_key"].status == "WARN"
+    for provider in ("groq", "openrouter", "nvidia", "gemini"):
+        assert checks[f"{provider}_model"].status == "PASS"
+    assert checks["llm_provider"].detail == "free LLM provider(s): groq, gemini"
 
 
 def test_doctor_free_tier_warned_under_strict_zero_cost(

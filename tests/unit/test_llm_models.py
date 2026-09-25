@@ -41,7 +41,7 @@ def _cap(tools: bool, structured: bool) -> Capabilities:
 
 
 def test_default_provider_order_and_labels() -> None:
-    assert PROVIDER_ORDER == ("openrouter", "nvidia", "gemini", "groq")
+    assert PROVIDER_ORDER == ("groq", "openrouter", "nvidia", "gemini")
     assert dict(PROVIDER_LABELS)["groq"] == "Groq"
     assert dict(PROVIDER_LABELS)["nvidia"] == "NVIDIA"
 

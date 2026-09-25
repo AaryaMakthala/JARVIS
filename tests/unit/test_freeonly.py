@@ -65,13 +65,17 @@ class FakeClient:
         self.response = response
         self.structured_response = structured_response
         self.raise_capability = raise_capability
+        self.text_calls = 0
+        self.structured_calls = 0
 
     def text(self, **kwargs: typing.Any) -> tuple[str, Usage]:
+        self.text_calls += 1
         if self.error is not None:
             raise self.error
         return self.response, Usage()
 
     def structured(self, **kwargs: typing.Any) -> tuple[object, Usage]:
+        self.structured_calls += 1
         if self.raise_capability:
             raise LLMCapabilityError("this model cannot do structured output")
         if self.error is not None:
@@ -120,6 +124,24 @@ def _settings(
 
 def _info(name: str, model: str) -> tuple[ProviderInfo, ModelSpec]:
     return ProviderInfo(name=name, model=model), model_spec(name, model)
+
+
+def _four_clients() -> dict[str, FakeClient]:
+    return {
+        "groq": FakeClient(response="groq"),
+        "openrouter": FakeClient(response="openrouter"),
+        "nvidia": FakeClient(response="nvidia"),
+        "gemini": FakeClient(response="gemini"),
+    }
+
+
+def _four_multi(clients: dict[str, FakeClient]) -> MultiProviderClient:
+    models = _models()
+    candidates = [
+        _info(name, models[name].planner) + (clients[name],)
+        for name in ("groq", "openrouter", "nvidia", "gemini")
+    ]
+    return MultiProviderClient(candidates)
 
 
 # ── free_tier vs zero_cost_endpoint under strict mode ─────────────────────
@@ -259,16 +281,111 @@ def test_missing_key_skips_that_provider_but_uses_the_next() -> None:
 
 def test_every_provider_missing_returns_none_and_safe_reasons() -> None:
     sel = build_llm_client(
-        _settings("openrouter", "nvidia", strict_zero_cost=True), MemoryKeyStore()
+        _settings("groq", "openrouter", "nvidia", "gemini", strict_zero_cost=False),
+        MemoryKeyStore(),
     )
     assert sel.client is None
-    assert len(sel.reasons) == 2
+    assert len(sel.reasons) == 4
+    assert all(
+        name in reason
+        for name, reason in zip(
+            ("groq", "openrouter", "nvidia", "gemini"), sel.reasons, strict=True
+        )
+    )
     for reason in sel.reasons:
         assert "key not found" in reason
-        assert "sk-" not in reason
+        assert "test-" not in reason
 
 
 # ── composite fallback behaviour ──────────────────────────────────────────
+
+
+def test_factory_configures_all_four_in_required_order() -> None:
+    keys = {
+        "groq_api_key": "test-groq-credential",
+        "openrouter_api_key": "test-openrouter-credential",
+        "nvidia_api_key": "test-nvidia-credential",
+        "gemini_api_key": "test-gemini-credential",
+    }
+    sel = build_llm_client(
+        _settings("groq", "openrouter", "nvidia", "gemini", strict_zero_cost=False),
+        MemoryKeyStore(keys),
+    )
+    assert sel.client is not None
+    assert sel.info is not None and sel.info.name == "groq"
+    assert sel.client.providers == ["groq", "openrouter", "nvidia", "gemini"]
+    assert all(value not in repr(sel) for value in keys.values())
+
+
+def test_groq_is_selected_first_when_healthy() -> None:
+    clients = _four_clients()
+    multi = _four_multi(clients)
+    text, _usage = multi.text(system="s", user="u")
+    assert text == "groq"
+    assert clients["groq"].text_calls == 1
+    assert all(clients[name].text_calls == 0 for name in ("openrouter", "nvidia", "gemini"))
+
+
+def test_groq_failure_falls_back_to_openrouter() -> None:
+    clients = _four_clients()
+    clients["groq"].error = LLMTransientError("rate limited")
+    text, _usage = _four_multi(clients).text(system="s", user="u")
+    assert text == "openrouter"
+    assert clients["openrouter"].text_calls == 1
+    assert clients["nvidia"].text_calls == 0
+    assert clients["gemini"].text_calls == 0
+
+
+def test_openrouter_failure_falls_back_to_nvidia() -> None:
+    clients = _four_clients()
+    clients["groq"].error = LLMTransientError("rate limited")
+    clients["openrouter"].error = LLMAuthError("rejected")
+    text, _usage = _four_multi(clients).text(system="s", user="u")
+    assert text == "nvidia"
+    assert clients["nvidia"].text_calls == 1
+    assert clients["gemini"].text_calls == 0
+
+
+def test_nvidia_failure_falls_back_to_gemini() -> None:
+    clients = _four_clients()
+    clients["groq"].error = LLMTransientError("rate limited")
+    clients["openrouter"].error = LLMAuthError("rejected")
+    clients["nvidia"].error = LLMModelError("model unavailable")
+    text, _usage = _four_multi(clients).text(system="s", user="u")
+    assert text == "gemini"
+    assert clients["gemini"].text_calls == 1
+
+
+def test_all_four_failures_are_exhausted_safely() -> None:
+    clients = _four_clients()
+    clients["groq"].error = LLMTransientError("rate limited")
+    clients["openrouter"].error = LLMAuthError("rejected")
+    clients["nvidia"].error = LLMModelError("model unavailable")
+    clients["gemini"].error = LLMError("provider unavailable")
+    with pytest.raises(LLMError) as exc_info:
+        _four_multi(clients).text(system="s", user="u")
+    message = str(exc_info.value)
+    assert all(name in message for name in ("groq", "openrouter", "nvidia", "gemini"))
+    assert "test-" not in message
+
+
+def test_langgraph_uses_four_provider_multi_client(tmp_path: Path) -> None:
+    clients = _four_clients()
+    clients["groq"].error = LLMTransientError("rate limited")
+    clients["openrouter"].error = LLMAuthError("rejected")
+    clients["nvidia"].error = LLMModelError("model unavailable")
+    clients["gemini"].response = "Four."
+    clients["gemini"].structured_response = brain_conversation("Four.")
+    multi = _four_multi(clients)
+    ctx = make_app_context(
+        _settings("groq", "openrouter", "nvidia", "gemini", strict_zero_cost=False),
+        llm=multi,
+    )
+    saver = open_sqlite_checkpointer(str(tmp_path / "four-provider.db"))
+    outcome = run_task(ctx, saver, "What is 2 plus 2?", thread_id="four-provider")
+    assert outcome.final_answer == "Four."
+    assert all(client.structured_calls == 1 for client in clients.values())
+    assert all(client.text_calls == 0 for client in clients.values())
 
 
 def test_rate_limited_first_provider_falls_through() -> None:

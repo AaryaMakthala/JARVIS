@@ -52,10 +52,9 @@ PRICING_LABELS: dict[PricingMode, str] = {
 }
 
 #: Provider short name -> human-readable label (used by `jarvis init`, `keys`,
-#: `doctor`).  The consultative order matches the conservative free-only
-#: default (zero-cost providers first); the *effective* order is always
-#: ``[llm] provider_order`` in config.toml.
-PROVIDER_ORDER: tuple[str, ...] = ("openrouter", "nvidia", "gemini", "groq")
+#: `doctor`). The canonical order is also the default ``provider_order``; an
+#: existing config may override it explicitly.
+PROVIDER_ORDER: tuple[str, ...] = ("groq", "openrouter", "nvidia", "gemini")
 
 PROVIDER_LABELS: dict[str, str] = {
     "openrouter": "OpenRouter",

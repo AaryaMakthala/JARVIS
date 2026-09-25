@@ -10,12 +10,22 @@ from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import open_sqlite_checkpointer
 from jarvis.agent.runner import run_task
 from jarvis.config import LLMSettings, ProviderModels, Settings
-from jarvis.llm.client import GroqClient
+from jarvis.llm.client import (
+    FakeLLM,
+    GroqClient,
+    LLMAuthError,
+    LLMModelError,
+    LLMTransientError,
+)
+from jarvis.llm.models import ModelSpec, model_spec
+from jarvis.llm.multi import MultiProviderClient
+from jarvis.llm.provider import ProviderInfo
 from jarvis.voice.fakes import (
     FakeAudioInput,
     FakeFocusChecker,
@@ -57,6 +67,10 @@ def _scripted_wake(booleans: list[bool]) -> Callable[[AudioSegment], WakeWordRes
         return WakeWordResult(detected=False)
 
     return detect
+
+
+def _provider_candidate(name: str, model: str, client: Any) -> tuple[ProviderInfo, ModelSpec, Any]:
+    return ProviderInfo(name=name, model=model), model_spec(name, model), client
 
 
 def _make_loop(
@@ -184,6 +198,57 @@ class TestVoiceLoopRouting:
         response = loop._route("open notepad")
         assert response == "Sorry, I couldn't process that."
 
+    def _run_voice_pipeline(self, tmp_path: Path, llm: Any, thread_id: str) -> FakeTTS:
+        settings = Settings(
+            llm=LLMSettings(
+                provider_order=["groq", "openrouter", "nvidia", "gemini"],
+                strict_zero_cost=False,
+                models={
+                    "groq": ProviderModels(
+                        planner="openai/gpt-oss-120b",
+                        fast="openai/gpt-oss-20b",
+                    ),
+                    "openrouter": ProviderModels(planner="openrouter/free", fast="openrouter/free"),
+                    "nvidia": ProviderModels(
+                        planner="nvidia/nemotron-3-super-120b-a12b",
+                        fast="nvidia/nemotron-3.5-lightning-30b-a3b",
+                    ),
+                    "gemini": ProviderModels(planner="gemini-3.8-flash", fast="gemini-3.7-flash"),
+                },
+            )
+        )
+        ctx = make_app_context(settings, llm=llm)
+        saver = open_sqlite_checkpointer(str(tmp_path / f"{thread_id}.db"))
+        tts = FakeTTS()
+        audio = FakeAudioInput(
+            segments=[make_silence(1.0), *[make_speech("x", duration_s=0.5)] * 12]
+        )
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, False, False, False]))
+        stt = FakeSTT(results=[STTResult(text="What is 2 plus 2?")])
+
+        def submit(text: str, source: str) -> Any:
+            return run_task(
+                ctx,
+                saver,
+                text,
+                source=source,
+                thread_id=thread_id,
+            )
+
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=stt,
+            tts=tts,
+            submit_task=submit,
+            listen_timeout_s=5.0,
+            idle_timeout_s=0.3,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        return tts
+
     def test_wake_stt_groq_graph_tts_pipeline(self, tmp_path: Path) -> None:
         calls: list[dict[str, Any]] = []
         response = brain_conversation("Four.").model_dump_json()
@@ -207,42 +272,42 @@ class TestVoiceLoopRouting:
                 },
             )
         )
-        ctx = make_app_context(
-            settings,
-            llm=GroqClient("gsk-test", settings, completer=complete),
-        )
-        saver = open_sqlite_checkpointer(str(tmp_path / "checkpoints.db"))
-        tts = FakeTTS()
-        audio = FakeAudioInput(
-            segments=[make_silence(1.0), *[make_speech("x", duration_s=0.5)] * 12]
-        )
-        wake = FakeWakeWord(detect_fn=_scripted_wake([True, False, False, False]))
-        stt = FakeSTT(results=[STTResult(text="What is 2 plus 2?")])
-
-        def submit(text: str, source: str) -> Any:
-            return run_task(
-                ctx,
-                saver,
-                text,
-                source=source,
-                thread_id="voice-groq-e2e",
-            )
-
-        loop = VoiceLoop(
-            audio=audio,
-            wake_detector=wake,
-            stt=stt,
-            tts=tts,
-            submit_task=submit,
-            listen_timeout_s=5.0,
-            idle_timeout_s=0.3,
-        )
-        loop.start()
-        assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
+        client = GroqClient("test-groq-credential", settings, completer=complete)
+        tts = self._run_voice_pipeline(tmp_path, client, "voice-groq-e2e")
         assert tts.spoken == ["Yes?", "Four."]
         assert calls[0]["model"] == "openai/gpt-oss-120b"
         assert calls[0]["response_format"]["type"] == "json_schema"
+
+    def test_wake_stt_multi_provider_graph_tts_pipeline(self, tmp_path: Path) -> None:
+        errors = {
+            "groq": LLMTransientError("rate limited"),
+            "openrouter": LLMAuthError("rejected"),
+            "nvidia": LLMModelError("model unavailable"),
+        }
+        failed_clients: dict[str, Mock] = {}
+        for name, error in errors.items():
+            client = Mock()
+            client.text.side_effect = error
+            client.structured.side_effect = error
+            failed_clients[name] = client
+        gemini = FakeLLM([brain_conversation("Four."), "Four."])
+        multi = MultiProviderClient(
+            [
+                _provider_candidate("groq", "openai/gpt-oss-120b", failed_clients["groq"]),
+                _provider_candidate("openrouter", "openrouter/free", failed_clients["openrouter"]),
+                _provider_candidate(
+                    "nvidia",
+                    "nvidia/nemotron-3-super-120b-a12b",
+                    failed_clients["nvidia"],
+                ),
+                _provider_candidate("gemini", "gemini-3.8-flash", gemini),
+            ]
+        )
+        tts = self._run_voice_pipeline(tmp_path, multi, "voice-multi-e2e")
+        assert tts.spoken == ["Yes?", "Four."]
+        assert all(client.text.call_count == 0 for client in failed_clients.values())
+        assert all(client.structured.call_count == 1 for client in failed_clients.values())
+        assert len(gemini.calls) == 1
 
 
 # ── confirmation tests ──────────────────────────────────────────────────

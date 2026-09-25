@@ -125,6 +125,7 @@ def test_secret_env_vars_mapping() -> None:
     from jarvis.secrets import SECRET_ENV_VARS
 
     assert SECRET_ENV_VARS["groq_api_key"] == ("GROQ_API_KEY",)
+    assert SECRET_ENV_VARS["openrouter_api_key"] == ("OPENROUTER_API_KEY",)
     assert SECRET_ENV_VARS["gemini_api_key"] == ("GEMINI_API_KEY", "GOOGLE_API_KEY")
     assert SECRET_ENV_VARS["nvidia_api_key"] == ("NVIDIA_API_KEY",)
     assert "ipc_token" not in SECRET_ENV_VARS  # never from env

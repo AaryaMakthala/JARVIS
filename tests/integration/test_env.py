@@ -27,7 +27,7 @@ def test_full_init_flow_then_reload(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(config.DEFAULT_CONFIG_TOML, encoding="utf-8")
     settings = config.load_settings()
-    assert settings.llm.provider_order == ["openrouter", "nvidia", "gemini", "groq"]
+    assert settings.llm.provider_order == ["groq", "openrouter", "nvidia", "gemini"]
     assert settings.llm.free_only is True
     assert settings.llm.strict_zero_cost is True
     assert config.log_file().parent.name == "logs"

@@ -20,7 +20,7 @@ import time
 from typing import Any
 
 from jarvis.agent.context import VoiceToolsFacade, make_app_context
-from jarvis.config import Settings, VoiceSettings
+from jarvis.config import LLMSettings, ProviderModels, Settings, VoiceSettings
 from jarvis.daemon.protocol import (
     AuthMessage,
     ChatMessage,
@@ -29,6 +29,7 @@ from jarvis.daemon.protocol import (
     VoiceToggleMessage,
 )
 from jarvis.daemon.server import DaemonServer, TaskSlot, _parse_message
+from jarvis.llm.multi import MultiProviderClient
 from jarvis.voice.fakes import FakeSTT, FakeTTS, FakeWakeWord
 from jarvis.voice.service import VoiceService
 
@@ -50,6 +51,40 @@ class _FakeStore:
 
     def check_store_access(self) -> str:
         return "FakeStore"
+
+
+def test_default_context_wires_four_provider_multi_client() -> None:
+    settings = Settings(
+        llm=LLMSettings(
+            provider_order=["groq", "openrouter", "nvidia", "gemini"],
+            strict_zero_cost=False,
+            models={
+                "groq": ProviderModels(
+                    planner="openai/gpt-oss-120b",
+                    fast="openai/gpt-oss-20b",
+                ),
+                "openrouter": ProviderModels(planner="openrouter/free", fast="openrouter/free"),
+                "nvidia": ProviderModels(
+                    planner="nvidia/nemotron-3-super-120b-a12b",
+                    fast="nvidia/nemotron-3.5-lightning-30b-a3b",
+                ),
+                "gemini": ProviderModels(planner="gemini-3.8-flash", fast="gemini-3.7-flash"),
+            },
+        )
+    )
+    store = _FakeStore()
+    store._kv.update(
+        {
+            "groq_api_key": "test-groq-credential",
+            "openrouter_api_key": "test-openrouter-credential",
+            "nvidia_api_key": "test-nvidia-credential",
+            "gemini_api_key": "test-gemini-credential",
+        }
+    )
+    server = DaemonServer(settings=settings, store=store)
+    ctx = server._build_default_context()
+    assert isinstance(ctx.llm, MultiProviderClient)
+    assert ctx.llm.providers == ["groq", "openrouter", "nvidia", "gemini"]
 
 
 class _FakeVoiceService:

@@ -2,6 +2,40 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-25 — four-provider LLM fallback (no commit)
+
+**Status:** Groq → OpenRouter → NVIDIA → Gemini is implemented and covered with network-free
+factory, fallback, LangGraph, daemon, and voice/TTS tests. No provider is claimed live-working
+without a validated credential and a real inference result.
+
+### Configuration and policy
+- Canonical order is `groq`, `openrouter`, `nvidia`, `gemini`; the existing
+  `MultiProviderClient` walks this order for every structured/text operation.
+- Per-provider planner/fast models remain the already registered exact IDs: Groq
+  `openai/gpt-oss-120b` / `openai/gpt-oss-20b`, OpenRouter `openrouter/free` for both roles,
+  NVIDIA `nvidia/nemotron-3-super-120b-a12b` /
+  `nvidia/nemotron-3.5-lightning-30b-a3b`, and Gemini `gemini-3.8-flash` /
+  `gemini-3.7-flash`.
+- Credentials continue through Windows Credential Manager first, then the documented provider
+  environment variables. No key was printed, logged, tested, or added to configuration/diffs.
+- The safe generated default remains `strict_zero_cost = true`. The current runtime config uses
+  the explicit `free_only = true`, `strict_zero_cost = false` opt-in so Groq/Gemini free-tier
+  models can participate; their account billing state is not guaranteed zero-cost.
+
+### Implementation and validation
+- Plain doctor now validates every configured planner/fast model even when that provider's key is
+  absent, while selecting only providers with both eligible models and a readable credential.
+- Added four-provider tests for exact order/models, healthy Groq selection, each fallback edge,
+  exhaustion, missing/invalid providers, credential non-leakage, LangGraph, daemon injection,
+  and wake → STT → multi-provider agent → TTS. Existing OpenRouter route/header behaviour is
+  asserted unchanged.
+- Current non-live doctor: all four model checks PASS; Groq/Gemini credentials are present, while
+  OpenRouter/NVIDIA are not visible to this JARVIS process. No live request was run.
+- Focused provider/config/agent/daemon/voice suites, `pytest -q`, and
+  `pytest -q -m "not windows_only and not slow and not voice"` pass. `ruff check .`,
+  `ruff format --check .`, and `mypy src/jarvis/policy` pass. Only the pre-existing daemon
+  async-mock coroutine warnings remain.
+
 ## Session 2026-09-25 — real-LLM voice pipeline diagnosis and runtime hardening (no commit)
 
 **Status:** implementation and mocked end-to-end coverage are green. Live E2E remains blocked by

@@ -15,6 +15,7 @@ from jarvis.config import LLMSettings, ProviderModels, Settings
 from jarvis.llm.provider import (
     LLMConfigError,
     build_llm_client,
+    build_provider_client,
     provider_has_credential,
     provider_status,
 )
@@ -64,6 +65,35 @@ def _settings(
             fast_model=fast_model,
             strict_zero_cost=strict_zero_cost,
         )
+    )
+
+
+def _four_provider_settings() -> Settings:
+    return Settings(
+        llm=LLMSettings(
+            provider_order=["groq", "openrouter", "nvidia", "gemini"],
+            strict_zero_cost=False,
+            models={
+                "groq": ProviderModels(planner=PLANNER, fast=FAST),
+                "openrouter": ProviderModels(planner="openrouter/free", fast="openrouter/free"),
+                "nvidia": ProviderModels(
+                    planner="nvidia/nemotron-3-super-120b-a12b",
+                    fast="nvidia/nemotron-3.5-lightning-30b-a3b",
+                ),
+                "gemini": ProviderModels(planner="gemini-3.8-flash", fast="gemini-3.7-flash"),
+            },
+        )
+    )
+
+
+def _four_provider_store() -> MemoryKeyStore:
+    return MemoryKeyStore(
+        {
+            "groq_api_key": "test-groq-credential",
+            "openrouter_api_key": "test-openrouter-credential",
+            "nvidia_api_key": "test-nvidia-credential",
+            "gemini_api_key": "test-gemini-credential",
+        }
     )
 
 
@@ -209,6 +239,59 @@ def test_multiple_eligible_providers_make_a_composite() -> None:
     assert sel.info is not None and sel.info.name == "groq"
     # composite exposes the fallback order
     assert sel.client.providers == ["groq", "openrouter"]
+
+
+def test_all_four_factories_receive_exact_models_and_base_urls() -> None:
+    settings = _four_provider_settings()
+    store = _four_provider_store()
+    clients = {
+        name: build_provider_client(settings, store, name)
+        for name in ("groq", "openrouter", "nvidia", "gemini")
+    }
+    for name, client in clients.items():
+        configured = settings.llm.models[name]
+        assert client._model_for("planner") == configured.planner
+        assert client._model_for("fast") == configured.fast
+    assert clients["openrouter"]._provider == "openrouter"
+    assert str(clients["openrouter"]._http.base_url).rstrip("/") == ("https://openrouter.ai/api/v1")
+    assert clients["openrouter"]._http.headers["X-Title"] == "JARVIS"
+    assert str(clients["nvidia"]._http.base_url).rstrip("/") == (
+        "https://integrate.api.nvidia.com/v1"
+    )
+    assert str(clients["gemini"]._http.base_url).rstrip("/") == (
+        "https://generativelanguage.googleapis.com/v1beta"
+    )
+    for client in clients.values():
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
+def test_all_four_provider_statuses_are_safe_and_selectable() -> None:
+    selection = build_llm_client(_four_provider_settings(), _four_provider_store())
+    assert selection.client is not None
+    assert selection.client.providers == ["groq", "openrouter", "nvidia", "gemini"]
+    assert selection.info is not None and selection.info.name == "groq"
+    assert selection.reasons == []
+    serialized = repr(selection)
+    assert all(
+        credential not in serialized
+        for credential in (
+            "test-groq-credential",
+            "test-openrouter-credential",
+            "test-nvidia-credential",
+            "test-gemini-credential",
+        )
+    )
+    status = provider_status(_four_provider_settings(), _four_provider_store())
+    assert [row["name"] for row in status] == [
+        "groq",
+        "openrouter",
+        "nvidia",
+        "gemini",
+    ]
+    assert all(row["ok"] is True for row in status)
+    assert all("credential" not in row["reason"] for row in status)
 
 
 def test_provider_status_report_shape() -> None:
