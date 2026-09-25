@@ -43,7 +43,7 @@ from typing import Any, Protocol
 
 from jarvis.config import Settings
 from jarvis.llm import models as llm_models
-from jarvis.secrets import SECRET_ENV_VARS
+from jarvis.secrets import SECRET_ENV_VARS, SecretStoreError
 
 __all__ = [
     "LLMConfigError",
@@ -100,22 +100,28 @@ class _EnvBackedKeyStore:
 
     Lookup order per provider: (1) Windows keyring, (2) known environment
     variable(s), (3) missing.  Environment variables are read but never
-    copied into the keyring.  Store errors propagate (the caller turns them
-    into a skip reason).
+    copied into the keyring.  A keyring failure still permits an environment
+    fallback; the store error is re-raised only when no fallback is present.
     """
 
     def __init__(self, store: ProviderKeyStore) -> None:
         self._store = store
 
     def get(self, name: str) -> str | None:
-        # keyring errors propagate: surface as a skip reason, do not fall to env
-        stored = self._store.get(name)
+        store_error: SecretStoreError | None = None
+        try:
+            stored = self._store.get(name)
+        except SecretStoreError as exc:
+            stored = None
+            store_error = exc
         if stored:
             return stored
         for var in SECRET_ENV_VARS.get(name, ()):
             value = os.environ.get(var)
             if value:
                 return value
+        if store_error is not None:
+            raise store_error
         return None
 
     def has(self, name: str) -> bool:
@@ -228,9 +234,13 @@ def _provider_label(name: str) -> str:
 def provider_has_credential(store: ProviderKeyStore, name: str) -> bool:
     """Whether ``name`` has a credential reachable (keyring, then env).
 
-    Safe for ``doctor``/``keys status``: returns a boolean, never a value.
+    Safe for ``doctor``/``keys status``: returns a boolean, never a value or
+    a credential-store exception.
     """
-    return _store_from(store).has(f"{name}_api_key")
+    try:
+        return _store_from(store).has(f"{name}_api_key")
+    except SecretStoreError:
+        return False
 
 
 def build_provider_client(settings: Settings, store: ProviderKeyStore, name: str) -> Any:
@@ -337,7 +347,7 @@ def provider_status(settings: Settings, store: ProviderKeyStore) -> list[dict[st
             continue
 
         try:
-            planner, _fast = _resolve_models(settings, name)
+            planner, fast = _resolve_models(settings, name)
         except LLMConfigError as exc:
             rows.append(
                 {
@@ -355,12 +365,14 @@ def provider_status(settings: Settings, store: ProviderKeyStore) -> list[dict[st
             continue
 
         spec = llm_models.model_spec(name, planner)
-        allowed, _spec, reason = llm_models.qualify(
-            name,
-            planner,
-            free_only=settings.llm.free_only,
-            strict_zero_cost=settings.llm.strict_zero_cost,
-        )
+        try:
+            _guard_free(settings, name, planner, fast)
+        except LLMConfigError as exc:
+            allowed = False
+            reason = str(exc)
+        else:
+            allowed = True
+            reason = ""
         base = {
             "name": name,
             "label": label,

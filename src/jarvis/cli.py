@@ -158,6 +158,7 @@ def init_config(
         messages.append(f"{_provider_label(short)}: {'yes' if configured[short] else 'no'}")
     messages.append("LLM free-only mode: enabled")
     messages.append("LLM strict zero-cost mode: enabled")
+    messages.append("Groq and Gemini free-tier keys are blocked while strict mode is enabled")
     return messages
 
 
@@ -287,8 +288,64 @@ def _live_provider_check(
         return _check(label, "WARN", f"{name} is rate limited or transiently unavailable")
     except LLMError as exc:
         return _check(label, "FAIL", str(exc))
-    model = settings.llm.model_for(name, "planner")
-    return _check(label, "PASS", f"{model} reachable ({name}, free-only)")
+    model = settings.llm.model_for(name, "fast") or settings.llm.model_for(name, "planner")
+    return _check(label, "PASS", f"{model} reachable ({name}, eligible under current policy)")
+
+
+def _provider_model_diagnostic(
+    settings: config.Settings,
+    name: str,
+    planner: str,
+    fast: str,
+) -> tuple[Check, bool]:
+    """Return one provider model check and whether it is selectable."""
+    if not planner and not fast:
+        return (
+            _check(
+                f"{name}_model",
+                "WARN",
+                f"no model configured for {name} - run `jarvis init`",
+            ),
+            False,
+        )
+    effective_planner = planner or fast
+    effective_fast = fast or planner
+    role_models = [("planner", effective_planner)]
+    if effective_fast != effective_planner:
+        role_models.append(("fast", effective_fast))
+    evaluated: list[tuple[str, str, llm_models.ModelSpec, bool, str]] = []
+    for role, model in role_models:
+        allowed, spec, reason = llm_models.qualify(
+            name,
+            model,
+            free_only=settings.llm.free_only,
+            strict_zero_cost=settings.llm.strict_zero_cost,
+        )
+        evaluated.append((role, model, spec, allowed, reason))
+    failures = [item for item in evaluated if not item[3]]
+    if not failures:
+        details = "; ".join(
+            f"{role}={model}: {llm_models.pricing_message(spec)} "
+            f"(tools={spec.capabilities.supports_tools}, "
+            f"structured={spec.capabilities.supports_structured_output})"
+            for role, model, spec, _allowed, _reason in evaluated
+        )
+        return _check(f"{name}_model", "PASS", details), True
+    refused = next(
+        (item for item in failures if item[2].pricing_mode != "free_tier"),
+        failures[0],
+    )
+    if refused[2].pricing_mode == "free_tier":
+        return (
+            _check(
+                f"{name}_model",
+                "WARN",
+                f"{refused[1]} is free-tier eligible, but account billing state cannot be "
+                "verified under strict zero-cost mode (set strict_zero_cost=false to allow)",
+            ),
+            False,
+        )
+    return _check(f"{name}_model", "FAIL", f"{refused[0]} model: {refused[4]}"), False
 
 
 def run_doctor(
@@ -398,41 +455,10 @@ def run_doctor(
             continue
         planner = settings.llm.model_for(name, "planner")
         fast = settings.llm.model_for(name, "fast")
-        if not planner and not fast:
-            checks.append(
-                _check(
-                    f"{name}_model", "WARN", f"no model configured for {name} - run `jarvis init`"
-                )
-            )
-            continue
-        allowed, spec, reason = llm_models.qualify(
-            name,
-            planner,
-            free_only=settings.llm.free_only,
-            strict_zero_cost=settings.llm.strict_zero_cost,
-        )
-        if allowed:
-            caps = spec.capabilities
-            checks.append(
-                _check(
-                    f"{name}_model",
-                    "PASS",
-                    f"{planner}: {llm_models.pricing_message(spec)} "
-                    f"(tools={caps.supports_tools}, structured={caps.supports_structured_output})",
-                )
-            )
+        model_check, selectable = _provider_model_diagnostic(settings, name, planner, fast)
+        checks.append(model_check)
+        if selectable:
             configured_providers.append(name)
-        elif spec.pricing_mode == "free_tier":
-            checks.append(
-                _check(
-                    f"{name}_model",
-                    "WARN",
-                    f"{planner} is free-tier eligible, but account billing state cannot be "
-                    "verified under strict zero-cost mode (set strict_zero_cost=false to allow)",
-                )
-            )
-        else:
-            checks.append(_check(f"{name}_model", "FAIL", reason))
 
     if configured_providers:
         checks.append(

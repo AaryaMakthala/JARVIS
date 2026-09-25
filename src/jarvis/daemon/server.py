@@ -418,14 +418,8 @@ class DaemonServer:
     async def _serve(self) -> None:
         """Accept connections, manage the task queue, clean up stale confirmations."""
         print("[DIAG] _serve: entered", flush=True)
-        # Initialise the voice service first so the agent context can be wired
-        # to its live loop (dictation tools need ``ctx.voice``).
-        self._bootstrap_voice()
-        print("[DIAG] _serve: _bootstrap_voice() returned", flush=True)
-
-        if self._ctx is None:
-            self._ctx = self._build_default_context()
-        print("[DIAG] _serve: default context built", flush=True)
+        self._initialize_runtime()
+        print("[DIAG] _serve: runtime initialised", flush=True)
 
         server = await asyncio.start_server(
             self._handle_client,
@@ -472,6 +466,13 @@ class DaemonServer:
             self._stop_voice()
             logger.info("daemon shut down cleanly")
 
+    def _initialize_runtime(self) -> None:
+        """Build the agent context and wire the voice service safely."""
+        if self._ctx is None:
+            self._ctx = self._build_default_context()
+        self._bootstrap_voice()
+        self._refresh_ctx_voice_bridge()
+
     def _bootstrap_voice(self) -> None:
         """Initialise the VoiceService and honour ``[voice] enabled`` (boot).
 
@@ -496,6 +497,7 @@ class DaemonServer:
                 traceback.print_exc()
 
         if self._voice_service is not None:
+            self._refresh_ctx_voice_bridge()
             try:
                 msg = self._voice_service.start()
                 print(f"[DIAG] _bootstrap_voice(): service.start() -> {msg!r}", flush=True)
@@ -904,8 +906,8 @@ class DaemonServer:
                     )
                 )
                 return
-            self._refresh_ctx_voice_bridge()
 
+        self._refresh_ctx_voice_bridge()
         text = self._voice_service.start()
         if self._service_state(self._voice_service) == "error":
             code = self._service_error_code(self._voice_service) or "loop-crashed"
@@ -962,6 +964,9 @@ class DaemonServer:
         for voice tasks are driven inside the worker thread by
         :meth:`_run_voice_confirmation` (Tier 1 only), never over IPC.
         """
+        if self._ctx is None:
+            logger.warning("voice task rejected: runtime context is not initialised")
+            return _VoiceOutcome(error="AI backend is starting — try again")
         task_id = f"v{int(time.time() * 1000)}"
         slot = TaskSlot(task_id=task_id, text=text, source=source, owner_id=VOICE_OWNER)
 

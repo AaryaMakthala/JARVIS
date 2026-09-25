@@ -7,8 +7,15 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+from jarvis.agent.context import make_app_context
+from jarvis.agent.graph import open_sqlite_checkpointer
+from jarvis.agent.runner import run_task
+from jarvis.config import LLMSettings, ProviderModels, Settings
+from jarvis.llm.client import GroqClient
 from jarvis.voice.fakes import (
     FakeAudioInput,
     FakeFocusChecker,
@@ -30,6 +37,7 @@ from jarvis.voice.loop import (
     VoiceLoop,
     _approval_words,
 )
+from support import brain_conversation
 
 # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -175,6 +183,66 @@ class TestVoiceLoopRouting:
         loop, _, _, _, _ = _make_loop(submit_task=boom)
         response = loop._route("open notepad")
         assert response == "Sorry, I couldn't process that."
+
+    def test_wake_stt_groq_graph_tts_pipeline(self, tmp_path: Path) -> None:
+        calls: list[dict[str, Any]] = []
+        response = brain_conversation("Four.").model_dump_json()
+
+        def complete(**kwargs: Any) -> Any:
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=response))],
+                usage=SimpleNamespace(prompt_tokens=12, completion_tokens=4),
+            )
+
+        settings = Settings(
+            llm=LLMSettings(
+                provider_order=["groq"],
+                strict_zero_cost=False,
+                models={
+                    "groq": ProviderModels(
+                        planner="openai/gpt-oss-120b",
+                        fast="openai/gpt-oss-20b",
+                    )
+                },
+            )
+        )
+        ctx = make_app_context(
+            settings,
+            llm=GroqClient("gsk-test", settings, completer=complete),
+        )
+        saver = open_sqlite_checkpointer(str(tmp_path / "checkpoints.db"))
+        tts = FakeTTS()
+        audio = FakeAudioInput(
+            segments=[make_silence(1.0), *[make_speech("x", duration_s=0.5)] * 12]
+        )
+        wake = FakeWakeWord(detect_fn=_scripted_wake([True, False, False, False]))
+        stt = FakeSTT(results=[STTResult(text="What is 2 plus 2?")])
+
+        def submit(text: str, source: str) -> Any:
+            return run_task(
+                ctx,
+                saver,
+                text,
+                source=source,
+                thread_id="voice-groq-e2e",
+            )
+
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=stt,
+            tts=tts,
+            submit_task=submit,
+            listen_timeout_s=5.0,
+            idle_timeout_s=0.3,
+        )
+        loop.start()
+        assert loop._thread is not None
+        loop._thread.join(timeout=10.0)
+        assert tts.spoken == ["Yes?", "Four."]
+        assert calls[0]["model"] == "openai/gpt-oss-120b"
+        assert calls[0]["response_format"]["type"] == "json_schema"
 
 
 # ── confirmation tests ──────────────────────────────────────────────────

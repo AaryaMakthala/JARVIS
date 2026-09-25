@@ -137,6 +137,13 @@ def test_free_tier_rejected_under_strict_zero_cost() -> None:
         assert "billing state cannot be verified" in reason
 
 
+def test_free_tier_is_rejected_when_policy_is_omitted() -> None:
+    allowed, spec, reason = qualify("groq", _GROQ_PLANNER)
+    assert allowed is False
+    assert spec.pricing_mode == "free_tier"
+    assert "strict_zero_cost" in reason
+
+
 def test_free_tier_accepted_when_strict_zero_cost_is_false() -> None:
     for provider in ("groq", "gemini"):
         allowed, _spec, _reason = qualify(

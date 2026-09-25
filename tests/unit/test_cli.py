@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from jarvis import __version__, cli
+from jarvis.config import ProviderModels
 
 
 class FakeStore:
@@ -215,6 +216,23 @@ def test_doctor_zero_cost_provider_passes_under_strict_zero_cost(
     assert checks["llm_provider"].detail == "free LLM provider(s): openrouter"
 
 
+def test_doctor_checks_per_provider_fast_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    settings = cli.config.load_settings()
+    settings.llm.provider_order = ["groq"]
+    settings.llm.models = {
+        "groq": ProviderModels(planner="openai/gpt-oss-120b", fast="unknown-fast-model")
+    }
+    settings.llm.strict_zero_cost = False
+    store = FakeStore(groq_api_key="gsk-key-1234")
+    checks = {c.name: c for c in cli.run_doctor(settings=settings, store=store)}
+    assert checks["groq_model"].status == "FAIL"
+    assert "fast model" in checks["groq_model"].detail
+    assert checks["llm_provider"].status == "FAIL"
+
+
 def test_doctor_paid_or_unregistered_model_fails_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -258,6 +276,7 @@ def test_init_config_writes_config_and_stores_key(tmp_path: Path) -> None:
     assert parsed["llm"]["free_only"] is True
     assert store.get("groq_api_key") == "gsk-test-123"
     assert "groq" in " ".join(messages)
+    assert "Groq and Gemini free-tier keys are blocked" in " ".join(messages)
 
 
 # ── doctor --live (probe of configured providers, scripted fake client) ────

@@ -15,8 +15,10 @@ from jarvis.config import LLMSettings, ProviderModels, Settings
 from jarvis.llm.provider import (
     LLMConfigError,
     build_llm_client,
+    provider_has_credential,
     provider_status,
 )
+from jarvis.secrets import SecretStoreError
 
 PLANNER = "openai/gpt-oss-120b"
 FAST = "openai/gpt-oss-20b"
@@ -38,8 +40,11 @@ class MemoryKeyStore:
 class ThrowingStore(MemoryKeyStore):
     """A keyring that blows up (environmental failure is a skip reason)."""
 
+    def get(self, name: str) -> str | None:
+        raise SecretStoreError("keyring unavailable")
+
     def has(self, name: str) -> bool:
-        raise RuntimeError("keyring unavailable")
+        raise SecretStoreError("keyring unavailable")
 
 
 def _settings(
@@ -103,6 +108,10 @@ def test_throws_back_to_next_provider_then_none() -> None:
     assert "key" in sel.reasons[0].lower()
 
 
+def test_credential_probe_returns_false_when_keyring_fails() -> None:
+    assert provider_has_credential(ThrowingStore(), "groq") is False
+
+
 def test_selection_with_key_and_model_builds_groq() -> None:
     store = MemoryKeyStore({"groq_api_key": "sk-test"})
     sel = build_llm_client(_settings(["groq"]), store)
@@ -162,6 +171,13 @@ def test_env_key_is_used_but_not_copied_to_keyring(
     assert store.has("groq_api_key") is False
 
 
+def test_env_key_is_used_when_keyring_read_fails(monkeypatch: typing.Any) -> None:
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-env-fallback")
+    sel = build_llm_client(_settings(["groq"]), ThrowingStore())
+    assert sel.client is not None
+    assert sel.info is not None and sel.info.name == "groq"
+
+
 def test_gemini_env_google_fallback(monkeypatch: typing.Any) -> None:
     monkeypatch.setenv("GOOGLE_API_KEY", "AIza-env-key")
     settings = Settings(
@@ -211,6 +227,20 @@ def test_provider_status_report_shape() -> None:
     assert status[1]["name"] == "gemini"
     assert status[1]["ok"] is False
     assert "api key" in status[1]["reason"].lower()
+
+
+def test_provider_status_checks_fast_model() -> None:
+    settings = Settings(
+        llm=LLMSettings(
+            provider_order=["groq"],
+            strict_zero_cost=False,
+            models={"groq": ProviderModels(planner=PLANNER, fast="unknown-fast-model")},
+        )
+    )
+    status = provider_status(settings, MemoryKeyStore({"groq_api_key": "k"}))
+    assert status[0]["ok"] is False
+    assert "fast model" in status[0]["reason"]
+    assert "not registered" in status[0]["reason"]
 
 
 def test_provider_status_marks_free_tier_not_ok_under_strict() -> None:

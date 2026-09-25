@@ -227,7 +227,7 @@ def qualify(
     model: str,
     *,
     free_only: bool = True,
-    strict_zero_cost: bool = False,
+    strict_zero_cost: bool = True,
 ) -> tuple[bool, ModelSpec, str]:
     """Decide whether ``model`` may be used under the current pricing policy.
 

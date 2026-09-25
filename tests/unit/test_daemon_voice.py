@@ -19,6 +19,7 @@ import threading
 import time
 from typing import Any
 
+from jarvis.agent.context import VoiceToolsFacade, make_app_context
 from jarvis.config import Settings, VoiceSettings
 from jarvis.daemon.protocol import (
     AuthMessage,
@@ -54,7 +55,8 @@ class _FakeStore:
 class _FakeVoiceService:
     """Records start/stop calls like the real VoiceService would."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_start: Any = None) -> None:
+        self._on_start = on_start
         self.start_calls = 0
         self.stop_calls = 0
         self.active = False
@@ -62,6 +64,8 @@ class _FakeVoiceService:
         self._error_code: str | None = None
 
     def start(self) -> str:
+        if self._on_start is not None:
+            self._on_start(self)
         if self.active:
             return "voice is already active"
         self.start_calls += 1
@@ -191,7 +195,7 @@ class TestVoiceToggleProtocol:
 class TestToggleEndToEnd:
     def _start(self, settings: Settings) -> tuple[_ToggleServer, _ServerHarness]:
         server = _ToggleServer(settings)
-        server._bootstrap_voice()  # mirrors the boot wiring the real _serve() does
+        server._initialize_runtime()
         harness = _ServerHarness(server)
         harness.start()
         return server, harness
@@ -219,6 +223,34 @@ class TestToggleEndToEnd:
                 c.close()
         finally:
             harness.stop()
+
+    def test_runtime_wires_context_before_voice_starts(self) -> None:
+        server = _ToggleServer(Settings(voice=VoiceSettings(enabled=True)))
+        observed: list[bool] = []
+
+        def _check_start(service: Any) -> None:
+            observed.append(server._ctx is not None)
+            assert server._ctx is not None
+            assert server._ctx.voice is not None
+            assert server._ctx.voice.service is service
+
+        server.fake_voice._on_start = _check_start
+        server._initialize_runtime()
+        assert observed == [True]
+        assert server.fake_voice.start_calls == 1
+
+    def test_toggle_existing_service_refreshes_injected_context_bridge(self) -> None:
+        server = _ToggleServer(Settings(voice=VoiceSettings(enabled=True)))
+        server._ctx = make_app_context(
+            Settings(voice=VoiceSettings(enabled=True)),
+            voice=VoiceToolsFacade(),
+        )
+        server._voice_service = server.fake_voice
+        conn = _FakeConn()
+        asyncio.run(server._handle_voice_toggle(VoiceToggleMessage(state=True), conn))
+        assert server._ctx is not None and server._ctx.voice is not None
+        assert server._ctx.voice.service is server.fake_voice
+        assert server.fake_voice.start_calls == 1
 
     def test_toggle_off_when_never_started_is_idempotent(self) -> None:
         server, harness = self._start(Settings(voice=VoiceSettings(enabled=False)))
@@ -475,6 +507,7 @@ class _VoiceBridgeServer(DaemonServer):
 
     def __init__(self, *, approve: bool = True, voice_service: Any = None) -> None:
         super().__init__(settings=Settings(voice=VoiceSettings(enabled=False)), store=_FakeStore())
+        self._ctx = object()
         self._voice_service = voice_service
         self.loop_stub = _VoiceLoopStub(can_approve=approve)
         self.worker_events: list[str] = []
@@ -503,6 +536,14 @@ class _VoiceBridgeServer(DaemonServer):
 
 
 class TestVoiceWorkerBridge:
+    def test_voice_submit_before_runtime_initialization_fails_cleanly(self) -> None:
+        server = DaemonServer(
+            settings=Settings(voice=VoiceSettings(enabled=False)), store=_FakeStore()
+        )
+        outcome = server._voice_submit("hello", "voice")
+        assert outcome.error == "AI backend is starting — try again"
+        assert server._active is None
+
     def test_voice_submit_runs_worker_and_returns_final(self) -> None:
         server = _VoiceBridgeServer(approve=True)
         outcome = server._voice_submit("create file", "voice")
@@ -562,6 +603,7 @@ class TestWorkerResilience:
         server = DaemonServer(
             settings=Settings(voice=VoiceSettings(enabled=False)), store=_FakeStore()
         )
+        server._ctx = object()
         # Would previously hang forever: the worker died before touching the
         # slot, so _voice_submit kept waiting on slot.event.
         outcome = server._voice_submit("hello", "voice")
@@ -581,6 +623,7 @@ class TestWorkerResilience:
                 super().__init__(
                     settings=Settings(voice=VoiceSettings(enabled=False)), store=_FakeStore()
                 )
+                self._ctx = object()
 
             def _worker_run(self, slot: TaskSlot) -> None:  # type: ignore[override]
                 time.sleep(5.0)  # never sets slot.done / slot.event

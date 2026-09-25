@@ -2,6 +2,45 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-25 — real-LLM voice pipeline diagnosis and runtime hardening (no commit)
+
+**Status:** implementation and mocked end-to-end coverage are green. Live E2E remains blocked by
+invalid stored Groq/Gemini credentials; no key or user runtime config was changed.
+
+### Root cause
+- The real config selected Groq/Gemini but had no per-provider model map; strict zero-cost mode
+  also correctly blocks their free-tier models until the user explicitly opts out.
+- Authentication-only provider probes rejected both stored credentials (401/400), so no live model
+  could be verified or used. Current official Groq docs list both configured model IDs, but publish
+  paid token pricing; selecting them therefore still requires explicit `strict_zero_cost = false`.
+- The daemon started voice before building `AppContext`, allowing an immediate wake to submit with
+  no context; an injected/reused voice service was not always linked into the context bridge.
+
+### Changes
+- Build the context before voice startup, refresh the bridge before/after service creation, and
+  fail a pre-startup voice submission cleanly instead of raising.
+- Preserve keyring-to-environment credential fallback when keyring access fails; credential
+  presence probes now remain non-throwing.
+- Make pricing qualification strict by default and make doctor/provider status validate every
+  configured planner/fast role. `jarvis init` now warns about the Groq/Gemini strict-mode block.
+- Add a fully mocked wake → STT → real `GroqClient` transport → LangGraph → TTS regression test
+  plus daemon startup/bridge, credential fallback, role diagnostics, and policy-default tests.
+
+### Validation
+- Focused affected suites: 166 passed.
+- `pytest -q`: exit 0, 6 skipped; only the pre-existing daemon async-mock coroutine warnings.
+- `pytest -q -m "not windows_only and not slow and not voice"`: exit 0, 4 skipped; the same
+  pre-existing warnings remain.
+- `ruff check .`, `ruff format --check .`, and `mypy src/jarvis/policy`: pass.
+- PowerShell environment-override smoke resolved Groq planner/fast models and
+  `strict_zero_cost = false`; plain `jarvis doctor` then marked both model and provider checks PASS
+  without inference or key output.
+
+### Manual next step
+- Replace the Groq key, configure Groq planner/fast models and `strict_zero_cost = false` as an
+  explicit free-tier opt-in, run `jarvis doctor --live`, then repeat wake/STT/response/TTS.
+
+
 ## Session 2026-09-24 (later) — voice re-arm quiet-start gate + Phase 7 Audit DONE (no commit)
 
 Two unrelated work items, both green on the dev PC.
@@ -1257,7 +1296,7 @@ shows `strict_zero_cost PASS` and the `zero-cost`/`free-tier` distinction on pro
 
 ---
 
-## Session: quiet-start/re-arm diagnosis � first-wake regression follow-up (no commit)
+## Session: quiet-start/re-arm diagnosis — first-wake regression follow-up (no commit)
 
 **Status: NOT committed** (per instruction; no commit/push for this follow-up).
 
@@ -1268,7 +1307,7 @@ produced no "Yes?"/response at all. Investigated exhaustively with live diagnost
 ### Root-cause verdict
 - Static trace: the re-arm quiet-start gate (`_REARM_QUIET_GATE_S=0.5`,
   `_quiet_start_drain()`) runs ONLY in `_reset_voice_state()` / `_rearm_wake_for_confirmation()`
-  � i.e. post-interaction and pre-confirmation. The startup path
+  — i.e. post-interaction and pre-confirmation. The startup path
   (`_run()` ? `audio.open()` ? `_set_state("LISTENING")` ? `wake_detector.reset()` ?
   `_wait_for_wake()`) contains NO gate, drain, or extra reset. Empirically confirmed: daemon
   logs show `WAKE_WAIT_START` immediately after the startup reset, with no `RESETTING`,
@@ -1286,8 +1325,8 @@ produced no "Yes?"/response at all. Investigated exhaustively with live diagnost
   init 0.31 s + speech 1.53 s, NO hang) ? capture ? `RESETTING` ? `LISTENING`.
 - Conclusion: NOT a code regression. The first-wake pipeline is intact end-to-end. The
   reported failure is an INPUT-AMPLITUDE margin: the detector is sensitive to the level of
-  the phrase in the fed stream (0.45 at x1 playback vs 0.65�0.99 at x2/human volumes);
-  the fixed threshold (0.5) was never changed. Root cause in the real world � mic
+  the phrase in the fed stream (0.45 at x1 playback vs 0.65–0.99 at x2/human volumes);
+  the fixed threshold (0.5) was never changed. Root cause in the real world — mic
   level/AGC/room at launch time, not the loop, the detector, or the TTS. Hypoteses A/B/C/D
   from the task are all closed: (A) frames reach detector (frames_seen grows at 16 k/s,
   blocks_dropped=0), (B) scores correct and turn into wakes, (C) no startup suppression,
@@ -1307,6 +1346,6 @@ produced no "Yes?"/response at all. Investigated exhaustively with live diagnost
 
 ### Manual test for the user (real device)
 Run daemon ? wait for "voice activated" ? say "Hey Jarvis": expect a "Yes?" ack and
-response. A quieter-than-usual mic (laptop AGC) can sit below threshold � check Windows
+response. A quieter-than-usual mic (laptop AGC) can sit below threshold — check Windows
 mic volume/enhancements if it doesn't react; but faces-talking at normal volume matched
 historical 0.9+ scores on this exact build.
