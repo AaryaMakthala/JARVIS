@@ -2,6 +2,37 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-25 — `keys set --visible`: explicit opt-in visible key entry (no commit)
+
+**Status:** `jarvis keys set <provider>` keeps fully hidden `getpass` input as the default; a new
+explicit `--visible` flag opts in to echoed entry and a full-key receipt. Credential storage
+(`SecretStore` / Windows Credential Manager) and all LLM/provider/model config are untouched.
+
+- New `--visible` flag on `jarvis keys set` (default off, never enabled implicitly). Visible mode
+  prints `WARNING: API key visibility is enabled.` before prompting, reads through the new
+  `visible_input()` (`input()` — the terminal/PowerShell line editor handles echo, paste and
+  backspace), normalises any literal BS/DEL characters in the received line via
+  `_apply_backspace()`, and after a successful `store.set()` prints the receipt plus
+  `Key: <full key>`.
+- Default mode unchanged: hidden input, masked first-4/last-4 preview only, no warning.
+  `keys status` remains presence-only; `keys paste`/`clear` unchanged.
+- Receipts are built strictly after storage succeeds: empty input and storage failures print no
+  fragment of the key. The new code path logs nothing; the receipt is printed with rich
+  `markup=False, soft_wrap=True` so a raw key is never parsed as markup or wrapped mid-line.
+- Tests (`tests/unit/test_keys_cli.py`, +13): visible receipt/paste/backspace/empty/storage
+  failure, default visible reader is terminal `input()`, default invocation stays hidden and
+  unwarned, command-level default receipt stays masked, and caplog assertions that the full key
+  never reaches logs in either mode. Test keys are obviously fake fixtures.
+- Validation: focused keys/secrets/init-flow = 56 passed; full `pytest -q` = **947 passed,
+  6 skipped** (pre-existing daemon async-mock warnings only); `ruff check .` +
+  `ruff format --check .` clean; `mypy src/jarvis/policy` Success. `mypy src/jarvis/cli.py`
+  reports 8 pre-existing errors (missing `types-pyperclip` stub + untouched password/contacts
+  code); none fall in the changed lines.
+- Manual smoke (user, PowerShell): `jarvis keys set groq` → hidden as before;
+  `jarvis keys set nvidia --visible` → warning, characters echo while typing/pasting, receipt +
+  `Key: <full>`; empty Enter in either mode → exact rejection, nothing stored; `jarvis keys
+  status` → presence-only lines.
+
 ## Session 2026-09-25 — masked preview after `keys set` (no commit)
 
 **Status:** `jarvis keys set <provider>` keeps its hidden `getpass` input and the unchanged

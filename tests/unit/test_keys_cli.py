@@ -1,14 +1,20 @@
 """``jarvis keys`` sub-app: set/paste/clear/status (secret-safe).
 
-Asserts the contract: hidden input, whitespace stripped, explicit safe receipt
-feedback followed by a masked preview (first/last 4 characters only), empty
-values rejected without storage, clipboard import never echoes the value,
-``status`` shows only ``<provider>: configured|not configured``, and unknown
-providers are rejected.  The complete secret must never appear in any output.
+Asserts the contract: hidden input is the default, whitespace stripped,
+explicit safe receipt feedback followed by a masked preview (first/last 4
+characters only), empty values rejected without storage, clipboard import
+never echoes the value, ``status`` shows only
+``<provider>: configured|not configured``, and unknown providers are rejected.
+The complete secret must never appear in any output or log.
+
+Visible entry exists only behind the explicit ``--visible`` opt-in flag; these
+tests pin that opt-in down (warning shown, full key in the receipt) *and* that
+neither mode ever writes the full key to logs.
 """
 
 from __future__ import annotations
 
+import logging
 import typing
 
 import pytest
@@ -328,3 +334,190 @@ def test_clear_removes_key() -> None:
 def test_clear_unknown_provider_rejected() -> None:
     with pytest.raises(ValueError, match="unknown provider"):
         cli.keys_clear_command(FakeStore(), "mystery")
+
+
+# ── visible mode (explicit --visible opt-in; intentionally insecure) ────
+
+_VISIBLE_SECRET = "nvapi-visible-test-key-12345678"
+_VISIBLE_WARNING = "WARNING: API key visibility is enabled."
+
+
+def test_visible_mode_shows_full_key_in_receipt() -> None:
+    store = FakeStore()
+    out = cli.keys_set_command(
+        store,
+        "nvidia",
+        interactive=True,
+        visible=True,
+        prompt_fn=lambda _prompt: f"  {_VISIBLE_SECRET}\r\n",
+    )
+    receipt, key_line = out.splitlines()
+    assert receipt == "✓ API key received and saved securely."
+    assert key_line == f"Key: {_VISIBLE_SECRET}"  # explicit opt-in shows the whole key
+    assert store.get("nvidia_api_key") == _VISIBLE_SECRET
+
+
+def test_visible_mode_default_reader_is_terminal_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Visible mode reads via input(): the terminal echoes, edits and accepts paste."""
+    store = FakeStore()
+    prompts: list[str] = []
+
+    def fake_input(prompt: str) -> str:
+        prompts.append(prompt)
+        return _VISIBLE_SECRET
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    out = cli.keys_set_command(store, "nvidia", interactive=True, visible=True)
+    assert prompts == ["NVIDIA API key: "]
+    assert store.get("nvidia_api_key") == _VISIBLE_SECRET
+    assert out.splitlines()[1] == f"Key: {_VISIBLE_SECRET}"
+
+
+def test_visible_mode_paste_in_single_read_is_stored_and_shown() -> None:
+    store = FakeStore()
+    pasted = f"  {_VISIBLE_SECRET}\r\n"  # a Windows paste arrives as one burst
+    calls: list[str] = []
+    out = cli.keys_set_command(
+        store,
+        "nvidia",
+        interactive=True,
+        visible=True,
+        prompt_fn=lambda prompt: (calls.append(prompt), pasted)[1],
+    )
+    assert len(calls) == 1  # one read consumed the whole pasted line
+    assert store.get("nvidia_api_key") == _VISIBLE_SECRET
+    assert out.splitlines()[1] == f"Key: {_VISIBLE_SECRET}"
+
+
+def test_visible_mode_applies_backspace_edits() -> None:
+    store = FakeStore()
+    typed = "nvapi-abc\x08def"  # typed abc, one backspace, then def
+    out = cli.keys_set_command(
+        store, "nvidia", interactive=True, visible=True, prompt_fn=lambda _p: typed
+    )
+    assert store.get("nvidia_api_key") == "nvapi-abdef"
+    assert out.splitlines()[1] == "Key: nvapi-abdef"
+    assert "nvapi-abcdef" not in out  # the unedited line was never accepted
+
+
+def test_apply_backspace_handles_leading_and_consecutive_backspaces() -> None:
+    assert cli._apply_backspace("\x08\x08ab\x08c") == "ac"
+    assert cli._apply_backspace("ab\x7f") == "a"
+    assert cli._apply_backspace("plain-line") == "plain-line"  # cooked terminals: no-op
+
+
+def test_visible_mode_empty_input_is_rejected_without_storing() -> None:
+    store = FakeStore()
+    with pytest.raises(ValueError, match=r"✗ No API key entered\. Nothing was saved\."):
+        cli.keys_set_command(
+            store, "nvidia", interactive=True, visible=True, prompt_fn=lambda _p: " \r\n "
+        )
+    assert store.get("nvidia_api_key") is None
+
+
+def test_keys_set_cli_visible_flag_warns_and_prints_full_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+
+    result = runner.invoke(
+        cli.app, ["keys", "set", "nvidia", "--visible"], input=f"{_VISIBLE_SECRET}\n"
+    )
+
+    assert result.exit_code == 0
+    assert _VISIBLE_WARNING in result.output  # labelled as intentionally insecure
+    assert "✓ API key received and saved securely." in result.output
+    assert f"Key: {_VISIBLE_SECRET}" in result.output
+    assert store.get("nvidia_api_key") == _VISIBLE_SECRET
+
+
+def test_keys_set_cli_visible_empty_input_exits_without_storing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+
+    result = runner.invoke(cli.app, ["keys", "set", "nvidia", "--visible"], input="\n")
+
+    assert result.exit_code == 1
+    assert "✗ No API key entered. Nothing was saved." in result.output
+    assert "Key:" not in result.output  # no receipt without a stored value
+    assert store.get("nvidia_api_key") is None
+
+
+def test_keys_set_cli_visible_storage_failure_never_prints_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.secret_module, "SecretStore", FailingStore)
+
+    result = runner.invoke(
+        cli.app, ["keys", "set", "nvidia", "--visible"], input=f"{_VISIBLE_SECRET}\n"
+    )
+
+    assert result.exit_code == 1
+    assert "✗ API key received, but secure storage failed." in result.output
+    assert "API key received and saved securely" not in result.output
+    assert "Key:" not in result.output  # receipt is built only after storage succeeds
+    assert _VISIBLE_SECRET not in result.output
+
+
+def test_keys_set_cli_default_is_hidden_and_unwarned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default invocation must stay on getpass with no warning and no full key."""
+    store = FakeStore()
+    secret = "test-default-hidden-secret"
+    prompts: list[str] = []
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda p: (prompts.append(p), secret)[1])
+
+    result = runner.invoke(cli.app, ["keys", "set", "groq"])
+
+    assert result.exit_code == 0
+    assert prompts == ["Groq API key: "]  # hidden reader, no --visible involved
+    assert _VISIBLE_WARNING not in result.output
+    assert secret not in result.output
+    assert f"Key: {cli.masked_key_preview(secret)}" in result.output
+    assert store.get("groq_api_key") == secret
+
+
+def test_keys_set_command_defaults_to_hidden_receipt() -> None:
+    """Without visible=True the receipt must be masked even when value is given."""
+    store = FakeStore()
+    out = cli.keys_set_command(store, "groq", value=_VISIBLE_SECRET, interactive=False)
+    assert out.splitlines()[1] == f"Key: {cli.masked_key_preview(_VISIBLE_SECRET)}"
+    assert _VISIBLE_SECRET not in out
+
+
+# ── log hygiene: the full key never reaches logs in either mode ──────────
+
+
+def test_hidden_mode_never_writes_key_to_logs(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FakeStore()
+    secret = "test-log-leak-hidden-secret-1234567890"
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _p: f"  {secret}\r\n")
+
+    with caplog.at_level(logging.DEBUG):
+        result = runner.invoke(cli.app, ["keys", "set", "groq"])
+
+    assert result.exit_code == 0
+    assert secret not in result.output
+    assert secret not in caplog.text
+    assert secret not in caplog.text.lower()
+
+
+def test_visible_mode_shows_key_only_in_receipt_never_in_logs(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FakeStore()
+    secret = "test-log-leak-visible-secret-1234567890"
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+
+    with caplog.at_level(logging.DEBUG):
+        result = runner.invoke(cli.app, ["keys", "set", "nvidia", "--visible"], input=f"{secret}\n")
+
+    assert result.exit_code == 0
+    assert f"Key: {secret}" in result.output  # explicit --visible session only
+    assert secret not in caplog.text

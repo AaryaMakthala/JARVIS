@@ -167,6 +167,9 @@ def init_config(
 _KEYS_SET_SAVED_MESSAGE = "✓ API key received and saved securely."
 _KEYS_SET_EMPTY_MESSAGE = "✗ No API key entered. Nothing was saved."
 _KEYS_SET_PREVIEW_PREFIX = "Key: "
+#: Shown by `jarvis keys set --visible` *before* prompting. Visible key entry
+#: is an intentional, explicitly opted-in insecurity - never a default.
+_KEYS_SET_VISIBLE_WARNING = "WARNING: API key visibility is enabled."
 #: Bullet character used to mask hidden parts of a secret in previews.
 _MASK_GLYPH = "•"
 #: Number of secret characters revealed at each end of a masked preview.
@@ -216,6 +219,37 @@ def _clipboard_clear() -> None:
         logger.warning("could not clear the clipboard: %s", exc)
 
 
+def visible_input(prompt: str) -> str:
+    """Read one API-key line *with* echo (explicit ``--visible`` mode only).
+
+    Echoing, pasting and backspace editing are delegated to the terminal's
+    own line editor through ``input()``, which behaves correctly in Windows
+    PowerShell as well as cmd: characters appear while typing, pasted text is
+    shown normally, and backspace edits the line before Enter.  The raw line
+    (minus the newline) is returned; nothing here is ever logged.
+    """
+    return input(prompt)
+
+
+def _apply_backspace(line: str) -> str:
+    """Apply literal backspace characters (BS ``\x08`` / DEL ``\x7f``) to a line.
+
+    A cooked console applies backspace before the line reaches Python, so for
+    normal terminal typing this is a no-op.  It still matters when the
+    characters arrive literally - piped input, or a paste containing control
+    characters - so visible mode honours editing as far as practical.  A
+    backspace at the start of the line deletes nothing.
+    """
+    edited: list[str] = []
+    for char in line:
+        if char in ("\b", "\x7f"):
+            if edited:
+                edited.pop()
+        else:
+            edited.append(char)
+    return "".join(edited)
+
+
 def keys_set_command(
     store: secret_module.SecretStore,
     short: str,
@@ -223,26 +257,35 @@ def keys_set_command(
     value: str | None = None,
     interactive: bool = True,
     prompt_fn: Any = None,
+    visible: bool = False,
 ) -> str:
-    """Securely store a provider API key through hidden input.
+    """Securely store a provider API key; hidden input unless ``visible=True``.
 
-    Input stays completely hidden (``getpass``) while typing or pasting.  On
-    success the returned receipt is the saved confirmation line followed by a
-    masked preview line (``Key: <first4>•••…last4>``) built by
+    Default (``visible=False``): input stays completely hidden (``getpass``)
+    while typing or pasting, and the success receipt is the saved confirmation
+    line followed by a masked preview (``Key: <first4>•••…last4>``) built by
     :func:`masked_key_preview` - the full value is never part of the return
-    value, any log, or any exception.  The preview is computed only *after*
-    the credential store accepted the value, so a storage failure returns no
-    fragment of the key at all.
+    value, any log, or any exception.
+
+    ``visible=True`` is the explicit opt-in (CLI: ``jarvis keys set <p>
+    --visible``) that reads through :func:`visible_input` (the terminal's own
+    line editor, so echo/paste/backspace work in PowerShell) and puts the
+    **full** key on the ``Key:`` line of the receipt.  Even then the value is
+    never logged and never raised in an exception: the receipt is built only
+    *after* the credential store accepted the value, so a storage failure or
+    empty input returns no fragment of the key at all.
     """
     _validate_provider(short)
     if interactive:
-        prompt_fn = prompt_fn or getpass.getpass
-        value = prompt_fn(f"{_provider_label(short)} API key: ")
+        reader = (prompt_fn or visible_input) if visible else (prompt_fn or getpass.getpass)
+        raw = reader(f"{_provider_label(short)} API key: ")
+        value = _apply_backspace(raw or "") if visible else raw
     value = (value or "").strip()
     if not value:
         raise ValueError(_KEYS_SET_EMPTY_MESSAGE)
     store.set(PROVIDER_SECRETS[short], value)
-    return f"{_KEYS_SET_SAVED_MESSAGE}\n{_KEYS_SET_PREVIEW_PREFIX}{masked_key_preview(value)}"
+    shown = value if visible else masked_key_preview(value)
+    return f"{_KEYS_SET_SAVED_MESSAGE}\n{_KEYS_SET_PREVIEW_PREFIX}{shown}"
 
 
 def keys_paste_command(
@@ -620,17 +663,28 @@ app.add_typer(keys_app, name="keys")
 @keys_app.command("set")
 def keys_set(
     provider: Annotated[str, typer.Argument(help="groq|openrouter|gemini|nvidia|tavily")],
+    visible: Annotated[
+        bool,
+        typer.Option(
+            "--visible",
+            help="Echo the key while typing and print it in full (INSECURE, opt-in only).",
+        ),
+    ] = False,
 ) -> None:
-    """Securely store a provider API key (hidden paste-friendly input)."""
+    """Store a provider API key (hidden input; opt in with --visible)."""
+    if visible:
+        console.print(f"[yellow]{_KEYS_SET_VISIBLE_WARNING}[/yellow]")
     try:
-        message = keys_set_command(secret_module.SecretStore(), provider)
+        message = keys_set_command(secret_module.SecretStore(), provider, visible=visible)
     except secret_module.SecretStoreError:
         console.print("[red]✗ API key received, but secure storage failed.[/red]")
         raise typer.Exit(code=1)
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
-    console.print(f"[green]{message}[/green]")
+    # markup=False + soft_wrap: the receipt may contain the raw key in visible
+    # mode, so rich must neither parse it as markup nor wrap it mid-line.
+    console.print(message, style="green", markup=False, soft_wrap=True)
 
 
 @keys_app.command("paste")
