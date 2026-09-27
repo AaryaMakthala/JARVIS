@@ -2,6 +2,100 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-27 — voice lifecycle proof, exactly-once steps, dynamic provider health (no commit)
+
+### What was asked for
+
+Prove the voice lifecycle on the console, make a non-idempotent step impossible to run twice,
+keep provider preference dynamic (never a permanent blacklist), keep internal routing JSON out of
+user-visible output, and make "2 times 2" / "2 multiplied by 2" behave identically *without*
+hard-coding arithmetic in the app.
+
+### Real defects found and fixed (not test bugs)
+
+| # | File | Defect | Fix |
+|---|------|--------|-----|
+| 1 | `voice/loop.py` | Idle timeout was wall-clock only, so any stream delivering frames faster than real time (test fake, or a device replaying a buffer) satisfied it thousands of times a second and **busy-spun a CPU core** | Deadline measured in *audio seconds consumed*, with a wall-clock slack (`_IDLE_WALL_SLACK_S`) so a fully stalled stream still yields, plus a cancellable `_idle_backoff()` so re-arming cannot spin |
+| 2 | `voice/status.py` | `transcribing()` was never called, so every real interaction logged an **illegal `CAPTURE_COMPLETE -> THINKING`** jump | Added `transcribing()` and called it from `_run_interaction`; transitions are now clean |
+| 3 | `voice/status.py` | Console printed the enum value: `[VOICE] WAKE_DETECTED`, `[VOICE] CAPTURE_COMPLETE` — not the required text | `CONSOLE_LABELS` + `console_label()` in `voice/states.py`; JSONL keeps the machine vocabulary |
+| 4 | `llm/failures.py` | `classify()` promised "Never raises" but `str(exc)` and a property-style `status_code` could raise, taking down the very fallback logic meant to catch the failure | `_safe_text()` / `_safe_status()` helpers, both failure-proof |
+| 5 | `llm/health.py` | `snapshot()` read the **real** clock while every other method used the injected one, so `cooling` disagreed with `is_cooling()` and `jarvis doctor` could report the wrong state | `snapshot(now)` takes the moment; `ProviderHealth.snapshot()` passes `self._clock()` |
+| 6 | `llm/health.py` | **A single 429 demoted a provider to the back of the rotation permanently.** `order()` sorted by `consecutive_failures` even after the cooldown expired, and a provider only ever got called after the others failed — so it could never win one back. This is a blacklist, which the requirement forbids | An **expired cooldown is a fresh probe** back at its configured position. The streak is deliberately *not* cleared, so failing again still earns a longer cooldown. Nothing is ever dropped |
+| 7 | `voice/status.py` | The `stt` log record carried `redacted=<transcript>`. `redact()` only masks *recognised* secrets and `+`-prefixed numbers, so for ordinary speech the "redacted copy" was the **whole utterance verbatim** — the JSONL kept everything the user said | The log record now carries `chars` and `words` only. The console still shows the exact `[VOICE] STT: "…"` line, which is the channel the user opted into via `echo_transcript` |
+| 8 | `agent/nodes/act.py` | The exactly-once guard called `_recorded_result` but the helper was named `_already_executed`, and `logger` was never imported | Helper renamed, `logger` defined. Guard replays a successful result and advances `step_index`; a *failed* or `verified=False` step stays retryable |
+
+### Required console vocabulary — now exact and asserted
+
+`READY → WAKE DETECTED → LISTENING → CAPTURE COMPLETE → TRANSCRIBING → STT → THINKING →
+PROVIDER → MODEL → ANSWER → SPEAKING → RESETTING → READY`, with `[VOICE] RECOVERING` on a
+recoverable failure. `READY` is printed at start-up **and** after every wake, so a missing
+final `READY` is visible; `illegal_transitions == []` for a full interaction is asserted.
+
+### Tests added (142, all green)
+
+`tests/unit/test_voice_status.py` (36) exact terminal text, READY-restored, console/log split,
+broken-stream safety, state-machine vocabulary.
+`tests/unit/test_llm_health.py` (38) finite cooldowns, self-recovery, `(provider, role)`
+granularity, "expired cooldown = fresh probe", stable ordering, never-dropped, classification.
+`tests/unit/test_answer.py` (36) parse-driven leak detection, prose that merely says "goal" is
+untouched, `safe_final_answer`, `spoken_answer`, repair-prompt text.
+`tests/unit/test_act_node.py` (14) exactly-once, failed/verified-failed stay retryable, and the
+guard is **not** a policy bypass.
+`tests/unit/test_math_phrasings.py` (18) the four reported phrasings round-trip cleanly, and a
+**structural guard fails the build** if anyone hard-codes arithmetic words in `src/jarvis`.
+
+### `tests/unit/test_voice_loop.py` — 5 tests were rewritten, not weakened
+
+The idle timeout no longer ends the loop (that *was* the production bug: the wake word went dead
+until a restart), so `join()`-until-thread-exit could never finish. Added `_wait_until()` /
+`_stop_and_join()` helpers: wait for the behaviour under test, then stop. Two tests assert
+per-interaction wake-detector reset counts, so they now set `idle_timeout_s=0` to isolate the
+per-interaction re-arm from the (correct) idle re-arm; `test_no_per_frame_reset_while_waiting` and
+`test_wake_heartbeat_includes_audio_level` do the same for the same reason.
+All 23 classes green individually.
+
+### Decisions worth knowing
+
+- **`CONTEXT_LENGTH` is retryable on the same provider** — a shrink-the-prompt retry can succeed,
+  and a sibling model may have a bigger window. Not a bug.
+- **`ToolSpec.execute()` does not verify** (that is `run_verified()`), so the act node records
+  `verified=None`; the guard treats `None` as "not yet verified", not as a failure.
+- **`ERROR -> READY` is deliberately illegal**; recovery from an error goes through `STARTING`.
+  Resuming a listening state would hide that the mic or thread died.
+- `enabled=False` on the reporter silences the **console only**; the log sink is independent,
+  because turning off the on-screen status must not blind `jarvis doctor`.
+- Math is the planner's job. No phrase table, no `eval`, no `ast.literal_eval` — asserted.
+
+### Deferred / not verified
+
+- **The full `tests/unit/test_voice_loop.py` file was never run in one process.** Every one of its
+  23 classes is green individually, but the aggregate exceeds 2 minutes (real-time audio waits),
+  and a whole-suite run was explicitly out of scope. The rest of `tests/unit/` is likewise unrun.
+- `pytest -q` overall: **not run.** No integration, `windows_only`, voice, or benchmark run.
+- `mypy src/jarvis/policy`: not run (nothing in `policy/` was touched).
+- **The suspicious STT content was never traced to a source.** No audio/STT recording was captured,
+  and nothing is blacklisted. It remains unexplained.
+- Real microphone / real providers: not exercised. Everything above is fakes and unit tests.
+
+### Manual smoke tests for the Windows PC
+
+```powershell
+.venv\Scripts\ruff check .
+.venv\Scripts\python -m pytest -q tests/unit/test_voice_status.py tests/unit/test_llm_health.py tests/unit/test_answer.py tests/unit/test_act_node.py tests/unit/test_math_phrasings.py
+.venv\Scripts\python -m pytest -q tests/unit/test_voice_loop.py     # ~3 min: use a generous timeout
+.venv\Scripts\python -m pytest -q                                    # full suite
+jarvis doctor
+.venv\Scripts\python -m jarvis daemon --foreground
+```
+
+Say "Hey Jarvis", then **wait well past the idle timeout** (default 120 s), then say it again —
+the second wake must work. Check the console shows every line in the vocabulary above, that
+`READY` appears once per interaction, and that `jarvis.jsonl` contains `event=stt` records with
+`chars=`/`words=` but **no transcript words**. Then unplug/replug a provider's key and confirm the
+next call falls back and the provider returns on its own.
+
+Suggested commit: `fix(voice): prove the interaction lifecycle and stop the idle busy-spin`
+
 ## Session 2026-09-25 — `keys set --visible`: explicit opt-in visible key entry (no commit)
 
 **Status:** `jarvis keys set <provider>` keeps fully hidden `getpass` input as the default; a new
@@ -1455,3 +1549,161 @@ Run daemon ? wait for "voice activated" ? say "Hey Jarvis": expect a "Yes?" ack 
 response. A quieter-than-usual mic (laptop AGC) can sit below threshold — check Windows
 mic volume/enhancements if it doesn't react; but faces-talking at normal volume matched
 historical 0.9+ scores on this exact build.
+
+## Session: idle timeout is non-fatal (voice loop reliability)
+
+### What was actually wrong
+The non-fatal idle timeout had already been implemented in `VoiceLoop._run`, but:
+
+1. **The regression test was racy, not slow-by-design.** It polled a list that the
+   wake-ack `"Yes?"` appended to *before* capture, so it asserted on a half-finished
+   interaction and failed. On failure it never called `loop.stop()`, leaving a live
+   voice thread cycling `READY/RECOVERING/RESETTING` for the rest of the session —
+   that was the ~40 min "stuck" run, not a slow test.
+2. **The idle path reused the post-interaction reset** (`_rearm()`: flush -> quiet
+   drain -> `wake_detector.reset()`), so a wake that never happened spent the
+   once-per-interaction re-arm and made "re-armed exactly once per interaction"
+   unobservable.
+3. **~20 existing tests used the idle timeout as the loop's terminator** (`join(10)`
+   + `assert not is_active()`). With a non-fatal timeout they can never pass: a fake
+   mic that runs out of script keeps listening, exactly as a real one does.
+
+### Change made
+- `src/jarvis/voice/loop.py`
+  - `_resume_after_idle()` replaces `_rearm()` on the idle path: reports
+    `RECOVERING` -> `READY` and re-enters the wait. No flush, no quiet drain, no
+    detector reset (nothing was spoken, the model was scoring silence).
+  - New `idle_backoff_s` ctor knob (default unchanged at 0.5 s) so tests can shrink
+    the post-timeout pause without changing production behaviour.
+  - `_empty_read_backoff()`: a *zero-sample* wake read (stalled/half-closed device)
+    now yields 20 ms instead of hot-spinning; with `idle_timeout_s` disabled nothing
+    else bounded that loop.
+- `tests/unit/test_voice_loop.py`
+  - Helpers `_wait_for` / `_stop_loop` / `_run_scripted` + `_PhaseSpy` reporter:
+    lifecycle phases and recoveries are asserted directly, every wait is bounded
+    (5 s), and `stop()` always runs in a `finally`, so a regression fails in seconds
+    and never leaks a spinning voice thread.
+  - `test_idle_timeout_is_non_fatal` rewritten: first wait forced to time out, the
+    wake fires only after that timeout was observed, one full interaction runs
+    (ack -> capture -> STT -> agent -> answer), the loop returns to `READY`, survives
+    a further idle timeout, exits only on `stop()` with reason `None`, no illegal
+    phase transitions, `reset_calls == 2`.
+  - Converted the ~20 `join()`-terminated tests to "wait for the effect, then
+    `stop()`" (the pattern the rest of the file already used).
+  - `TestVoiceLevelDiagnostics.test_wake_heartbeat_includes_audio_level` /
+    `test_wake_heartbeat_is_rate_limited` and the other idle-heavy tests pass
+    `idle_backoff_s=0.01`.
+  - `TestVoiceClarificationCapture.test_empty_utterance_fails_closed` used the default
+    30 s command window: now 0.2 s (the wait-for-speech behaviour is covered by
+    `test_no_speech_capture_waits_for_speech_then_gives_up`). 30 s -> 0.2 s.
+
+### Validation
+- `pytest tests/unit/test_voice_loop.py` -> 78 passed (~2 s total, was minutes).
+- `pytest tests/unit/test_voice_status.py` -> 36 passed.
+- `pytest tests/unit/test_daemon_voice.py tests/unit/test_voice_wiring.py
+  tests/unit/test_tools_dictation.py tests/unit/test_invariants.py` -> 92 passed, 1 skipped.
+- `test_idle_timeout_is_non_fatal` alone: 0.09 s, run 5x, stable.
+- `ruff check` / `ruff format --check` clean; `mypy src/jarvis/policy`: Success.
+
+### Note for review
+`tests/unit/test_voice_loop.py` is stored with CRLF line endings (unstaged diff is a
+whole-file line-ending change against the index). Left as-is; normalise with
+`git add --renormalize` only if the repo wants LF.
+
+
+---
+
+## Session: Phase 8 memory + `jarvis run` (one-shot command)
+
+### Where the roadmap actually stood
+`docs/05_BUILD_PLAN.md` Phase 8 (`src/jarvis/memory/*`) was still five one-line
+stubs and `src/jarvis/ml/__init__.py` is still a stub, so memory was the next real
+gap. `jarvis run "<command>"` (in the `docs/01_PROJECT_SPEC.md` CLI table) did not
+exist at all. Both are now done except the classifier (see "Not done").
+
+### Phase 8: memory (local, offline, no model downloads)
+- `memory/db.py` - SQLite schema (`skills`, `failures`, `preferences`, `task_log`),
+  WAL, `PRAGMA user_version`, bounded pruning, and the shared secret helpers
+  (`secret_key`, `looks_secret`, `redact_secrets`, `safe_value`, `safe_plan`,
+  `secret_free_rows`).
+- `memory/embeddings.py` - deterministic 256-dim BLAKE2b lexical embeddings
+  (cosine similarity). Chosen over sentence-transformers so retrieval works with
+  no network and no 90 MB model; the interface is swappable later.
+- `memory/skills.py` - only *verified* plans are stored; near-duplicate goals fold
+  into the existing row and bump `success_count`; `trusted = fail_count <= success_count`.
+- `memory/failures.py`, `memory/prefs.py` - failure history (feeds replan) and
+  explicit, inspectable preferences (never inferred).
+- `memory/store.py` - thread-safe `SqliteMemory`; `open_memory()` **never raises** -
+  it returns `NullMemory` when memory is disabled, in `dry_run`, or if the file
+  cannot be opened.
+- `agent/nodes/memory_save.py` + `graph.py` - `respond -> memory_save -> END`.
+  Only `ok and verified and not tainted` steps become skills; failed / unverified /
+  tainted steps become failure records; a cancelled or halted task writes nothing.
+  Every write is fail-soft - memory never breaks a task.
+- Wiring: in-process `chat --no-daemon` and the daemon open memory lazily and close
+  it in `finally`; `[memory]` settings added to config (`enabled`, `save_skills`,
+  `similarity_threshold`, row caps).
+- `jarvis skills list|show|delete|clear` - the user can inspect and delete anything
+  JARVIS learned. `skills clear` also wipes failures and preferences.
+
+### Audit self-review fix (Phase 7 acceptance)
+`jarvis audit` and `audit_last_session` now pass `log_path=config.log_file()`. Without
+it the self-review step compared against nothing and the Phase 7 criterion "audit can
+review its own last session" was not actually met.
+
+### `jarvis run "<command>"`
+- Default path talks to a running daemon over IPC; `--no-daemon` runs in-process.
+  Both share the *same* code as `chat`: `resolve_interrupts()` (extracted from
+  `chat_loop`) answers clarification and confirmation prompts, and
+  `_daemon_one_shot()` (extracted from `_daemon_chat_loop`) handles the daemon's
+  `ConfirmRequest` / `ClarificationRequest` / `FinalMessage` stream.
+  **There is no `--yes` and no way to skip a prompt**: an approval is bound to the
+  same `action_hash` and the same typed-confirmation / password rules as the REPL,
+  so the one-shot path can never be more permissive than the interactive one.
+- `--dry-run` is accepted **only** with `--no-daemon`; with the daemon it exits 2 and
+  says so. The daemon owns one long-lived `AppContext` shared by all its tasks, so
+  honouring a per-request flag would mean mutating shared state between tasks; it
+  refuses rather than silently running for real.
+- Exit codes: 0 answered, 1 provider missing / daemon unreachable / task error,
+  2 bad usage.
+
+### Security fixes found while reviewing the memory code
+1. `FailureStore.record` stored tool error text verbatim (only truncated). A tool
+   that echoes a credential back ("login failed ... password=hunter2") would have
+   persisted it. Now redacted via the shared `redact_secrets()` before the row is
+   written; the useful part of the message is kept, only the value is dropped.
+2. `jarvis skills show/delete <unknown id>` raised `typer.Exit` before the store was
+   closed, leaking the SQLite handle. All four skills commands now go through
+   `_memory_store()`, a context manager that closes on every path.
+3. `_close_memory_backend(ctx)` takes a *context* and reads `ctx.memory`; passing a
+   store to it silently did nothing. Split into `_close_memory_backend(ctx)` and
+   `_close_store(memory)` so both call sites are honest.
+4. With `[memory] enabled = false` the CLI got a `NullMemory` backend with no
+   `.skills` attribute and crashed with an `AttributeError`. It now prints how to
+   enable memory and exits 1.
+
+### Validation
+- `pytest tests/unit/test_run_cli.py` -> 11 passed (new).
+- `pytest tests/unit/test_skills_cli.py` -> 17 passed (3 new: disabled-memory paths,
+  close-on-every-exit-path, per-command connection).
+- `pytest tests/unit/test_memory.py` -> 54 passed (4 new: error redaction, nested
+  step redaction, `redact_secrets` prose/idempotence).
+- Affected regression set (`test_memory*`, `test_skills_cli`, `test_run_cli`,
+  `test_agent`, `test_replan`, `test_invariants`) and
+  (`test_cli`, `test_daemon_server`, `test_daemon_client`, `test_voice_loop`) -> exit 0.
+- `ruff check src/jarvis tests/unit` clean; `ruff format --check` clean on every file
+  I touched; `mypy src/jarvis/policy`: Success. Full suite not run (by instruction).
+
+### Known limitation
+`jarvis run --dry-run` requires `--no-daemon`. A per-request dry-run over IPC needs
+the daemon to build a per-task `AppContext` (or a `dry_run` field on `ChatMessage`
+plus a derived context), which is a Phase 10 hardening item, not a one-line flag.
+
+### Not done (deliberately)
+- `src/jarvis/ml/__init__.py` risk classifier: still a stub. A trained ONNX model and
+  labelled in-session data do not exist, and nothing in the v1 policy path requires
+  it - the deterministic `policy/engine.py` is authoritative. Do not ship a fake
+  classifier for the sake of the module existing.
+- A global `jarvis --dry-run` flag. Only `jarvis run --dry-run` exists today.
+- `jarvis undo` (the undo log is written by the delete path; there is no command to
+  surface it yet).

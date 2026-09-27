@@ -14,6 +14,10 @@ Routers (all deterministic, no LLM):
 * ``route_after_act``     -> verify | respond
 * ``route_after_verify``  -> act | replan | policy_gate | respond
 * ``route_after_replan``  -> validate | respond
+
+``memory_save`` is not a routed node: ``respond`` is the only terminal node and
+it always hands off to ``memory_save`` (docs/02 section 4), so every task gets
+exactly one memory write attempt - including refusals and failures.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from jarvis.agent.nodes.brain import brain
 from jarvis.agent.nodes.clarify import clarify
 from jarvis.agent.nodes.intake import intake
 from jarvis.agent.nodes.memory_retrieve import memory_retrieve
+from jarvis.agent.nodes.memory_save import memory_save
 from jarvis.agent.nodes.policy_gate import policy_gate
 from jarvis.agent.nodes.replan import replan
 from jarvis.agent.nodes.respond import respond
@@ -38,6 +43,7 @@ __all__ = [
     "clarify",
     "intake",
     "memory_retrieve",
+    "memory_save",
     "policy_gate",
     "replan",
     "respond",

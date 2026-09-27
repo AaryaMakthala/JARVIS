@@ -18,6 +18,7 @@ from __future__ import annotations
 import getpass
 import logging
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -51,6 +52,7 @@ from jarvis.llm.provider import (
     build_provider_client,
     provider_has_credential,
 )
+from jarvis.memory import open_memory
 from jarvis.platform_guard import is_64bit, is_python_supported, is_windows
 from jarvis.policy import tiers
 from jarvis.policy.unlock import UnlockManager
@@ -800,7 +802,7 @@ def _run_audit_cli(sections: list[str] | None, out: Path | None) -> tuple[list[A
     unknown = [s for s in chosen if s not in _SECTIONS]
     if unknown:
         raise typer.BadParameter(f"unknown audit section: {', '.join(unknown)}")
-    findings = audit_checks.run_checks(chosen)
+    findings = audit_checks.run_checks(chosen, log_path=config.log_file())
     target = out if out is not None else config.reports_dir()
     report_path = write_report(findings, target)
     return findings, report_path
@@ -1028,69 +1030,73 @@ def chat_loop(ctx: AppContext, saver: SqliteSaver) -> None:
             continue
 
         outcome = run_task(ctx, saver, line)
-        # Answer any pending clarification / confirmation interrupts.  Each
-        # answer resumes the graph, which may surface the other kind in turn.
-        while True:
-            if outcome.interrupt_kind == "clarification":
-                req = outcome.confirmation
-                console.print("[yellow]clarification needed[/yellow]")
-                console.print(req.get("question") or "(no question)")
-                answer = _chat_prompt("Your answer:")
-                outcome = resume_task(ctx, saver, outcome.task_id, answer or "")
-                continue
-            if not outcome.confirmation:
-                break
-            req = outcome.confirmation
-            console.print(
-                "".join(
-                    (
-                        "[yellow]approval needed[/yellow] (",
-                        tiers.tier_label(req.get("tier")),
-                        ")",
-                    )
-                )
-            )
-            console.print(req.get("summary") or "(no summary)")
-            if req.get("untrusted"):
-                console.print(
-                    "[red]NOTE: this action was derived from untrusted content "
-                    "(web/file text).[/red]"
-                )
-            answer = _chat_prompt("Approve?")
-            agreed = (answer or "").strip().lower() in ("y", "yes")
-            typed: str | None = None
-            if agreed and req.get("typed_confirmation"):
-                typed = _chat_prompt(
-                    f"Type this exactly to confirm the delete: {req.get('typed_confirmation')}"
-                )
-            if agreed and req.get("needs_unlock"):
-                agreed = _tier2_unlock_or_refuse(ctx, req)
-            outcome = resume_task(
-                ctx,
-                saver,
-                outcome.task_id,
-                _confirmation_answer(agreed, req, typed),
-            )
+        outcome = resolve_interrupts(outcome, ctx, saver)
+        _print_outcome(outcome)
 
-        if outcome.error:
-            console.print(f"[red]{outcome.error}[/red]")
-        elif outcome.final_answer:
-            console.print(f"[green]{outcome.final_answer}[/green]")
-        else:
-            console.print("[dim](no answer)[/dim]")
+
+def resolve_interrupts(outcome: Any, ctx: AppContext, saver: SqliteSaver) -> Any:
+    """Answer every pending clarification / confirmation, then return.
+
+    Shared by the interactive REPL (:func:`chat_loop`) and the one-shot
+    ``jarvis run`` so both take *exactly* the same safety path: an approval can
+    never be obtained more easily through the non-interactive command than
+    through the chat REPL.  Each answer resumes the graph, which may surface
+    the other kind of interrupt in turn.
+    """
+    while True:
+        if outcome.interrupt_kind == "clarification":
+            req = outcome.confirmation
+            console.print("[yellow]clarification needed[/yellow]")
+            console.print(req.get("question") or "(no question)")
+            answer = _chat_prompt("Your answer:")
+            outcome = resume_task(ctx, saver, outcome.task_id, answer or "")
+            continue
+        if not outcome.confirmation:
+            return outcome
+        req = outcome.confirmation
+        console.print(
+            "".join(
+                (
+                    "[yellow]approval needed[/yellow] (",
+                    tiers.tier_label(req.get("tier")),
+                    ")",
+                )
+            )
+        )
+        console.print(req.get("summary") or "(no summary)")
+        if req.get("untrusted"):
+            console.print(
+                "[red]NOTE: this action was derived from untrusted content (web/file text).[/red]"
+            )
+        answer = _chat_prompt("Approve?")
+        agreed = (answer or "").strip().lower() in ("y", "yes")
+        typed: str | None = None
+        if agreed and req.get("typed_confirmation"):
+            typed = _chat_prompt(
+                f"Type this exactly to confirm the delete: {req.get('typed_confirmation')}"
+            )
+        if agreed and req.get("needs_unlock"):
+            agreed = _tier2_unlock_or_refuse(ctx, req)
+        outcome = resume_task(
+            ctx,
+            saver,
+            outcome.task_id,
+            _confirmation_answer(agreed, req, typed),
+        )
+
+
+def _print_outcome(outcome: Any) -> None:
+    """Print a finished task result (shared by ``chat`` and ``run``)."""
+    if outcome.error:
+        console.print(f"[red]{outcome.error}[/red]")
+    elif outcome.final_answer:
+        console.print(f"[green]{outcome.final_answer}[/green]")
+    else:
+        console.print("[dim](no answer)[/dim]")
 
 
 def _daemon_chat_loop(client: Any) -> None:
     """Interactive REPL that talks to the daemon over IPC."""
-    from jarvis.daemon.client import DaemonError
-    from jarvis.daemon.protocol import (
-        ClarificationRequest,
-        ConfirmRequest,
-        ErrorMessage,
-        EventMessage,
-        FinalMessage,
-    )
-
     console.print("[dim]JARVIS chat via daemon (Ctrl+C to exit)[/dim]")
     while True:
         try:
@@ -1101,71 +1107,186 @@ def _daemon_chat_loop(client: Any) -> None:
         line = (line or "").strip()
         if not line:
             continue
+        _daemon_one_shot(client, line)
 
-        try:
-            task_id = client.send_chat(line)
-        except DaemonError as exc:
-            console.print(f"[red]{exc.message}[/red]")
-            continue
 
-        # Wait for events, confirmations, or final answer
-        while True:
-            msg = client.wait_for_event(timeout=300)
-            if msg is None:
-                console.print("[yellow]timed out waiting for response[/yellow]")
-                break
-            if isinstance(msg, FinalMessage):
-                console.print(f"[green]{msg.text}[/green]")
-                break
-            if isinstance(msg, ConfirmRequest):
-                # Display confirmation
-                from jarvis.policy import tiers as _tiers
+def _daemon_one_shot(client: Any, line: str) -> str:
+    """Send one command to the daemon and print events until it finishes.
 
-                console.print(
-                    "".join(
-                        (
-                            "[yellow]approval needed[/yellow] (",
-                            _tiers.tier_label(msg.tier),
-                            ")",
-                        )
+    Returns the final text (empty when the daemon reported an error or the wait
+    timed out).  Shared by the chat REPL and ``jarvis run`` so the one-shot
+    command cannot be more permissive than the interactive session: both go
+    through the same ``ConfirmRequest`` / ``ClarificationRequest`` handling and
+    the same password prompt.
+    """
+    from jarvis.daemon.client import DaemonError
+    from jarvis.daemon.protocol import (
+        ClarificationRequest,
+        ConfirmRequest,
+        ErrorMessage,
+        EventMessage,
+        FinalMessage,
+    )
+
+    try:
+        task_id = client.send_chat(line)
+    except DaemonError as exc:
+        console.print(f"[red]{exc.message}[/red]")
+        return ""
+
+    while True:
+        msg = client.wait_for_event(timeout=300)
+        if msg is None:
+            console.print("[yellow]timed out waiting for response[/yellow]")
+            return ""
+        if isinstance(msg, FinalMessage):
+            console.print(f"[green]{msg.text}[/green]")
+            return msg.text
+        if isinstance(msg, ConfirmRequest):
+            # Display confirmation
+            from jarvis.policy import tiers as _tiers
+
+            console.print(
+                "".join(
+                    (
+                        "[yellow]approval needed[/yellow] (",
+                        _tiers.tier_label(msg.tier),
+                        ")",
                     )
                 )
-                console.print(msg.summary or "(no summary)")
-                if msg.untrusted:
-                    console.print("[red]NOTE: this action was derived from untrusted content[/red]")
-                answer = _chat_prompt("Approve?")
-                agreed = (answer or "").strip().lower() in ("y", "yes")
-                typed: str | None = None
-                if agreed and msg.typed_confirmation:
-                    typed = _chat_prompt(f"Type this exactly to confirm: {msg.typed_confirmation}")
-                password: str | None = None
-                if agreed and msg.needs_password:
-                    password = _chat_password_prompt("JARVIS password: ")
+            )
+            console.print(msg.summary or "(no summary)")
+            if msg.untrusted:
+                console.print("[red]NOTE: this action was derived from untrusted content[/red]")
+            answer = _chat_prompt("Approve?")
+            agreed = (answer or "").strip().lower() in ("y", "yes")
+            typed: str | None = None
+            if agreed and msg.typed_confirmation:
+                typed = _chat_prompt(f"Type this exactly to confirm: {msg.typed_confirmation}")
+            password: str | None = None
+            if agreed and msg.needs_password:
+                password = _chat_password_prompt("JARVIS password: ")
 
-                try:
-                    client.send_confirm(
-                        task_id,
-                        approved=agreed,
-                        action_hash=msg.action_hash,
-                        password=password,
-                        typed_confirmation=typed,
-                    )
-                except DaemonError as exc:
-                    console.print(f"[red]{exc.message}[/red]")
-            elif isinstance(msg, ClarificationRequest):
-                console.print(f"[yellow]clarification needed: {msg.question}[/yellow]")
-                answer = _chat_prompt("Your answer:")
-                try:
-                    client.send_clarification(task_id, answer=answer or "")
-                except DaemonError as exc:
-                    console.print(f"[red]{exc.message}[/red]")
-            elif isinstance(msg, ErrorMessage):
-                console.print(f"[red]{msg.message}[/red]")
-            elif isinstance(msg, EventMessage):
-                # Streaming events (plan, step_start, step_result, log)
-                data = msg.data
-                if msg.kind == "log" and "message" in data:
-                    console.print(f"[dim]{data['message']}[/dim]")
+            try:
+                client.send_confirm(
+                    task_id,
+                    approved=agreed,
+                    action_hash=msg.action_hash,
+                    password=password,
+                    typed_confirmation=typed,
+                )
+            except DaemonError as exc:
+                console.print(f"[red]{exc.message}[/red]")
+        elif isinstance(msg, ClarificationRequest):
+            console.print(f"[yellow]clarification needed: {msg.question}[/yellow]")
+            answer = _chat_prompt("Your answer:")
+            try:
+                client.send_clarification(task_id, answer=answer or "")
+            except DaemonError as exc:
+                console.print(f"[red]{exc.message}[/red]")
+        elif isinstance(msg, ErrorMessage):
+            console.print(f"[red]{msg.message}[/red]")
+            return ""
+        elif isinstance(msg, EventMessage):
+            # Streaming events (plan, step_start, step_result, log)
+            data = msg.data
+            if msg.kind == "log" and "message" in data:
+                console.print(f"[dim]{data['message']}[/dim]")
+
+
+@app.command()
+def run(
+    command: Annotated[str, typer.Argument(help="What JARVIS should do, in plain English.")],
+    no_daemon: Annotated[
+        bool, typer.Option("--no-daemon", help="Run the agent in-process (no daemon).")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Describe the actions; execute nothing.")
+    ] = False,
+) -> None:
+    """Run a single command and print the result (one shot, then exit)."""
+    command = command.strip()
+    if not command:
+        console.print('[red]give a command, e.g. jarvis run "open notepad"[/red]')
+        raise typer.Exit(code=2)
+    if dry_run and not no_daemon:
+        # Fail closed: the daemon owns one long-lived AppContext, so a
+        # per-request dry-run flag cannot be honoured there without mutating
+        # shared state.  Refuse rather than silently running for real.
+        console.print("[red]--dry-run needs --no-daemon (the daemon runs for real)[/red]")
+        raise typer.Exit(code=2)
+    if no_daemon:
+        _run_no_daemon(command, dry_run=dry_run)
+    else:
+        _run_with_daemon(command)
+
+
+def _run_no_daemon(command: str, *, dry_run: bool = False) -> None:
+    """One in-process task, with the same confirmation path as ``chat``."""
+    settings = config.load_settings()
+    store = secret_module.SecretStore()
+    selection = build_llm_client(settings, store, logger=logging.getLogger("jarvis.cli"))
+    if selection.client is None:
+        detail = "; ".join(selection.reasons) or "no provider is configured"
+        console.print(f"[red]No free LLM provider configured: {detail}[/red]")
+        raise typer.Exit(code=1)
+
+    try:
+        unlock_manager = UnlockManager(store, settings=settings)
+        ctx = make_app_context(
+            settings,
+            llm=selection.client,
+            unlock=unlock_manager,
+            dry_run=dry_run,
+            memory=open_memory(
+                settings=settings, logger=logging.getLogger("jarvis.cli"), dry_run=dry_run
+            ),
+        )
+        saver = open_sqlite_checkpointer(str(config.checkpoints_db()))
+    except LLMError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+    try:
+        outcome = run_task(ctx, saver, command)
+        outcome = resolve_interrupts(outcome, ctx, saver)
+        _print_outcome(outcome)
+        if outcome.error or not outcome.final_answer:
+            raise typer.Exit(code=1)
+    finally:
+        _close_memory_backend(ctx)
+        _close_checkpointer(saver)
+
+
+def _close_checkpointer(saver: Any) -> None:
+    """Close the checkpointer's connection, if the installed saver exposes one."""
+    conn = getattr(saver, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            logging.getLogger("jarvis.cli").debug("closing checkpointer failed", exc_info=True)
+
+
+def _run_with_daemon(command: str) -> None:
+    """Send one command to a running daemon and print the result."""
+    from jarvis.daemon.client import DaemonClient, DaemonError
+
+    try:
+        client = DaemonClient()
+        client.connect()
+    except DaemonError as exc:
+        console.print(f"[red]cannot connect to daemon: {exc.message}[/red]")
+        console.print("[dim]start it with `jarvis daemon --foreground`, or use --no-daemon[/dim]")
+        raise typer.Exit(code=1) from exc
+    try:
+        if not _daemon_one_shot(client, command):
+            raise typer.Exit(code=1)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            logging.getLogger("jarvis.cli").debug("closing daemon client failed", exc_info=True)
 
 
 @app.command()
@@ -1196,14 +1317,22 @@ def _chat_no_daemon() -> None:
 
     try:
         unlock_manager = UnlockManager(store, settings=settings)
-        ctx = make_app_context(settings, llm=selection.client, unlock=unlock_manager)
+        ctx = make_app_context(
+            settings,
+            llm=selection.client,
+            unlock=unlock_manager,
+            memory=open_memory(settings=settings, logger=logging.getLogger("jarvis.cli")),
+        )
         saver = open_sqlite_checkpointer(str(config.checkpoints_db()))
     except LLMError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
 
     console.print("[dim]JARVIS chat (Ctrl+C to exit)[/dim]")
-    chat_loop(ctx, saver)
+    try:
+        chat_loop(ctx, saver)
+    finally:
+        _close_memory_backend(ctx)
 
 
 def _chat_with_daemon() -> None:
@@ -1477,6 +1606,152 @@ def contacts_list() -> None:
         return
     for row in rows:
         console.print(row)
+
+
+# ── learned skills / memory (Phase 8) ──────────────────────────────────────
+
+
+def _open_memory_store(settings: config.Settings | None = None) -> Any:
+    """Open the local memory store for a CLI command (testable seam)."""
+    return open_memory(settings=settings or config.load_settings())
+
+
+@contextmanager
+def _memory_store() -> Any:
+    """Yield an open memory store and always release its connection.
+
+    Every skills command goes through here: a ``typer.Exit`` on a missing id
+    used to skip the close and leak the SQLite handle.  When memory is disabled
+    (or could not be opened) the ``NullMemory`` backend has no ``skills``
+    attribute, so the caller gets a clear message instead of an
+    ``AttributeError`` traceback.
+    """
+    memory = _open_memory_store()
+    try:
+        if not hasattr(memory, "skills"):
+            console.print(
+                "[yellow]memory is disabled in config, so there is nothing to show.\n"
+                "set [memory] enabled = true in config.toml[/yellow]"
+            )
+            raise typer.Exit(code=1)
+        yield memory
+    finally:
+        _close_store(memory)
+
+
+def _close_memory_backend(ctx: Any) -> None:
+    """Release a context's memory connection, ignoring an absent backend."""
+    _close_store(getattr(ctx, "memory", None))
+
+
+def _close_store(memory: Any) -> None:
+    """Close a memory backend (or a store opened directly by a command)."""
+    close = getattr(memory, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            logging.getLogger("jarvis.cli").debug("closing memory failed", exc_info=True)
+
+
+def skills_list_command(store: Any, limit: int = 20) -> list[str]:
+    """Format stored skills for display (testable; no raw JSON).
+
+    The tool list comes *before* the goal because a goal can be arbitrarily
+    long: putting it first let a wide goal push the tools off the end of a
+    terminal row, hiding the most useful part of the line.
+    """
+    rows = []
+    for skill in store.skills.all(limit=limit):
+        tools = ",".join(skill.tools_used) or "-"
+        mark = "!" if not skill.trusted else " "
+        goal = skill.goal_text.replace("\n", " ").strip()
+        rows.append(
+            f"{mark}{skill.id:>4} ok={skill.success_count:<3} fail={skill.fail_count:<3} "
+            f"[{tools}]  {goal[:70]}"
+        )
+    return rows
+
+
+skills_app = typer.Typer(help="Learned skills and preferences.", no_args_is_help=True)
+app.add_typer(skills_app, name="skills")
+
+
+@skills_app.command("list")
+def skills_list(
+    limit: Annotated[int, typer.Option(help="Maximum rows to show.")] = 20,
+) -> None:
+    """List the skills JARVIS has learned (verified plans only)."""
+    with _memory_store() as memory:
+        rows = skills_list_command(memory, limit=limit)
+        counts = memory.counts() if hasattr(memory, "counts") else {}
+        if not rows:
+            console.print(
+                "[yellow]no skills yet. JARVIS saves one after a task completes "
+                "and every step verifies.[/yellow]"
+            )
+        else:
+            console.print("[dim]skills (leading ! = fails more often than it succeeds)[/dim]")
+            for row in rows:
+                # markup=False: a goal containing "[redacted]" or "[bold]" is data,
+                # not console markup, and must never be swallowed or styled.
+                console.print(row, markup=False, highlight=False)
+        if counts:
+            console.print(
+                f"[dim]{counts.get('skills', 0)} skills, "
+                f"{counts.get('failures', 0)} recorded failures, "
+                f"{counts.get('preferences', 0)} preferences[/dim]"
+            )
+
+
+@skills_app.command("show")
+def skills_show(
+    skill_id: Annotated[int, typer.Argument(help="Skill id from `jarvis skills list`.")],
+) -> None:
+    """Show one stored skill in full."""
+    with _memory_store() as memory:
+        skill = memory.skills.get(skill_id)
+        if skill is None:
+            console.print(f"[red]no skill with id {skill_id}[/red]")
+            raise typer.Exit(code=1)
+        console.print(skill.goal_text.replace("\n", " "), markup=False, highlight=False)
+        console.print(f"id={skill.id} ok={skill.success_count} fail={skill.fail_count}")
+        console.print(f"tools: {', '.join(skill.tools_used) or '-'}")
+        console.print(f"last used: {skill.last_used_at or 'unknown'}")
+        for step in (skill.plan or {}).get("steps", []):
+            args = ", ".join(f"{k}={v}" for k, v in (step.get("args") or {}).items())
+            console.print(f"  - {step.get('tool')}({args})", markup=False, highlight=False)
+
+
+@skills_app.command("delete")
+def skills_delete(
+    skill_id: Annotated[int, typer.Argument(help="Skill id from `jarvis skills list`.")],
+) -> None:
+    """Forget one stored skill."""
+    with _memory_store() as memory:
+        if not memory.skills.delete(skill_id):
+            console.print(f"[red]no skill with id {skill_id}[/red]")
+            raise typer.Exit(code=1)
+        console.print(f"[green]deleted skill {skill_id}[/green]")
+
+
+@skills_app.command("clear")
+def skills_clear() -> None:
+    """Forget every skill, recorded failure and preference (asks first)."""
+    if not typer.confirm("Delete all learned skills, failures and preferences?"):
+        console.print("[dim]cancelled[/dim]")
+        return
+    with _memory_store() as memory:
+        counts = memory.counts() if hasattr(memory, "counts") else {}
+        removed = sum(
+            int(n or 0)
+            for n in (
+                memory.skills.clear(),
+                memory.failures.clear(),
+                memory.preferences.clear(),
+            )
+        )
+        console.print(f"[green]cleared {removed} memory rows[/green] (was {counts})")
 
 
 # ── voice on / off ────────────────────────────────────────────────────────

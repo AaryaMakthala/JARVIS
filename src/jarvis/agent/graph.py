@@ -8,17 +8,21 @@ Topology (docs/02_ARCHITECTURE.md sec. 4):
                  | (conversation)           | (action)                 | (clarification)
                  v                           v                         v
               respond                    validate                   clarify
-                                            |  ^        (answer)        |
-                                            v  +- replan<-...           +----> brain
+                                             |  ^        (answer)        |
+                                             v  +- replan<-...           +----> brain
                        policy_gate <--------+      (validate rejected)
 
                        policy_gate -> act -> verify -> policy_gate (next step) | respond
+
+                       respond -> memory_save -> END   (Phase 8, exactly one write)
 
 Confirmations suspend inside ``policy_gate`` via ``interrupt`` and
 clarifications suspend inside ``clarify``; resume re-enters that node
 deterministically.  ``brain`` is the only LLM classification step and projects
 its transient :class:`BrainDecision` onto the checkpointed Plan/Step shape
-before anything else sees the state.
+before anything else sees the state.  ``memory_save`` is a deterministic,
+LLM-free writer that only records a *verified* plan (or a failure); it can
+neither execute a tool nor approve one.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from jarvis.agent.nodes import (
     clarify,
     intake,
     memory_retrieve,
+    memory_save,
     policy_gate,
     replan,
     respond,
@@ -119,6 +124,7 @@ def build_graph(ctx: AppContext, checkpointer: Any = None) -> Any:
     g.add_node("verify", wrap(verify, ctx))
     g.add_node("replan", wrap(replan, ctx))
     g.add_node("respond", wrap(respond, ctx))
+    g.add_node("memory_save", wrap(memory_save, ctx))
 
     g.add_edge(START, "intake")
     g.add_conditional_edges(
@@ -158,7 +164,8 @@ def build_graph(ctx: AppContext, checkpointer: Any = None) -> Any:
     g.add_conditional_edges(
         "replan", route_after_replan, {"validate": "validate", "respond": "respond"}
     )
-    g.add_edge("respond", END)
+    g.add_edge("respond", "memory_save")
+    g.add_edge("memory_save", END)
 
     if checkpointer is None:
         return g.compile()

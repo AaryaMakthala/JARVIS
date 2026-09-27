@@ -785,6 +785,58 @@ def test_invariant_16_voice_error_codes_are_a_closed_set() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Invariant 8 (memory half): nothing secret is ever persisted to memory.db
+# ---------------------------------------------------------------------------
+
+
+def test_invariant_8_nothing_secret_reaches_memory_db(tmp_path: Any) -> None:
+    """Skills, failures and preferences must never store a credential.
+
+    The graph-state half of "no secrets leave the process" is invariant 7 above.
+    This covers the *durable* half: a tool whose error message echoes a
+    password, a verified plan carrying a credential argument, and a preference
+    value, all of which are third-party or user-supplied text that flows into
+    ``memory.db``.  Reads the raw file bytes, not the parsed rows, so a column
+    that is written but never read back still fails.
+    """
+    from jarvis.config import Settings as _Settings
+    from jarvis.memory import SqliteMemory, open_db
+
+    db = tmp_path / "memory.db"
+    store = SqliteMemory(open_db(db), settings=_Settings())
+    try:
+        store.skills.save(
+            "unlock the vault",
+            plan={
+                "kind": "tool",
+                "goal": "unlock the vault",
+                "steps": [
+                    {
+                        "id": "s1",
+                        "tool": "unlock",
+                        "args": {"password": "hunter2secret"},
+                        "expect": "ok",
+                    }
+                ],
+            },
+            tools_used=["unlock"],
+        )
+        store.failures.record(
+            "unlock the vault",
+            {"tool": "unlock", "args": {"api_key": "sk-live-hunter2secret"}},
+            "denied: password=hunter2secret, token=sk-live-hunter2secret",
+        )
+        with pytest.raises(ValueError):
+            store.preferences.set("units", "password=hunter2secret")
+    finally:
+        store.close()
+
+    raw = db.read_bytes()
+    assert b"hunter2secret" not in raw
+    assert b"sk-live-hunter2secret" not in raw
+
+
+# ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 

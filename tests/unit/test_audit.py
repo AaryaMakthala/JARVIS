@@ -452,10 +452,13 @@ def test_audit_run_writes_report_and_verifies(
     spec = make_audit_run_spec()
     args = spec.args_model.model_validate({"sections": ["performance"]})
     monkeypatch.setattr("jarvis.config.reports_dir", lambda: tmp_path)
-    monkeypatch.setattr(
-        "jarvis.tools.audit.audit_checks.run_checks",
-        lambda _sections: [Finding("performance", "info", "CPU usage", "12.5%")],
-    )
+    seen: dict = {}
+
+    def fake_run(sections, *, log_path=None, **kwargs):
+        seen["log_path"] = log_path
+        return [Finding("performance", "info", "CPU usage", "12.5%")]
+
+    monkeypatch.setattr("jarvis.tools.audit.audit_checks.run_checks", fake_run)
     result = spec.execute(args, _ctx())
     assert result.ok
     report = Path(result.data["report_path"])
@@ -463,6 +466,10 @@ def test_audit_run_writes_report_and_verifies(
     assert result.data["count"] == 1
     verified = spec.apply_verify(args, result, _ctx())
     assert verified.verified is True
+    # Phase 7 acceptance: the self-review section needs the task log, which is
+    # only passed in when the caller supplies log_path.
+    assert seen["log_path"] is not None
+    assert seen["log_path"].name.endswith(".jsonl")
 
 
 def test_audit_run_rejects_bad_section() -> None:

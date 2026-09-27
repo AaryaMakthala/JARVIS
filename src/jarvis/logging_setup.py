@@ -3,7 +3,9 @@
 Every log record emitted through the root logger is serialised to a single JSON
 line and passed through :func:`redact` so secrets (API keys, passwords, phone
 numbers, registered secret values) never reach the log file. Library code must
-use :func:`get_logger`; only the CLI writes to the console (via ``rich``).
+use :func:`get_logger`; the CLI writes to the console via ``rich``, and the few
+daemon/lifecycle lines that a user genuinely needs on screen go through
+:func:`console` (which never raises, so it is safe under ``pythonw``).
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import json
 import logging
 import logging.handlers
 import re
+import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -145,3 +148,31 @@ def configure_logging(
 def get_logger(name: str) -> logging.Logger:
     """Return a child logger of the ``jarvis`` namespace."""
     return logging.getLogger(f"{_LOGGER_NAME}.{name}")
+
+
+def console(message: str) -> bool:
+    """Write one line to the console *and* mirror it to the JSONL log.
+
+    This is the only sanctioned way for library/daemon code to reach the
+    terminal.  Two reasons it exists instead of a bare ``print``:
+
+    * under ``pythonw`` ``sys.stdout`` is ``None`` and a ``print`` raises, so
+      every print in a daemon code path was a latent crash; here a missing or
+      broken stream just degrades to log-only;
+    * a message that is useful to the user is nearly always useful in the log
+      too, and duplicating it guarantees the two never disagree.
+
+    Returns True when the console write succeeded.
+    """
+    logger = get_logger("console")
+    logger.info(message)
+    stream = sys.stdout
+    if stream is None or getattr(stream, "closed", False):
+        return False
+    try:
+        stream.write(message + "\n")
+        stream.flush()
+    except Exception:
+        logger.debug("console write failed", exc_info=True)
+        return False
+    return True

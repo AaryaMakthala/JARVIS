@@ -12,6 +12,31 @@ Runs in a background thread.  The loop:
    - Other → submits to the agent as a voice-sourced task.
 5. Speaks the response via TTS.
 
+Reliability contract (this is the part that matters most)
+----------------------------------------------------------
+**After every successful or recoverable interaction the loop returns to
+``READY``, and the next ``"Hey Jarvis"`` works without restarting the
+daemon.**  Concretely, that is enforced by:
+
+* every interaction being wrapped in its own ``try``/``except`` (:meth:`_run`),
+  so no single failure can end the loop thread;
+* an idle timeout being **non-fatal** — it bounds one *wait*, not the loop: the
+  loop reports ``RECOVERING``, returns to the armed ``READY`` state and waits
+  again (it used to ``break`` out of the loop, which left the daemon alive with
+  a permanently dead wake word).  An idle wait is deliberately **not** an
+  interaction, so it does not spend the once-per-interaction re-arm (nothing
+  was spoken, so there is no response echo to flush and no room to drain);
+* :meth:`_rearm` running after *every* interaction, success or failure, in the
+  order ``flush → quiet-start drain → wake_detector.reset() → counters``;
+* an empty capture, an empty transcript, a dead route, a TTS error and an
+  unexpected exception all reporting ``RECOVERING`` and then ``READY``;
+* every answer passing through :func:`jarvis.agent.answer.spoken_answer`, so
+  an internal routing document or a 900-character search dump is never read
+  aloud.
+
+The explicit lifecycle vocabulary lives in :mod:`jarvis.voice.states` and the
+console/JSONL reporting in :mod:`jarvis.voice.status`.
+
 No audio data ever leaves this module; only text is passed onward.
 """
 
@@ -23,6 +48,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from jarvis.agent.answer import spoken_answer
 from jarvis.logging_setup import redact
 from jarvis.voice.interfaces import (
     AudioInput,
@@ -31,6 +57,12 @@ from jarvis.voice.interfaces import (
     TextToSpeech,
     WakeWordDetector,
     WindowFocusChecker,
+)
+from jarvis.voice.states import VoicePhase, next_interaction_id
+from jarvis.voice.status import (
+    DEFAULT_WAKE_WORD,
+    ProviderReport,
+    VoiceStatusReporter,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,10 +127,38 @@ _WAKE_HEARTBEAT_S = 3.0
 #: of over the tail of the response still ringing in the room/mic.  Event-
 #: driven (the drain ends the moment a quiet chunk arrives) and capped so a
 #: persistently noisy room can never wedge the loop.
-_REARM_QUIET_GATE_S = 0.5
+DEFAULT_REARM_QUIET_GATE_S = 0.5
+_REARM_QUIET_GATE_S = DEFAULT_REARM_QUIET_GATE_S
 
 #: RMS (float samples in [-1, 1]) below which a chunk counts as silence.
 _SILENCE_RMS = 0.01
+
+#: Longest answer handed to TTS.  Reading a multi-source web-search dump aloud
+#: produced 79 seconds of dead air; the full text is still reported on the
+#: console (truncated) and kept in the task result.
+DEFAULT_MAX_SPOKEN_CHARS = 300
+
+#: Pause before re-entering the wake wait after an idle timeout.  The idle
+#: deadline is measured in *audio* seconds, so a stream that delivers frames
+#: instantly (a test fake, or a device that replays a cached buffer) would
+#: otherwise satisfy it thousands of times a second and busy-spin one core.
+#: Yielding for a fixed period bounds that to a few waits per second.  On a real
+#: microphone the pause is imperceptible because the deadline takes
+#: ``idle_timeout_s`` of real audio to elapse in the first place.  Overridable
+#: per instance (see ``VoiceLoop(idle_backoff_s=...)``) so a test can shrink it
+#: without changing the production default.
+_IDLE_BACKOFF_S = 0.5
+
+#: Pause after a wake read that returned *no* samples at all.  A stalled or
+#: half-closed device can return empty reads forever; without this the wake wait
+#: would hot-spin a core doing no work, and with ``idle_timeout_s`` disabled
+#: nothing would bound it at all.
+_EMPTY_READ_BACKOFF_S = 0.02
+
+#: Extra wall-clock allowance on top of the audio-second idle deadline, so a
+#: completely stalled stream (no audio at all) still yields and re-arms instead
+#: of waiting forever.
+_IDLE_WALL_SLACK_S = 5.0
 
 
 def _segment_rms(segment: AudioSegment) -> float:
@@ -151,6 +211,12 @@ class VoiceLoop:
         max_segment_s: float = DEFAULT_MAX_SEGMENT_S,
         silence_threshold: float = _SILENCE_RMS,
         rearm_quiet_gate_s: float = _REARM_QUIET_GATE_S,
+        idle_backoff_s: float = _IDLE_BACKOFF_S,
+        reporter: VoiceStatusReporter | None = None,
+        report_status: bool = True,
+        echo_transcript: bool = True,
+        max_spoken_chars: int = DEFAULT_MAX_SPOKEN_CHARS,
+        routing_report: Callable[[], ProviderReport | None] | None = None,
     ) -> None:
         self._audio = audio
         self._wake_detector = wake_detector
@@ -171,6 +237,19 @@ class VoiceLoop:
         self._silence_threshold = max(silence_threshold, 0.0)
         #: Bounded quiet-start drain length, 0 disables it (see the constant).
         self._rearm_quiet_gate_s = max(rearm_quiet_gate_s, 0.0)
+        #: Pause between a non-fatal idle timeout and the next wake wait.
+        self._idle_backoff_s = max(idle_backoff_s, 0.0)
+        #: Longest utterance handed to TTS (see :func:`spoken_answer`).
+        self._max_spoken_chars = max(int(max_spoken_chars), 40)
+        #: Optional provider/model probe, called after the agent answered, so
+        #: the console can show which provider actually served the request.
+        self._routing_report = routing_report
+        self._reporter = reporter or VoiceStatusReporter(
+            stream="auto",
+            enabled=report_status,
+            echo_transcript=echo_transcript,
+            wake_word=wake_word or DEFAULT_WAKE_WORD,
+        )
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -185,8 +264,19 @@ class VoiceLoop:
         self._audio_opened = False
         self._wake_frames_read = 0
         self._phase_state = "off"
+        self._interaction_id = ""
 
     # ── public API ──────────────────────────────────────────────────────
+
+    @property
+    def reporter(self) -> VoiceStatusReporter:
+        """The lifecycle reporter (console + JSONL) used by this loop."""
+        return self._reporter
+
+    @property
+    def interaction_id(self) -> str:
+        """Id of the interaction currently running (empty between wakes)."""
+        return self._interaction_id
 
     def _set_state(self, state: str) -> None:
         """Record and log a voice-phase transition.
@@ -200,6 +290,15 @@ class VoiceLoop:
         self._phase_state = state
         logger.info("VOICE state=%s", state)
 
+    def _recover(self, reason: str) -> None:
+        """Report an isolated failure that the loop will recover from.
+
+        Called from every per-phase guard so a failed interaction is visibly
+        distinguishable from a successful one, and is always followed by the
+        caller's re-arm back to ``READY``.
+        """
+        self._reporter.recovering(reason)
+
     def start(self) -> None:
         """Start the voice loop in a background thread (idempotent)."""
         if self._running:
@@ -210,8 +309,7 @@ class VoiceLoop:
         self._idle_timed_out = False
         self._thread = threading.Thread(target=self._run, daemon=True, name="voice-loop")
         self._thread.start()
-        logger.info("voice loop started")
-        print("[DIAG] voice.loop.start(): thread 'voice-loop' launched", flush=True)
+        logger.info("voice loop started (wake_word=%s)", self._wake_word)
 
     def stop(self) -> None:
         """Stop the voice loop and wait for the thread to finish.
@@ -227,8 +325,10 @@ class VoiceLoop:
         self._tts.stop()
         if not self._stopped.wait(timeout=10.0):
             logger.warning("voice loop thread did not stop within 10s; leaving audio open")
+            self._reporter.error("loop thread did not stop within 10s")
             return
         self._audio.close()
+        self._reporter.stopping()
         logger.info("voice loop stopped")
 
     def is_active(self) -> bool:
@@ -372,19 +472,31 @@ class VoiceLoop:
         """
         reason: str | None = None
         try:
+            self._reporter.state(VoicePhase.STARTING)
             self._audio.open()
             self._audio_opened = True
             self._set_state("LISTENING")
             if self._wake_detector is not None:
                 self._wake_detector.reset()
+            self._reporter.ready(self._wake_word)
 
             while self._running and not self._stop_event.is_set():
                 # Phase 1: Wait for wake word (or voice activity)
                 logger.info("VOICE WAKE_WAIT_RESTART")
                 if not self._wait_for_wake():
                     if self._idle_timed_out:
-                        logger.info("voice loop idle timeout reached; stopping")
-                        break
+                        # Non-fatal by design.  The idle timeout exists only so
+                        # one silent wait does not hold the microphone open
+                        # forever, so it releases the device and waits again.
+                        # It used to ``break`` out of the loop, which left the
+                        # daemon running with voice permanently dead: the wake
+                        # word never worked again until a restart.
+                        logger.info(
+                            "voice loop idle timeout reached; releasing mic and "
+                            "resuming the wake wait"
+                        )
+                        self._idle_timed_out = False
+                        self._resume_after_idle()
                     continue
 
                 # One interaction is isolated: an unexpected exception in any
@@ -397,6 +509,7 @@ class VoiceLoop:
                     self._run_interaction()
                 except Exception:
                     logger.exception("voice interaction failed; resetting and continuing to listen")
+                    self._recover("unexpected failure inside the interaction")
 
                 # Re-arm for the next wake: reset the wake-word model's rolling
                 # buffer and discard audio captured while the response was
@@ -407,10 +520,12 @@ class VoiceLoop:
                     self._rearm()
                 except Exception:
                     logger.exception("voice re-arm failed after interaction; continuing to wait")
+                    self._recover("re-arm failed; retrying")
 
         except Exception:
             logger.exception("voice loop crashed")
             reason = "mic-open-failed" if not self._audio_opened else "loop-crashed"
+            self._reporter.error(reason)
         finally:
             self._running = False
             self._idle_timed_out = False
@@ -429,9 +544,19 @@ class VoiceLoop:
         """Block until the wake word is detected.
 
         Returns True if the wake word was detected, False if the loop should
-        stop (idle timeout or stop request).  The idle deadline is measured
-        with ``time.monotonic()`` and re-checked on a cancellable poll loop so
-        a stop request is never delayed by a long sleep.
+        stop (stop request) or the idle deadline elapsed.  An idle timeout is
+        **not** fatal: the caller re-enters the wait, so the deadline bounds one
+        wait, not the lifetime of the loop.
+
+        The deadline is measured in **audio seconds actually consumed**, with a
+        wall-clock slack on top.  Measuring it in audio keeps the re-arm rate
+        bounded when a stream delivers frames faster than real time (a test
+        fake, or a device replaying a buffer) — otherwise a wall-clock-only
+        deadline is satisfied thousands of times a second and the loop
+        busy-spins a core while doing nothing.  The slack still releases the
+        microphone when the stream delivers no audio at all.  A stop request
+        is honoured promptly either way, because both bounds are re-checked on
+        the cancellable poll loop.
 
         A transient exception from the wake detector itself is logged and the
         detector re-armed, never allowed to kill the loop: model hiccups must
@@ -439,31 +564,49 @@ class VoiceLoop:
         surfaces as ``loop-crashed``.
         """
         logger.info("VOICE WAKE_WAIT_START")
+        self._idle_timed_out = False
+        self._reporter.waiting_for_wake()
         if self._wake_detector is None:
             # No wake-word model; use a simple voice-activity gate.
             segment = self._audio.read(4800)  # 300 ms
+            if segment.duration_s > 0 and not self._stop_event.is_set():
+                self._set_state("WAKE_DETECTED")
+                self._reporter.wake_detected()
             return segment.duration_s > 0 and not self._stop_event.is_set()
 
         wait_start = time.monotonic()
-        deadline: float | None = None
+        wall_deadline: float | None = None
         if self._idle_timeout_s > 0:
-            deadline = wait_start + self._idle_timeout_s
+            wall_deadline = wait_start + self._idle_timeout_s + _IDLE_WALL_SLACK_S
+        audio_s = 0.0
 
         # Read chunks and feed to the wake-word model.
         chunk_frames = 1280  # 80 ms at 16 kHz
         last_heartbeat = wait_start
         while self._running and not self._stop_event.is_set():
-            if deadline is not None and time.monotonic() >= deadline:
+            if self._idle_timeout_s > 0 and (
+                audio_s >= self._idle_timeout_s
+                or (wall_deadline is not None and time.monotonic() >= wall_deadline)
+            ):
                 self._idle_timed_out = True
+                self._idle_backoff()
                 return False
             segment = self._audio.read(chunk_frames)
             if segment.duration_s < 0.05:
+                # An *empty* read means the stream is stalled or half-closed: it
+                # advances neither the audio clock nor the model, so yield
+                # instead of spinning on it (see :meth:`_empty_read_backoff`).
+                # A merely short read is real audio from a source that returns
+                # less than was asked for, so it is discarded without a pause.
+                if not segment.samples:
+                    self._empty_read_backoff()
                 logger.debug(
                     "voice boundary: wake read too short (duration_s=%.3f)",
                     segment.duration_s,
                 )
                 continue
             self._wake_frames_read += len(segment.samples)
+            audio_s += segment.duration_s
             logger.debug(
                 "voice boundary: wake frame (frames=%d duration_s=%.3f)",
                 len(segment.samples),
@@ -473,15 +616,17 @@ class VoiceLoop:
                 last_heartbeat = time.monotonic()
                 logger.info(
                     "voice boundary: waiting for wake word "
-                    "(frames_read=%d elapsed_s=%.1f audio_rms=%.4f)",
+                    "(frames_read=%d elapsed_s=%.1f audio_s=%.1f audio_rms=%.4f)",
                     self._wake_frames_read,
                     time.monotonic() - wait_start,
+                    audio_s,
                     _segment_rms(segment),
                 )
             try:
                 result = self._wake_detector.detect(segment)
             except Exception:
                 logger.exception("voice boundary: wake detector error; re-arming and continuing")
+                self._recover("wake detector error; re-arming")
                 self._rearm()
                 continue
             if result.detected:
@@ -489,8 +634,45 @@ class VoiceLoop:
                 logger.info("VOICE WAKE_DETECTED")
                 logger.info("voice boundary: wake trigger; entering interaction")
                 self._set_state("WAKE_DETECTED")
+                self._reporter.wake_detected()
                 return True
         return False
+
+    def _idle_backoff(self) -> None:
+        """Yield briefly after an idle timeout so re-arming cannot busy-spin.
+
+        A cancellable wait, so ``stop()`` is honoured immediately.
+        """
+        self._stop_event.wait(self._idle_backoff_s)
+
+    def _empty_read_backoff(self) -> None:
+        """Yield briefly when a wake read returned no audio at all.
+
+        A stalled or half-closed microphone can return empty reads
+        indefinitely.  Without this the wake wait would spin a core flat with
+        no work done — and with ``idle_timeout_s`` disabled nothing would bound
+        it.  Cancellable, so ``stop()`` is honoured immediately.
+        """
+        self._stop_event.wait(_EMPTY_READ_BACKOFF_S)
+
+    def _resume_after_idle(self) -> None:
+        """Return to the armed wake wait after a non-fatal idle timeout.
+
+        Deliberately *not* :meth:`_rearm`.  An idle wait is not an interaction:
+        nothing was spoken, so there is no response echo to flush and no room
+        state to drain back to a quiet baseline, and the detector has been
+        scoring silence the whole time.  Running the post-interaction reset here
+        would spend the once-per-interaction re-arm on a wake that never
+        happened and make "re-armed exactly once per interaction"
+        unobservable.
+
+        What the loop must guarantee is that it stays *armed*: this reports
+        ``RECOVERING`` then ``READY``, so the next "hey jarvis" is still
+        detected and a machine that stays silent for hours never needs the
+        daemon restarted.
+        """
+        self._recover("idle timeout; still armed for the next wake word")
+        self._reporter.ready(self._wake_word)
 
     def _run_interaction(self) -> None:
         """Run one wake-activated interaction (ack → capture → STT → route → TTS).
@@ -508,6 +690,8 @@ class VoiceLoop:
         """
         logger.info("VOICE INTERACTION_START")
         logger.info("voice boundary: interaction start")
+        self._interaction_id = next_interaction_id()
+        self._reporter.bind(self._interaction_id, self._wake_word)
 
         # Phase 2: Acknowledge wake.  The state is still WAKE_DETECTED so the
         # JSONL shows the required sequence LISTENING → WAKE_DETECTED → "Yes?"
@@ -518,6 +702,7 @@ class VoiceLoop:
             self._tts.speak("Yes?")
         except Exception:
             logger.exception("voice interaction failed at wake-ack; continuing to listen")
+            self._recover("wake acknowledgement failed")
             return
         logger.info("wake acknowledged — listening for command")
 
@@ -525,10 +710,13 @@ class VoiceLoop:
         # acknowledgement so the spoken command is read fresh and TTS output is
         # never mistaken for a follow-up command.
         self._set_state("CAPTURING")
+        self._reporter.listening()
+        self._reporter.capture_start(max_segment_s=self._max_segment_s)
         try:
             self._audio.flush()
         except Exception:
             logger.exception("voice interaction failed at capture-flush; continuing to listen")
+            self._recover("microphone flush failed")
             return
         logger.info("VOICE capture_started")
         logger.info("VOICE COMMAND_CAPTURE_START")
@@ -537,6 +725,7 @@ class VoiceLoop:
             segment = self._read_command(int(self._max_segment_s * 16_000))
         except Exception:
             logger.exception("voice interaction failed at capture; continuing to listen")
+            self._recover("command capture failed")
             return
         logger.info("VOICE capture_finished")
         logger.info("VOICE COMMAND_CAPTURE_END")
@@ -545,64 +734,138 @@ class VoiceLoop:
             segment.duration_s,
             len(segment.samples),
         )
+        self._reporter.capture_end(
+            duration_s=segment.duration_s,
+            samples=len(segment.samples),
+        )
         if not segment.samples:
             logger.info("voice boundary: no command detected; returning to wake")
+            self._reporter.stt_empty()
             return
         if segment.duration_s < 0.3:
             logger.info("voice boundary: capture too short — returning to wake")
+            self._recover("captured audio too short")
             return  # too short, likely noise
 
         # Phase 4: Transcribe
         self._set_state("TRANSCRIBING")
+        self._reporter.transcribing()
         logger.info("VOICE STT_START")
         logger.info("voice boundary: stt start (audio_s=%.3f)", segment.duration_s)
         try:
             result = self._stt.transcribe(segment)
         except Exception:
             logger.exception("voice interaction failed at stt; continuing to listen")
+            self._recover("speech recognition failed")
             return
 
         # Command transcripts are logged only at DEBUG, through the
         # redaction filter.  INFO carries a character count only so
         # possible sensitive wording never reaches the log (docs/03 §10).
+        # The console line is the *exact* transcript the agent will receive, so
+        # a misrecognition is visible where it happens rather than surfacing as
+        # a nonsensical task later.
         text = result.text.strip()
         logger.info("VOICE transcript=%d chars", len(text))
         logger.info("VOICE STT_RESULT")
         logger.info("voice boundary: stt done (chars=%d language=%s)", len(text), result.language)
         logger.info("voice transcript: %d chars", len(text))
         logger.debug("voice transcript: %r", redact(text))
+        self._reporter.transcript(text, language=result.language or "")
         if not text:
             logger.info("voice boundary: stt empty — no command; returning to wake")
+            self._reporter.stt_empty()
             return
 
         # Phase 5: Route
         self._set_state("PROCESSING")
+        self._reporter.thinking()
         logger.info("VOICE ROUTING_START")
         logger.info("voice boundary: routing command")
         try:
             response = self._route(text)
         except Exception:
             logger.exception("voice interaction failed at route; continuing to listen")
+            self._recover("routing the request failed")
             return
         logger.info("VOICE ROUTING_COMPLETE")
+        self._report_routing()
         if response is None:
             logger.info("voice boundary: route returned no response; returning to wake")
             return
+        spoken = self._prepare_spoken(response)
         logger.info("VOICE RESPONSE_START")
-        logger.info("voice boundary: response ready (chars=%d)", len(response))
+        logger.info("voice boundary: response ready (chars=%d)", len(spoken))
+        self._reporter.answer(spoken)
 
         self._set_state("SPEAKING")
+        self._reporter.speaking(backend=self._tts_backend(), chars=len(spoken))
         try:
             logger.info("VOICE TTS_START")
             logger.info("voice boundary: tts response speech starting")
-            self._tts.speak(response)
+            self._tts.speak(spoken)
             logger.info("VOICE TTS_COMPLETE")
             logger.info("voice boundary: tts response speech done")
         except Exception:
+            # A TTS failure is isolated: the answer was produced, the log says
+            # so, and the loop still returns to READY.  Voice must never go
+            # permanently deaf because a speech engine hiccuped.
             logger.exception("voice interaction failed at tts-response; continuing to listen")
+            self._recover("speech synthesis failed")
             return
         logger.info("VOICE INTERACTION_COMPLETE")
         logger.info("voice boundary: interaction completed")
+
+    def _report_routing(self) -> None:
+        """Publish which provider/model served the request (best effort).
+
+        The probe is injected (the daemon wires it to the live ``LLMClient``)
+        so this module never imports the LLM layer.  A failure here is
+        swallowed: missing routing metadata must never fail an interaction.
+        """
+        if self._routing_report is None:
+            return
+        try:
+            report = self._routing_report()
+        except Exception:
+            logger.debug("routing report unavailable", exc_info=True)
+            return
+        if report is None:
+            return
+        try:
+            self._reporter.routing(report)
+        except Exception:
+            logger.debug("routing report could not be printed", exc_info=True)
+
+    def _tts_backend(self) -> str:
+        """Best-effort backend label for the TTS engine (log-friendly)."""
+        for attr in ("backend", "name", "engine_name"):
+            value = getattr(self._tts, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return type(self._tts).__name__
+
+    def _prepare_spoken(self, response: str) -> str:
+        """Return the bounded, leak-free text that TTS will actually speak.
+
+        :func:`~jarvis.agent.answer.spoken_answer` drops any internal routing
+        payload (a JSON document echoed into the answer) and caps the length at
+        a sentence boundary, so a document-length answer becomes a spoken
+        sentence instead of 79 seconds of dead air.  The full text is still on
+        the console and in the task result.
+        """
+        try:
+            spoken = spoken_answer(response, budget=self._max_spoken_chars)
+        except Exception:
+            logger.debug("spoken answer preparation failed", exc_info=True)
+            return response
+        if spoken != response:
+            logger.info(
+                "voice boundary: spoken answer bounded (%d -> %d chars)",
+                len(response),
+                len(spoken),
+            )
+        return spoken
 
     def _quiet_start_drain(self) -> None:
         """Discard non-quiet audio until the mic returns to its baseline.
@@ -660,6 +923,7 @@ class VoiceLoop:
         a partial reset can never kill the loop.
         """
         self._set_state("RESETTING")
+        self._reporter.resetting()
         try:
             self._audio.flush()
             logger.debug("voice reset: audio flushed")
@@ -677,6 +941,7 @@ class VoiceLoop:
                 logger.debug("voice reset: wake detector reset failed", exc_info=True)
         self._wake_frames_read = 0
         self._set_state("LISTENING")
+        self._reporter.ready(self._wake_word)
 
     def _rearm(self) -> None:
         """Re-arm the wake word after an interaction has finished.

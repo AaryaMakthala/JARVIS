@@ -24,7 +24,6 @@ import signal
 import sys
 import threading
 import time
-import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -54,6 +53,7 @@ from jarvis.daemon.protocol import (
 )
 from jarvis.daemon.task_runtime import TaskRuntime, TerminalSink, VoiceSink, timeout_answer
 from jarvis.logging_setup import get_logger
+from jarvis.memory import open_memory
 from jarvis.policy.unlock import UnlockManager
 from jarvis.secrets import SecretStore
 from jarvis.tools.base import CancelToken
@@ -262,38 +262,40 @@ class DaemonServer:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pid_file: Any = None
         self._voice_service: Any = None  # VoiceService | None
+        self._memory: Any = None  # SqliteMemory | None (Phase 8, opened lazily)
 
     # ── public API ──────────────────────────────────────────────────────
 
     def run(self) -> None:
         """Start the server and block until shutdown."""
+        # Redirect first, then report: under ``pythonw`` ``sys.stdout`` is
+        # ``None``, and every console write below would otherwise raise.  This
+        # ordering also means the "log file" line lands in the log too.
+        self._redirect_std()
         # Attach the JSONL file handler unconditionally: the daemon is the long
         # lived process that must prove the voice pipeline stage-by-stage, and
         # the console script may bypass cli.main() (where logging is normally
         # configured). configure_logging() is idempotent per log file.
         logging_setup.configure_logging()
-        print(f"[DIAG] server.run(): log file -> {log_file()}", flush=True)
-        print("[DIAG] server.run(): entered", flush=True)
-        self._redirect_std()
+        logging_setup.console(f"[DAEMON] log file -> {log_file()}")
         self._install_excepthooks()
         if not self._check_single_instance():
-            print("[DIAG] server.run(): another daemon alive — returning (exit path A)", flush=True)
+            logger.info("daemon: another instance is already alive; exiting")
             return
         self._pid_file = daemon_runtime_file()
         self._pid_file.parent.mkdir(parents=True, exist_ok=True)
         try:
             asyncio.run(self._serve())
         except KeyboardInterrupt:
-            print("[DIAG] server.run(): KeyboardInterrupt from asyncio.run", flush=True)
-            traceback.print_exc()
+            logger.info("daemon: interrupted by the user")
             raise
         except BaseException:
-            print("[DIAG] server.run(): exception from asyncio.run", flush=True)
-            traceback.print_exc()
+            logger.exception("daemon: unhandled failure while serving")
             raise
         finally:
+            self._close_memory()
             self._cleanup_pid_file()
-        print("[DIAG] server.run(): asyncio.run returned cleanly (exit path B)", flush=True)
+        logger.info("daemon: stopped cleanly")
 
     # ── stdio redirect for pythonw ─────────────────────────────────────
 
@@ -417,9 +419,7 @@ class DaemonServer:
 
     async def _serve(self) -> None:
         """Accept connections, manage the task queue, clean up stale confirmations."""
-        print("[DIAG] _serve: entered", flush=True)
         self._initialize_runtime()
-        print("[DIAG] _serve: runtime initialised", flush=True)
 
         server = await asyncio.start_server(
             self._handle_client,
@@ -442,10 +442,7 @@ class DaemonServer:
                 loop.add_signal_handler(sig, self._shutdown_event.set)
             except NotImplementedError:
                 pass
-        print(
-            "[DIAG] _serve: signal handlers installed — waiting on shutdown_event",
-            flush=True,
-        )
+        logger.info("daemon ready — serving until shutdown is requested")
 
         try:
             await self._shutdown_event.wait()
@@ -482,25 +479,21 @@ class DaemonServer:
         stops the daemon — text/CLI operation continues.
         """
         self._voice_service = None
-        print(
-            f"[DIAG] _bootstrap_voice(): entered; voice.enabled={self._settings.voice.enabled}, "
-            f"VoiceService={bool(VoiceService)}",
-            flush=True,
+        logger.info(
+            "voice bootstrap: enabled=%s service_available=%s",
+            self._settings.voice.enabled,
+            bool(VoiceService),
         )
         if self._settings.voice.enabled and VoiceService is not None:
             try:
                 self._voice_service = self._build_voice_service()
-                print("[DIAG] _bootstrap_voice(): _build_voice_service() OK", flush=True)
             except Exception:
                 logger.warning("could not initialise voice service", exc_info=True)
-                print("[DIAG] _bootstrap_voice(): _build_voice_service() RAISED", flush=True)
-                traceback.print_exc()
 
         if self._voice_service is not None:
             self._refresh_ctx_voice_bridge()
             try:
                 msg = self._voice_service.start()
-                print(f"[DIAG] _bootstrap_voice(): service.start() -> {msg!r}", flush=True)
                 if self._service_state(self._voice_service) == "error":
                     code = self._service_error_code(self._voice_service) or "loop-crashed"
                     logger.warning("voice auto-start failed: %s (%s)", code, msg)
@@ -508,8 +501,6 @@ class DaemonServer:
                     logger.info("voice auto-start: %s", msg)
             except Exception:
                 logger.warning("failed to auto-start voice", exc_info=True)
-                print("[DIAG] _bootstrap_voice(): service.start() RAISED", flush=True)
-                traceback.print_exc()
 
     def _build_default_context(self) -> Any:
         """Build an AppContext with the current settings."""
@@ -529,12 +520,49 @@ class DaemonServer:
         return make_app_context(
             self._settings,
             llm=llm,
+            memory=self._open_memory(),
             unlock=self._unlock,
             voice=VoiceToolsFacade(service=self._voice_service),
         )
 
+    def _open_memory(self) -> Any:
+        """Open the local memory store once, for the daemon's whole lifetime.
+
+        Phase 8: the daemon is where memory actually pays off — the same
+        verified task asked by voice twice now retrieves the earlier approach.
+        One connection is shared by the worker threads (it is lock-protected in
+        :class:`~jarvis.memory.store.SqliteMemory`), opened lazily so a daemon
+        that fails to start never creates the file, and closed on shutdown.
+        """
+        if self._memory is None:
+            try:
+                self._memory = open_memory(settings=self._settings, logger=logger)
+            except Exception:
+                logger.warning("could not open the memory store", exc_info=True)
+                self._memory = None
+        return self._memory
+
+    def _close_memory(self) -> None:
+        """Close the memory connection if one was opened."""
+        memory, self._memory = self._memory, None
+        if memory is None:
+            return
+        try:
+            close = getattr(memory, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            logger.debug("closing the memory store failed", exc_info=True)
+
     def _build_voice_service(self) -> Any:
-        """Build a VoiceService with lazy-imported backends."""
+        """Build a VoiceService with lazy-imported backends.
+
+        Every backend is optional, so each factory is probed independently and
+        a failure only disables that component (surfacing later as a fixed
+        ``VOICE_ERROR_CODES`` entry from :class:`VoiceService`).  Diagnostics go
+        to the log, never to ``print``: the daemon also runs under ``pythonw``,
+        where ``sys.stdout`` is ``None`` and a print would raise.
+        """
         from jarvis.voice.service import VoiceService
 
         audio = None
@@ -542,9 +570,13 @@ class DaemonServer:
         stt = None
         tts = None
         focus = None
-        print(
-            f"[DIAG] _build_voice_service(): entered (voice.enabled={self._settings.voice.enabled})",
-            flush=True,
+        logger.info(
+            "voice backends: silence_timeout_s=%.2f max_segment_s=%.1f "
+            "rearm_quiet_gate_s=%.2f max_spoken_chars=%d",
+            self._settings.voice.silence_timeout_s,
+            self._settings.voice.max_segment_s,
+            self._settings.voice.rearm_quiet_gate_s,
+            self._settings.voice.max_spoken_chars,
         )
 
         try:
@@ -555,61 +587,36 @@ class DaemonServer:
                 channels=1,
                 input_device=self._settings.voice.input_device,
             )
-            print(f"[DIAG] _build_voice_service(): audio={audio!r}", flush=True)
         except Exception:
             logger.debug("microphone audio unavailable", exc_info=True)
-            print("[DIAG] _build_voice_service(): audio_input.create() RAISED", flush=True)
-            traceback.print_exc()
 
         try:
             from jarvis.voice.wake import create as create_wake
 
             wake = create_wake(model_name=self._settings.voice.wake_word)
-            print(f"[DIAG] _build_voice_service(): wake={wake!r}", flush=True)
         except Exception:
             logger.debug("wake-word unavailable", exc_info=True)
-            print("[DIAG] _build_voice_service(): wake.create() RAISED", flush=True)
-            traceback.print_exc()
 
         try:
             from jarvis.voice.stt import create as create_stt
 
             stt = create_stt(model_size=self._settings.voice.stt_model)
-            print(f"[DIAG] _build_voice_service(): stt={stt!r}", flush=True)
         except Exception:
             logger.debug("STT unavailable", exc_info=True)
-            print("[DIAG] _build_voice_service(): stt.create() RAISED", flush=True)
-            traceback.print_exc()
 
         try:
             from jarvis.voice.tts import create as create_tts
 
             tts = create_tts(backend=self._settings.voice.tts_backend)
-            print(
-                f"[DIAG] _build_voice_service(): tts={type(tts).__name__ if tts else None!r}",
-                flush=True,
-            )
         except Exception:
             logger.debug("TTS unavailable", exc_info=True)
-            print("[DIAG] _build_voice_service(): tts.create() RAISED", flush=True)
-            traceback.print_exc()
 
         try:
             from jarvis.voice.focus import WindowFocusChecker
 
             focus = WindowFocusChecker()
-            print(f"[DIAG] _build_voice_service(): focus={focus!r}", flush=True)
         except Exception:
             logger.debug("focus checker unavailable", exc_info=True)
-            print("[DIAG] _build_voice_service(): focus.create() RAISED", flush=True)
-            traceback.print_exc()
-
-        print(
-            "[DIAG] _build_voice_service(): building VoiceService "
-            f"(silence_timeout_s={self._settings.voice.silence_timeout_s} "
-            f"max_segment_s={self._settings.voice.max_segment_s})",
-            flush=True,
-        )
 
         return VoiceService(
             audio=audio,
@@ -626,7 +633,33 @@ class DaemonServer:
             silence_timeout_s=self._settings.voice.silence_timeout_s,
             max_segment_s=self._settings.voice.max_segment_s,
             silence_threshold=self._settings.voice.silence_threshold,
+            rearm_quiet_gate_s=self._settings.voice.rearm_quiet_gate_s,
+            max_spoken_chars=self._settings.voice.max_spoken_chars,
+            report_status=self._settings.voice.status,
+            echo_transcript=self._settings.voice.echo_transcript,
+            routing_report=self._llm_routing_report,
         )
+
+    def _llm_routing_report(self) -> Any:
+        """Describe which provider/model served the most recent LLM call.
+
+        Read only, and only safe labels: the provider name, the model id, a
+        latency, and a failure-category string.  A missing or unconfigured LLM
+        returns ``None`` so the voice console simply omits the ``[LLM]`` lines
+        instead of guessing.  This never raises — the voice loop treats a
+        failure here as "no routing metadata".
+        """
+        llm = getattr(self._ctx, "llm", None) if self._ctx is not None else None
+        meta = getattr(llm, "last_call", None)
+        if meta is None:
+            return None
+        try:
+            from jarvis.voice.status import report_from_call_meta
+
+            return report_from_call_meta(meta)
+        except Exception:
+            logger.debug("routing report could not be built", exc_info=True)
+            return None
 
     def _stop_voice(self) -> None:
         """Stop the voice pipeline on shutdown / toggle-off (idempotent)."""

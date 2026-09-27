@@ -23,6 +23,7 @@ from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from jarvis.agent.answer import describe_violation, looks_like_internal_payload
 from jarvis.agent.state import Decision, Plan, Step
 
 __all__ = [
@@ -132,6 +133,26 @@ class BrainDecision(BaseModel):
     clarification_question: str | None = None
     response_hint: str = ""
     conversation_context: str = ""
+
+    @field_validator("response_text")
+    @classmethod
+    def _response_text_is_natural_language(cls, value: str) -> str:
+        """``response_text`` must be prose, never an echoed routing document.
+
+        Small/free models sometimes serialise the whole ``BrainDecision``
+        template into the string field.  Projected verbatim, that produced the
+        reported symptom of a correct sentence followed by ``goal`` /
+        ``actions`` / ``response_hint`` / ``conversation_context``.
+
+        Rejecting it here means the value never enters ``AgentState``, and the
+        LLM clients' existing one-shot repair path re-asks the model with
+        :func:`jarvis.agent.answer.describe_violation` telling it exactly what
+        was wrong.  The check parses JSON rather than matching patterns, so
+        prose containing the word "goal" is unaffected.
+        """
+        if looks_like_internal_payload(value):
+            raise ValueError(describe_violation(value))
+        return value
 
     @model_validator(mode="after")
     def _direction_requires_field(self) -> BrainDecision:

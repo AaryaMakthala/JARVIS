@@ -19,6 +19,11 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel, ValidationError
 
 from jarvis import config
+from jarvis.llm.failures import (
+    FailureCategory,
+    classify,
+    should_retry_same_provider,
+)
 from jarvis.logging_setup import get_logger
 
 _MODEL_ROLES = ("planner", "fast", "vision")
@@ -40,6 +45,16 @@ class LLMError(RuntimeError):
     or raw provider payloads.
     """
 
+    #: Explicit :class:`jarvis.llm.failures.FailureCategory` for this failure.
+    #: Read structurally by the composite client so it does not have to re-derive
+    #: the reason from the message text.
+    category: FailureCategory = FailureCategory.UNEXPECTED
+
+    def __init__(self, message: str, *, category: FailureCategory | None = None) -> None:
+        super().__init__(message)
+        if category is not None:
+            self.category = category
+
 
 class LLMTransientError(LLMError):
     """Rate limit or 5xx server error.
@@ -47,13 +62,19 @@ class LLMTransientError(LLMError):
     The caller may retry (bounded) or fall through to the next free provider.
     """
 
+    category = FailureCategory.SERVER_ERROR
+
 
 class LLMAuthError(LLMError):
     """The credential was rejected (HTTP 401/403).  Never retried."""
 
+    category = FailureCategory.AUTH
+
 
 class LLMModelError(LLMError):
     """The model name is unknown/retired on the provider (HTTP 404)."""
+
+    category = FailureCategory.UNSUPPORTED_MODEL
 
 
 class LLMCapabilityError(LLMError):
@@ -63,6 +84,29 @@ class LLMCapabilityError(LLMError):
     provider is skipped for that operation and the next compatible free
     provider is tried instead of silently degrading.
     """
+
+    category = FailureCategory.UNSUPPORTED_CAPABILITY
+
+
+class LLMInvalidOutputError(LLMError):
+    """The model answered but the payload was not the required schema.
+
+    Distinct from a transport failure: the provider is healthy, so the caller
+    falls through to the next provider for *this* call and cools this one down
+    briefly, rather than retrying the identical request.
+    """
+
+    category = FailureCategory.INVALID_STRUCTURED_OUTPUT
+
+
+class LLMContextLengthError(LLMError):
+    """The prompt does not fit the model's context window.
+
+    Retrying the same request can never help, so this fails straight through to
+    the next provider and cools the current one for a longer period.
+    """
+
+    category = FailureCategory.CONTEXT_LENGTH
 
 
 @runtime_checkable
@@ -95,7 +139,103 @@ def is_json_schema_unsupported(exc: Exception) -> bool:
     return "json_schema" in str(exc).lower()
 
 
-class GroqClient:
+#: Categories that mean "the provider refused this request shape", which for
+#: ``structured()`` is grounds to retry the same call in plain-JSON mode.
+_SCHEMA_REJECTIONS = frozenset(
+    {FailureCategory.UNSUPPORTED_CAPABILITY, FailureCategory.MALFORMED_REQUEST}
+)
+
+
+def _is_schema_rejection(exc: BaseException) -> bool:
+    """Did the provider reject the ``json_schema`` *response format itself*?
+
+    Two signals count, because providers differ in what they say:
+
+    * the error text names ``json_schema``/``response_format``/``does not
+      support`` (the original check), or
+    * the provider answered HTTP 400/422 with no other explanation.  Groq
+      returns a bare ``400 Bad Request`` for an unknown response format, and
+      the old text-only check therefore re-paid that failed probe on *every*
+      call for the whole session.
+
+    The downgrade is safe: ``{"type": "json_object"}`` demands strictly less of
+    the provider, so if the schema shape was the problem it now succeeds, and
+    if something else was wrong the retry 400s too and propagates.
+    """
+    if is_json_schema_unsupported(exc) or classify(exc) in _SCHEMA_REJECTIONS:
+        return True
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    try:
+        return int(status) in (400, 422) if status is not None else False
+    except (TypeError, ValueError):
+        return False
+
+
+def _as_llm_error(category: FailureCategory, message: str, exc: BaseException) -> LLMError:
+    """Build the most specific :class:`LLMError` subclass for ``category``."""
+    mapping: dict[FailureCategory, type[LLMError]] = {
+        FailureCategory.AUTH: LLMAuthError,
+        FailureCategory.UNSUPPORTED_MODEL: LLMModelError,
+        FailureCategory.UNSUPPORTED_CAPABILITY: LLMCapabilityError,
+        FailureCategory.CONTEXT_LENGTH: LLMContextLengthError,
+        FailureCategory.INVALID_STRUCTURED_OUTPUT: LLMInvalidOutputError,
+        FailureCategory.RATE_LIMIT: LLMTransientError,
+        FailureCategory.SERVER_ERROR: LLMTransientError,
+        FailureCategory.CONNECTION: LLMTransientError,
+        FailureCategory.DNS: LLMTransientError,
+        FailureCategory.TLS: LLMTransientError,
+        FailureCategory.TIMEOUT: LLMTransientError,
+    }
+    error_cls = mapping.get(category, LLMError)
+    return error_cls(message, category=category)
+
+
+@dataclass
+class CallMeta:
+    """Safe metadata about the most recent call, for observability.
+
+    No credential, prompt, or raw payload — only the labels, the latency, and
+    the failure category.  :class:`~jarvis.voice.status.VoiceStatusReporter`
+    reads this to print which provider actually answered.
+    """
+
+    provider: str = ""
+    model: str = ""
+    role: str = ""
+    latency_ms: int = 0
+    failure_category: str = ""
+    ok: bool = True
+
+
+class _MetaMixin:
+    """Shared last-call bookkeeping for the real provider clients."""
+
+    def _reset_meta(self, provider: str) -> None:
+        self.last_call = CallMeta(provider=provider)
+
+    def _mark_ok(self, model: str, role: str, latency_ms: int) -> None:
+        self.last_call = CallMeta(
+            provider=self.last_call.provider,
+            model=model,
+            role=role,
+            latency_ms=latency_ms,
+            ok=True,
+        )
+
+    def _mark_failed(
+        self, model: str, role: str, category: FailureCategory, latency_ms: int
+    ) -> None:
+        self.last_call = CallMeta(
+            provider=self.last_call.provider,
+            model=model,
+            role=role,
+            latency_ms=latency_ms,
+            failure_category=category.value,
+            ok=False,
+        )
+
+
+class GroqClient(_MetaMixin):
     """Real LLM client using the Groq SDK.
 
     ``api_key`` is required at construction and never logged. A ``completer``
@@ -128,6 +268,7 @@ class GroqClient:
         self.usage = Usage()
         # model name -> json_schema supported? (cached per session)
         self._schema_modes: dict[str, bool] = {}
+        self._reset_meta(self._provider_name)
 
     def _default_completer(self, **kwargs: Any) -> Any:
         return self._groq.chat.completions.create(**kwargs)
@@ -153,17 +294,22 @@ class GroqClient:
         messages: list[dict[str, str]],
         response_format: dict[str, Any] | None,
         temperature: float,
+        role: str = "planner",
     ) -> tuple[str, int, int]:
-        """Run one completion; bounded retry for transient 429/5xx errors.
+        """Run one completion; bounded retry for genuinely transient failures.
 
-        Returns ``(content, prompt_tokens, completion_tokens)``.  Invalid
-        credentials, unknown models and json_schema capability errors are
-        never retried; rate-limit/server errors retry up to ``max_retries``
-        and then raise :class:`LLMTransientError` so the composite client can
-        fall through to the next free provider.
+        Returns ``(content, prompt_tokens, completion_tokens)``.  Only
+        categories in :data:`~jarvis.llm.failures.RETRYABLE` are retried (429,
+        5xx, transport, timeout); a rejected key, an unknown model, a context
+        overflow, or a malformed request fails straight through, because
+        repeating the identical request cannot help.  When the retries are
+        exhausted the error carries its explicit
+        :class:`~jarvis.llm.failures.FailureCategory` so the composite client
+        knows what to log and how long to cool this provider down.
         """
         backoff = 1.0
         attempts = 0
+        started = time.perf_counter()
         while True:
             try:
                 resp = self._completer(
@@ -173,34 +319,28 @@ class GroqClient:
                     temperature=temperature,
                     timeout=self._settings.llm.timeout_seconds,
                 )
-            except self._groq_module.RateLimitError as exc:
+            except Exception as exc:
+                category = classify(exc)
                 attempts += 1
-                if attempts > self._settings.llm.max_retries:
-                    raise LLMTransientError(
-                        f"Groq rate limit persisted after {attempts} attempts"
+                if category is FailureCategory.CONTEXT_LENGTH:
+                    raise LLMContextLengthError(
+                        f"Groq model {model!r} context window exceeded ({category.value})"
                     ) from exc
-                self._logger.warning("Groq rate limited; retrying in %.1fs", backoff)
-                time.sleep(backoff)
-                backoff *= 2
-                continue
-            except self._groq_module.InternalServerError as exc:
-                attempts += 1
-                if attempts > self._settings.llm.max_retries:
-                    raise LLMTransientError(
-                        f"Groq server error persisted after {attempts} attempts"
-                    ) from exc
-                self._logger.warning("Groq server error; retrying in %.1fs", backoff)
-                time.sleep(backoff)
-                backoff *= 2
-                continue
-            except self._groq_module.AuthenticationError as exc:
-                raise LLMAuthError("Groq rejected the API key (authentication failed)") from exc
-            except self._groq_module.NotFoundError as exc:
-                raise LLMModelError(
-                    f"Groq model {model!r} is not available (not found on the provider)"
+                if (
+                    should_retry_same_provider(category)
+                    and attempts <= self._settings.llm.max_retries
+                ):
+                    self._logger.warning("groq %s; retrying in %.1fs", category.value, backoff)
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                elapsed = int((time.perf_counter() - started) * 1000)
+                self._mark_failed(model, role, category, elapsed)
+                raise _as_llm_error(
+                    category,
+                    f"Groq {category.value} after {attempts} attempt(s)",
+                    exc,
                 ) from exc
-            except self._groq_module.GroqError:
-                raise  # let structured()/text() decide how to handle
 
             content = (resp.choices[0].message.content or "") if resp.choices else ""
             usage = getattr(resp, "usage", None)
@@ -211,6 +351,7 @@ class GroqClient:
                 prompt_tokens=self.usage.prompt_tokens + prompt_tokens,
                 completion_tokens=self.usage.completion_tokens + completion_tokens,
             )
+            self._mark_ok(model, role, int((time.perf_counter() - started) * 1000))
             return content, prompt_tokens, completion_tokens
 
     @staticmethod
@@ -238,7 +379,9 @@ class GroqClient:
 
         if self._schema_modes.get(model) is False:
             self._logger.info("structured output mode: json (cached, model %s)", model)
-            return self._parse(model, schema, messages, {"type": "json_object"}, temperature)
+            return self._parse(
+                model, schema, messages, {"type": "json_object"}, temperature, model_role
+            )
 
         try:
             result = self._parse(
@@ -254,15 +397,25 @@ class GroqClient:
                     },
                 },
                 temperature,
+                model_role,
             )
-        except self._groq_module.GroqError as exc:
-            if not is_json_schema_unsupported(exc):
-                raise LLMError(f"Groq structured output failed: {exc}") from exc
+        except Exception as exc:
+            if not _is_schema_rejection(exc):
+                raise
+            # The provider rejected the *json_schema response format itself*.
+            # Cache that for the session so the failed probe is paid exactly
+            # once: previously the capability cache was only written when the
+            # error text contained the literal "json_schema", so a plain HTTP
+            # 400 was re-attempted on every single call forever.
             self._logger.info(
-                "model %s does not support json_schema; falling back to JSON mode", model
+                "model %s rejected json_schema (%s); using JSON mode for the rest of the session",
+                model,
+                exc,
             )
             self._schema_modes[model] = False
-            return self._parse(model, schema, messages, {"type": "json_object"}, temperature)
+            return self._parse(
+                model, schema, messages, {"type": "json_object"}, temperature, model_role
+            )
 
         self._schema_modes[model] = True
         self._logger.info("structured output mode: json_schema (model %s)", model)
@@ -275,13 +428,23 @@ class GroqClient:
         messages: list[dict[str, str]],
         response_format: dict[str, Any],
         temperature: float,
+        role: str = "planner",
     ) -> tuple[BaseModel, Usage]:
-        """Ask the model for JSON, validate it, and repair it once if invalid."""
+        """Ask the model for JSON, validate it, and repair it once if invalid.
+
+        A single repair round is attempted.  If that also fails the provider
+        has answered but cannot produce the schema, so the error is
+        :class:`LLMInvalidOutputError` (category
+        ``invalid_structured_output``): the provider is healthy, so the
+        composite client falls through to the next one for this call rather
+        than re-sending the identical request.
+        """
         raw, _, _ = self._complete(
             model=model,
             messages=messages,
             response_format=response_format,
             temperature=temperature,
+            role=role,
         )
         try:
             parsed = schema.model_validate_json(self._strip_json_fence(raw))
@@ -304,12 +467,14 @@ class GroqClient:
                 messages=repair_messages,
                 response_format=response_format,
                 temperature=temperature,
+                role=role,
             )
             try:
                 parsed = schema.model_validate_json(self._strip_json_fence(raw2))
             except ValidationError as second_error:
-                raise LLMError(
-                    f"structured output could not be repaired: {second_error}"
+                raise LLMInvalidOutputError(
+                    f"structured output could not be repaired: {second_error}",
+                    category=FailureCategory.INVALID_STRUCTURED_OUTPUT,
                 ) from second_error
         return parsed, self._snapshot_usage()
 
@@ -333,9 +498,13 @@ class GroqClient:
                 messages=messages,
                 response_format=None,
                 temperature=temperature,
+                role=model_role,
             )
-        except self._groq_module.GroqError as exc:
-            raise LLMError(f"Groq completion failed: {exc}") from exc
+        except LLMError:
+            raise
+        except Exception as exc:
+            category = classify(exc)
+            raise _as_llm_error(category, f"Groq completion failed: {category.value}", exc) from exc
         return content, self._snapshot_usage()
 
     def _snapshot_usage(self) -> Usage:

@@ -83,11 +83,15 @@ class AgentState(TypedDict, total=False):
     ``retry_now`` (verify -> retry the same step) and - Phase 7 - ``replan_now``
     (verify -> try a fresh plan), ``pending_replan`` (validate ran for a
     replanned plan), ``request_kind`` (the classified request, set by the brain
-    node) and ``replan_decision`` (the last ReplanDecision, stored so the final
+    node) and     ``replan_decision`` (the last ReplanDecision, stored so the final
     answer can stay honest).  ``clarification_question`` /
     ``clarification_answer`` / ``clarification_count`` belong to the ``brain``
     -> ``clarify`` loop: the question the brain asked, the human's validated
     free-text answer, and how many questions were asked (bounded in code).
+    ``memory_saved`` / ``memory_saved_reason`` / ``memory_failure_logged`` are
+    written by the Phase 8 ``memory_save`` node after ``respond``; the reason is
+    kept so a caller can report honestly that nothing was learned (dry-run,
+    tainted, unverified) and whether a failure was logged instead.
     """
 
     task_id: str
@@ -120,6 +124,10 @@ class AgentState(TypedDict, total=False):
     clarification_question: str | None
     clarification_answer: str | None
     clarification_count: int
+    # operational (Phase 8: written by memory_save after respond)
+    memory_saved: bool
+    memory_saved_reason: str | None
+    memory_failure_logged: bool
 
 
 class Profile(BaseModel):

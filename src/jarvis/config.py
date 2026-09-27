@@ -108,6 +108,12 @@ window_timeout_s = 10.0
 
 [memory]
 retrieval_limit = 3
+enabled = true
+save_skills = true
+similarity_threshold = 0.75
+max_skills = 500
+max_failures = 200
+max_preferences = 50
 """
 
 
@@ -228,6 +234,21 @@ class VoiceSettings(BaseModel):
     idle_timeout_s: float = 120.0
     max_session_s: float = 1800.0
     max_dictation_chars: int = 20000
+    #: Bounded quiet-start drain applied before every wake re-arm, in seconds
+    #: of *audio* (0 disables).  Keeps the second/third wake as detectable as
+    #: the first by making the detector re-arm under the same quiet baseline.
+    rearm_quiet_gate_s: float = 0.5
+    #: Print the ``[VOICE]``/``[LLM]`` lifecycle lines to the console.  The
+    #: JSONL log is written either way; turning this off only silences the
+    #: terminal, never the diagnostics.
+    status: bool = True
+    #: Show the exact transcript in the ``[VOICE] STT: "…"`` console line.
+    #: The JSONL file always carries only a length plus a redacted copy.
+    echo_transcript: bool = True
+    #: Longest answer handed to TTS.  Longer answers are cut at a sentence
+    #: boundary for speech; the full text still reaches the console and the
+    #: task result.
+    max_spoken_chars: int = 300
 
 
 class WhatsAppSettings(BaseModel):
@@ -248,9 +269,22 @@ class MemorySettings(BaseModel):
 
     ``retrieval_limit`` caps how many records the memory_retrieve node hands
     the planner, so a single prompt can never be flooded by stored memory.
+    ``enabled`` turns the whole store off (the daemon and CLI then pass
+    :class:`~jarvis.memory.base.NullMemory`, so behaviour is unchanged and
+    nothing is written).  ``save_skills`` is a separate, narrower switch: with
+    it off JARVIS still *reads* past examples but never records new ones.
+    ``similarity_threshold`` is the cosine floor for a stored example to be
+    considered relevant at all (docs/02 section 9, default 0.75).  The
+    ``max_*`` values bound each table so ``memory.db`` cannot grow forever.
     """
 
     retrieval_limit: int = 3
+    enabled: bool = True
+    save_skills: bool = True
+    similarity_threshold: float = 0.75
+    max_skills: int = 500
+    max_failures: int = 200
+    max_preferences: int = 50
 
 
 class Settings(BaseSettings):

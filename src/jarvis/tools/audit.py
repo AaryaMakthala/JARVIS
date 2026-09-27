@@ -60,7 +60,10 @@ def _run_audit(args: AuditRunArgs, ctx: ToolContext) -> ToolResult:
             output=f"[dry-run] would run read-only audit sections: {args.sections or 'all'}",
         )
     sections = list(args.sections) or list(_SECTIONS)
-    findings = audit_checks.run_checks(sections)
+    # ``self_review`` reads the task log; without log_path it can only report
+    # "unknown", which is how the Phase 7 acceptance criterion (repeated
+    # failures listed honestly) silently never held in production.
+    findings = audit_checks.run_checks(sections, log_path=config.log_file())
     report_path = write_report(findings, config.reports_dir())
     by_severity: dict[str, int] = {}
     for finding in findings:

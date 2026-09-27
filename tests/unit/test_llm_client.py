@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 import jarvis.llm.client as llm_module
 from jarvis.config import LLMSettings, Settings
-from jarvis.llm.client import FakeLLM, GroqClient, LLMError, Usage
+from jarvis.llm.client import FakeLLM, GroqClient, LLMAuthError, LLMError, Usage
 
 PLAN_JSON = '{"action": "open_app", "args": {"app": "notepad"}}'
 
@@ -56,6 +56,12 @@ def server_error() -> Exception:
     import groq
 
     return groq.InternalServerError("boom", response=_http_response(500), body=None)
+
+
+def auth_error(message: str) -> Exception:
+    import groq
+
+    return groq.AuthenticationError(message, response=_http_response(401), body=None)
 
 
 class FakeCompleter:
@@ -175,15 +181,68 @@ def test_text_returns_content_and_tracks_usage() -> None:
 
 
 def test_non_schema_groq_error_wraps_in_llm_error() -> None:
+    """A 400 is downgraded once for ``structured()``, then surfaces as LLMError.
+
+    Contract change (bug fix): a bare HTTP 400 from Groq means "unknown response
+    format", so ``structured()`` now retries once in plain-JSON mode.  When that
+    also 400s the failure is raised, not swallowed.  ``text()`` sends no response
+    format, so it raises on the first 400.
+    """
     def _raising(_kwargs: Any) -> Any:
         raise bad_request("some other 400")
 
-    completer = FakeCompleter().add(_raising).add(_raising)
+    completer = (
+        FakeCompleter().add(_raising).add(_raising).add(_raising)
+    )  # text, json_schema probe, json_object retry
     client = GroqClient("gsk-key", settings(), completer=completer)
     with pytest.raises(LLMError):
         client.text(system="s", user="u")
     with pytest.raises(LLMError):
         client.structured(system="s", user="u", schema=Plan)
+    assert completer.json_schema_calls() == 1
+    assert completer.json_object_calls() == 1
+
+
+def test_bare_400_schema_probe_is_paid_only_once() -> None:
+    """The failed json_schema probe must be cached, not re-tried every call.
+
+    Regression for the production symptom where a Groq 400 was re-paid on every
+    single structured call for the whole session, because the capability cache
+    was only written when the error text literally mentioned ``json_schema``.
+    """
+    def _reject_schema(kwargs: Any) -> Any:
+        if (kwargs.get("response_format") or {}).get("type") == "json_schema":
+            raise bad_request("Bad Request")
+        return make_response(PLAN_JSON)
+
+    completer = FakeCompleter()
+    for _ in range(4):
+        completer.add(_reject_schema)
+    client = GroqClient("gsk-key", settings(), completer=completer)
+
+    for _ in range(4):
+        plan, _usage = client.structured(system="s", user="u", schema=Plan)
+        assert plan.action == "open_app"
+
+    assert completer.json_schema_calls() == 1, "the 400 probe must happen once per session"
+    assert completer.json_object_calls() == 4
+
+
+def test_auth_error_is_never_downgraded_to_json_mode() -> None:
+    """Only a request-shape rejection may be retried in JSON mode."""
+
+    def _unauthorised(_kwargs: Any) -> Any:
+        raise auth_error("invalid api key")
+
+    completer = FakeCompleter()
+    for _ in range(3):
+        completer.add(_unauthorised)
+    client = GroqClient("gsk-key", settings(), completer=completer)
+
+    with pytest.raises(LLMAuthError):
+        client.structured(system="s", user="u", schema=Plan)
+    assert completer.json_schema_calls() == 1
+    assert completer.json_object_calls() == 0
 
 
 def test_rate_limit_retries_then_succeeds() -> None:

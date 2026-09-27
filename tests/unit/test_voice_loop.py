@@ -47,6 +47,8 @@ from jarvis.voice.loop import (
     VoiceLoop,
     _approval_words,
 )
+from jarvis.voice.states import VoicePhase
+from jarvis.voice.status import VoiceStatusReporter
 from support import brain_conversation
 
 # ── helpers ─────────────────────────────────────────────────────────────
@@ -67,6 +69,87 @@ def _scripted_wake(booleans: list[bool]) -> Callable[[AudioSegment], WakeWordRes
         return WakeWordResult(detected=False)
 
     return detect
+
+
+#: Longest any test waits for a scripted effect before failing.  Every wait in
+#: this module is bounded by it, so a regression in the loop fails a test in
+#: seconds instead of hanging the session.
+_WAIT_TIMEOUT_S = 5.0
+
+
+def _wait_for(predicate: Callable[[], bool], timeout_s: float = _WAIT_TIMEOUT_S) -> bool:
+    """Return True as soon as ``predicate`` holds, else False within ``timeout_s``."""
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)
+    return True
+
+
+def _stop_loop(loop: VoiceLoop) -> None:
+    """Stop a started loop and prove its thread ended (bounded, never hangs)."""
+    loop.stop()
+    thread = loop._thread
+    assert thread is not None
+    assert not thread.is_alive(), "stop() returned while the loop thread was still running"
+
+
+def _run_scripted(
+    loop: VoiceLoop,
+    done: Callable[[], bool],
+    *,
+    what: str,
+    timeout_s: float = _WAIT_TIMEOUT_S,
+) -> None:
+    """Run a started loop until ``done()`` holds, then stop it explicitly.
+
+    A wake loop never ends by itself: an idle timeout is explicitly non-fatal
+    (:meth:`VoiceLoop._resume_after_idle`), so a scripted audio run keeps
+    listening forever and ``join()`` would block for its whole timeout.  Tests
+    therefore wait for the effect they are about to assert and then call
+    ``stop()`` — the same way the daemon ends a session.
+
+    Both halves are bounded and the stop runs in a ``finally``, so a
+    regression fails the test in seconds and never leaves a live voice thread
+    cycling in the background.
+    """
+    try:
+        assert _wait_for(done, timeout_s), f"timed out after {timeout_s}s waiting for {what}"
+    finally:
+        _stop_loop(loop)
+
+
+class _PhaseSpy(VoiceStatusReporter):
+    """A reporter that records the lifecycle instead of printing it.
+
+    The ordering of phases and recoveries *is* the voice reliability contract,
+    so tests assert on it directly instead of guessing from wall-clock timing.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(stream=None, enabled=False)
+        self.phases: list[str] = []
+        self.recoveries: list[str] = []
+        self.ready_count = 0
+        self.wake_detected_count = 0
+
+    @property
+    def idle_timeouts(self) -> int:
+        """How many non-fatal idle timeouts the loop has reported."""
+        return sum(1 for reason in self.recoveries if "idle timeout" in reason)
+
+    def state(self, phase: VoicePhase, *, detail: str = "", **fields: Any) -> None:
+        self.phases.append(str(phase))
+        if phase is VoicePhase.READY:
+            self.ready_count += 1
+        elif phase is VoicePhase.WAKE_DETECTED:
+            self.wake_detected_count += 1
+        super().state(phase, detail=detail, **fields)
+
+    def recovering(self, reason: str) -> None:
+        self.recoveries.append(reason)
+        super().recovering(reason)
 
 
 def _provider_candidate(name: str, model: str, client: Any) -> tuple[ProviderInfo, ModelSpec, Any]:
@@ -246,7 +329,9 @@ class TestVoiceLoopRouting:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
+        # An idle timeout no longer ends the loop, so wait for the answer the
+        # pipeline owes and then stop the loop explicitly.
+        _run_scripted(loop, lambda: tts.spoken == ["Yes?", "Four."], what="the spoken answer")
         return tts
 
     def test_wake_stt_groq_graph_tts_pipeline(self, tmp_path: Path) -> None:
@@ -593,8 +678,11 @@ class TestVoiceLoopRearmAndCapture:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
-        assert not loop.is_active()
+        _run_scripted(
+            loop,
+            lambda: submitted == ["open notepad", "open notepad"] and wake.reset_calls >= 2,
+            what="both scripted wakes to be processed and re-armed",
+        )
         assert submitted == ["open notepad", "open notepad"]
         # After each interaction the detector was re-armed and stale audio
         # (TTS echo etc.) flushed so it is never heard as the next command.
@@ -620,8 +708,11 @@ class TestVoiceLoopRearmAndCapture:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
-        assert not loop.is_active()
+        _run_scripted(
+            loop,
+            lambda: len(submitted) == 3 and wake.reset_calls >= 3,
+            what="all three scripted cycles",
+        )
         assert submitted == ["open notepad", "open notepad", "open notepad"]
         assert loop._tts.spoken == ["Yes?", "ok", "Yes?", "ok", "Yes?", "ok"]
         assert audio.close_calls >= 1  # clean shutdown after all three cycles
@@ -643,8 +734,9 @@ class TestVoiceLoopRearmAndCapture:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
-        assert not loop.is_active()
+        _run_scripted(
+            loop, lambda: wake.reset_calls >= 1, what="the failed utterance to be re-armed"
+        )
         assert submitted == []
         assert wake.reset_calls >= 1  # re-armed after the failed utterance
 
@@ -721,7 +813,11 @@ class TestVoiceLoopRearmAndCapture:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
+        _run_scripted(
+            loop,
+            lambda: submitted == ["open notepad"] and wake.reset_calls >= 1,
+            what="the command that follows the post-ack pause",
+        )
         assert submitted == ["open notepad"]  # the pause did not eat the command
         assert loop._tts.spoken == ["Yes?", "ok"]
         assert wake.reset_calls >= 1
@@ -791,8 +887,11 @@ class TestRearmQuietStartGate:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
-        assert not loop.is_active()
+        _run_scripted(
+            loop,
+            lambda: len(submitted) == 2 and wake.reset_calls >= 3,
+            what="both cycles to run and be re-armed",
+        )
         # Both cycles ran end-to-end.
         assert submitted == ["open notepad", "open notepad"]
         # The echo (fills 0.3 / 0.15) was drained during re-arm and never
@@ -856,8 +955,11 @@ class TestRearmQuietStartGate:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
-        assert not loop.is_active()
+        _run_scripted(
+            loop,
+            lambda: len(submitted) == 2 and wake.reset_calls >= 3,
+            what="both cycles despite the room never going quiet",
+        )
         assert submitted == ["open notepad", "open notepad"]
         assert wake.reset_calls == 3
 
@@ -953,8 +1055,11 @@ class TestFirstWakeAfterQuietStartup:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
-        assert not loop.is_active()
+        _run_scripted(
+            loop,
+            lambda: submitted == ["open notepad"] and wake.reset_calls >= 2,
+            what="the first wake to drive an interaction",
+        )
         # The first wake was honoured end-to-end.
         assert submitted == ["open notepad"]
         assert loop._tts.spoken == ["Yes?", "ok"]
@@ -1055,10 +1160,20 @@ class TestInteractionLifecycleHardening:
                 return seg
             return AudioSegment(samples=[0.0] * num_frames, sample_rate=self._sample_rate)
 
-    def _run_to_idle(self, loop: VoiceLoop) -> None:
-        assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
-        assert not loop.is_active()
+    def _run_to_idle(
+        self,
+        loop: VoiceLoop,
+        done: Callable[[], bool],
+        *,
+        what: str,
+    ) -> None:
+        """Run until ``done()`` holds, then stop the loop and check it ended.
+
+        The loop deliberately survives an idle timeout, so a scripted run
+        never finishes on its own; the caller states what it is waiting for and
+        the loop is stopped explicitly.
+        """
+        _run_scripted(loop, done, what=what)
 
     def test_ack_speaks_before_command_capture_starts(self) -> None:
         """Ordering: wake → speak "Yes?" → flush → first capture chunk read."""
@@ -1090,7 +1205,11 @@ class TestInteractionLifecycleHardening:
             idle_timeout_s=0.3,
         )
         loop.start()
-        self._run_to_idle(loop)
+        self._run_to_idle(
+            loop,
+            lambda: submitted == ["open notepad"] and wake.reset_calls >= 2,
+            what="the interaction to complete and be re-armed",
+        )
         assert submitted == ["open notepad"]
         assert loop._tts.spoken == ["Yes?", "ok"]
         assert ("speak", "Yes?") in events
@@ -1118,7 +1237,9 @@ class TestInteractionLifecycleHardening:
             idle_timeout_s=0.5,
         )
         loop.start()
-        self._run_to_idle(loop)
+        self._run_to_idle(
+            loop, lambda: len(loop._tts.spoken) >= 3, what="the second wake to answer"
+        )
         # First interaction died at capture; the SECOND wake still worked.
         assert loop._tts.spoken == ["Yes?", "Yes?", "ok"]
         assert submitted == ["open notepad"]
@@ -1148,7 +1269,9 @@ class TestInteractionLifecycleHardening:
             idle_timeout_s=0.5,
         )
         loop.start()
-        self._run_to_idle(loop)
+        self._run_to_idle(
+            loop, lambda: len(loop._tts.spoken) >= 3, what="the second wake to answer"
+        )
         assert loop._tts.spoken == ["Yes?", "Yes?", "ok"]
         assert submitted == ["open notepad"]
         assert wake.reset_calls >= 2
@@ -1166,7 +1289,9 @@ class TestInteractionLifecycleHardening:
             idle_timeout_s=0.5,
         )
         loop.start()
-        self._run_to_idle(loop)
+        self._run_to_idle(
+            loop, lambda: len(loop._tts.spoken) >= 4, what="the second wake to answer"
+        )
         # First route hit a dead submit_task; the loop still re-armed and the
         # SECOND wake completed normally.
         assert loop._tts.spoken == ["Yes?", "Sorry, I couldn't process that.", "Yes?", "ok"]
@@ -1197,7 +1322,9 @@ class TestInteractionLifecycleHardening:
             idle_timeout_s=0.5,
         )
         loop.start()
-        self._run_to_idle(loop)
+        self._run_to_idle(
+            loop, lambda: len(submitted) == 2, what="both scripted wakes to be routed"
+        )
         # First interaction: the command WAS processed and its response text
         # was enqueued, but the spoken response failed; the loop re-armed and
         # the SECOND wake completed fully.
@@ -1236,7 +1363,9 @@ class TestInteractionLifecycleHardening:
             idle_timeout_s=0.5,
         )
         loop.start()
-        self._run_to_idle(loop)
+        self._run_to_idle(
+            loop, lambda: len(loop._tts.spoken) >= 3, what="the second wake to answer"
+        )
         assert loop._tts.spoken == ["Yes?", "Yes?", "ok"]
         assert submitted == ["open notepad"]
         assert wake.reset_calls >= 2  # reset even though the interaction blew up
@@ -1260,7 +1389,7 @@ class TestInteractionLifecycleHardening:
             idle_timeout_s=0.3,
         )
         loop.start()
-        self._run_to_idle(loop)
+        self._run_to_idle(loop, lambda: len(submitted) == 1, what="the interaction to be routed")
         assert submitted == ["open notepad"]
         text = caplog.text  # type: ignore[attr-defined]
         for marker in (
@@ -1477,20 +1606,96 @@ class TestSessionLimits:
         assert "character limit reached" in response
         assert not loop.is_dictating
 
-    def test_idle_timeout_stops_loop(self) -> None:
-        audio = FakeAudioInput(segments=[make_speech("fake", duration_s=0.5)] * 10)
-        wake = FakeWakeWord(results=[WakeWordResult(detected=False)])
+    def test_idle_timeout_is_non_fatal(self) -> None:
+        """A timed-out wake wait must leave the loop armed, usable, and alive.
+
+        The contract (docs/02, voice reliability contract): an idle timeout
+        bounds **one wait**, never the loop.  The loop must report
+        ``RECOVERING``, return to ``READY``, still detect the next
+        "hey jarvis", drive a complete interaction with it, tolerate further
+        idle timeouts afterwards, and end only on an explicit ``stop()``.
+
+        Deterministic, with no wall-clock guessing and no real audio timing:
+
+        * the first wait is forced to time out — ``idle_timeout_s`` is shorter
+          than the scripted audio, so the deadline is always reached before a
+          wake could be scored;
+        * the detector reports a wake only once an idle timeout has actually
+          been observed *and* no interaction re-arm has happened yet, so the
+          post-timeout wake is attributed by construction instead of by
+          counting frames;
+        * every wait is a bounded predicate poll and ``stop()`` runs in a
+          ``finally``, so a regression fails in seconds instead of hanging.
+        """
+        submitted: list[str] = []
+        spy = _PhaseSpy()
+        reasons: list[str | None] = []
+        tts = FakeTTS()
+
+        def fake_submit(text: str, source: str) -> Any:
+            # The voice submit receives the STT transcript of the spoken
+            # command (the "Yes?" ack is TTS speech, not a task).
+            submitted.append(text)
+            return type(
+                "Outcome", (), {"final_answer": "ok", "confirmation": None, "error": None}
+            )()
+
+        # Wake #1 never fires: the first wait ends in the idle timeout.  Wake
+        # #2 fires only after that timeout was reported, and never again after
+        # the interaction's re-arm (``reset_calls`` reaching 2), so exactly one
+        # interaction is possible and it is provably the post-timeout one.
+        wake = FakeWakeWord(
+            detect_fn=lambda _seg: WakeWordResult(
+                detected=spy.idle_timeouts >= 1 and wake.reset_calls == 1
+            )
+        )
+        audio = FakeAudioInput(segments=[make_speech("fake", duration_s=0.5)] * 120)
         loop = VoiceLoop(
             audio=audio,
             wake_detector=wake,
-            stt=FakeSTT(),
-            tts=FakeTTS(),
-            idle_timeout_s=0.01,
+            stt=FakeSTT(results=[STTResult(text="open notepad", language="en")]),
+            tts=tts,
+            submit_task=fake_submit,
+            reporter=spy,
+            on_exit=reasons.append,
+            idle_timeout_s=0.02,
+            listen_timeout_s=0.3,
+            idle_backoff_s=0.01,
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=5.0)
+        try:
+            # 1. The first wait times out, is reported, and the loop lives on.
+            assert _wait_for(lambda: spy.idle_timeouts >= 1), "the first wait never timed out"
+            assert loop.is_active(), "an idle timeout must not end the loop"
+            assert spy.ready_count >= 2, "the loop must return to READY after a timeout"
+
+            # 2. The wake word that arrives after the timeout drives a whole
+            #    interaction: ack → capture → STT → agent → spoken answer.
+            assert _wait_for(lambda: tts.spoken == ["Yes?", "ok"]), (
+                f"the post-timeout wake did not run a full interaction: {tts.spoken!r}"
+            )
+            assert submitted == ["open notepad"]  # the agent got the transcript
+            assert spy.wake_detected_count == 1
+
+            # 3. Back at READY, and a further idle timeout is survivable.
+            assert _wait_for(lambda: spy.ready_count >= 3), "no READY after the interaction"
+            assert _wait_for(lambda: spy.idle_timeouts >= 2), (
+                "the loop stopped tolerating idle timeouts after the interaction"
+            )
+            assert loop.is_active(), "repeated idle timeouts must not end the loop"
+        finally:
+            _stop_loop(loop)
+
+        # 4. Only the explicit stop ended it, cleanly and without a crash.
         assert not loop.is_active()
+        assert reasons == [None], "an idle timeout must not be reported as a crash"
+        assert spy.illegal_transitions == [], "idle recovery broke the lifecycle machine"
+        # The idle timeout was recovered from *before* the next wake was heard.
+        assert spy.phases.index("RECOVERING") < spy.phases.index("WAKE_DETECTED")
+        # Startup + exactly one interaction re-arm: idle waits spend none, so
+        # "re-armed exactly once per interaction" stays observable.
+        assert wake.reset_calls == 2
 
 
 # ── F6: voice confirmations fail closed ─────────────────────────────────
@@ -1646,6 +1851,11 @@ class TestVoiceClarificationCapture:
             audio_segments=[make_silence(0.01)] * 2,
             wake_results=[WakeWordResult(detected=True)],
         )
+        # Only silence follows the prompt, so capture waits out the command
+        # window and returns nothing.  A short window keeps the test bounded —
+        # the "waited for speech, then gave up" behaviour itself is covered by
+        # test_no_speech_capture_waits_for_speech_then_gives_up.
+        loop._listen_timeout_s = 0.2
         assert loop.capture_free_text("Which file?", rearm_timeout_s=1.0) == ""
 
     def test_empty_transcript_fails_closed(self) -> None:
@@ -1746,17 +1956,28 @@ class TestVoiceLoopOnExit:
         assert audio.close_calls >= 1
 
     def test_idle_timeout_reports_none(self) -> None:
+        """An idle timeout is not a crash: the loop stays up and exits cleanly.
+
+        It used to end the loop, which is what the old ``_run_to_exit`` here
+        relied on; now the loop survives the timeout, so it has to be stopped
+        explicitly and the only exit reason must still be ``None``.
+        """
         reasons: list[str | None] = []
+        spy = _PhaseSpy()
         audio = FakeAudioInput(segments=[make_silence(0.01)] * 2)
         loop = VoiceLoop(
             audio=audio,
             wake_detector=FakeWakeWord(results=[WakeWordResult(detected=False)]),
             stt=FakeSTT(),
             tts=FakeTTS(),
+            reporter=spy,
             idle_timeout_s=0.02,
+            idle_backoff_s=0.01,  # this test waits on the timeout itself
             on_exit=reasons.append,
         )
-        self._run_to_exit(loop)
+        loop.start()
+        _run_scripted(loop, lambda: spy.idle_timeouts >= 1, what="the idle timeout")
+        assert spy.idle_timeouts >= 1  # the loop is still listening, not dead
         assert reasons == [None]
 
 
@@ -1797,7 +2018,13 @@ class TestStateMachineAndRearm:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
+        _run_scripted(
+            loop,
+            lambda: (
+                submitted == ["open notepad"] and caplog.text.count("VOICE state=LISTENING") >= 2
+            ),  # type: ignore[attr-defined]
+            what="the full state sequence to be logged",
+        )
         assert submitted == ["open notepad"]
         states = re.findall(r"VOICE state=(\w+)", caplog.text)  # type: ignore[arg-type]
         assert states == [
@@ -1826,7 +2053,11 @@ class TestStateMachineAndRearm:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
+        _run_scripted(
+            loop,
+            lambda: len(submitted) == 2 and wake.reset_calls >= 3,
+            what="both interactions to be re-armed",
+        )
         assert submitted == ["open notepad", "open notepad"]
         # 1 (startup) + 1 per interaction — no extra resets.
         assert wake.reset_calls == 3
@@ -1854,7 +2085,11 @@ class TestStateMachineAndRearm:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
+        _run_scripted(
+            loop,
+            lambda: len(submitted) == 1 and wake.reset_calls >= 3,
+            what="both interactions to be re-armed",
+        )
         assert submitted == ["open notepad"]  # only the second interaction routed
         # Startup reset + one re-arm per interaction (failed + success) = 3.
         assert wake.reset_calls == 3
@@ -1870,10 +2105,13 @@ class TestStateMachineAndRearm:
             stt=FakeSTT(),
             tts=FakeTTS(),
             idle_timeout_s=0.2,
+            idle_backoff_s=0.01,  # idle cycles are the point here, not the wait
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
+        _run_scripted(
+            loop, lambda: len(wake.detect_calls) >= 5, what="frames to reach the detector"
+        )
         assert len(wake.detect_calls) >= 5  # frames were actually fed
         assert wake.reset_calls == 1  # startup only, no per-frame resets
 
@@ -1898,7 +2136,7 @@ class TestStateMachineAndRearm:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
+        _run_scripted(loop, lambda: len(loop._tts.spoken) >= 2, what="the answer to be spoken")
         assert submitted == ["open notepad"]
         assert loop._tts.spoken == ["Yes?", "ok"]
 
@@ -1926,7 +2164,11 @@ class TestVoiceLevelDiagnostics:
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
+        _run_scripted(
+            loop,
+            lambda: "waiting for wake word" in caplog.text,  # type: ignore[attr-defined]
+            what="the wake heartbeat",
+        )
         text = caplog.text  # type: ignore[attr-defined]
         assert "audio_rms=" in text
         assert "waiting for wake word" in text
@@ -1945,10 +2187,11 @@ class TestVoiceLevelDiagnostics:
             stt=FakeSTT(),
             tts=FakeTTS(),
             idle_timeout_s=0.2,
+            idle_backoff_s=0.01,  # this test waits on the frames, not the timeout
         )
         loop.start()
         assert loop._thread is not None
-        loop._thread.join(timeout=10.0)
+        _run_scripted(loop, lambda: len(wake.detect_calls) >= 20, what="20 frames to be scored")
         heartbeat_lines = [
             line
             for line in caplog.text.splitlines()  # type: ignore[attr-defined]

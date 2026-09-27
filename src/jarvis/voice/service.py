@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import traceback
 from typing import Any, Literal
 
 from jarvis.voice.interfaces import (
@@ -32,7 +31,14 @@ from jarvis.voice.interfaces import (
     WakeWordDetector,
     WindowFocusChecker,
 )
-from jarvis.voice.loop import DEFAULT_MAX_DICTATION_CHARS, DEFAULT_MAX_SESSION_S, VoiceLoop
+from jarvis.voice.loop import (
+    DEFAULT_MAX_DICTATION_CHARS,
+    DEFAULT_MAX_SESSION_S,
+    DEFAULT_MAX_SPOKEN_CHARS,
+    DEFAULT_REARM_QUIET_GATE_S,
+    VoiceLoop,
+)
+from jarvis.voice.status import VoiceStatusReporter
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +111,12 @@ class VoiceService:
         silence_timeout_s: float = 0.7,
         max_segment_s: float = 30.0,
         silence_threshold: float = 0.01,
+        rearm_quiet_gate_s: float = DEFAULT_REARM_QUIET_GATE_S,
+        max_spoken_chars: int = DEFAULT_MAX_SPOKEN_CHARS,
+        report_status: bool = True,
+        echo_transcript: bool = True,
+        reporter: VoiceStatusReporter | None = None,
+        routing_report: Any | None = None,
     ) -> None:
         self._audio = audio
         self._wake_detector = wake_detector
@@ -122,6 +134,12 @@ class VoiceService:
         self._silence_timeout_s = silence_timeout_s
         self._max_segment_s = max_segment_s
         self._silence_threshold = silence_threshold
+        self._rearm_quiet_gate_s = rearm_quiet_gate_s
+        self._max_spoken_chars = max_spoken_chars
+        self._report_status = report_status
+        self._echo_transcript = echo_transcript
+        self._reporter = reporter
+        self._routing_report = routing_report
         self._state: VoiceState = "off"
         self._error_code: str | None = None
         self._loop: VoiceLoop | None = None
@@ -155,22 +173,21 @@ class VoiceService:
 
     def _start_locked(self) -> str:
         self._state = "starting"
-        print("[DIAG] voice.service._start_locked(): state=starting", flush=True)
+        logger.info("voice service start requested")
         if self._loop is not None and self._loop.is_active():
             self._state = "on"
             return "voice is already active"
 
         error = self._missing_component_code()
-        print(f"[DIAG] voice.service._start_locked(): missing_component={error!r}", flush=True)
+        logger.debug("voice service missing component check: %s", error)
         if error is None and self._audio is not None:
             # Open the microphone synchronously so a broken device is
             # reported here (mic-open-failed), not silently in the thread.
             try:
                 self._audio.open()
-                print("[DIAG] voice.service._start_locked(): audio.open() OK", flush=True)
+                logger.debug("voice microphone opened successfully")
             except Exception:
                 logger.warning("voice audio could not be opened", exc_info=True)
-                print("[DIAG] voice.service._start_locked(): audio.open() FAILED", flush=True)
                 error = "mic-open-failed"
 
         if error is not None:
@@ -199,13 +216,17 @@ class VoiceService:
                 silence_timeout_s=self._silence_timeout_s,
                 max_segment_s=self._max_segment_s,
                 silence_threshold=self._silence_threshold,
+                rearm_quiet_gate_s=self._rearm_quiet_gate_s,
+                max_spoken_chars=self._max_spoken_chars,
+                report_status=self._report_status,
+                echo_transcript=self._echo_transcript,
+                reporter=self._reporter,
+                routing_report=self._routing_report,
                 on_exit=self._on_loop_exit,
             )
             self._loop.start()
         except Exception:
             logger.exception("voice loop failed to start")
-            print("[DIAG] voice.service._start_locked(): VoiceLoop.start() RAISED", flush=True)
-            traceback.print_exc()
             if self._audio is not None:
                 try:
                     self._audio.close()
