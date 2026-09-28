@@ -179,12 +179,28 @@ class LLMSettings(BaseModel):
 
 
 class AgentSettings(BaseModel):
-    """LangGraph agent caps (used from Phase 1 onwards)."""
+    """LangGraph agent caps (used from Phase 1 onwards).
+
+    ``verify_enabled`` and ``replan_enabled`` are the ablation switches for
+    docs/07_TESTING_AND_BENCHMARK.md section 3.4: turning them off measures what
+    verification/retry and replanning are worth (claim C2).  Both default to
+    ``True``, so an ordinary install is byte-for-byte the Phase 1 behaviour.
+
+    They are *capability* switches, never *safety* switches.  With verification
+    off the ``verify`` node stops calling each tool's ``verify()`` and stops
+    retrying, and with replanning off it stops asking the LLM for a fresh plan;
+    in both cases a step that actually failed still halts the task instead of
+    quietly advancing.  The policy engine, confirmation and Tier 3 blocks are
+    untouched by either flag, so an ablated run is still safe to execute
+    (docs/07 section 3.4 keeps the policy engine on in every profile).
+    """
 
     max_steps: int = 12
     max_retries_per_step: int = 2
     max_replans: int = 2
     step_timeout_seconds: int = 30
+    verify_enabled: bool = True
+    replan_enabled: bool = True
 
 
 class PolicySettings(BaseModel):

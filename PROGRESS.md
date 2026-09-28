@@ -2,6 +2,112 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-28 — FIX: live confirmation request never reached `jarvis chat` (no commit)
+
+### Symptom
+
+`jarvis chat` "lock my computer": LLM produced the action, `brain` logged it, then silence for
+~35–40 s, and the terminal printed "Confirmation timed out. I did not perform the action." — the
+Tier-1 confirmation prompt was never displayed.
+
+### Root cause (exact)
+
+The daemon violates its own reply convention ( honoured by `cancel`, `status` and the queued-chat
+branch: **exactly one reply per client→server request**) in three success paths:
+
+1. `_handle_chat` "start immediately" branch sent **no ack**. `DaemonClient.send_chat` blocks on
+   the next server message via `_send_recv_sync` — so it received the **first downstream message,
+   the `ConfirmRequest`**, matched it against `isinstance(resp, EventMessage/ErrorMessage)`, and
+   silently returned without it. The prompt was consumed before the CLI's `wait_for_event` loop
+   ever started.
+2. `_handle_confirm` success path sent nothing → `send_confirm` would block and later consume the
+   `FinalMessage` (result invisible).
+3. `_handle_clarification` — same defect for clarification answers.
+
+The CLI then waited on `wait_for_event` for a message that had already been swallowed; the
+worker's 30 s `CONFIRMATION_TIMEOUT_S` elapsed, the graph resumed with the D1 timeout refusal,
+and the terminal printed the timeout message (30 s worker window + LLM time ≈ the observed
+35–40 s). Note the policy/act path was never at fault — the graph correctly paused on
+`interrupt()` and the payload was created and dispatched; it was eaten one hop later.
+
+### Fix
+
+- `daemon/server.py`: all three handlers now ack with `EventMessage(kind="log")` on the success
+  path ("started" / "confirmation received" / "clarification received"), matching the existing
+  queued-chat ack. Error paths already replied and are unchanged. No policy, hash, resume-value
+  or timeout behaviour was touched.
+- `daemon/client.py`: `send_chat` now **raises `DaemonError`** if the reply to a submission is
+  neither an EventMessage nor an ErrorMessage (belt-and-braces: with a stale daemon or future
+  protocol drift, a ConfirmRequest must fail loudly, never be silently discarded).
+
+### Tests
+
+- `tests/unit/test_daemon_server.py::TestRequestAcks` (3): the immediately-started chat sends an
+  ack (worker stubbed, no real graph), delivered ConfirmResponse acks, delivered clarification
+  acks.
+- `tests/unit/test_daemon_client.py::TestSendChatConsumesOnlyTheAck` (4): scripted
+  ack→ConfirmRequest order (the exact live Tier-1 message sequence) — `send_chat` returns the
+  task_id and `wait_for_event` still delivers the prompt; a ConfirmRequest as the submission
+  reply raises; error replies and EOF still raise.
+- Sanity: `40 passed` in the two daemon suites (~1.2 s); ruff check/format clean on all four
+  touched files. No full pytest, no integration/voice runs (per instructions).
+
+### Not covered by tests
+
+The real end-to-end lock: `jarvis daemon --foreground` + `jarvis chat "lock my computer"` on the
+PC (needs a real desktop session). The tool itself was already covered in
+`tests/unit/test_tools_lock_computer.py`.
+
+## Session 2026-09-28 — Phase 8: `lock_computer` tool implemented (docs/04 §2.4 gap) (no commit)
+
+### What was asked for
+
+Continue Phase 8 item-by-item without a broad audit. The previous "known/remaining" note claimed
+`lock_jarvis`'s declared tier disagreed with docs/04 — that note was **stale**: docs/04 line 98
+lists `lock_jarvis` at Tier 0, exactly what the code declares. The real gap was the tool the note
+was conflated with: **`lock_computer`** is specified in docs/01 F4 ("calls `LockWorkStation`"),
+docs/02 §repo layout ("system.py — lock_computer, system_info, audit tools") and docs/04 §2.4
+(Tier 1, best-effort verification) but **did not exist** — an LLM asking to lock the PC would have
+hit "unknown tool = rejected".
+
+### Implemented
+
+- `tools/system.py`: `LockComputerArgs` (extra=forbid, no fields) + `make_lock_computer_spec()` —
+  `base_tier=1` per docs/04, `windows_only=True`, timeout 10 s. `_run_lock_computer` calls
+  `ctypes.windll.user32.LockWorkStation()` inside try/except (never raises to the graph); a zero
+  return produces an honest `ToolResult(ok=False, error=...)` with the Win32 error code, and
+  error 5 gets the specific "not running in your interactive session" explanation (the daemon or
+  a service context cannot lock the desktop). `_verify_lock_computer` reports `verified=None` —
+  docs/04 says "best effort" and the lock screen is not observable from user mode, so claiming a
+  verified=True would be a lie. Dry-run path returns without touching Win32. The Windows-only
+  `ctypes.windll` import is inside the run function (platform guard rule), so the module imports
+  on any OS.
+- `tools/registry.py`: registered in `build_default_registry` next to `lock_jarvis`.
+- Policy: the engine maps the declared Tier 1 to `allowed=True, needs_confirm=True,
+  needs_unlock=False` — one approval, no password — asserted against the real engine + registry.
+- The risk classifier's per-tool prior for the new tool is derived from the registry by the
+  existing wiring (both CLI and daemon build priors from the registry), so no classifier change.
+
+### Tests
+
+- `tests/unit/test_tools_lock_computer.py` (new, 13 tests): spec contract, args extra=forbid,
+  dry-run touches no Win32 (recording fake on `ctypes.windll`), success path, zero-return honest
+  failure, access-denied message, missing windll never raises, `verified=None`, registry
+  registration, real-engine Tier 1/needs_confirm, and classifier-cannot-lower (invariant 1/12).
+- `tests/unit/test_policy_file_rules.py`: +2 — Tier 1/needs_confirm via the shared `_decide`
+  helper, and the declared tier is a floor the engine never lowers.
+- Targeted sanity: 81 passed across lock_computer + policy-rules + risk-classifier; invariants
+  (registry-wide no-lower property) and benchmark-tasks suites pass. Ruff check/format clean on
+  all touched files; `mypy src/jarvis/policy` Success. No full-suite run (per instructions).
+
+### Phase 8 status after this session
+
+Deliverables: memory/* ✓, memory_retrieve/memory_save nodes ✓, replan ✓, risk classifier (`ml/`)
+✓ (lexical backend; ONNX export remains the documented human notebook work in docs/08 §5),
+skills CLI ✓, skill-safety save gate ✓, `lock_computer` ✓ (this session).
+Acceptance: repetition retrieval ✓, retry→replan honest final message ✓, classifier can never
+lower a tier ✓ (tested). **Phase 8 has no remaining code items.**
+
 ## Session 2026-09-28 — Phase 8 risk classifier (`ml/`) + `jarvis undo` (no commit)
 
 ### What was asked for

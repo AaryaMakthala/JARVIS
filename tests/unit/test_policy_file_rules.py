@@ -25,7 +25,7 @@ from jarvis.tools.files import (
     make_read_file_spec,
     make_undo_last_delete_spec,
 )
-from jarvis.tools.system import make_lock_jarvis_spec
+from jarvis.tools.system import make_lock_computer_spec, make_lock_jarvis_spec
 from support import make_spec, registry_with
 
 
@@ -48,6 +48,7 @@ def _ctx(ws: Path, *, typed: bool = True) -> Any:
         make_list_dir_spec(),
         make_read_file_spec(),
         make_lock_jarvis_spec(),
+        make_lock_computer_spec(),
     )
     return make_app_context(settings, registry=registry)
 
@@ -202,6 +203,24 @@ def test_lock_jarvis_is_tier0_and_harmless(ws: Path) -> None:
     assert decision.allowed is True
     assert decision.tier == tiers.TIER_SAFE
     assert decision.needs_confirm is False
+
+
+def test_lock_computer_is_tier1_and_requires_approval(ws: Path) -> None:
+    """docs/04 §2.4: ``lock_computer`` is Tier 1 - allowed, but only after the
+    user approves the confirmation prompt (tier >= TIER_CONFIRM)."""
+    decision = _decide(_ctx(ws), "lock_computer", {})
+    assert decision.allowed is True
+    assert decision.tier == tiers.TIER_CONFIRM
+    assert decision.needs_confirm is True
+    assert decision.needs_unlock is False
+
+
+def test_lock_computer_declared_tier_is_never_lowered(ws: Path) -> None:
+    """The engine uses ``max(base, rules, classifier)``; the declared Tier 1 is a
+    floor, and a lower classifier opinion cannot weaken it (invariant 1/12)."""
+    ctx = _ctx(ws)
+    decision = ctx.engine.decide(_step("lock_computer", {}), ctx.policy_ctx)
+    assert decision.tier >= tiers.TIER_CONFIRM
 
 
 def test_undo_last_delete_is_tier1(ws: Path) -> None:

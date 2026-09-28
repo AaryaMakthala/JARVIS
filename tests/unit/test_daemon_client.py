@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import json
 
-from jarvis.daemon.client import DaemonClient, _parse_server_message
+import pytest
+
+from jarvis.daemon.client import DaemonClient, DaemonError, _parse_server_message
 from jarvis.daemon.protocol import ClarificationRequest, ConfirmRequest, FinalMessage
 
 
@@ -25,6 +27,25 @@ class _FakeReader:
             return self._lines.pop(0)
         await asyncio.Event().wait()  # block; lets the outer timeout fire
         return b""
+
+
+class _FakeWriter:
+    """Minimal async writer capturing frames for assertions."""
+
+    def __init__(self) -> None:
+        self.buffer: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.buffer.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def is_closing(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        return None
 
 
 def _client(lines: list[bytes]) -> DaemonClient:
@@ -113,3 +134,72 @@ class TestWaitForEvent:
 
     def test_timeout_returns_none(self) -> None:
         assert _client([]).wait_for_event(timeout=0.05) is None
+
+
+# ── send_chat: only the ack may be consumed ──────────────────────────────
+
+
+class TestSendChatConsumesOnlyTheAck:
+    """Regression (live bug): the server used to send no ack for an
+    immediately-started chat task, so ``send_chat`` consumed the first
+    downstream message — the ConfirmRequest — and the confirmation prompt
+    never reached the terminal; the answer window elapsed and the task was
+    refused with "Confirmation timed out."
+    """
+
+    @staticmethod
+    def _client_with_writer(lines: list[bytes]) -> tuple[DaemonClient, _FakeWriter]:
+        client = DaemonClient(port=1, token="t")
+        client._reader = _FakeReader(lines)
+        writer = _FakeWriter()
+        client._writer = writer
+        return client, writer
+
+    def test_ack_is_consumed_and_confirm_request_stays_queued(self) -> None:
+        """The live message order for a Tier-1 task: the chat ack first, then
+        the ConfirmRequest must still be delivered to ``wait_for_event``."""
+        ack = json.dumps({"type": "event", "task_id": "t7", "kind": "log"}).encode() + b"\n"
+        confirm = (
+            json.dumps(
+                {"type": "confirm_request", "task_id": "t7", "tier": 1, "summary": "Lock"}
+            ).encode()
+            + b"\n"
+        )
+        client, _writer = self._client_with_writer([ack, confirm])
+        returned = client.send_chat("lock my computer")
+        assert returned == "t7"
+        msg = client.wait_for_event(timeout=5)
+        assert isinstance(msg, ConfirmRequest)
+        assert msg.tier == 1
+        assert msg.summary == "Lock"
+
+    def test_confirm_request_in_reply_to_submission_fails_loudly(self) -> None:
+        """Belt-and-braces: if a ConfirmRequest ever arrives as the reply to a
+        submission (stale daemon, protocol drift) the client must raise — not
+        discard it, which is what made the prompt invisible."""
+        confirm = (
+            json.dumps({"type": "confirm_request", "task_id": "t7", "tier": 1}).encode() + b"\n"
+        )
+        client, _writer = self._client_with_writer([confirm])
+        with pytest.raises(DaemonError) as excinfo:
+            client.send_chat("lock my computer")
+        assert "ConfirmRequest" in excinfo.value.message
+
+    def test_error_reply_to_submission_still_raises(self) -> None:
+        err = (
+            json.dumps(
+                {"type": "error", "task_id": "", "code": "queue_full", "message": "full"}
+            ).encode()
+            + b"\n"
+        )
+        client, _writer = self._client_with_writer([err])
+        with pytest.raises(DaemonError) as excinfo:
+            client.send_chat("hello")
+        assert excinfo.value.code == "queue_full"
+
+    def test_eof_on_submission_raises(self) -> None:
+        """The scripted EOF line (``b""``) makes ``_recv`` return ``None``;
+        the submission must surface that as a DaemonError, not hang."""
+        client, _writer = self._client_with_writer([b""])
+        with pytest.raises(DaemonError):
+            client.send_chat("hello")

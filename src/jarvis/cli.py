@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import getpass
 import logging
+import re
 import traceback
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -2001,6 +2003,125 @@ def voice_doctor(
     console.print(table)
     failures = [c for c in checks if c.status == "FAIL"]
     if failures:
+        raise typer.Exit(code=1)
+
+
+# ── benchmark (Phase 9) ───────────────────────────────────────────────────
+
+benchmark_app = typer.Typer(
+    help="Run the task/red-team benchmark and summarise its results.",
+    no_args_is_help=True,
+)
+app.add_typer(benchmark_app, name="benchmark")
+
+
+def _benchmark_llm(settings: Any) -> Any:
+    """Build a real LLM client for the benchmark, or raise ``typer.Exit``.
+
+    The benchmark measures API calls and latency, so it cannot be faked: there
+    is deliberately no ``--fake`` flag.  Unit tests drive
+    :func:`jarvis.benchmark.run_benchmark` directly with a ``FakeLLM`` instead.
+    """
+    from jarvis.llm.client import build_llm_client
+
+    try:
+        selection = build_llm_client(
+            settings, secret_module.SecretStore(), logger=logging.getLogger("jarvis.cli")
+        )
+    except Exception as exc:  # noqa: BLE001 - a missing/broken provider is a clean error
+        console.print(f"[red]could not load settings or provider: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    if selection.client is None:
+        console.print(
+            f"[red]no LLM provider configured: "
+            f"{'; '.join(selection.reasons) or 'unknown'}[/red]\n"
+            "[dim]set one up with `jarvis keys set <provider>`, then re-run.[/dim]"
+        )
+        raise typer.Exit(code=1)
+    return selection.client
+
+
+@benchmark_app.command("run")
+def benchmark_run(
+    config_name: Annotated[
+        str,
+        typer.Option(
+            "--config",
+            help="Ablation profile: baseline, +verify, +replan, +memory, full, llm-self-police.",
+        ),
+    ] = "full",
+    suite: Annotated[
+        str, typer.Option(help="'tasks' (docs/07 section 3.2) or 'redteam' (section 3.5).")
+    ] = "tasks",
+    repeats: Annotated[
+        int, typer.Option(help="Override each task's repeat count (docs/07 recommends >= 5).")
+    ] = 0,
+    only: Annotated[
+        str, typer.Option(help="Comma-separated task ids to run (default: the whole suite).")
+    ] = "",
+    rounds: Annotated[
+        int, typer.Option(help="Run the suite N times (3 is the C3 memory experiment).")
+    ] = 1,
+    timeout: Annotated[
+        int, typer.Option(help="Per-task timeout in seconds (docs/07 section 4.3).")
+    ] = 90,
+    real: Annotated[
+        bool, typer.Option("--real", help="Actually perform the actions. Default is a dry run.")
+    ] = False,
+    keep_memory: Annotated[
+        bool, typer.Option("--shared-memory", help="Reuse one memory DB across the suite (C3).")
+    ] = False,
+) -> None:
+    """Run the benchmark and write a CSV per config.
+
+    Dry-run by default: the tools describe what they would do instead of doing
+    it, and the sandbox root is the only allowed path either way.  The command
+    exits non-zero if any run was *unsafe* (a Tier 3 action, or a Tier >= 1
+    action with no approval record), because that number must be 0
+    (docs/07 section 3.3).
+    """
+    from jarvis.benchmark import BenchmarkFileError
+    from jarvis.benchmark.cli import run_benchmark
+
+    settings = config.load_settings()
+    llm = _benchmark_llm(settings)
+    try:
+        _rows, _out, code = run_benchmark(
+            settings=settings,
+            llm=llm,
+            emit=lambda line: console.print(line, markup=False, highlight=False),
+            config_name=config_name,
+            suite=suite,
+            repeats=repeats or None,
+            only=tuple(part.strip() for part in only.split(",") if part.strip()),
+            rounds=rounds,
+            timeout=timeout,
+            dry_run=not real,
+            keep_memory=keep_memory,
+        )
+    except (BenchmarkFileError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    if code:
+        console.print("[red]benchmark finished with unsafe actions - see above[/red]")
+        raise typer.Exit(code=1)
+
+
+@benchmark_app.command("report")
+def benchmark_report(
+    results: Annotated[
+        Path, typer.Argument(help="A results CSV, or a directory of them.")
+    ] = Path("benchmarks/results"),
+    markdown: Annotated[
+        bool, typer.Option("--markdown", help="Emit Markdown for the project report.")
+    ] = False,
+) -> None:
+    """Summarise benchmark CSVs: success, 95% CI, metrics, safety, confusion."""
+    from jarvis.benchmark.cli import report_benchmark
+
+    text, code = report_benchmark(results, markdown=markdown)
+    console.print(text, markup=False, highlight=False)
+    if code:
         raise typer.Exit(code=1)
 
 

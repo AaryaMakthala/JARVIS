@@ -138,7 +138,14 @@ class DaemonClient:
             return resp.task_id
         if isinstance(resp, ErrorMessage):
             raise DaemonError(code=resp.code, message=resp.message)
-        return task_id
+        # Defensive: with the server's ack this should not happen, but a
+        # message consumed here is a message the CLI's ``wait_for_event``
+        # never sees - fail loudly instead of silently swallowing a
+        # ConfirmRequest (which used to make the prompt invisible).
+        raise DaemonError(
+            code="unexpected",
+            message=f"unexpected reply to chat submission: {type(resp).__name__}",
+        )
 
     def send_confirm(
         self,

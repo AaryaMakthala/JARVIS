@@ -10,6 +10,8 @@ import asyncio
 import json
 from unittest.mock import AsyncMock
 
+import pytest
+
 from jarvis.daemon.protocol import (
     AuthMessage,
     StatusRequest,
@@ -304,3 +306,72 @@ class TestHandleClarification:
         data = json.loads(writer.write.call_args[0][0].decode("utf-8"))
         assert data["code"] == "no_such_task"
         assert slot.resume_answer is None
+
+
+class TestRequestAcks:
+    """Regression (live bug): three handlers sent no reply on their success
+    path.  The CLI's send helpers each block on the *next* server message, so
+    with no ack they consumed downstream messages instead: ``send_chat`` ate
+    the ConfirmRequest (prompt never displayed, answer window elapsed), and
+    ``send_confirm``/``send_clarification`` would have eaten the final result.
+    Every accepted client→server request must get exactly one reply.
+    """
+
+    def test_immediately_started_chat_sends_an_ack(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from jarvis.daemon.protocol import ChatMessage
+
+        server = _server()
+        # No real graph: the spawned worker thread must do nothing and exit.
+        monkeypatch.setattr(server, "_worker_run", lambda slot: None)
+        server._active = None  # no running task -> the task starts immediately
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+
+        asyncio.run(server._handle_chat(ChatMessage(id="t1", text="lock my computer"), conn))
+
+        # The ack is sent synchronously, before any worker progress.
+        written = writer.write.call_args[0][0].decode("utf-8")
+        data = json.loads(written)
+        assert data["type"] == "event"
+        assert data["task_id"] == "t1"
+        assert data["kind"] == "log"
+        assert server._active is not None and server._active.task_id == "t1"
+
+    def test_delivered_confirm_response_sends_an_ack(self) -> None:
+        from jarvis.daemon.protocol import ConfirmResponse
+
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="setup", source="chat", owner_id="oid")
+        server._active = slot
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+
+        asyncio.run(
+            server._handle_confirm(
+                ConfirmResponse(task_id="t1", approved=True, action_hash="h"), conn
+            )
+        )
+        assert slot.resume_answer == {"approved": True, "action_hash": "h"}
+        assert slot.event.is_set() is True
+        written = writer.write.call_args[0][0].decode("utf-8")
+        data = json.loads(written)
+        assert data["type"] == "event"
+        assert data["task_id"] == "t1"
+
+    def test_delivered_clarification_sends_an_ack(self) -> None:
+        from jarvis.daemon.protocol import ClarificationResponse
+
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="setup", source="chat", owner_id="oid")
+        server._active = slot
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+
+        asyncio.run(
+            server._handle_clarification(ClarificationResponse(task_id="t1", answer="x"), conn)
+        )
+        assert slot.resume_answer == "x"
+        written = writer.write.call_args[0][0].decode("utf-8")
+        data = json.loads(written)
+        assert data["type"] == "event"
+        assert data["task_id"] == "t1"

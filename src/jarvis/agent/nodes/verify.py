@@ -2,6 +2,12 @@
 
 Never re-runs a side-effecting tool.  Successful-but-non-verifiable steps
 (verify() returns None) advance but are reported honestly later.
+
+``settings.agent.verify_enabled`` / ``replan_enabled`` turn this node into a
+pure bookkeeping step so the benchmark can measure what the two abilities are
+worth (docs/07 section 3.4).  An ablated node still never advances past a step
+that failed - the switch removes the recovery machinery, not fail-closed
+behaviour.
 """
 
 from __future__ import annotations
@@ -20,6 +26,12 @@ def verify(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         return {"halted_reason": "Nothing to verify."}
 
     last = results[-1]
+    verify_on = ctx.settings.agent.verify_enabled
+    replan_on = ctx.settings.agent.replan_enabled
+
+    if not verify_on:
+        return _advance_ablated(state, results, last, ctx)
+
     plan: Plan | None = state.get("plan")
     step = None
     if plan and plan.steps:
@@ -57,7 +69,7 @@ def verify(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             return {"results": results, "retry_count": retry_count + 1, "retry_now": True}
         # Retries exhausted: try a fresh plan while the replan budget allows it,
         # otherwise fail closed (never move to the next step on a failure).
-        if int(state.get("replan_count") or 0) < ctx.settings.agent.max_replans:
+        if replan_on and int(state.get("replan_count") or 0) < ctx.settings.agent.max_replans:
             return {
                 "results": results,
                 "retry_count": max_retries,
@@ -71,6 +83,32 @@ def verify(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             "replan_now": False,
         }
 
+    return {
+        "results": results,
+        "step_index": int(state.get("step_index") or 0) + 1,
+        "retry_count": 0,
+        "retry_now": False,
+        "replan_now": False,
+    }
+
+
+def _advance_ablated(
+    state: dict[str, Any], results: list[Any], last: Any, ctx: AppContext
+) -> dict[str, Any]:
+    """Advance without independent verification, retry or replanning.
+
+    A step the tool itself reported as failed still halts the run: the ablation
+    answers "what if JARVIS could not check its own work", not "what if JARVIS
+    pretended a failure did not happen".
+    """
+    if not last.ok:
+        return {
+            "results": results,
+            "step_index": int(state.get("step_index") or 0),
+            "retry_count": int(state.get("retry_count") or 0),
+            "retry_now": False,
+            "replan_now": False,
+        }
     return {
         "results": results,
         "step_index": int(state.get("step_index") or 0) + 1,

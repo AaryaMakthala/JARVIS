@@ -1002,6 +1002,19 @@ class DaemonServer:
                 self._active = slot
                 conn.active_task = task_id
                 threading.Thread(target=self._worker_run, args=(slot,), daemon=True).start()
+                # Ack every accepted request (the queued branch above already
+                # does).  ``send_chat`` blocks on the next server message to
+                # learn the task_id; with no ack it would receive the first
+                # *downstream* message instead - e.g. the ConfirmRequest -
+                # and silently discard it, so the confirmation prompt never
+                # reached the terminal and the answer window elapsed.
+                await conn.send(
+                    EventMessage(
+                        task_id=task_id,
+                        kind="log",
+                        data={"message": "started"},
+                    )
+                )
 
     # ── voice task submission (runs in the voice loop thread) ──────────
 
@@ -1319,6 +1332,14 @@ class DaemonServer:
 
         slot.resume_answer = answer
         slot.event.set()  # wake the worker thread
+        # Ack the response (``send_confirm`` blocks on the next server
+        # message; without an ack it would consume the eventual
+        # FinalMessage and the terminal would print nothing).
+        await conn.send(
+            EventMessage(
+                task_id=slot.task_id, kind="log", data={"message": "confirmation received"}
+            )
+        )
 
     async def _handle_clarification(
         self, msg: ClarificationResponse, conn: ClientConnection
@@ -1340,6 +1361,12 @@ class DaemonServer:
         # closed).  Never the password, never a confirmation flag.
         slot.resume_answer = msg.answer if isinstance(msg.answer, str) else ""
         slot.event.set()  # wake the worker thread
+        # Ack the response (same reason as _handle_confirm above).
+        await conn.send(
+            EventMessage(
+                task_id=slot.task_id, kind="log", data={"message": "clarification received"}
+            )
+        )
 
     # ── cancel ─────────────────────────────────────────────────────────
 

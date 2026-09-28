@@ -1,8 +1,16 @@
-"""system_info tool: read-only machine telemetry (Tier 0).
+"""System tools: ``system_info`` (read-only telemetry) plus the two locks.
 
-Uses ``psutil`` exclusively - no writes, no subprocesses, no network.
-Verification for read-only information is not meaningful, so ``verify()``
-reports ``None`` ("unverifiable") rather than claiming success.
+``system_info`` uses ``psutil`` exclusively - no writes, no subprocesses, no
+network.  Verification for read-only information is not meaningful, so
+``verify()`` reports ``None`` ("unverifiable") rather than claiming success.
+
+``lock_jarvis`` (Tier 0) locks only this agent's permission session;
+``lock_computer`` (Tier 1, docs/04 §2.4) locks the Windows workstation via
+``user32.LockWorkStation`` and verifies nothing (the lock screen is not
+observable from user mode, so ``verified=None``).
+
+All Windows-specific imports (``ctypes.windll``) live inside the run functions
+behind the platform guard, so this module imports on any OS for tests.
 """
 
 from __future__ import annotations
@@ -158,4 +166,74 @@ def make_lock_jarvis_spec() -> ToolSpec:
         run=_run_lock_jarvis,
         verify=_verify_lock_jarvis,
         describe=lambda args: "Lock the JARVIS session",
+    )
+
+
+class LockComputerArgs(BaseModel):
+    """Lock the Windows workstation itself (``LockWorkStation``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+#: Exit code ``win32api``/``ctypes`` report when ``LockWorkStation`` is called
+#: from a non-interactive session (e.g. the daemon runs as a service).  The
+#: docs/04 spec promises honest failure, not a retry loop.
+_ACCESS_DENIED_EXIT = 5
+
+
+def _run_lock_computer(args: LockComputerArgs, ctx: ToolContext) -> ToolResult:
+    """Call ``user32.LockWorkStation``; best effort, never raises (docs/04)."""
+    del args
+    if ctx.dry_run:
+        return ToolResult(ok=True, output="[dry-run] would lock the Windows workstation")
+    try:
+        import ctypes
+
+        result_code = ctypes.windll.user32.LockWorkStation()
+    except Exception as exc:  # noqa: BLE001 - never raise to the graph
+        return ToolResult(ok=False, error=f"LockWorkStation failed: {exc}")
+    if result_code == 0:
+        error_code = getattr(ctypes, "get_last_error", int)() or 5
+        if error_code == _ACCESS_DENIED_EXIT:
+            return ToolResult(
+                ok=False,
+                error="could not lock the workstation (access denied; "
+                "the process is not running in your interactive session)",
+            )
+        return ToolResult(
+            ok=False,
+            error=f"could not lock the workstation (Win32 error {error_code})",
+        )
+    return ToolResult(
+        ok=True,
+        output="Windows workstation locked",
+        data={"locked": True},
+    )
+
+
+def _verify_lock_computer(
+    args: LockComputerArgs, result: ToolResult, ctx: ToolContext
+) -> ToolResult:
+    """Best-effort verification: the lock screen state is not observable (docs/04)."""
+    del args, ctx
+    return result.model_copy(update={"verified": None})
+
+
+def make_lock_computer_spec() -> ToolSpec:
+    """Build the ``lock_computer`` tool (Tier 1; ends the interactive session's
+    usability until the user returns, so docs/04 §2.4 lists it as Tier 1)."""
+    return ToolSpec(
+        name="lock_computer",
+        description=(
+            "Lock the Windows computer (LockWorkStation). The desktop locks "
+            "immediately; the user signs back in to resume. Not undoable "
+            "remotely."
+        ),
+        args_model=LockComputerArgs,
+        base_tier=1,
+        timeout_s=10,
+        run=_run_lock_computer,
+        verify=_verify_lock_computer,
+        describe=lambda args: "Lock the Windows computer",
+        windows_only=True,
     )
