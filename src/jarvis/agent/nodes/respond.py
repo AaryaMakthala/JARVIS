@@ -78,18 +78,27 @@ def _answer_for(state: dict[str, Any]) -> dict[str, str]:
 
     # Verified-False is a hard failure: never claim success on an action whose
     # post-condition check reported failure (docs/02_ARCHITECTURE.md section 11).
+    # ``verified is None`` is deliberately NOT here: an *unverifiable* step
+    # (the tool said ok, there is just no post-condition to check) is not a
+    # failure, and reporting it as one made the planner refuse to retry the
+    # same task later ("a previous attempt failed") — see memory_save, which
+    # must draw the same line.
     failures = [r for r in results if not r.ok or r.verified is False]
     if failures:
         last = failures[-1]
         if last.ok and last.verified is False:
             detail = f"step {last.step_id} could not be verified"
-        else:
-            detail = last.error or f"step {last.step_id} failed"
-        return _answer(f"Could not complete the task: {detail}.")
+            return _answer(f"Could not complete the task: {detail}.")
+        return _answer(
+            f"Could not complete the task: {last.error or f'step {last.step_id} failed'}."
+        )
 
     unverified = [r for r in results if r.verified is None and r.ok]
     if unverified:
-        hint = f" ({len(unverified)} step(s) could not be verified)"
+        hint = (
+            f" ({len(unverified)} step(s) succeeded, but completion could "
+            "not be independently verified)"
+        )
         return _answer(_success_text(results) + hint)
 
     return _answer(_success_text(results))

@@ -248,7 +248,11 @@ def test_respond_never_claims_success_when_verification_failed() -> None:
 
 
 def test_respond_marks_unverified_success_honestly() -> None:
+    """ok + verified=None is a success reported truthfully — never a failure
+    (regression: a successful lock_computer used to read as if it failed)."""
     results = [StepResult(step_id="s1", ok=True, output="I did it", verified=None)]
     out = respond({"results": results}, None)
     assert out["final_answer"].startswith("I did it")
-    assert "could not be verified" in out["final_answer"]
+    assert "could not be independently verified" in out["final_answer"]
+    assert "Could not complete" not in out["final_answer"]
+    assert "failed" not in out["final_answer"].lower()

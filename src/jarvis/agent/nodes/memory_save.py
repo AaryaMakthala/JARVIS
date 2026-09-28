@@ -19,15 +19,22 @@ no memory backend             nothing to write to (``NullMemory``)
 ``cancelled`` / halted        the human stopped; nothing was proven
 not a tool plan               a conversation is not an executable skill
 any result not ``ok``         the task did not succeed
-any ``verified is not True``  "worked" but unproven is not "verified"
+any ``verified is False``     the tool's own check said it did not hold
 any tainted result            output came from web/file/window text
 any ``depends_on_untrusted``  the args were built from untrusted text
 ============================  =============================================
 
+``verified is None`` ("succeeded, but there is no post-condition to check")
+is a *third* state, not a failure: the step executed successfully and only the
+independent proof is missing.  Recording it as a failure poisoned the failure
+memory — a later "lock my computer" was refused with "a previous attempt
+failed" although the lock had succeeded — so it is excluded here and in
+:func:`_failure_record`.
+
 Failures are still worth recording, and that is the *other* half of this node:
-a failed or unverified step is appended to the failure log so a later replan
-sees "this approach already failed here".  A tainted step is still recorded as
-a failure (the failure text is redacted) but never becomes a skill.
+a failed or verification-failed step is appended to the failure log so a later
+replan sees "this approach already failed here".  A tainted step is still
+recorded as a failure (the failure text is redacted) but never becomes a skill.
 """
 
 from __future__ import annotations
@@ -122,8 +129,10 @@ def _skill_gate(state: dict[str, Any], ctx: AppContext) -> str:
         return "plan and results disagree on step count"
     if any(not result.ok for result in results):
         return "at least one step failed"
-    if any(result.verified is not True for result in results):
-        return "at least one step was not verified"
+    if any(result.verified is False for result in results):
+        return "at least one step failed verification"
+    if any(result.verified is None for result in results):
+        return "a step's completion could not be independently verified"
     if any(result.tainted for result in results):
         return "a step returned untrusted external text"
     if any(step.depends_on_untrusted for step in plan.steps):
@@ -154,13 +163,20 @@ def _skill_record(state: dict[str, Any]) -> MemoryRecord:
 def _failure_record(state: dict[str, Any]) -> MemoryRecord | None:
     """The first bad step to remember, if the task did not fully succeed.
 
-    "Bad" means failed, unverified **or tainted**: a step whose output was
-    untrusted external text is exactly the approach a later run should not
-    repeat, even though it technically succeeded.  A tainted result is recorded
-    with its output text dropped, since that text is the untrusted part.
+    "Bad" means failed, failed-verification **or tainted**: a step whose
+    output was untrusted external text is exactly the approach a later run
+    should not repeat, even though it technically succeeded.  A step with
+    ``verified=None`` is *not* bad — "succeeded, unverifiable" is not
+    "failed" — and must never enter the failure log (that poisoned it and
+    blocked later successful runs of the same task).  A tainted result is
+    recorded with its output text dropped, since that text is the untrusted
+    part.
     """
     results: list[StepResult] = list(state.get("results") or [])
-    bad = next((r for r in results if not r.ok or r.verified is not True or r.tainted), None)
+    bad = next(
+        (r for r in results if not r.ok or r.verified is False or r.tainted),
+        None,
+    )
     if bad is None:
         return None
     plan: Plan | None = state.get("plan")

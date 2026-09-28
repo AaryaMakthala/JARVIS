@@ -171,15 +171,42 @@ def test_a_failed_step_is_not_saved(backend: SqliteMemory) -> None:
     assert backend.counts()["failures"] == 1
 
 
-def test_an_unverified_step_is_not_saved(backend: SqliteMemory) -> None:
+def test_an_unverifiable_step_is_not_saved_and_not_a_failure(backend: SqliteMemory) -> None:
+    """ok + verified=None: succeeded, but no post-condition exists to check.
+
+    Regression (live bug): a successful ``lock_computer`` (the workstation is
+    locked, so nothing can be independently verified) was classified as a
+    failure, written into the failure memory, and the next "lock my computer"
+    was refused with "a previous attempt failed".  Unverifiable is not failed.
+    """
     out = memory_save(_state(results=[_ok(verified=None)]), _ctx(backend))
-    assert "not verified" in out["memory_saved_reason"]
-    assert backend.counts()["skills"] == 0
+    assert out["memory_saved"] is False  # still not a *skill* (no proof)
+    assert out["memory_failure_logged"] is False  # and never a *failure*
+    assert "could not be independently verified" in out["memory_saved_reason"]
+    assert backend.counts() == {"skills": 0, "failures": 0, "preferences": 0}
 
 
 def test_a_verification_failure_is_not_saved(backend: SqliteMemory) -> None:
     out = memory_save(_state(results=[_ok(verified=False)]), _ctx(backend))
-    assert "not verified" in out["memory_saved_reason"]
+    assert "failed verification" in out["memory_saved_reason"]
+
+
+def test_unverified_success_never_blocks_the_same_task_later(
+    backend: SqliteMemory,
+) -> None:
+    """The live scenario end-to-end: lock succeeds unverified; a later task
+    with the same goal must not retrieve a "do not repeat that approach"
+    hint from memory."""
+    plan = _plan(_step("lock_computer"), goal="lock my computer")
+    memory_save(_state(plan, [_ok(verified=None)]), _ctx(backend))
+
+    # A second identical run (as the user actually did) is not blocked:
+    again = memory_save(_state(plan, [_ok(verified=None)]), _ctx(backend))
+    assert again["memory_failure_logged"] is False
+
+    # And the planner is never shown a failure for the successful task.
+    records = backend.retrieve("lock my computer", limit=5)
+    assert all("failed" not in record.text.lower() for record in records)
 
 
 def test_tainted_output_is_not_saved(backend: SqliteMemory) -> None:
@@ -252,6 +279,37 @@ def test_the_failure_names_the_tool_that_failed(backend: SqliteMemory) -> None:
     assert backend.failures.repeated_tools("open notepad") == ["delete_path"]
 
 
+def test_ok_false_still_enters_failure_memory(backend: SqliteMemory) -> None:
+    """Fail-closed preserved: a genuine ok=False failure is still remembered
+    (unchanged behaviour alongside the verified=None correction)."""
+    state = _state(
+        _plan(_step("lock_computer"), goal="lock my computer"),
+        [StepResult(step_id="s1", ok=False, error="access denied", verified=None)],
+    )
+    out = memory_save(state, _ctx(backend))
+    assert out["memory_failure_logged"] is True
+    assert backend.counts()["failures"] == 1
+    assert backend.failures.repeated_tools("lock my computer") == ["lock_computer"]
+
+
+def test_verified_false_enters_failure_memory_but_none_does_not(backend: SqliteMemory) -> None:
+    """The classification line, side by side: ``False`` is a real failure,
+    ``None`` is only an unverifiable success."""
+    bad = _state(
+        _plan(_step("lock_computer"), goal="lock my computer"),
+        [_ok(verified=False)],
+    )
+    memory_save(bad, _ctx(backend))
+    assert backend.counts()["failures"] == 1
+
+    good = _state(
+        _plan(_step("lock_computer"), goal="lock my computer"),
+        [_ok(verified=None)],
+    )
+    memory_save(good, _ctx(backend))
+    assert backend.counts()["failures"] == 1  # unchanged by the second run
+
+
 # --------------------------------------------------------------------- safety
 
 
@@ -306,3 +364,13 @@ def test_gate_reasons_are_specific(state: dict, expected_fragment: str) -> None:
 
 def test_gate_passes_for_a_clean_plan() -> None:
     assert _skill_gate(_state(), _ctx(SpyMemory())) == ""
+
+
+def test_gate_rejects_verified_none_for_the_skill_but_for_a_specific_reason() -> None:
+    """The gate distinguishes "failed" from "unverifiable" in its reason text,
+    even though neither may become a skill."""
+    failed = _skill_gate(_state(results=[_ok(verified=False)]), _ctx(SpyMemory()))
+    unverifiable = _skill_gate(_state(results=[_ok(verified=None)]), _ctx(SpyMemory()))
+    assert "failed verification" in failed
+    assert "could not be independently verified" in unverifiable
+    assert failed != unverifiable

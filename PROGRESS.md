@@ -2,6 +2,56 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-28 — FIX: `verified=None` was recorded as a task failure (no commit)
+
+### Symptom
+
+After a *successful* real `lock my computer` ("Windows workstation locked (1 step(s) could not be
+verified)"), the next attempt was refused: "I'm unable to lock the computer because a previous
+attempt using the lock_computer tool failed, and I must not repeat that approach."
+
+### Root cause (exact)
+
+`agent/nodes/memory_save.py` classified any result with `verified is not True` as "bad": both
+`_skill_gate` and `_failure_record` treated `verified=None` ("succeeded, but there is no
+post-condition to check") the same as a failure. A successful `lock_computer` therefore
+1. blocked the skill save (correct) and
+2. **wrote a row into the failure store** (wrong).
+
+`SqliteMemory.retrieve` surfaces recent failures to the planner as
+`Failure.as_memory_text()` = `Earlier attempt to "lock my computer" failed at lock_computer: …
+Do not repeat that approach.` — the LLM quoted it verbatim on the next request. Everything else
+in the pipeline already drew the line correctly: `verify.py` retries only on
+`not ok or verified is False` (None advances), `respond.py`'s failure filter is
+`not ok or verified is False`, `telemetry.py` marks None as `completed_unverified`, and
+`act.py`'s exactly-once guard advances on `ok and verified is not False`. memory_save was the
+sole outlier.
+
+### Fix
+
+- `memory_save._failure_record`: bad = `not ok or verified is False or tainted` — `None` never
+  enters the failure log. Fail-closed for genuine `ok=False` unchanged.
+- `memory_save._skill_gate`: `verified is False` → "at least one step failed verification";
+  `verified is None` → its own reason "a step's completion could not be independently verified"
+  (still not a *skill* — no proof — but explicitly not a failure).
+- `respond.py`: unverifiable-success hint is now truthful —
+  `(<n> step(s) succeeded, but completion could not be independently verified)`; the
+  verified=False branch keeps its exact previous message (pinned by invariant test).
+
+### Tests
+
+`tests/unit/test_memory_save_node.py`: unverifiable success saves nothing and logs no failure;
+end-to-end repeat scenario (same-goal second run not blocked, `retrieve("lock my computer")`
+yields no "failed" text); `ok=False` still enters failure memory; `verified=False` vs `None`
+side-by-side classification; gate reason strings. `test_agent.py`: unverified success asserts
+truthful wording ("could not be independently verified", no "Could not complete", no "failed").
+Focused sanity: 110 passed across memory_save, agent, memory_graph, replan, invariants; ruff
+check/format clean on the four touched files. No full pytest, no integration/voice runs.
+
+### Not covered by tests
+
+The real Windows lock (needs a desktop session); the tool itself was not modified.
+
 ## Session 2026-09-28 — FIX: live confirmation request never reached `jarvis chat` (no commit)
 
 ### Symptom
