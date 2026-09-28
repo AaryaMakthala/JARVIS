@@ -816,6 +816,11 @@ def _verify_undo_last_delete(
     if not result.ok:
         return result.model_copy(update={"verified": False})
     target = result.data.get("original_path")
+    if target is None:
+        # "nothing to undo" is a successful no-op, not a failed restore: there
+        # was no path to verify.  Reporting False here would make a caller that
+        # checks ``verified`` (e.g. `jarvis undo`) report a phantom failure.
+        return result.model_copy(update={"verified": None})
     if not isinstance(target, str):
         return result.model_copy(update={"verified": False})
     try:

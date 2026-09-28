@@ -53,6 +53,7 @@ from jarvis.llm.provider import (
     provider_has_credential,
 )
 from jarvis.memory import open_memory
+from jarvis.ml.risk import build_classifier
 from jarvis.platform_guard import is_64bit, is_python_supported, is_windows
 from jarvis.policy import tiers
 from jarvis.policy.unlock import UnlockManager
@@ -1223,6 +1224,33 @@ def run(
         _run_with_daemon(command)
 
 
+def _task_context(
+    settings: config.Settings,
+    store: secret_module.SecretStore,
+    llm: Any,
+    *,
+    dry_run: bool = False,
+) -> AppContext:
+    """Build the in-process task context (LLM + memory + policy + classifier).
+
+    The registry is built once and shared: the risk classifier derives its
+    per-tool priors from it, so both decide from the same specs.
+    """
+    from jarvis.tools.registry import build_default_registry
+
+    log = logging.getLogger("jarvis.cli")
+    registry = build_default_registry(settings)
+    return make_app_context(
+        settings,
+        llm=llm,
+        registry=registry,
+        classifier=build_classifier(settings, registry, logger=log),
+        unlock=UnlockManager(store, settings=settings),
+        dry_run=dry_run,
+        memory=open_memory(settings=settings, logger=log, dry_run=dry_run),
+    )
+
+
 def _run_no_daemon(command: str, *, dry_run: bool = False) -> None:
     """One in-process task, with the same confirmation path as ``chat``."""
     settings = config.load_settings()
@@ -1234,16 +1262,7 @@ def _run_no_daemon(command: str, *, dry_run: bool = False) -> None:
         raise typer.Exit(code=1)
 
     try:
-        unlock_manager = UnlockManager(store, settings=settings)
-        ctx = make_app_context(
-            settings,
-            llm=selection.client,
-            unlock=unlock_manager,
-            dry_run=dry_run,
-            memory=open_memory(
-                settings=settings, logger=logging.getLogger("jarvis.cli"), dry_run=dry_run
-            ),
-        )
+        ctx = _task_context(settings, store, selection.client, dry_run=dry_run)
         saver = open_sqlite_checkpointer(str(config.checkpoints_db()))
     except LLMError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -1318,13 +1337,7 @@ def _chat_no_daemon() -> None:
         raise typer.Exit(code=1)
 
     try:
-        unlock_manager = UnlockManager(store, settings=settings)
-        ctx = make_app_context(
-            settings,
-            llm=selection.client,
-            unlock=unlock_manager,
-            memory=open_memory(settings=settings, logger=logging.getLogger("jarvis.cli")),
-        )
+        ctx = _task_context(settings, store, selection.client)
         saver = open_sqlite_checkpointer(str(config.checkpoints_db()))
     except LLMError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -1353,6 +1366,124 @@ def _chat_with_daemon() -> None:
         _daemon_chat_loop(client)
     finally:
         client.close()
+
+
+# ── undo ─────────────────────────────────────────────────────────────────
+
+#: The tool ``jarvis undo`` runs.  Named here so the command fails loudly at
+#: import-free test time if the registry ever drops it.
+UNDO_TOOL = "undo_last_delete"
+
+#: ``jarvis undo`` is a hard-coded single-tool invocation, not an LLM plan, so
+#: there is no user wording to hand the classifier - inventing a sentence here
+#: would let a fixed string decide a safety tier.  The classifier still runs on
+#: the action itself (tool name + args + the tool's declared prior), so a future
+#: change to the tool's tier is still enforced; with an empty string the
+#: documented Tier 1 stands and the confirmation below is the gate.
+UNDO_CLASSIFIER_INPUT = ""
+
+
+def _undo_step() -> Any:
+    """The deterministic single step behind ``jarvis undo`` (no LLM involved)."""
+    from jarvis.agent.state import Step
+
+    return Step(
+        id="undo-last-delete",
+        tool=UNDO_TOOL,
+        args={},
+        rationale="user ran `jarvis undo`",
+        expect="the most recently deleted item is back where it was",
+    )
+
+
+def _undo_context(
+    settings: config.Settings, store: secret_module.SecretStore, *, dry_run: bool = False
+) -> AppContext:
+    """Context for ``jarvis undo``: policy + registry + classifier, no LLM.
+
+    No memory backend and no checkpointer are opened, so the command has no
+    persistent state to leak or leave locked (contrast ``run``/``chat``).
+    """
+    from jarvis.tools.registry import build_default_registry
+
+    log = logging.getLogger("jarvis.cli")
+    registry = build_default_registry(settings)
+    return make_app_context(
+        settings,
+        registry=registry,
+        classifier=build_classifier(settings, registry, logger=log),
+        unlock=UnlockManager(store, settings=settings),
+        dry_run=dry_run,
+    )
+
+
+def _confirm_undo(ctx: AppContext, decision: Any) -> bool:
+    """Ask for approval, then a Tier-2 password - the graph's exact order.
+
+    There is deliberately no ``--yes``: an approval that could be obtained more
+    easily from the command line than from the chat REPL would defeat the whole
+    confirmation design (docs/03 invariant 7).
+    """
+    console.print(f"[yellow]approval needed[/yellow] ({tiers.tier_label(decision.tier)})")
+    console.print(decision.summary)
+    answer = _chat_prompt("Approve?")
+    agreed = (answer or "").strip().lower() in ("y", "yes")
+    if agreed and decision.needs_typed_confirmation:
+        typed = _chat_prompt(f"Type this exactly to confirm: {decision.needs_typed_confirmation}")
+        agreed = (typed or "").strip() == decision.needs_typed_confirmation
+    if agreed and decision.needs_unlock:
+        agreed = _tier2_unlock_or_refuse(ctx, {"action_hash": decision.action_hash})
+    return agreed
+
+
+def _run_undo(dry_run: bool = False) -> None:
+    """Restore the most recent delete, through the normal policy path."""
+    from jarvis.agent.nodes.util import policy_context_for
+
+    settings = config.load_settings()
+    store = secret_module.SecretStore()
+    ctx = _undo_context(settings, store, dry_run=dry_run)
+    policy_ctx = policy_context_for(
+        {"user_input": UNDO_CLASSIFIER_INPUT, "results": []}, ctx.policy_ctx
+    )
+    if policy_ctx is None:  # pragma: no cover - make_app_context always sets it
+        console.print("[red]no policy context; refusing[/red]")
+        raise typer.Exit(code=1)
+    decision = ctx.engine.decide(_undo_step(), policy_ctx)
+    if not decision.allowed:
+        for reason in decision.reasons or ["blocked by policy"]:
+            console.print(f"[red]{reason}[/red]")
+        raise typer.Exit(code=1)
+    if decision.needs_confirm and not _confirm_undo(ctx, decision):
+        console.print("[yellow]cancelled - nothing was restored[/yellow]")
+        raise typer.Exit(code=1)
+
+    spec = ctx.registry.get(UNDO_TOOL)
+    args = spec.args_model.model_validate({})
+    result = spec.run_verified(args, ctx.tool_context())
+    if not result.ok:
+        console.print(f"[red]{result.error}[/red]")
+        raise typer.Exit(code=1)
+    console.print(result.output or "done")
+    if result.verified is False:
+        console.print("[yellow]the restore could not be verified - check the file[/yellow]")
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def undo(
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Describe the action; restore nothing.")
+    ] = False,
+) -> None:
+    """Restore the most recently deleted files from the Recycle Bin."""
+    try:
+        _run_undo(dry_run=dry_run)
+    except typer.Exit:
+        raise
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]could not read the undo log: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
 
 
 # ── password commands ────────────────────────────────────────────────────

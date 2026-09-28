@@ -263,6 +263,7 @@ class DaemonServer:
         self._pid_file: Any = None
         self._voice_service: Any = None  # VoiceService | None
         self._memory: Any = None  # SqliteMemory | None (Phase 8, opened lazily)
+        self._app_registry: Any = None  # ToolRegistry | None (built with the context)
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -506,6 +507,7 @@ class DaemonServer:
         """Build an AppContext with the current settings."""
         from jarvis.agent.context import VoiceToolsFacade, make_app_context
         from jarvis.llm.provider import build_llm_client
+        from jarvis.ml.risk import build_classifier
 
         selection = build_llm_client(self._settings, self._store, logger=logger)
         llm = selection.client
@@ -520,10 +522,25 @@ class DaemonServer:
         return make_app_context(
             self._settings,
             llm=llm,
+            registry=self._registry(),
             memory=self._open_memory(),
             unlock=self._unlock,
+            classifier=build_classifier(self._settings, self._registry(), logger=logger),
             voice=VoiceToolsFacade(service=self._voice_service),
         )
+
+    def _registry(self) -> Any:
+        """The tool registry the daemon's context is built with.
+
+        Built once and shared with the risk classifier, so the classifier's
+        per-tool priors come from the *same* specs the engine will decide on
+        (there is no second copy of the tier table to drift).
+        """
+        if self._app_registry is None:
+            from jarvis.tools.registry import build_default_registry
+
+            self._app_registry = build_default_registry(self._settings)
+        return self._app_registry
 
     def _open_memory(self) -> Any:
         """Open the local memory store once, for the daemon's whole lifetime.

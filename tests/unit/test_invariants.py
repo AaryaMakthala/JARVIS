@@ -11,6 +11,7 @@ resume) that the Phase 2+ tools plug into:
  * 9  unverifiable / failed verification is reported, never claimed as success
  * 11 Tier-2 actions cannot slip past an unlocked-session gate
  * 12 the LLM cannot lower a tier (planner-only claims are ignored)
+ * 12 the Phase 8 risk classifier can only raise a tier, never lower one
  * 13 no side effects before interrupt(); resume never re-runs the planner
 """
 
@@ -33,6 +34,8 @@ from jarvis.agent.schemas import BrainDecision
 from jarvis.agent.state import Step
 from jarvis.config import AgentSettings, PolicySettings, Settings
 from jarvis.llm.client import FakeLLM
+from jarvis.policy import tiers
+from jarvis.policy.engine import PolicyContext
 from jarvis.policy.unlock import UnlockManager
 from jarvis.tools.base import ToolContext
 from jarvis.tools.files import make_delete_path_spec
@@ -429,6 +432,66 @@ def test_invariant_12_llm_cannot_lower_tier(tmp_path: Any) -> None:
         assert first.confirmation["tier"] == 1  # base_tier won, not the LLM's claim
     finally:
         saver.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Invariant 12 (Phase 8): the risk classifier can add a tier, never remove one
+# ---------------------------------------------------------------------------
+
+
+def test_invariant_12_risk_classifier_can_only_raise_a_tier(tmp_path: Any) -> None:
+    """docs/08 §4: the classifier's verdict enters the engine through ``max()``.
+
+    Three claims are checked at once: a classifier that says "safe" cannot pull a
+    Tier 1 tool down, one that says "dangerous" raises it, and one that returns
+    nonsense (or explodes) cannot take a tool *below* its declared tier.
+    """
+    from jarvis.ml.risk import RiskClassifier
+    from jarvis.tools.registry import build_default_registry
+
+    settings = Settings(policy=PolicySettings(allowed_roots=[str(tmp_path.resolve())]))
+    registry = build_default_registry(settings)
+    write = "create_file"
+    step = Step(
+        id="s1",
+        tool=write,
+        args={"path": str(tmp_path / "note.txt"), "content": "hi"},
+        rationale="r",
+    )
+    prior = registry.get(write).base_tier
+    assert prior == 1
+
+    class _Fixed:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def min_tier(self, *_a: Any, **_k: Any) -> int:
+            return self.value
+
+    base_ctx = make_app_context(settings, registry=registry)
+    base = base_ctx.engine.decide(step, base_ctx.policy_ctx)
+    assert base.tier == prior
+
+    for claim, expected in ((0, prior), (1, prior), (2, tiers.TIER_CONFIRM_UNLOCK)):
+        decision = base_ctx.engine.decide(
+            step,
+            PolicyContext(registry=registry, settings=settings, classifier=_Fixed(claim)),
+        )
+        assert decision.tier == expected, claim
+        assert decision.needs_confirm >= base.needs_confirm
+        assert decision.needs_unlock >= base.needs_unlock
+
+    # A classifier that misbehaves entirely still cannot lower the tier: the
+    # shipped one returns 0 on any internal error, and max() keeps the rules.
+    broken = RiskClassifier(prior_tiers={})
+    assert broken.min_tier(step, "delete everything") <= tiers.TIER_CONFIRM_UNLOCK
+    assert (
+        base_ctx.engine.decide(
+            step,
+            PolicyContext(registry=registry, settings=settings, classifier=broken),
+        ).tier
+        >= prior
+    )
 
 
 # ---------------------------------------------------------------------------

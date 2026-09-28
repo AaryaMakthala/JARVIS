@@ -2,6 +2,108 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-28 — Phase 8 risk classifier (`ml/`) + `jarvis undo` (no commit)
+
+### What was asked for
+
+Continue from `e9a7399` and implement the genuinely unfinished product capabilities rather than
+stopping at analysis. Two remained, both flagged in the previous session:
+`src/jarvis/ml/__init__.py` was a stub, and the undo tool existed with no CLI.
+
+### Product capability 1 — risk classifier (`jarvis.ml`)
+
+The policy engine already had an escalate-only hook (`max(base_tier, rules, classifier)`) and a
+`RiskClassifier` Protocol, but nothing implemented or supplied it. Now:
+
+- `ml/serialize.py` — the documented action string
+  `tool=… | args={…} | user="…" | tainted=…`, with `<PATH:…>` / `<PHONE>` redaction and hard bounds
+  on depth, list length, string length and total size (a hostile arg object cannot blow up the input).
+- `ml/signals.py` — deterministic lexical evidence → `safe` / `sensitive` / `dangerous`. The tool's
+  declared tier is one *prior vote*; signals add weighted votes; the arg-max label's margin maps to a
+  softmax-comparable confidence; below the threshold the label escalates one step, clamped so
+  `dangerous` never becomes Tier 3. Negation cues ("don't delete anything") cancel a signal.
+- `ml/inference.py` — optional ONNX wrapper. `onnxruntime` / `tokenizers` are imported lazily inside
+  `OnnxPredictor.load`; every foreseeable failure raises `ClassifierUnavailable`, so the caller
+  degrades instead of crashing. No model ships, so the lexical backend is the default.
+- `ml/risk.py` — `RiskClassifier` (`min_tier` / `predict` / `explain`), `build_classifier(settings,
+  registry)`. `min_tier` never raises and never returns outside 0..2. `auto` uses ONNX when a model is
+  present and lexical otherwise; an explicitly requested but unusable ONNX backend disables the layer
+  and the rules run alone.
+- Config: `[risk] enabled / backend / threshold / model_dir` in `config.py`.
+- Wired into production: `cli._task_context` and `daemon/server.py` both build the registry **once**
+  and derive the classifier's per-tool priors from it, so rules and classifier decide from the same specs.
+
+`PolicyContext` gained `user_input` (read **only** by the classifier — no rule may change because the
+user phrased something differently) and now receives the tainted result fragments it always declared.
+`agent/nodes/util.py::policy_context_for` is the single place that builds that context, shared by
+`policy_gate` and `validate`.
+
+### Product capability 2 — `jarvis undo`
+
+Implemented in `cli.py` as the deterministic, LLM-free path the spec's CLI table asks for
+(`docs/01` line 50). It runs a hard-coded `Step` through **the same** `PolicyEngine` the graph uses,
+then through the same gates in the same order as `resolve_interrupts`: approval → typed-name
+confirmation → Tier-2 password. There is no `--yes`/`-y`: an approval obtainable more easily from the
+command line than from the chat REPL would defeat invariant 7 (asserted by test). It opens no memory
+backend and no checkpointer, so there is no persistent state to leak or leave locked.
+
+### Real defects found and fixed (not test bugs)
+
+| # | File | Defect | Fix |
+|---|------|--------|-----|
+| 1 | `agent/nodes/{policy_gate,validate}.py` | The tainted-fragment collector was **dead code**: both nodes built a bare `PolicyContext`, so `tainted_fragments` was always empty and the docs/03 §8 taint escalation could never see real untrusted output | One shared `policy_context_for(state, ctx)` helper collects tainted `StepResult.output` and threads `user_input`; both nodes use it |
+| 2 | `ml/signals.py` | With no evidence and no prior, the tie-break picked the most severe of three zero-vote labels, so an unrecognised tool reading "hmm" was reported **Tier 2** | `_winner` returns `safe` when nothing fired — "no opinion" is not "dangerous" |
+| 3 | `ml/signals.py` | A bare noun such as "defender" in a read-only question ("is defender on?") fired a protection-tampering signal, escalating `defender_status` to Tier 2 | Tampering is now a composite verb+noun co-occurrence; bare nouns are not signals |
+| 4 | `ml/signals.py` | A prior/text tie plus the low-confidence escalation **stacked two steps** of caution, so "lock the computer now" jumped from Tier 0 to Tier 2 | Ties break toward the prior, and one ambiguous sentence escalates one label |
+| 5 | `ml/signals.py` | The "no counter-evidence" confidence shortcut tested the prior tier for truthiness, so `audit_run` ("run a security audit", no keyword matched) got confidence 0.5 instead of 1.0 | Presence check is explicit (`prior_label is not None and … in LABEL_MIN_TIER`) |
+| 6 | `ml/signals.py` | Taint was a heavy `dangerous` vote, which turned any web-sourced Tier-1 write into a password prompt — stricter than docs/03 §8, which escalates taint to Tier 1 and no further | Taint now raises the *floor* to Tier 1 exactly as §8 does; the flag still travels in the serialised text and the audit trail for the trained model |
+| 7 | `tools/files.py` | `_verify_undo_last_delete` reported `verified=False` for a successful **no-op** ("nothing to undo"), because no `original_path` was present — a caller checking `verified` would report a phantom failure | No restore attempted ⇒ `verified=None` ("not applicable", the value dry-run already uses). A real failed restore still reports `False` |
+| 8 | `pyproject.toml` | `onnxruntime` / `tokenizers` are untyped optional-extra imports, so `import-untyped` was unfixable without a new dependency — same situation the previous session fixed for `psutil` | Added a config-only `[[tool.mypy.overrides]]`; no new package |
+
+### Design decision worth defending in the viva
+
+`jarvis undo` passes an **empty** `user_input` to the classifier. The command is a hard-coded
+single-tool invocation, not an LLM plan, so there is no user wording to classify, and inventing a
+sentence there would let a fixed string decide a safety tier. The classifier still runs on the action
+itself, so a future change to the tool's declared tier is still enforced; with an empty string the
+documented Tier 1 stands and the mandatory approval is the gate. Feeding it the literal text
+"undo the last delete" instead would have matched the destructive-verb signal and demanded a password
+for a Tier-1 tool.
+
+### Verification
+
+- `tests/unit/test_risk_classifier.py` (50 tests) — serializer contract/redaction/bounds, signal
+  arithmetic and every false-escalation regression above, backend selection, and a registry-wide
+  property test that no tool's tier, `needs_confirm` or `needs_unlock` is ever lowered.
+- `tests/unit/test_undo_cli.py` (18 tests) — real registry/engine/classifier/tool; only `FakeDirTrash`
+  and a `tmp_path` undo log replace the irreversible edges. Covers: no `--yes`; decline restores
+  nothing; approve restores and verifies; prompt shows tier + action; one prompt per run; Tier-2
+  wrong/right password; no unlock manager ⇒ fail closed; typed name must match; Tier 3 never prompts;
+  "nothing to undo" is exit 0; dead Recycle Bin and out-of-roots targets fail non-zero; `--dry-run`
+  restores nothing; no memory/checkpointer opened; the shipped stack really yields Tier 1.
+- `tests/unit/test_invariants.py` — new `test_invariant_12_risk_classifier_can_only_raise_a_tier`
+  (invariant 12 now covers the classifier as well as the LLM).
+- `368 passed` across the classifier, undo, invariants, files, run/CLI, config, memory, replan, agent,
+  act, untrusted, daemon and schema unit suites; `30 passed` in `tests/integration`.
+- `ruff check .` clean; `ruff format` clean for every file touched.
+  `mypy src/jarvis/ml src/jarvis/policy` clean (the strict gate is `policy`).
+- Manual: `jarvis doctor` still exits 0; `jarvis undo --help` lists only `--dry-run`.
+
+### Known / remaining
+
+- Phase 8 acceptance is now met on all three bullets: skill retrieval + call counting
+  (`memory_retrieve`, `test_memory_graph.py`), retry→replan with an honest final message
+  (`test_replan.py`), and a test proving the classifier can never lower a tier.
+- No ONNX model ships. `backend = "onnx"` is implemented and tested against an injected predictor and
+  against its failure paths, but exercising it end-to-end needs a trained export (docs/08 §5,
+  deliberately human work).
+- `lock_jarvis` is declared `base_tier=0` while docs/04 lists it as Tier 1; the classifier currently
+  raises it from the wording. Left as-is rather than silently editing an unrelated tool's tier —
+  worth a decision.
+- `mypy src/jarvis` overall is still noisy (~150 pre-existing errors, mostly LangGraph `add_node`
+  overloads); pre-existing, not a regression.
+- `tests/unit/test_llm_client.py` fails `ruff format --check` in the baseline; untouched this session.
+
 ## Session 2026-09-28 — per-task telemetry (`task_log`) + audit self-review over it (no commit)
 
 ### What was asked for

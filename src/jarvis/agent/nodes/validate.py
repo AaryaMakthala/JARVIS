@@ -17,6 +17,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from jarvis.agent.context import AppContext
+from jarvis.agent.nodes.util import policy_context_for
 
 
 def validate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
@@ -59,10 +60,13 @@ def validate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     if gated is None:
         # Pre-compute and stash the resolved paths for each step so that
-        # policy_gate can detect TOCTOU changes after interrupt/resume.
+        # policy_gate can detect TOCTOU changes after interrupt/resume.  The same
+        # enrichment the gate uses is applied here, so the snapshot it records
+        # is the one the gate will compare against.
         gated = {}
+        pctx = policy_context_for(state, ctx.policy_ctx)
         for step in plan.steps:
-            decision = ctx.engine.decide(step, ctx.policy_ctx)
+            decision = ctx.engine.decide(step, pctx)
             gated[step.id] = list(decision.resolved_paths)
 
     if replaying:

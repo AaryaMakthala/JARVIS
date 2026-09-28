@@ -76,3 +76,10 @@ strict = true
 [[tool.mypy.overrides]]
 module = "psutil"
 ignore_missing_imports = true
+
+# Same for the optional [ml] extra: onnxruntime and tokenizers are untyped, are
+# imported lazily inside jarvis.ml.inference, and are genuinely optional - the
+# lexical backend is the default. Real errors in our own code stay visible.
+[[tool.mypy.overrides]]
+module = ["onnxruntime", "tokenizers"]
+ignore_missing_imports = true

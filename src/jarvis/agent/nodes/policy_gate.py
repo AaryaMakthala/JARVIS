@@ -10,28 +10,16 @@ tampered approval from being trusted.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Any
 
 from langgraph.types import interrupt
 
 from jarvis.agent.context import AppContext
+from jarvis.agent.nodes.util import policy_context_for
 from jarvis.agent.schemas import ConfirmationRequest
-from jarvis.agent.state import Decision, StepResult
+from jarvis.agent.state import Decision
 
-
-def _collect_tainted_fragments(state: dict[str, Any]) -> tuple[str, ...]:
-    """Extract tainted output text from previous step results.
-
-    Only fragments from ``StepResult`` objects where ``tainted=True`` are
-    included.  This data is trusted (produced by our own tools, not by the
-    LLM) and used by the engine for deterministic taint detection.
-    """
-    fragments: list[str] = []
-    for r in state.get("results") or []:
-        if isinstance(r, StepResult) and r.tainted and r.output:
-            fragments.append(r.output)
-    return tuple(fragments)
+__all__ = ["confirmation_payload", "policy_gate", "refusal_text"]
 
 
 def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
@@ -47,14 +35,11 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     step = plan.steps[idx]
 
-    # Build a PolicyContext enriched with tainted fragments from previous
-    # results so the engine can independently verify taint, regardless of
-    # what the LLM asserted in ``step.depends_on_untrusted`` (docs/03 §8).
-    tainted = _collect_tainted_fragments(state)
-    if tainted and ctx.policy_ctx is not None:
-        pctx = dataclasses.replace(ctx.policy_ctx, tainted_fragments=tainted)
-    else:
-        pctx = ctx.policy_ctx
+    # Enrich the PolicyContext with tainted fragments from previous results and
+    # the user's own words, so the engine can verify taint independently of what
+    # the LLM asserted in ``step.depends_on_untrusted`` (docs/03 §8) and the risk
+    # classifier sees the original request (docs/08 §3).
+    pctx = policy_context_for(state, ctx.policy_ctx)
 
     decision = ctx.engine.decide(step, pctx)
     decisions = dict(state.get("decisions") or {})

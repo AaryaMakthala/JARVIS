@@ -27,9 +27,17 @@ from jarvis.tools.registry import ToolRegistry, UnknownTool
 
 
 class RiskClassifier(Protocol):
-    """Phase 8: an ML wrapper that may only *raise* a tier."""
+    """Phase 8: an ML wrapper that may only *raise* a tier.
 
-    def min_tier(self, step: Step) -> int: ...
+    ``min_tier`` returns 0..2 (Tier 3 is never delegated to a model) and the
+    engine combines it with ``max()``, so a wrong or broken classifier can make
+    JARVIS ask for confirmation but can never let an action through.  The
+    optional arguments are the inputs docs/08 section 3 says the model needs;
+    they default so a classifier written before them still satisfies the
+    protocol.
+    """
+
+    def min_tier(self, step: Step, user_input: str = "", tainted: bool | None = None) -> int: ...
 
 
 class UnlockManager(Protocol):
@@ -50,6 +58,11 @@ class PolicyContext:
     #: checks these independently of ``step.depends_on_untrusted`` so an
     #: LLM omission cannot suppress the taint escalation.
     tainted_fragments: tuple[str, ...] = ()
+    #: The user's original request (the graph's ``user_input``).  Only the
+    #: classifier reads it: the wording of a command is a risk signal
+    #: (docs/08 §3), but the rules must not change because the user phrased
+    #: something differently, so no rule consults this field.
+    user_input: str = ""
 
 
 def _blocked(step: Step, reasons: list[str], summary: str) -> Decision:
@@ -130,12 +143,19 @@ class PolicyEngine:
         # previous results.  Either signal forces the escalation.
         llm_says_tainted = bool(step.depends_on_untrusted)
         engine_says_tainted = rules.args_overlap_taint(step.args, ctx.tainted_fragments)
-        if (llm_says_tainted or engine_says_tainted) and tier >= tiers.TIER_CONFIRM:
+        tainted = llm_says_tainted or engine_says_tainted
+        if tainted and tier >= tiers.TIER_CONFIRM:
             tier = max(tier, tiers.TIER_CONFIRM)
             reasons.append("derived from untrusted content")
 
+        # ── Optional risk classifier (Phase 8) ─────────────────────────
+        # The last word on the tier, and the only `max()` a non-rule layer gets:
+        # this can add a confirmation but can never remove one.
         if ctx.classifier is not None:
-            tier = max(tier, ctx.classifier.min_tier(step))
+            classifier_tier = ctx.classifier.min_tier(step, ctx.user_input, tainted)
+            if classifier_tier > tier:
+                reasons.append(f"risk classifier raised this to tier {classifier_tier}")
+            tier = max(tier, classifier_tier)
 
         allowed = tier < tiers.TIER_BLOCKED
 

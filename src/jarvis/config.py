@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from platformdirs import PlatformDirs
 from pydantic import BaseModel, ConfigDict
@@ -212,6 +212,34 @@ class AppSettings(BaseModel):
     chrome: str = "chrome.exe"
 
 
+class RiskSettings(BaseModel):
+    """Risk-classifier settings (``[risk]`` in config.toml, Phase 8).
+
+    The classifier is an *extra* safety layer that can only raise a tier
+    (docs/08_RISK_CLASSIFIER.md, docs/03 section 4 step 5), so it is safe to
+    leave on: the worst it can do is ask the user to confirm something the
+    rules already allowed.  ``enabled = false`` restores rules-only decisions
+    exactly, which is the ablation switch used in the report.
+
+    ``backend`` picks the implementation:
+
+    * ``"lexical"`` - deterministic offline lexicon, no weights on disk;
+    * ``"onnx"`` - the fine-tuned model; refuses to start if it cannot load
+      rather than silently degrading;
+    * ``"auto"`` (default) - ``onnx`` when a model directory is present and
+      loadable, otherwise ``lexical``.
+
+    ``threshold`` is the minimum confidence for a prediction to be taken at
+    face value; below it the label is escalated one step (fail toward caution).
+    ``model_dir`` overrides the packaged ``ml/models/risk_classifier`` folder.
+    """
+
+    enabled: bool = True
+    backend: Literal["auto", "lexical", "onnx"] = "auto"
+    threshold: float = 0.5
+    model_dir: str = ""
+
+
 class DaemonSettings(BaseModel):
     """Daemon/IPC settings (used from Phase 3 onwards)."""
 
@@ -314,6 +342,7 @@ class Settings(BaseSettings):
     voice: VoiceSettings = VoiceSettings()
     whatsapp: WhatsAppSettings = WhatsAppSettings()
     memory: MemorySettings = MemorySettings()
+    risk: RiskSettings = RiskSettings()
     config_version: int = 1
 
     @classmethod
