@@ -1,12 +1,15 @@
-"""Local skill/failure/preference memory.
+"""Local skill/failure/preference memory plus per-task telemetry.
 
 Phase 8 wires the real SQLite backends: :class:`SqliteMemory` implements the
-:class:`MemoryBackend` boundary for the agent, and the three stores behind it
+:class:`MemoryBackend` boundary for the agent, and the stores behind it
 (:class:`~jarvis.memory.skills.SkillStore`,
 :class:`~jarvis.memory.failures.FailureStore`,
 :class:`~jarvis.memory.prefs.PreferenceStore`) are also used directly by the
-``jarvis skills`` CLI.  :class:`NullMemory` remains the deterministic no-op used
-when the store is disabled, in ``--dry-run``, or cannot be opened.
+``jarvis skills`` CLI.  :class:`~jarvis.memory.tasklog.TaskLogStore` keeps the
+``task_log`` counters (``api_calls``/``tokens``/``steps``/``replans``) that
+``docs/01_PROJECT_SPEC.md`` requires for observability.  :class:`NullMemory`
+remains the deterministic no-op used when the store is disabled, in
+``--dry-run``, or cannot be opened.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from jarvis.memory.failures import Failure, FailureStore
 from jarvis.memory.prefs import Preference, PreferenceStore
 from jarvis.memory.skills import Skill, SkillStore
 from jarvis.memory.store import SqliteMemory, open_memory
+from jarvis.memory.tasklog import TaskLogStore, TaskRecord, TaskSummary
 
 __all__ = [
     "Failure",
@@ -30,6 +34,9 @@ __all__ = [
     "Skill",
     "SkillStore",
     "SqliteMemory",
+    "TaskLogStore",
+    "TaskRecord",
+    "TaskSummary",
     "open_db",
     "open_memory",
 ]

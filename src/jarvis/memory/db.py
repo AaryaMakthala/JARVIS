@@ -33,9 +33,11 @@ __all__ = [
     "SCHEMA_VERSION",
     "connect",
     "init_schema",
+    "insert_task_log",
     "looks_secret",
     "prune_failures",
     "prune_skills",
+    "prune_task_log",
     "redact_secrets",
     "safe_plan",
     "safe_value",
@@ -94,6 +96,7 @@ CREATE TABLE IF NOT EXISTS task_log (
 
 CREATE INDEX IF NOT EXISTS idx_skills_last_used ON skills (last_used_at DESC);
 CREATE INDEX IF NOT EXISTS idx_failures_created ON failures (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_log_started ON task_log (started_at DESC);
 """
 
 #: Argument/field *names* that usually carry credential material.  Matched
@@ -326,6 +329,29 @@ def prune_preferences(conn: sqlite3.Connection, max_rows: int) -> int:
         """
         DELETE FROM preferences WHERE key IN (
           SELECT key FROM preferences ORDER BY updated_at ASC, key ASC LIMIT ?
+        )
+        """,
+        (total - max_rows,),
+    )
+    return int(cur.rowcount or 0)
+
+
+def prune_task_log(conn: sqlite3.Connection, max_rows: int) -> int:
+    """Drop the oldest ``task_log`` rows above ``max_rows``.
+
+    Ordered by ``started_at`` (the task's own start, not the finish time) so a
+    task that sat on a pending confirmation for an hour is pruned in the same
+    order it began, not because it happened to finish late.
+    """
+    if max_rows <= 0:
+        return 0
+    total = int(conn.execute("SELECT COUNT(*) FROM task_log").fetchone()[0])
+    if total <= max_rows:
+        return 0
+    cur = conn.execute(
+        """
+        DELETE FROM task_log WHERE task_id IN (
+          SELECT task_id FROM task_log ORDER BY started_at ASC, task_id ASC LIMIT ?
         )
         """,
         (total - max_rows,),

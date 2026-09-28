@@ -802,7 +802,9 @@ def _run_audit_cli(sections: list[str] | None, out: Path | None) -> tuple[list[A
     unknown = [s for s in chosen if s not in _SECTIONS]
     if unknown:
         raise typer.BadParameter(f"unknown audit section: {', '.join(unknown)}")
-    findings = audit_checks.run_checks(chosen, log_path=config.log_file())
+    findings = audit_checks.run_checks(
+        chosen, log_path=config.log_file(), memory_db=config.memory_db()
+    )
     target = out if out is not None else config.reports_dir()
     report_path = write_report(findings, target)
     return findings, report_path

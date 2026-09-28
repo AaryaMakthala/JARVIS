@@ -386,6 +386,156 @@ def test_self_review_unknown_without_log() -> None:
     assert findings[0].severity == "unknown"
 
 
+# ── self-review over the per-task log (task_history) ─────────────────────
+
+
+def _seed_task_log(path: Path, rows: list[tuple[str, str, int, int, int]]) -> Path:
+    """Write a real memory.db whose task_log holds ``(id, input, status, calls, tokens)``."""
+    from jarvis.memory import SqliteMemory
+    from jarvis.memory.db import open_db
+
+    store = SqliteMemory(open_db(path), settings=Settings())
+    try:
+        for task_id, user_input, status_index, calls, tokens in rows:
+            store.record_task(task_id, source="terminal", user_input=user_input)
+            store.record_task(
+                task_id,
+                status=("completed", "answered", "failed", "halted", "partial")[status_index],
+                source="terminal",
+                user_input=user_input,
+                api_calls=calls,
+                tokens=tokens,
+            )
+    finally:
+        store.close()
+    return path
+
+
+def _task_findings(db: Path) -> list[Finding]:
+    """Only the ``task_history`` findings (the JSONL ``self_review`` ones are absent)."""
+    return [
+        f
+        for f in checks.run_checks(["self"], memory_db=db)
+        if f.title not in ("JARVIS failure log", "Repeated failures in JARVIS log")
+    ]
+
+
+def test_task_history_lists_repeated_failures(tmp_path: Path) -> None:
+    """Phase 7 acceptance: repeated failures surface from a seeded task_log."""
+    db = _seed_task_log(
+        tmp_path / "memory.db",
+        [
+            ("t1", "delete the build folder", 2, 1, 90),  # failed
+            ("t2", "delete the build folder", 2, 1, 85),  # failed again -> a repeat
+            ("t3", "delete the build folder", 2, 1, 80),
+            ("t4", "open notepad", 0, 1, 70),  # completed
+        ],
+    )
+    repeat = next(f for f in _task_findings(db) if f.title == "Repeated task failures")
+    assert repeat.severity == "warning"
+    assert "3x" in repeat.detail
+    assert "delete the build folder" in repeat.detail
+
+
+def test_task_history_a_single_failure_is_not_a_repeat(tmp_path: Path) -> None:
+    db = _seed_task_log(
+        tmp_path / "memory.db",
+        [("t1", "a", 2, 1, 10), ("t2", "b", 2, 1, 10), ("t3", "c", 0, 1, 10)],
+    )
+    repeat = next(f for f in _task_findings(db) if f.title == "Repeated task failures")
+    assert repeat.severity == "ok"
+
+
+def test_task_history_reports_reliability_and_llm_cost(tmp_path: Path) -> None:
+    db = _seed_task_log(
+        tmp_path / "memory.db",
+        [
+            ("t1", "a", 0, 1, 100),
+            ("t2", "b", 0, 1, 100),
+            ("t3", "c", 2, 3, 300),
+            ("t4", "d", 0, 1, 100),
+        ],
+    )
+    findings = _task_findings(db)
+    rate = next(f for f in findings if f.title == "Task success rate")
+    assert rate.severity == "ok"  # 1 failure in 4 is under the warning threshold
+    assert "3 completed" in rate.detail and "1 failed" in rate.detail
+    cost = next(f for f in findings if f.title == "LLM cost per task")
+    assert "1.5 calls/task" in cost.detail
+    assert "6 calls" in cost.detail and "600 tokens" in cost.detail
+
+
+def test_task_history_warns_on_a_persistent_failure_rate(tmp_path: Path) -> None:
+    db = _seed_task_log(
+        tmp_path / "memory.db",
+        [
+            ("t1", "a", 0, 1, 10),
+            ("t2", "b", 2, 1, 10),
+            ("t3", "c", 2, 1, 10),
+            ("t4", "d", 2, 1, 10),
+        ],
+    )
+    rate = next(f for f in _task_findings(db) if f.title == "Task success rate")
+    assert rate.severity == "warning"
+    assert "75% failed" in rate.detail
+
+
+def test_task_history_counts_an_unfinished_task_as_unfinished(tmp_path: Path) -> None:
+    """A task that died mid-flight must not be read as a success."""
+    from jarvis.memory import SqliteMemory
+    from jarvis.memory.db import open_db
+
+    db = tmp_path / "memory.db"
+    store = SqliteMemory(open_db(db), settings=Settings())
+    try:
+        store.record_task("running-one", source="terminal", user_input="long task")
+    finally:
+        store.close()
+    rate = next(f for f in _task_findings(db) if f.title == "Task success rate")
+    assert "1 unfinished" in rate.detail
+
+
+def test_task_history_is_unknown_without_a_database(tmp_path: Path) -> None:
+    finding = _task_findings(tmp_path / "absent.db")[0]
+    assert finding.severity == "unknown"
+
+
+def test_task_history_is_unknown_for_an_empty_database(tmp_path: Path) -> None:
+    from jarvis.memory.db import open_db
+
+    db = tmp_path / "empty.db"
+    open_db(db).close()
+    finding = _task_findings(db)[0]
+    assert finding.severity == "unknown"
+    assert "empty" in finding.detail
+
+
+def test_task_history_never_writes_to_the_database(tmp_path: Path) -> None:
+    """The audit is read-only: it must not create, stamp or upgrade anything."""
+    from jarvis.memory.db import connect, user_version
+
+    db = _seed_task_log(tmp_path / "memory.db", [("t1", "a", 0, 1, 10)])
+
+    def snapshot() -> tuple[int, int, int]:
+        conn = connect(db, read_only=True)
+        try:
+            rows = int(conn.execute("SELECT COUNT(*) FROM task_log").fetchone()[0])
+            return (rows, user_version(conn), db.stat().st_mtime_ns)
+        finally:
+            conn.close()
+
+    before = snapshot()
+    _task_findings(db)
+    assert snapshot() == before
+
+
+def test_task_history_does_not_create_a_missing_database(tmp_path: Path) -> None:
+    """A read-only audit must not leave a stray memory.db behind."""
+    db = tmp_path / "never-existed.db"
+    assert _task_findings(db)[0].severity == "unknown"
+    assert not db.exists()
+
+
 # ── heuristics ───────────────────────────────────────────────────────────
 
 

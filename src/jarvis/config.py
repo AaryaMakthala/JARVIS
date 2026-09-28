@@ -274,8 +274,11 @@ class MemorySettings(BaseModel):
     nothing is written).  ``save_skills`` is a separate, narrower switch: with
     it off JARVIS still *reads* past examples but never records new ones.
     ``similarity_threshold`` is the cosine floor for a stored example to be
-    considered relevant at all (docs/02 section 9, default 0.75).  The
-    ``max_*`` values bound each table so ``memory.db`` cannot grow forever.
+    considered relevant at all (docs/02 section 9, default 0.75).
+    ``max_*`` values bound each table so ``memory.db`` cannot grow forever;
+    ``max_task_log`` bounds the per-task telemetry rows (the Observability
+    requirement in docs/01 section "Targets"), which are written even when
+    ``save_skills`` is off because they are counters, not learned examples.
     """
 
     retrieval_limit: int = 3
@@ -285,6 +288,7 @@ class MemorySettings(BaseModel):
     max_skills: int = 500
     max_failures: int = 200
     max_preferences: int = 50
+    max_task_log: int = 500
 
 
 class Settings(BaseSettings):

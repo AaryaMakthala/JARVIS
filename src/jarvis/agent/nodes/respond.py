@@ -7,6 +7,10 @@ every string this node returns passes
 :func:`jarvis.agent.answer.safe_final_answer`, so a leaked routing document
 cannot reach the terminal, the IPC client, or TTS even if it somehow got into
 state (an old checkpoint, a future node, a provider that ignored the schema).
+
+It is also the single writer of the task's ``task_log`` row, so every terminal
+path leaves a measured record of what the task cost (LLM calls, tokens, steps,
+replans) and how it ended.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from typing import Any
 
 from jarvis.agent.answer import safe_final_answer
 from jarvis.agent.context import AppContext
+from jarvis.agent.nodes.telemetry import record_finished
 from jarvis.agent.state import StepResult
 
 #: Longest single tool output line shown as a final answer.  A tool's raw
@@ -26,8 +31,32 @@ MAX_ANSWER_LINE_CHARS = 400
 
 
 def respond(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
-    """Produce the final human-facing answer."""
-    del ctx
+    """Produce the final human-facing answer.
+
+    Also the documented writer of the task's ``task_log`` row
+    (``docs/02_ARCHITECTURE.md`` section 5): ``respond`` is the one node every
+    terminal path reaches, so the per-task ``api_calls``/``tokens`` counters
+    are final here.  ``telemetry.record_finished`` cannot raise and cannot
+    change the answer.
+    """
+    update = _answer_for(state)
+    record_finished(state, ctx)
+    return update
+
+
+def _answer(text: str) -> dict[str, str]:
+    """Wrap a final answer after stripping any leaked internal payload."""
+    return {"final_answer": safe_final_answer(text)}
+
+
+def _answer_for(state: dict[str, Any]) -> dict[str, str]:
+    """The honest summary for this terminal state.
+
+    The branch order is the user-facing contract, and
+    :func:`jarvis.agent.nodes.telemetry.task_status` reads the same fields in
+    the same priority so a logged ``completed`` can never contradict the
+    message the human just read.
+    """
     if state.get("cancelled"):
         return _answer("Cancelled.")
 
@@ -64,11 +93,6 @@ def respond(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         return _answer(_success_text(results) + hint)
 
     return _answer(_success_text(results))
-
-
-def _answer(text: str) -> dict[str, str]:
-    """Wrap a final answer after stripping any leaked internal payload."""
-    return {"final_answer": safe_final_answer(text)}
 
 
 def _success_text(results: list[StepResult]) -> str:

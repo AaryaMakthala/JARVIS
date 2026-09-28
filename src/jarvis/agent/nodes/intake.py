@@ -4,6 +4,11 @@ Cheap and deterministic (no LLM).  Meta commands like "cancel" / "stop" mark
 the task cancelled so the graph can respond without planning.  The raw input
 is validated and normalised through :class:`UserRequest` so every downstream
 node sees a trimmed ``text`` and a known ``source``.
+
+This is also where the task's ``task_log`` row is *opened* (observability,
+docs/01 section "Targets"): a task that then suspends on a confirmation, or
+dies with the daemon, stays visible as ``running`` instead of leaving no trace
+at all.  :func:`jarvis.agent.nodes.telemetry.record_started` cannot raise.
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ import re
 from typing import Any
 
 from jarvis.agent.context import AppContext
+from jarvis.agent.nodes.telemetry import record_started
 from jarvis.agent.nodes.util import new_task_id
 from jarvis.agent.schemas import UserRequest
 
@@ -20,7 +26,6 @@ _CANCEL_RE = re.compile(r"^(cancel|stop|abort|never mind|no thanks|wait)$", re.I
 
 def intake(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     """Prepare the state for one task run."""
-    del ctx
     user_input = (state.get("user_input") or "").strip()
     source = state.get("source", "terminal")
     request = UserRequest(
@@ -60,4 +65,7 @@ def intake(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         update["halted_reason"] = "Cancelled by the user."
     else:
         update["halted_reason"] = None
+    # Read from ``update`` (not ``state``): on a first run the task_id is
+    # assigned here, so the caller would otherwise have no id to log under.
+    record_started(update, ctx)
     return update

@@ -45,7 +45,7 @@ SECTION_CHECKS: dict[str, tuple[str, ...]] = {
     ),
     "performance": ("performance",),
     "updates": ("pending_updates",),
-    "self": ("self_review",),
+    "self": ("self_review", "task_history"),
 }
 ALLOWED_SECTIONS: tuple[str, ...] = tuple(SECTION_CHECKS)
 
@@ -283,9 +283,14 @@ def _check_listening_ports(psutil_module: Any, os_name: str, section: str) -> li
         if pid is None:
             return None
         try:
-            return psutil_module.Process(pid).name()
+            name = psutil_module.Process(pid).name()
         except Exception:  # noqa: BLE001 - process may have exited meanwhile
             return None
+        # psutil_module is the injectable Any stand-in for the real module, so
+        # name() is untyped here while always being str at runtime. Convert
+        # explicitly (same idiom as the rest of this file) instead of trusting
+        # the Any through to the declared return type.
+        return name if isinstance(name, str) else str(name)
 
     loopback = ("127.0.0.1", "::1", "0.0.0.0", "::")
     exposed = [
@@ -499,6 +504,95 @@ def _check_self_review(log_path: Path | None, section: str) -> list[Finding]:
     ]
 
 
+# ── self-review over the per-task log ────────────────────────────────────
+
+#: A failure share above this is worth a warning; below it, a plain "info".
+#: A single failure out of one task is not a trend, so a floor on the sample
+#: size keeps the check quiet on a fresh install.
+_FAIL_RATE_WARNING = 0.25
+_FAIL_RATE_MIN_SAMPLE = 4
+
+
+def _check_task_history(memory_db: Path | None, section: str) -> list[Finding]:
+    """Report on the ``task_log`` counters the agent has been recording.
+
+    This is the "JARVIS self-review" of ``docs/04_TOOLS_SPEC.md`` section 8
+    ("query ``task_log`` and ``failures``") and the Phase 7 acceptance
+    criterion "self-review section correctly lists repeated failures from a
+    seeded ``task_log``".  It is **strictly read-only**: the store is opened
+    with ``read_only=True`` so the audit cannot create the database, stamp a
+    WAL or bump ``user_version`` on someone's machine.
+
+    Three observations, in the order a reader wants them:
+
+    * commands that failed more than once (the actionable one),
+    * the completed / failed / unfinished split,
+    * the measured LLM cost per task.
+    """
+    if memory_db is None or not memory_db.exists():
+        return [_unknown(section, "Task history", "No memory.db task log to review (no tasks yet)")]
+    try:
+        from jarvis.memory.db import connect
+        from jarvis.memory.tasklog import TaskLogStore
+
+        conn = connect(memory_db, read_only=True)
+    except (OSError, ValueError, ImportError) as exc:
+        return [_unknown(section, "Task history", f"could not open the task log: {exc}")]
+    try:
+        store = TaskLogStore(conn)
+        summary = store.summary()
+        repeats = store.failure_repeats()
+    except Exception as exc:  # noqa: BLE001 - a corrupt db is "unknown", never a crash
+        logger.warning("task history unavailable: %s", exc)
+        return [_unknown(section, "Task history", f"could not read the task log: {exc}")]
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001, S110 - closing must not mask a finding
+            pass
+
+    if not summary.tasks:
+        return [_unknown(section, "Task history", "The task log is empty (no tasks recorded yet)")]
+
+    findings = [_repeats_finding(repeats, section), _reliability_finding(summary, section)]
+    findings.append(
+        Finding(
+            section,
+            "info",
+            "LLM cost per task",
+            f"{summary.api_calls_per_task:.1f} calls/task "
+            f"({summary.api_calls} calls, {summary.tokens} tokens over "
+            f"{summary.tasks} tasks; {summary.replans} replans)",
+        )
+    )
+    return findings
+
+
+def _repeats_finding(repeats: list[tuple[str, int]], section: str) -> Finding:
+    """A command that failed more than once is worth the user's attention."""
+    if not repeats:
+        return Finding(section, "ok", "Repeated task failures", "No command has failed twice")
+    return Finding(
+        section,
+        "warning",
+        "Repeated task failures",
+        "; ".join(f"{hits}x: {text}" for text, hits in repeats),
+    )
+
+
+def _reliability_finding(summary: Any, section: str) -> Finding:
+    """Completed / failed / unfinished split, honest about the running rows."""
+    done = summary.completed + summary.failed
+    rate = (summary.failed / done) if done else 0.0
+    detail = (
+        f"{summary.completed} completed, {summary.failed} failed, "
+        f"{summary.unfinished} unfinished (never finished)"
+    )
+    if done >= _FAIL_RATE_MIN_SAMPLE and rate > _FAIL_RATE_WARNING:
+        return Finding(section, "warning", "Task success rate", f"{rate:.0%} failed - {detail}")
+    return Finding(section, "ok", "Task success rate", detail)
+
+
 # ── Public entry points ──────────────────────────────────────────────────
 
 
@@ -507,6 +601,7 @@ def run_checks(
     *,
     executor: CheckExecutor | None = None,
     log_path: Path | None = None,
+    memory_db: Path | None = None,
     os_name: str | None = None,
     psutil_module: Any | None = None,
     winreg_module: Any | None = None,
@@ -515,9 +610,10 @@ def run_checks(
 
     ``sections`` entries must be in :data:`ALLOWED_SECTIONS` else
     :class:`ValueError` is raised.  ``executor`` (PowerShell), ``log_path``
-    (self-review source), ``os_name`` and the psutil/winreg modules are
-    injectable so unit tests run recorded fixtures on any OS; defaults are the
-    live system.  This function never writes to disk.
+    (self-review source), ``memory_db`` (per-task telemetry source), ``os_name``
+    and the psutil/winreg modules are injectable so unit tests run recorded
+    fixtures on any OS; defaults are the live system.  This function never
+    writes to disk.
     """
     real_executor = executor if executor is not None else _run_powershell
     current_os = os_name if os_name is not None else platform.system()
@@ -573,4 +669,6 @@ def run_checks(
                 )
             elif check == "self_review":
                 findings.extend(_check_self_review(log_path, section))
+            elif check == "task_history":
+                findings.extend(_check_task_history(memory_db, section))
     return findings

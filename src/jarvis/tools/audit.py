@@ -60,10 +60,13 @@ def _run_audit(args: AuditRunArgs, ctx: ToolContext) -> ToolResult:
             output=f"[dry-run] would run read-only audit sections: {args.sections or 'all'}",
         )
     sections = list(args.sections) or list(_SECTIONS)
-    # ``self_review`` reads the task log; without log_path it can only report
+    # ``self_review`` reads the JSONL log; without log_path it can only report
     # "unknown", which is how the Phase 7 acceptance criterion (repeated
-    # failures listed honestly) silently never held in production.
-    findings = audit_checks.run_checks(sections, log_path=config.log_file())
+    # failures listed honestly) silently never held in production.  Same for
+    # ``task_history``, which reads the per-task counters out of memory.db.
+    findings = audit_checks.run_checks(
+        sections, log_path=config.log_file(), memory_db=config.memory_db()
+    )
     report_path = write_report(findings, config.reports_dir())
     by_severity: dict[str, int] = {}
     for finding in findings:

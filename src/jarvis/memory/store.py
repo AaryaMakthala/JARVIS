@@ -31,6 +31,7 @@ from jarvis.memory.db import open_db
 from jarvis.memory.failures import FailureStore
 from jarvis.memory.prefs import PreferenceStore
 from jarvis.memory.skills import SkillStore
+from jarvis.memory.tasklog import TaskLogStore
 
 __all__ = ["SqliteMemory", "open_memory"]
 
@@ -60,6 +61,7 @@ class SqliteMemory:
         self.preferences = PreferenceStore(
             conn, max_rows=int(getattr(memory, "max_preferences", 50))
         )
+        self.task_log = TaskLogStore(conn, max_rows=int(getattr(memory, "max_task_log", 500)))
 
     # ------------------------------------------------------- MemoryBackend
 
@@ -99,6 +101,47 @@ class SqliteMemory:
                         self._log.info("preference not stored: %s", exc)
                 return
             self._remember_episodic(record)
+
+    # ---------------------------------------------------------------- metrics
+
+    def record_task(
+        self,
+        task_id: str,
+        *,
+        status: str = "running",
+        source: str = "",
+        user_input: str = "",
+        api_calls: int = 0,
+        tokens: int = 0,
+        steps: int = 0,
+        replans: int = 0,
+    ) -> None:
+        """Upsert this task's telemetry row; a failure never fails a task.
+
+        ``status="running"`` opens the row (``intake``), anything else closes
+        it (``respond``).  Both calls merge into the same ``task_id`` row, so a
+        task that paused on a confirmation keeps the start time it really had
+        instead of restarting the clock on resume.
+        """
+        if not task_id:
+            return
+        with self._lock:
+            try:
+                if status == "running":
+                    self.task_log.start(task_id, source=source, user_input=user_input)
+                else:
+                    self.task_log.finish(
+                        task_id,
+                        status=status,
+                        source=source,
+                        user_input=user_input,
+                        api_calls=api_calls,
+                        tokens=tokens,
+                        steps=steps,
+                        replans=replans,
+                    )
+            except sqlite3.Error as exc:
+                self._log.warning("task telemetry not recorded: %s", exc)
 
     # ------------------------------------------------------------- helpers
 
@@ -176,13 +219,26 @@ class SqliteMemory:
                 pass
 
     def counts(self) -> dict[str, int]:
-        """Row counts per table, for ``jarvis doctor`` / ``jarvis skills``."""
+        """Row counts per table, for ``jarvis doctor`` / ``jarvis skills``.
+
+        Learned memory only.  The ``task_log`` is telemetry, not something the
+        user "learned", so it is reported through :meth:`task_metrics` instead.
+        """
         with self._lock:
             return {
                 "skills": self.skills.count(),
                 "failures": self.failures.count(),
                 "preferences": self.preferences.count(),
             }
+
+    def task_metrics(self) -> Any:
+        """Aggregate task telemetry, or ``None`` when it cannot be read."""
+        with self._lock:
+            try:
+                return self.task_log.summary()
+            except sqlite3.Error as exc:
+                self._log.warning("task telemetry not readable: %s", exc)
+                return None
 
     def __enter__(self) -> Self:
         return self

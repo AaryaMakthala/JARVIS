@@ -7,7 +7,9 @@ backends; this module defines the boundary every backend must satisfy plus a
 deterministic :class:`NullMemory` so the graph runs without a store.
 
 Invariant: **no secret material is ever stored in memory** (docs/03 §5).  The
-interfaces take/return :class:`MemoryRecord` only.
+retrieval interfaces take/return :class:`MemoryRecord` only; telemetry is a
+separate :meth:`MemoryBackend.record_task` sink that carries counters (and a
+redacted copy of the command) and is never handed to the model.
 """
 
 from __future__ import annotations
@@ -37,6 +39,30 @@ class MemoryBackend(Protocol):
     def remember(self, record: MemoryRecord) -> None:
         """Store a record for later retrieval (no-op for read-only backends)."""
 
+    def record_task(
+        self,
+        task_id: str,
+        *,
+        status: str = "running",
+        source: str = "",
+        user_input: str = "",
+        api_calls: int = 0,
+        tokens: int = 0,
+        steps: int = 0,
+        replans: int = 0,
+    ) -> None:
+        """Store per-task telemetry counters (no-op for read-only backends).
+
+        Separate from :meth:`remember` on purpose.  A ``MemoryRecord`` is
+        retrieved by the planner, so it must stay a small, verified,
+        non-tainted *example*; a task row is a counter (calls, tokens, steps,
+        replans) that is never fed back to the model and is only read by
+        humans, the audit self-review and the benchmark.
+
+        ``status="running"`` opens the row; any other status finishes it, so
+        one task is one row even across a confirmation resume.
+        """
+
 
 class NullMemory:
     """Deterministic no-op backend: never returns anything, never stores."""
@@ -47,3 +73,18 @@ class NullMemory:
 
     def remember(self, record: MemoryRecord) -> None:
         del record  # discarded: without a backend there is no memory to write
+
+    def record_task(
+        self,
+        task_id: str,
+        *,
+        status: str = "running",
+        source: str = "",
+        user_input: str = "",
+        api_calls: int = 0,
+        tokens: int = 0,
+        steps: int = 0,
+        replans: int = 0,
+    ) -> None:
+        """No-op: with no store there is nowhere to record telemetry."""
+        del task_id, status, source, user_input, api_calls, tokens, steps, replans

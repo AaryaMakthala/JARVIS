@@ -85,7 +85,11 @@ def run_task(
     task_id = thread_id or uuid4().hex[:12]
     graph = build_graph(ctx, checkpointer)
     config = {"configurable": {"thread_id": task_id}}
-    values = graph.invoke({"user_input": user_input, "source": source}, config)
+    # Seed ``task_id`` so the graph and the outcome agree on one identifier.
+    # Left to itself ``intake`` would mint a second, unrelated id, and the
+    # per-task ``task_log`` row (and every ``agent event=... task_id=`` log
+    # line) would be keyed on an id the caller never sees.
+    values = graph.invoke({"user_input": user_input, "source": source, "task_id": task_id}, config)
     return _outcome(task_id, config, checkpointer, graph, values)
 
 
