@@ -1,4 +1,4 @@
-# JARVIS — Windows Desktop AI Agent (Final Year Project)
+# JARVIS — Windows Desktop AI Agent 
 
 JARVIS runs in the background on your Windows PC, listens for "Hey Jarvis" (or takes typed commands
 in a terminal), plans tasks with an LLM, and executes them through a **safe, verified tool layer**.
