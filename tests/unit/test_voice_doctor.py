@@ -108,6 +108,20 @@ def test_all_backends_missing_reports_failures(monkeypatch: pytest.MonkeyPatch) 
     assert "mic_device" not in checks and "mic_open" not in checks
 
 
+def test_wake_model_failure_names_the_real_import_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A broken transitive dependency (the real dev-PC case: onnxruntime could
+    not load without the MSVC runtime) must be named, not reported as a
+    missing openwakeword package."""
+    _patch_factories(monkeypatch, wake=None)
+    monkeypatch.setattr(
+        "jarvis.voice.wake.import_error",
+        lambda: "ImportError: DLL load failed while importing onnxruntime_pybind11_state",
+    )
+    checks = _by_name(run_voice_doctor(_settings(), mic=False, stt=False, tts=False))
+    assert checks["wake_model"].status == "FAIL"
+    assert "onnxruntime" in checks["wake_model"].detail
+
+
 def test_full_pass_path(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_factories(monkeypatch, audio=FakeAudio(), wake=FakeWake(), stt=FakeSTT(), tts=object())
     checks = _by_name(run_voice_doctor(_settings()))

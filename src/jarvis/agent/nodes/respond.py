@@ -95,13 +95,27 @@ def _answer_for(state: dict[str, Any]) -> dict[str, str]:
 
     unverified = [r for r in results if r.verified is None and r.ok]
     if unverified:
-        hint = (
-            f" ({len(unverified)} step(s) succeeded, but completion could "
-            "not be independently verified)"
-        )
-        return _answer(_success_text(results) + hint)
+        return _answer(_success_text(results) + _unverified_hint(unverified))
 
     return _answer(_success_text(results))
+
+
+def _unverified_hint(unverified: list[StepResult]) -> str:
+    """The parenthetical for step(s) that succeeded without a post-condition.
+
+    A tool may declare *why* it is unverifiable (``StepResult.verify_note``,
+    e.g. ``lock_computer``: the Windows lock screen is not observable).  When
+    every unverifiable step carries such a note the answer says exactly that,
+    so a documented best-effort action does not read like a shortfall.  A step
+    with no note keeps the generic, deliberately cautious wording.
+    """
+    notes = [(r.verify_note or "").strip() for r in unverified]
+    if notes and all(notes):
+        return " (" + "; ".join(notes) + ")"
+    return (
+        f" ({len(unverified)} step(s) succeeded, but completion could "
+        "not be independently verified)"
+    )
 
 
 def _success_text(results: list[StepResult]) -> str:

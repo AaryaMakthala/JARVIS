@@ -51,6 +51,14 @@ build/
 .ruff_cache/
 .mypy_cache/
 .pytest_cache/
+.hypothesis/
+
+# Local test/tooling artifacts (may be regenerated; never commit runtime output)
+# NOTE: final-results.xml and server_diff_review.txt are already tracked; run
+# `git rm --cached <file>` once so these entries take effect.
+final-results.xml
+server_diff_review.txt
+
 
 # OS files
 .DS_Store

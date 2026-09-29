@@ -211,12 +211,29 @@ def _run_lock_computer(args: LockComputerArgs, ctx: ToolContext) -> ToolResult:
     )
 
 
+#: Reported when ``lock_computer`` succeeded: ``LockWorkStation`` is
+#: asynchronous (winlogon switches to the secure desktop after it returns) and
+#: the lock state is not readable from a user-mode process, so there is no
+#: deterministic post-condition to check.  ``verified`` therefore stays ``None``
+#: (docs/04 §2.4: "Best effort"), and this note keeps the final answer
+#: accurate instead of the generic "could not be independently verified".
+_LOCK_VERIFY_NOTE = (
+    "best-effort action: the Windows lock screen cannot be observed from this process"
+)
+
+
 def _verify_lock_computer(
     args: LockComputerArgs, result: ToolResult, ctx: ToolContext
 ) -> ToolResult:
-    """Best-effort verification: the lock screen state is not observable (docs/04)."""
+    """Best-effort verification: the lock screen state is not observable (docs/04).
+
+    Deliberately does **not** poll, sleep or retry: ``LockWorkStation`` returns
+    before winlogon finishes the switch, so an immediate probe would report a
+    false failure for a lock that is in fact engaging.  ``verified=None`` +
+    :data:`_LOCK_VERIFY_NOTE` is the honest result.
+    """
     del args, ctx
-    return result.model_copy(update={"verified": None})
+    return result.model_copy(update={"verified": None, "verify_note": _LOCK_VERIFY_NOTE})
 
 
 def make_lock_computer_spec() -> ToolSpec:

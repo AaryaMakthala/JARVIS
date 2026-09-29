@@ -133,6 +133,7 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         error=result.error,
         tainted=result.tainted,
         verified=result.verified,
+        verify_note=result.verify_note,
         duration_ms=elapsed_ms,
     )
     return append_result(state, step_result)

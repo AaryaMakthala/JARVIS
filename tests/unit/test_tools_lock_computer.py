@@ -118,12 +118,18 @@ class TestLockComputerRun:
         assert "LockWorkStation failed" in (result.error or "")
 
     def test_verify_is_best_effort_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """docs/04: verification is 'best effort' -> verified=None, not a claim."""
+        """docs/04: verification is 'best effort' -> verified=None, not a claim.
+
+        The note must explain the missing post-condition, so the final answer
+        is accurate instead of reading like a verification shortfall.
+        """
         _install_windll(monkeypatch, 1)
         spec = make_lock_computer_spec()
         raw = spec.run(LockComputerArgs(), _ctx())
         verified = spec.apply_verify(LockComputerArgs(), raw, _ctx())
         assert verified.verified is None
+        assert "best-effort" in verified.verify_note
+        assert "cannot be observed" in verified.verify_note
 
 
 # ── Registry + policy integration ───────────────────────────────────────

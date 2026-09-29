@@ -140,20 +140,63 @@ class OpenWakeWordDetector:
         )
 
 
+def import_error() -> str | None:
+    """Return why ``openwakeword`` cannot be imported, or ``None`` if it can.
+
+    :func:`create` returns ``None`` for three very different situations, and a
+    real-machine bug proved how misleading the single "not installed" message
+    was: ``openwakeword`` *was* installed; importing it failed one level down,
+    in ``onnxruntime``, because its native extension needs the Microsoft
+    Visual C++ runtime (``DLL load failed while importing
+    onnxruntime_pybind11_state``).  ``jarvis voice doctor`` calls this so the
+    failure text names the real cause instead of telling the user to install a
+    package that is already present.
+
+    Read-only and side-effect free: one import attempt, no download, no retry.
+    """
+    try:
+        import openwakeword.model  # noqa: F401 - import presence is the check
+    except Exception as exc:  # noqa: BLE001 - any import failure is the answer
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 def create(
     model_name: str = _DEFAULT_MODEL,
     threshold: float = _DEFAULT_THRESHOLD,
 ) -> OpenWakeWordDetector | None:
-    """Create a detector; returns ``None`` if openwakeword is not installed.
+    """Create a detector; returns ``None`` if the backend cannot be loaded.
 
-    The model file is downloaded on first use by openWakeWord.
+    ``None`` means one of: openwakeword is not installed, a dependency it
+    imports is broken (see :func:`import_error`), or the model itself could not
+    be loaded.  The real exception is always logged, so the diagnosis is never
+    guessed from the return value.  The model file is shipped inside the
+    openwakeword package for the pre-trained models; nothing is downloaded
+    here.
     """
     try:
         from openwakeword.model import Model as OwwModel
+    except ModuleNotFoundError as exc:
+        if (exc.name or "").split(".")[0] == "openwakeword":
+            logger.warning(
+                "openwakeword not installed — wake-word detection unavailable "
+                "(install with: pip install openwakeword)"
+            )
+        else:
+            # The package exists but a transitive dependency is missing.
+            logger.error(
+                "openwakeword is installed but its dependency %r is missing — "
+                "wake-word detection unavailable",
+                exc.name,
+            )
+        return None
     except ImportError:
-        logger.warning(
-            "openwakeword not installed — wake-word detection unavailable "
-            "(install with: pip install openwakeword)"
+        # Installed, but the native backend failed to load (most often the
+        # onnxruntime extension and the missing MSVC runtime).  Log the real
+        # traceback: without it the failure looks identical to "not installed".
+        logger.exception(
+            "openwakeword is installed but could not be imported — wake-word "
+            "detection unavailable"
         )
         return None
 

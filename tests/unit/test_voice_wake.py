@@ -164,6 +164,18 @@ class TestCreate:
         monkeypatch.setitem(sys.modules, "openwakeword.model", None)
         assert create() is None
 
+    def test_import_error_reports_a_broken_transitive_dependency(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``import_error`` surfaces the real exception; ``create`` returning
+        ``None`` alone cannot tell "not installed" from "backend broken"."""
+        from jarvis.voice import wake as wake_module
+
+        monkeypatch.setitem(sys.modules, "openwakeword", None)
+        reason = wake_module.import_error()
+        assert reason is not None
+        assert "openwakeword" in reason
+
     def test_create_returns_none_when_model_load_fails(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

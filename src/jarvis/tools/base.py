@@ -56,6 +56,13 @@ class ToolResult(BaseModel):
     error: str | None = None
     tainted: bool = False
     verified: bool | None = None
+    #: Human-facing explanation of the ``verified`` status, set by ``verify()``
+    #: when ``verified is None`` for a step whose completion cannot be observed
+    #: (a *best-effort* action, e.g. ``lock_computer``: the Windows lock screen
+    #: is not visible to a user-mode process).  It replaces the generic
+    #: "could not be independently verified" caveat in the final answer with an
+    #: accurate one, and is never a claim of verification.
+    verify_note: str = ""
 
 
 @dataclass
@@ -139,7 +146,9 @@ class ToolSpec:
                 verified = self.verify(args, result, ctx)
             except Exception:  # noqa: BLE001 - verification must not raise
                 return result.model_copy(update={"verified": False})
-            return result.model_copy(update={"verified": verified.verified})
+            return result.model_copy(
+                update={"verified": verified.verified, "verify_note": verified.verify_note}
+            )
         return result
 
     def path_arg_values(self, args: BaseModel) -> list[tuple[str, str]]:

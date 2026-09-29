@@ -131,18 +131,31 @@ def _input_device_name(input_device: int | str | None) -> tuple[str | None, str 
 
 
 def _probe_wake(wake_word: str) -> list[Check]:
-    """Load the wake model and run one inference on silence."""
+    """Load the wake model and run one inference on silence.
+
+    When the factory returns ``None`` the underlying import failure (if any) is
+    reported alongside the hint: a broken transitive dependency — the real
+    cause seen on the dev PC was onnxruntime failing to load without the
+    Microsoft Visual C++ runtime — otherwise looks like a missing package and
+    sends the user to install something that is already present.
+    """
     from jarvis.voice.wake import create as create_wake
+    from jarvis.voice.wake import import_error as wake_import_error
 
     wake = create_wake(model_name=wake_word)
     if wake is None:
-        return [
-            _check(
-                "wake_model",
-                "FAIL",
-                f"'{wake_word}': {VOICE_HINTS['wake-model-missing']}",
+        reason = wake_import_error()
+        if reason is not None:
+            # The package may well be installed; the import itself failed.  Say
+            # that instead of telling the user to install what is already there.
+            detail = (
+                f"'{wake_word}': openwakeword could not be imported "
+                f"({_sanitize(reason)}); on Windows this is usually the "
+                "Microsoft Visual C++ 2015-2022 Redistributable (x64) being absent"
             )
-        ]
+        else:
+            detail = f"'{wake_word}': {VOICE_HINTS['wake-model-missing']}"
+        return [_check("wake_model", "FAIL", detail)]
     try:
         wake.reset()
         result = wake.detect(AudioSegment(samples=[0.0] * 1280))

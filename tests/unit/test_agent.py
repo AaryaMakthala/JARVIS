@@ -256,3 +256,23 @@ def test_respond_marks_unverified_success_honestly() -> None:
     assert "could not be independently verified" in out["final_answer"]
     assert "Could not complete" not in out["final_answer"]
     assert "failed" not in out["final_answer"].lower()
+
+
+def test_respond_uses_a_best_effort_verify_note_when_present() -> None:
+    """A step that says *why* it is unverifiable reads accurately, not as a
+    shortfall (regression: a successful lock_computer reported "...could not
+    be independently verified" for an action that has no post-condition)."""
+    results = [
+        StepResult(
+            step_id="s1",
+            ok=True,
+            output="Windows workstation locked",
+            verified=None,
+            verify_note="best-effort action: the Windows lock screen cannot be observed",
+        )
+    ]
+    out = respond({"results": results}, None)
+    assert out["final_answer"].startswith("Windows workstation locked")
+    assert "cannot be observed" in out["final_answer"]
+    assert "could not be independently verified" not in out["final_answer"]
+    assert "Could not complete" not in out["final_answer"]

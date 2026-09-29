@@ -40,6 +40,7 @@ def verify(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             step = plan.steps[idx]
 
     verified = last.verified
+    note = last.verify_note
     if step is not None and last.step_id == step.id and last.ok:
         spec = ctx.registry.get_optional(step.tool)
         if spec is not None:
@@ -55,11 +56,13 @@ def verify(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
                     error=last.error,
                     tainted=last.tainted,
                     verified=last.verified,
+                    verify_note=last.verify_note,
                 )
                 outcome = spec.apply_verify(args, synthetic, ctx.tool_context())
                 verified = outcome.verified
+                note = outcome.verify_note
 
-    bumped = last.model_copy(update={"verified": verified})
+    bumped = last.model_copy(update={"verified": verified, "verify_note": note})
     results[-1] = bumped
 
     max_retries = ctx.settings.agent.max_retries_per_step

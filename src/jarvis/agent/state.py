@@ -71,6 +71,11 @@ class StepResult(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     verified: bool | None = None
+    #: Why ``verified`` is ``None`` (a *best-effort* action such as
+    #: ``lock_computer``); empty for the generic "no independent check ran".
+    #: ``respond`` prefers it over the generic caveat so the final answer is
+    #: accurate instead of implying a shortfall.
+    verify_note: str = ""
     tainted: bool = False  # output contains untrusted external text
     duration_ms: int = 0
 
