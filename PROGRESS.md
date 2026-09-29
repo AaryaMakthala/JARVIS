@@ -2,6 +2,142 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-29 — FIX: "open chrome" latency, spoken stop, prompt shutdown (no commit)
+
+### Root causes (evidence: `%LOCALAPPDATA%/jarvis/jarvis/logs/jarvis.jsonl`, task `v1790675197245`)
+
+**1. `open chrome` never opened anything.** `open_app` ran
+`subprocess.Popen(["chrome.exe"])`; on a stock install `chrome.exe` is **not** on
+`PATH` (verified: `shutil.which("chrome.exe") is None`), it only registers
+`HKLM\…\App Paths\chrome.exe` → `C:\Program Files\Google\Chrome\Application\chrome.exe`,
+which only `ShellExecute` consults. So the tool failed with `WinError 2` in ~4 ms,
+**three times** (`max_retries_per_step = 2`), then the graph called **replan** — a
+second LLM request. Log: 09:46:38.646 tool start → 38.653 third failure → 38.662 replan.
+
+**2. The 39.8 s THINKING stall is provider time, not the tool.** The replan call hit
+Groq 429 five times with bounded backoff (38.7 → 48.97, ~10 s), cooled groq for 60 s,
+fell through to openrouter (50.72), whose structured reply failed to parse and needed a
+16 s repair retry (09:47:06.8). `open_app` itself blocked nothing (4 ms). The only bound
+on the whole run was `VOICE_SUBMIT_TIMEOUT_S = 180 s`, so the loop thread just waited.
+
+**3. Shutdown warning.** `VoiceLoop.stop()` waits 10 s for `_stopped`, but the voice
+thread was inside `_voice_submit` waiting for that same task → `loop thread did not stop
+within 10s`. Not a timeout that needed enlarging: the wait simply had no way to *see*
+that the pipeline was going down.
+
+**4. Spoken stop could not work by construction.** The voice-loop thread is the only
+microphone reader, and it is blocked inside `_voice_submit` for the whole task, so no
+utterance could be heard while `THINKING`. `ctx.cancel` was never wired either
+(`_active_cancel` existed but was referenced nowhere), so even an IPC `cancel` only
+marked the slot and let the graph keep running.
+
+### Fixes (smallest safe change)
+
+| File | Why |
+|---|---|
+| `tools/apps.py` | `resolve_command()`: configured value → `shutil.which` → Windows `App Paths` (HKCU, HKLM, 32-bit view). Popen gets `[executable, *argv[1:]]`; the argument vector still comes from `[apps]` alone, no shell. Unresolvable → honest `ok=False`. |
+| `agent/nodes/__init__.py` | `wrap(node, ctx, cancel)` gates **every** node on a per-task `CancelToken` → `Cancelled`. Bound per *graph*, not on the shared `AppContext`, so an unwinding run can never see the next task's token. |
+| `agent/graph.py`, `agent/runner.py` | `build_graph(..., cancel=)`, `run_task(..., cancel=)`, `resume_task(..., cancel=)`. |
+| `daemon/server.py` | `TaskSlot.cancel`/`.cancelled`; `_worker_run` passes the token and handles `Cancelled` in `_finish_cancelled` (never rewrites the canceller's wording); `_handle_cancel` now actually cancels; `_voice_submit` watches for a spoken stop per bounded slice, honours `_voice_stopping`, and logs a one-shot `elapsed_s`; `_voice_stopping` set first in `_stop_voice()`, cleared on (re)start. |
+| `voice/loop.py` | `_CANCEL_REQUESTS` (fixed vocabulary), `STOP_ACKNOWLEDGEMENT = "Stopped."`, `watch_for_stop()` + `_capture_stop_request()` + `_extract_response()` handling of a cancelled outcome. `_read_command()` gained an optional `listen_timeout_s`. |
+| `voice/status.py` | `stop_request()` → console `[VOICE] STOP REQUESTED` + JSONL `stop_request`. |
+| `tools/apps.py` docs/04 §2.1 | Spec updated to match the resolver. |
+
+### Cancellation semantics
+
+- Trigger: wake word → one short utterance (≤4 s capture, 5 s window) matched against
+  `stop / stop it / cancel / abort / never mind …` **in code** — never the planner.
+- Boundary: the graph checks the token before entering any node, so the interrupted
+  step finishes and *nothing after it runs*; tools already check it in `ToolSpec.execute`.
+- Not interruptible mid-flight: an in-progress HTTP/LLM call and `open_app`'s 8 s
+  `verify()` poll are **not** cancellable — the run stops at the next node boundary and
+  the acknowledgement is spoken immediately, without waiting for the worker.
+- Wording is the module constant `STOP_ACKNOWLEDGEMENT`, reported once locally.
+- Single microphone reader: no watch while `slot.confirm_payload` is set, and
+  `watch_for_stop` re-checks `keep_watching` before every frame.
+- The detector is re-armed **once per watch session**, never per slice (a per-slice
+  `reset()` would starve openWakeWord's ~1.5 s window and make the wake word
+  undetectable); `_reset_voice_state()` ends the session.
+- No polling/retry/second listener/AGC: one bounded slice of audio (0.25 s, wall-clock)
+  alternates with one slot wait; each iteration is bounded either way, so the wait can
+  never spin.
+
+### Checks (focused only)
+
+ruff clean on all changed files. `pytest -q`, focused selections only:
+`test_tools_apps.py` **12 passed**; `test_agent.py` **13 passed** (incl.
+`test_cancelled_run_stops_before_the_next_step` and its no-cancel control);
+`test_voice_loop.py` **9 selected passed** (`TestInFlightStopWatch`,
+`TestCancelledInteraction`, and the normal-interaction regression
+`test_successful_interaction_speaks_and_keeps_listening`); `test_daemon_voice.py`
+**6 new passed** (`TestSpokenStopCancellation`, `TestShutdownDoesNotWaitForABlockedTask`)
++ **8 existing** voice-bridge/worker/IPC-cancel regressions still green.
+`resolve_command("chrome.exe")` verified against the real registry on this PC.
+No full suite, no integration, no benchmarks, no commit/push.
+
+## Session 2026-09-29 — DIAG+FIX: far-field wake sensitivity (threshold re-calibration) (no commit)
+
+### Measurements (real model + real mic on the dev PC)
+
+Method: the real `OpenWakeWordDetector` via `create()`, fed 16 kHz audio (synthesised
+clips resampled 22050 → 16000), plus one real speaker → room → mic pass through the
+actual Intel Smart Sound array mic with `sd.playrec`.
+
+| case | int16 RMS | max_score |
+|---|---|---|
+| "Hey Jarvis", normal level | 2122 | 0.9986 |
+| same, −20 dB | 212 | 0.9986 |
+| same, −40 dB | 21 | 0.9987 |
+| same, −60 dB | 2.1 | 0.9988 |
+| real mic, speaker→room→mic, loud | ~79 | 0.9766 |
+| real mic, speaker→room→mic, quiet (15%) | ~41 | 0.4909 |
+| "the weather is nice today" (non-wake) | 2122 | 0.0000 |
+| "hey service" (nearest non-wake phrase) | 2122 | 0.0866 |
+| "hey guys" / "hey there" / "hey buddy" | 2122 | ≤ 0.0054 |
+| "hey Charles" / "hey Travis" / "Jarvis" | 2122 | 0.39–0.87 (already trigger at 0.25) |
+
+### Root cause
+
+**Not the audio path.** `audio_input._block_to_float` (int16 ÷ 32768) and `wake.detect`
+(float × 32767 → int16) form an amplitude-faithful round trip, and the wake wait has
+**no** amplitude/energy/debounce gate (`_wait_for_wake` calls `detect()` on every
+1280-sample frame; `reset()` runs once per re-arm, not per frame). The table shows the
+pipeline is **level-invariant over 60 dB**, so a quiet far-field signal is not
+attenuated here and no gain/AGC is warranted — the old “score scales with microphone
+gain” note in `config.py` was simply wrong and is now corrected. A far-field miss is a
+genuinely lower score for the acoustically degraded utterance, so the score boundary is
+the only lever. Earlier live logs already recorded `max_score=0.4363` for a real human
+"hey jarvis" at threshold 0.5, which never fired at all — so “it used to work from
+farther away” cannot be attributed to a code change.
+
+### Fix (smallest safe change)
+
+`_DEFAULT_THRESHOLD` 0.25 → **0.15** in `voice/wake.py`, with the matching `config.py`
+default (`VoiceSettings.wake_threshold` and `DEFAULT_CONFIG_TOML`). 0.15 sits in the
+measured *empty band* between the non-wake ceiling (0.0866) and the phrase family that
+already triggers at 0.25 (0.39+): it adds **no** false trigger in the measured set, keeps
+~1.7× margin over the measured non-wake floor, and gives ~40% more headroom for a
+degraded far-field utterance. Nothing else changed — no gate, gain, AGC, framing change,
+polling or loop. `[voice] wake_threshold` in `config.toml` still overrides it.
+
+### Checks
+
+ruff clean on the 3 touched files; `pytest -q test_voice_wake.py test_config.py
+test_voice_doctor.py` → 43 passed. The calibration test now pins the band
+(`0.087 < threshold < 0.4363`) and asserts 0.44 / 0.30 / 0.20 detect while 0.09 / 0.05 do
+not. Real acoustic check on the dev PC's mic (speaker → room → mic): loud → 0.9766,
+quiet → 0.4909, both TRIGGER. No full suite, no benchmarks.
+
+### Remaining limitation (needs the user's own voice)
+
+The close-vs-far *human* score can only be measured by speaking. Live markers:
+`voice detector sample ... max_score=… threshold=…` (INFO, ~2 s) and
+`voice boundary: waiting for wake word ... audio_rms=…` (INFO, ~3 s). If far-field still
+misses at 0.15, lower `wake_threshold` toward 0.10 (still above the measured 0.0866
+ceiling); if false triggers appear, raise it back toward 0.25. **The daemon must be
+restarted** to pick up the new default. Windows microphone-array processing (noise
+suppression / AEC) is environmental and outside the code path.
+
 ## Session 2026-09-29 — FIX: post-wake command capture + incomplete-STT handling (no commit)
 
 ### Case 1 — wake phrase reaching the planner (STT "هداريس" → "Hello! How can I help?")

@@ -45,6 +45,7 @@ from jarvis.voice.loop import (
     _LOOSE_YES_WORDS,
     _STRICT_YES_WORDS,
     REPEAT_PROMPT,
+    STOP_ACKNOWLEDGEMENT,
     VoiceLoop,
     _approval_words,
     _transcript_problem,
@@ -135,6 +136,11 @@ class _PhaseSpy(VoiceStatusReporter):
         self.recoveries: list[str] = []
         self.ready_count = 0
         self.wake_detected_count = 0
+        self.stop_requests = 0
+
+    def stop_request(self) -> None:
+        self.stop_requests += 1
+        super().stop_request()
 
     @property
     def idle_timeouts(self) -> int:
@@ -2266,3 +2272,170 @@ class TestTranscriptUsabilityGate:
         loop._run_interaction()
         assert submitted == []  # the planner/tools were never reached
         assert tts.spoken == ["Yes?", REPEAT_PROMPT]
+
+
+# ── Spoken stop: cancelling the task that is running right now ─────────
+
+
+class TestInFlightStopWatch:
+    """A spoken "stop" cancels an in-flight task without touching the planner.
+
+    The watch re-uses the wake detector and reads audio on the **voice-loop
+    thread** (the one thread that already owns the microphone), for one bounded
+    slice at a time, only while the daemon's task wait is running.  A wake word
+    followed by a fixed cancel vocabulary is cancelled locally; a wake word
+    followed by anything else is dropped; nothing is ever submitted.
+    """
+
+    @staticmethod
+    def _loop(
+        *, transcript: str, spy: _PhaseSpy
+    ) -> tuple[VoiceLoop, FakeAudioInput, FakeSTT, list[str]]:
+        submitted: list[str] = []
+        stt = FakeSTT(results=[STTResult(text=transcript, language="en")])
+        audio = FakeAudioInput(
+            # One wake frame for the watch, then the utterance; every read after
+            # that is the fake's exhausted-input silence, which ends capture.
+            segments=[make_speech("wake", duration_s=0.1), make_speech("stop", duration_s=0.4)]
+        )
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=FakeWakeWord(detect_fn=lambda _s: WakeWordResult(detected=True)),
+            stt=stt,
+            tts=FakeTTS(),
+            submit_task=lambda text, source: submitted.append(text),
+            reporter=spy,
+        )
+        return loop, audio, stt, submitted
+
+    def test_cancel_word_cancels_locally_and_never_submits(self) -> None:
+        """"stop" is matched in code: reported once, no planner, no task."""
+        spy = _PhaseSpy()
+        loop, _audio, stt, submitted = self._loop(transcript=" Stop! ", spy=spy)
+
+        assert loop.watch_for_stop(1.0) == (True, True)
+        assert spy.stop_requests == 1  # one local report, on the console/JSONL
+        assert submitted == []  # the cancel never became a task for the agent
+        assert len(stt.transcribe_calls) == 1  # exactly one captured utterance
+
+    def test_other_utterances_are_dropped_and_the_task_keeps_running(self) -> None:
+        spy = _PhaseSpy()
+        loop, _audio, _stt, submitted = self._loop(transcript="open notepad", spy=spy)
+
+        assert loop.watch_for_stop(1.0) == (True, False)
+        assert spy.stop_requests == 0
+        assert submitted == []  # not cancelled *and* not submitted as a command
+
+    def test_watch_stands_down_when_another_reader_owns_the_microphone(self) -> None:
+        """``keep_watching`` False stops the watch before it reads a frame.
+
+        The confirmation/clarification dialogue runs on the worker thread; the
+        single-reader rule is what keeps the microphone uncontended.  ``watched``
+        must be False so the daemon waits on its slot instead of re-watching a
+        microphone it must not touch (which would spin the loop thread).
+        """
+        spy = _PhaseSpy()
+        loop, audio, _stt, _submitted = self._loop(transcript="stop", spy=spy)
+
+        assert loop.watch_for_stop(1.0, keep_watching=lambda: False) == (False, False)
+        assert audio.read_calls == []
+        assert spy.stop_requests == 0
+
+    def test_cancel_without_a_wake_detector_stands_down(self) -> None:
+        spy = _PhaseSpy()
+        loop, _audio, _stt, _submitted = self._loop(transcript="stop", spy=spy)
+        loop._wake_detector = None
+        assert loop.watch_for_stop(1.0) == (False, False)
+        assert spy.stop_requests == 0
+
+    def test_the_detector_is_rearmed_once_per_session_not_per_slice(self) -> None:
+        """A per-slice reset would make the wake word undetectable.
+
+        openWakeWord scores a contiguous ~1.5 s window; the daemon calls the
+        watch once per 0.25 s slice while a task runs, so re-arming every call
+        would never let "Hey Jarvis" reach threshold.  The session arms once, on
+        the first slice, and again only after the loop's own re-arm.
+        """
+        spy = _PhaseSpy()
+        audio = FakeAudioInput(segments=[make_speech("x", duration_s=0.1)] * 4)
+        wake = FakeWakeWord(detect_fn=lambda _s: WakeWordResult(detected=False))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=wake,
+            stt=FakeSTT(),
+            tts=FakeTTS(),
+            reporter=spy,
+        )
+
+        assert loop.watch_for_stop(0.05) == (True, False)
+        assert (wake.reset_calls, audio.flush_calls) == (1, 1)  # armed once
+
+        assert loop.watch_for_stop(0.05) == (True, False)
+        assert (wake.reset_calls, audio.flush_calls) == (1, 1)  # still armed
+
+        # The loop's own re-arm ends the session, so the next task's watch
+        # starts from a clean window instead of inheriting this one.
+        loop._reset_voice_state()
+        assert loop._stop_watch_armed is False
+        assert loop.watch_for_stop(0.05) == (True, False)
+        assert wake.reset_calls == 3  # session 1 (1) + loop re-arm (2) + session 2 (3)
+
+
+
+class TestCancelledInteraction:
+    """A task the daemon cancelled is answered locally and re-arms once.
+
+    The acknowledgement is the module constant, so deciding to stop can never
+    be the model's opinion, and the flow is the ordinary one: THINKING ->
+    SPEAKING -> RESETTING -> READY with no illegal transition.
+    """
+
+    @staticmethod
+    def _cancelled_outcome() -> Any:
+        return SimpleNamespace(cancelled=True, final_answer=None, error=None, confirmation=None)
+
+    def test_cancelled_outcome_is_answered_with_the_local_acknowledgement(self) -> None:
+        loop, _audio, _wake, _stt, _tts = _make_loop()
+        assert loop._extract_response(self._cancelled_outcome()) == STOP_ACKNOWLEDGEMENT
+
+    def test_a_failed_outcome_is_still_an_error_not_an_acknowledgement(self) -> None:
+        """Only a *cancelled* outcome gets the ack; failures stay honest."""
+        loop, _audio, _wake, _stt, _tts = _make_loop()
+        failed = SimpleNamespace(
+            cancelled=False,
+            final_answer=None,
+            error="command timed out — try again",
+            confirmation=None,
+        )
+        assert loop._extract_response(failed) != STOP_ACKNOWLEDGEMENT
+        assert "timed out" in (loop._extract_response(failed) or "")
+
+    def test_cancelled_interaction_speaks_once_and_re_arms(self) -> None:
+        """The full path: one submission, the local ack, then a clean READY."""
+        submitted: list[str] = []
+        spy = _PhaseSpy()
+        tts = FakeTTS()
+
+        def submit(text: str, source: str) -> Any:
+            submitted.append(text)
+            return self._cancelled_outcome()
+
+        loop, _audio, wake, _stt, _tts = _make_loop(
+            submit_task=submit,
+            tts=tts,
+            stt_results=[STTResult(text="open chrome", language="en")],
+            audio_segments=[make_speech("x", duration_s=0.5), make_silence(2.0)],
+        )
+        loop._reporter = spy
+
+        loop._run_interaction()
+        loop._rearm()
+
+        # The agent was asked exactly once and answered with the local ack.
+        assert submitted == ["open chrome"]
+        assert tts.spoken == ["Yes?", STOP_ACKNOWLEDGEMENT]
+        assert spy.stop_requests == 0  # the daemon-side stop was already reported
+        # Ordinary lifecycle, exactly one re-arm, no skipped or illegal stage.
+        assert spy.phases[-2:] == ["RESETTING", "READY"]
+        assert spy.illegal_transitions == []
+        assert wake.reset_calls >= 1

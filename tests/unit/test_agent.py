@@ -17,10 +17,19 @@ from jarvis.agent.graph import build_secure_serde
 from jarvis.agent.nodes.act import act
 from jarvis.agent.nodes.respond import respond
 from jarvis.agent.runner import resume_task, run_task
+from jarvis.agent.schemas import ActionIntent
 from jarvis.agent.state import Decision, Plan, Step, StepResult
 from jarvis.config import Settings
 from jarvis.llm.client import FakeLLM
-from support import approve, brain_action, make_spec, registry_with
+from jarvis.tools.base import Cancelled, CancelToken, ToolContext, ToolResult, ToolSpec
+from support import (
+    TextArgs,
+    approve,
+    brain_action,
+    brain_steps,
+    make_spec,
+    registry_with,
+)
 
 # ---------------------------------------------------------------------------
 # Decision schema (typed confirmation must stay a str | None)
@@ -121,6 +130,81 @@ def test_runner_reads_state_via_graph_not_checkpointer(tmp_path: Any) -> None:
         assert isinstance(outcome2.state["results"][0], StepResult)
     finally:
         conn.close()
+
+
+def test_cancelled_run_stops_before_the_next_step() -> None:
+    """A cancel stops the run at the next node: no further step executes.
+
+    The gate lives in ``nodes.wrap``, so it is checked before *every* node -
+    including the second ``act``.  The first tool cancels the run while it runs
+    (exactly what a spoken "stop" does), and the second tool must never be
+    reached: a cancel that let the rest of the plan run would be a machine that
+    ignores the user.
+    """
+    ran: list[str] = []
+    second_record: list[tuple[str, dict[str, Any]]] = []
+    cancel = CancelToken()
+    cancel_on_run = [True]
+
+    def run_first(args: Any, ctx: ToolContext) -> ToolResult:
+        ran.append("first")
+        if cancel_on_run[0]:
+            cancel.cancel()
+        return ToolResult(ok=True, output="first done")
+
+    first = ToolSpec(
+        name="fake_first",
+        description="fake first tool",
+        args_model=TextArgs,
+        base_tier=0,
+        run=run_first,
+    )
+    decisions = FakeLLM(
+        [
+            brain_steps(
+                [
+                    ActionIntent(tool="fake_first", args={"text": "a"}),
+                    ActionIntent(tool="fake_second", args={"text": "b"}),
+                ]
+            )
+        ]
+    )
+    ctx = make_app_context(
+        Settings(),
+        llm=decisions,
+        registry=registry_with(
+            first, make_spec("fake_second", base_tier=0, record=second_record)
+        ),
+    )
+
+    with pytest.raises(Cancelled):
+        run_task(ctx, None, "do both", cancel=cancel)
+
+    assert ran == ["first"]
+    assert second_record == []  # the cancelled run never reached step two
+
+    # Control: the same plan with nothing cancelling runs both steps, so the
+    # assertion above is about the gate and not about a plan that never had a
+    # second step to run.
+    cancel_on_run[0] = False
+    control = make_app_context(
+        Settings(),
+        llm=FakeLLM(
+            [
+                brain_steps(
+                    [
+                        ActionIntent(tool="fake_first", args={"text": "a"}),
+                        ActionIntent(tool="fake_second", args={"text": "b"}),
+                    ]
+                )
+            ]
+        ),
+        registry=registry_with(
+            first, make_spec("fake_second", base_tier=0, record=second_record)
+        ),
+    )
+    run_task(control, None, "do both")
+    assert [name for name, _ in second_record] == ["fake_second"]
 
 
 def test_runner_state_has_no_password_residue(tmp_path: Any) -> None:

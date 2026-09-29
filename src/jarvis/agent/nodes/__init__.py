@@ -36,6 +36,7 @@ from jarvis.agent.nodes.replan import replan
 from jarvis.agent.nodes.respond import respond
 from jarvis.agent.nodes.validate import validate
 from jarvis.agent.nodes.verify import verify
+from jarvis.tools.base import CancelToken
 
 __all__ = [
     "act",
@@ -62,10 +63,29 @@ __all__ = [
 
 
 def wrap(
-    node: Callable[..., dict[str, Any]], ctx: Any
+    node: Callable[..., dict[str, Any]],
+    ctx: Any,
+    cancel: CancelToken | None = None,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    """Bind a node function to its AppContext for use inside the graph."""
-    return lambda state: node(state, ctx)
+    """Bind a node function to its AppContext for use inside the graph.
+
+    ``cancel`` (optional) is the **per-task** token: when the user cancels a
+    run, the next node to be entered raises :class:`~jarvis.tools.base.Cancelled`
+    instead of executing, so the remaining steps of the plan are never planned
+    or acted on.  The check belongs here because ``wrap`` is the single choke
+    point every node passes through.  The token is bound per *graph* rather than
+    on the shared :class:`~jarvis.agent.context.AppContext` on purpose: a
+    cancelled run can still be unwinding while the next task starts, and a
+    shared field would let the new task's token mask the old task's cancel.
+    """
+    if cancel is None:
+        return lambda state: node(state, ctx)
+
+    def _gated(state: dict[str, Any]) -> dict[str, Any]:
+        cancel.check()
+        return node(state, ctx)
+
+    return _gated
 
 
 def route_after_intake(state: dict[str, Any]) -> str:

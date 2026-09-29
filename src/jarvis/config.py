@@ -91,10 +91,11 @@ port = 0
 enabled = false
 wake_word = "hey_jarvis"
 # openWakeWord score at/above which the wake word counts as detected.  Lower
-# than the library's 0.5 default on purpose: the score scales with microphone
-# gain, and 0.25 was chosen from the measured peak on the dev PC.  Raise it in
-# a room that false-triggers.
-wake_threshold = 0.25
+# than the library's 0.5 default on purpose: a real far-field "hey jarvis"
+# scores lower than a close one, and 0.15 is calibrated between the measured
+# non-wake ceiling (0.087) and the phrases that already trigger.  Raise it in a
+# room that false-triggers.
+wake_threshold = 0.15
 stt_model = "base"
 tts_backend = "piper"
 silence_threshold = 0.01
@@ -274,11 +275,13 @@ class VoiceSettings(BaseModel):
     enabled: bool = False
     wake_word: str = "hey_jarvis"
     #: openWakeWord score at/above which ``wake_word`` counts as detected.
-    #: Deliberately below the library default (0.5): the score scales with
-    #: microphone gain, so a fixed 0.5 is not calibrated for every machine.
-    #: 0.25 is derived from the measured peak on the dev PC (see
-    #: :mod:`jarvis.voice.wake`); raise it in a room that false-triggers.
-    wake_threshold: float = 0.25
+    #: Deliberately below the library default (0.5): a far-field utterance is
+    #: acoustically degraded and scores lower than a close one (amplitude alone
+    #: does not change the score - the pipeline is level-invariant).  0.15 is
+    #: calibrated between the measured non-wake ceiling (0.087) and the phrases
+    #: that already trigger; see :mod:`jarvis.voice.wake`.  Raise it in a room
+    #: that false-triggers.
+    wake_threshold: float = 0.15
     stt_model: str = "base"
     tts_backend: str = "piper"
     input_device: int | str | None = None

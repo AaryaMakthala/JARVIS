@@ -56,7 +56,7 @@ from jarvis.logging_setup import get_logger
 from jarvis.memory import open_memory
 from jarvis.policy.unlock import UnlockManager
 from jarvis.secrets import SecretStore
-from jarvis.tools.base import CancelToken
+from jarvis.tools.base import Cancelled, CancelToken
 
 try:
     from jarvis.voice.service import VoiceService
@@ -186,6 +186,14 @@ class TaskSlot:
     # survives queueing and promotion — the dispatch loop uses it to route
     # confirm requests and final results back to the right client).
     owner_id: str | None = None
+    #: This task's own cancellation token.  The graph checks it before entering
+    #: every node, so a cancel stops the run at the next step instead of leaving
+    #: the remaining plan to execute.  Per-slot on purpose: a cancelled run can
+    #: still be unwinding when the next task is promoted, and a single shared
+    #: token would let one task's cancel leak into another's.
+    cancel: CancelToken = field(default_factory=CancelToken)
+    #: True once a cancellation was requested (voice "stop" or IPC cancel).
+    cancelled: bool = False
     # Worker-thread signals
     event: threading.Event = field(default_factory=threading.Event)
     confirm_payload: dict[str, Any] | None = None
@@ -204,12 +212,15 @@ class _VoiceOutcome:
     """Minimal outcome object returned to the voice loop by ``_voice_submit``.
 
     Confirmation is always resolved inside the worker before this is returned,
-    which is why ``confirmation`` is fixed to ``None``.
+    which is why ``confirmation`` is fixed to ``None``.  ``cancelled`` is set
+    when the task was stopped on request (a spoken "stop" or a shutdown) and the
+    loop answered with its own fixed acknowledgement instead of an error.
     """
 
     final_answer: str | None = None
     error: str | None = None
     confirmation: None = None
+    cancelled: bool = False
 
 
 # ── Server ───────────────────────────────────────────────────────────────
@@ -253,7 +264,12 @@ class DaemonServer:
         self._clients: dict[str, ClientConnection] = {}
         self._queue: list[TaskSlot] = []
         self._active: TaskSlot | None = None
-        self._active_cancel = CancelToken()
+        #: Set for the whole of a voice-pipeline shutdown (Ctrl+C, `jarvis off`).
+        #: The voice-loop thread can be blocked waiting for an in-flight task, and
+        #: that wait only unwinds when it can *see* that the pipeline is going
+        #: down - without it ``VoiceLoop.stop()`` waits out its 10 s join and
+        #: reports "loop thread did not stop within 10s".
+        self._voice_stopping = threading.Event()
         self._lock = threading.Lock()
         self._shutdown_event = asyncio.Event()
         self._task_event = asyncio.Event()  # signals the loop: "check _active"
@@ -493,6 +509,7 @@ class DaemonServer:
 
         if self._voice_service is not None:
             self._refresh_ctx_voice_bridge()
+            self._voice_stopping.clear()
             try:
                 msg = self._voice_service.start()
                 if self._service_state(self._voice_service) == "error":
@@ -682,7 +699,13 @@ class DaemonServer:
             return None
 
     def _stop_voice(self) -> None:
-        """Stop the voice pipeline on shutdown / toggle-off (idempotent)."""
+        """Stop the voice pipeline on shutdown / toggle-off (idempotent).
+
+        ``_voice_stopping`` is set first: the voice-loop thread may be blocked
+        waiting for an in-flight task (see :meth:`_voice_submit`), and that wait
+        only unwinds once it can see the pipeline is going down.
+        """
+        self._voice_stopping.set()
         if self._voice_service is None:
             return
         try:
@@ -961,6 +984,7 @@ class DaemonServer:
                 return
 
         self._refresh_ctx_voice_bridge()
+        self._voice_stopping.clear()
         text = self._voice_service.start()
         if self._service_state(self._voice_service) == "error":
             code = self._service_error_code(self._voice_service) or "loop-crashed"
@@ -1051,7 +1075,8 @@ class DaemonServer:
                 threading.Thread(target=self._worker_run, args=(slot,), daemon=True).start()
                 logger.info("voice task started (task_id=%s)", task_id)
 
-        deadline = time.monotonic() + VOICE_SUBMIT_TIMEOUT_S
+        started = time.monotonic()
+        deadline = started + VOICE_SUBMIT_TIMEOUT_S
         waited = 0.0
         while not slot.done:
             remaining = deadline - time.monotonic()
@@ -1064,14 +1089,40 @@ class DaemonServer:
                     task_id,
                 )
                 return _VoiceOutcome(error="command timed out — try again")
-            slot.event.wait(min(_VOICE_POLL_INTERVAL_S, max(remaining, 0.001)))
-            slot.event.clear()
+            if self._voice_stopping.is_set():
+                # The pipeline is going down (Ctrl+C / `jarvis off`).  Do not hold
+                # the loop thread for the rest of the timeout: cancel the task so
+                # the worker stops at its next node boundary, and let
+                # VoiceLoop.stop() join the thread promptly.
+                logger.info(
+                    "voice task abandoned: the voice pipeline is stopping (task_id=%s)", task_id
+                )
+                self._cancel_voice_task(slot)
+                return _VoiceOutcome(cancelled=True)
+            watched, stop_requested = self._watch_for_stop(
+                slot, min(_VOICE_POLL_INTERVAL_S, remaining)
+            )
+            if stop_requested:
+                logger.info(
+                    "voice task cancelled by a spoken stop request (task_id=%s, elapsed=%.1fs)",
+                    task_id,
+                    time.monotonic() - started,
+                )
+                self._cancel_voice_task(slot)
+                return _VoiceOutcome(cancelled=True)
+            if not watched:
+                # Nothing to watch (no live loop, a confirmation owns the mic,
+                # or the detector failed): wait on the slot instead.  One of the
+                # two always bounds the iteration, so this wait loop can never
+                # spin the voice-loop thread.
+                slot.event.wait(min(_VOICE_POLL_INTERVAL_S, max(remaining, 0.001)))
+                slot.event.clear()
             waited += _VOICE_POLL_INTERVAL_S
             if waited >= 30.0:
                 logger.info(
                     "voice task still waiting (task_id=%s, elapsed=%.1fs)",
                     task_id,
-                    time.monotonic() - (deadline - VOICE_SUBMIT_TIMEOUT_S),
+                    time.monotonic() - started,
                 )
                 waited = 0.0
 
@@ -1079,11 +1130,65 @@ class DaemonServer:
             logger.warning("voice task errored (task_id=%s, error=%s)", task_id, slot.error)
             return _VoiceOutcome(error=slot.error)
         logger.info(
-            "voice task finished (task_id=%s, final_answer_chars=%d)",
+            "voice task finished (task_id=%s, elapsed_s=%.1f final_answer_chars=%d)",
             task_id,
+            time.monotonic() - started,
             len(slot.result_text or ""),
         )
         return _VoiceOutcome(final_answer=slot.result_text)
+
+    def _cancel_voice_task(self, slot: TaskSlot) -> None:
+        """Stop the in-flight task at its next node boundary (idempotent).
+
+        Sets the slot's own token - the graph checks it before entering every
+        node - so nothing further is planned, and no further tool runs.  The
+        caller (the voice-loop thread) does **not** wait for the worker: waiting
+        is what wedges the loop when a provider call is slow.  The worker
+        finishes its run, sees the token, flags the slot and wakes dispatch.
+        """
+        slot.cancelled = True
+        slot.cancel.cancel()
+        slot.done = True
+        slot.event.set()
+        self._wake_dispatch()
+
+    def _can_watch_for_stop(self, slot: TaskSlot) -> bool:
+        """Whether the voice loop may listen for a "stop" right now.
+
+        False when there is no live loop, and false while a confirmation or
+        clarification is pending: that dialogue runs on the worker thread, and
+        the microphone must have exactly one reader.
+        """
+        if slot.done or slot.confirm_payload is not None:
+            return False
+        loop = self._ctx_voice_loop()
+        return callable(getattr(loop, "watch_for_stop", None))
+
+    def _watch_for_stop(self, slot: TaskSlot, budget_s: float) -> tuple[bool, bool]:
+        """Listen for a spoken cancel request for one bounded slice.
+
+        The audio itself is read by the voice loop (it owns the microphone on
+        this thread); this only lends it the slot's end condition, so a
+        confirmation starting on the worker thread or a finished task stops the
+        watch within one frame.  Returns ``(watched, stop_requested)`` exactly as
+        :meth:`VoiceLoop.watch_for_stop` does, with ``False, False`` whenever the
+        watch could not run - the caller then waits on the slot instead, which is
+        what keeps both the wait loop and the shutdown path bounded.
+        """
+        if not self._can_watch_for_stop(slot):
+            return False, False
+        loop = self._ctx_voice_loop()
+        if loop is None:
+            return False, False
+        try:
+            watched, stop_requested = loop.watch_for_stop(
+                budget_s,
+                keep_watching=lambda: slot.confirm_payload is None and not slot.done,
+            )
+            return bool(watched), bool(stop_requested)
+        except Exception:  # a failed watch must never fail the task
+            logger.warning("stop watch failed; continuing the task", exc_info=True)
+            return False, False
 
     def _ctx_voice_loop(self) -> Any | None:
         """The live voice loop driving confirmations, or ``None``."""
@@ -1224,9 +1329,13 @@ class DaemonServer:
                 slot.text,
                 source=slot.source,
                 thread_id=task_id,
+                cancel=slot.cancel,
             )
 
             while True:
+                if slot.cancel.cancelled:
+                    self._finish_cancelled(slot)
+                    return
                 if outcome.error:
                     slot.error = outcome.error
                     slot.done = True
@@ -1270,13 +1379,22 @@ class DaemonServer:
                         if slot.done:
                             return  # cancelled while waiting (slot already finished)
                         resume_value = answer_value
-                    outcome = resume_task(self._ctx, saver, task_id, resume_value)
+                    outcome = resume_task(
+                        self._ctx, saver, task_id, resume_value, cancel=slot.cancel
+                    )
                     continue
                 else:
                     # No confirmation and no final answer — shouldn't happen, but be safe
                     slot.done = True
                     self._wake_dispatch()
                     return
+
+        except Cancelled:
+            # The user cancelled while a node was running: the run stopped at a
+            # node boundary, so no further step of the plan executed.  The
+            # canceller owns the wording and the slot flags, so nothing is
+            # rewritten here.
+            self._finish_cancelled(slot)
 
         except Exception as exc:  # noqa: BLE001
             slot.error = f"{type(exc).__name__}: {exc}"
@@ -1285,6 +1403,20 @@ class DaemonServer:
             if slot.owner_id == VOICE_OWNER:
                 slot.event.set()
             logger.error("worker for %s failed: %s", task_id, slot.error)
+
+    def _finish_cancelled(self, slot: TaskSlot) -> None:
+        """Book-keep a task that stopped at a cancellation boundary.
+
+        Deliberately does not touch ``slot.error`` / ``slot.result_text``: the
+        canceller already decided the wording (the voice path answers with its
+        own fixed acknowledgement, the IPC path with "cancelled by user").
+        """
+        slot.cancelled = True
+        slot.done = True
+        self._wake_dispatch()
+        if slot.owner_id == VOICE_OWNER:
+            slot.event.set()
+        logger.info("worker for %s stopped at a cancellation boundary", slot.task_id)
 
     # ── confirmation response ──────────────────────────────────────────
 
@@ -1381,7 +1513,10 @@ class DaemonServer:
         """Cancel a running or queued task."""
         with self._lock:
             if self._active and self._active.task_id == msg.task_id:
-                self._active_cancel.cancel()
+                # Cancel this task's own token: the graph stops at its next node
+                # boundary, so the remaining steps of the plan never execute.
+                self._active.cancel.cancel()
+                self._active.cancelled = True
                 self._active.error = "cancelled by user"
                 self._active.done = True
                 # Ack before waking the worker - see the note in _handle_confirm.

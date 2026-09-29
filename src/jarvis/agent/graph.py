@@ -111,20 +111,26 @@ def open_sqlite_checkpointer(path: str | None) -> SqliteSaver:
     return SqliteSaver(conn, serde=build_secure_serde())
 
 
-def build_graph(ctx: AppContext, checkpointer: Any = None) -> Any:
-    """Compile the agent graph for this context (optionally persistable)."""
+def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -> Any:
+    """Compile the agent graph for this context (optionally persistable).
+
+    ``cancel`` is the run's :class:`~jarvis.tools.base.CancelToken`; when it is
+    set (the user cancelled), the next node raises instead of executing.  Every
+    node is gated on it, so a cancelled run stops between steps and never
+    reaches the next tool call; ``None`` keeps the plain, ungated graph.
+    """
     g = StateGraph(AgentState)
-    g.add_node("intake", wrap(intake, ctx))
-    g.add_node("memory_retrieve", wrap(memory_retrieve, ctx))
-    g.add_node("brain", wrap(brain, ctx))
-    g.add_node("clarify", wrap(clarify, ctx))
-    g.add_node("validate", wrap(validate, ctx))
-    g.add_node("policy_gate", wrap(policy_gate, ctx))
-    g.add_node("act", wrap(act, ctx))
-    g.add_node("verify", wrap(verify, ctx))
-    g.add_node("replan", wrap(replan, ctx))
-    g.add_node("respond", wrap(respond, ctx))
-    g.add_node("memory_save", wrap(memory_save, ctx))
+    g.add_node("intake", wrap(intake, ctx, cancel))
+    g.add_node("memory_retrieve", wrap(memory_retrieve, ctx, cancel))
+    g.add_node("brain", wrap(brain, ctx, cancel))
+    g.add_node("clarify", wrap(clarify, ctx, cancel))
+    g.add_node("validate", wrap(validate, ctx, cancel))
+    g.add_node("policy_gate", wrap(policy_gate, ctx, cancel))
+    g.add_node("act", wrap(act, ctx, cancel))
+    g.add_node("verify", wrap(verify, ctx, cancel))
+    g.add_node("replan", wrap(replan, ctx, cancel))
+    g.add_node("respond", wrap(respond, ctx, cancel))
+    g.add_node("memory_save", wrap(memory_save, ctx, cancel))
 
     g.add_edge(START, "intake")
     g.add_conditional_edges(

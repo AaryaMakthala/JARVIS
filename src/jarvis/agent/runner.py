@@ -17,6 +17,7 @@ from jarvis.agent.context import AppContext
 from jarvis.agent.graph import build_graph
 from jarvis.agent.schemas import AgentResponse
 from jarvis.agent.state import Decision, StepResult
+from jarvis.tools.base import CancelToken
 
 __all__ = ["TaskOutcome", "extract_interrupt", "resume_task", "run_task"]
 
@@ -80,10 +81,15 @@ def run_task(
     *,
     source: str = "terminal",
     thread_id: str | None = None,
+    cancel: CancelToken | None = None,
 ) -> TaskOutcome:
-    """Start a new task; returns a TaskOutcome, possibly awaiting confirmation."""
+    """Start a new task; returns a TaskOutcome, possibly awaiting confirmation.
+
+    ``cancel`` is the caller's per-task :class:`CancelToken`; the graph checks it
+    before entering every node, so a cancelled run stops at the next step.
+    """
     task_id = thread_id or uuid4().hex[:12]
-    graph = build_graph(ctx, checkpointer)
+    graph = build_graph(ctx, checkpointer, cancel)
     config = {"configurable": {"thread_id": task_id}}
     # Seed ``task_id`` so the graph and the outcome agree on one identifier.
     # Left to itself ``intake`` would mint a second, unrelated id, and the
@@ -98,9 +104,11 @@ def resume_task(
     checkpointer: Any,
     thread_id: str,
     answer: Any,
+    *,
+    cancel: CancelToken | None = None,
 ) -> TaskOutcome:
     """Resume a task at its interruption point with the user's answer."""
-    graph = build_graph(ctx, checkpointer)
+    graph = build_graph(ctx, checkpointer, cancel)
     config = {"configurable": {"thread_id": thread_id}}
     values = graph.invoke(Command(resume=answer), config)
     return _outcome(thread_id, config, checkpointer, graph, values)

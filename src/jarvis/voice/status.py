@@ -394,6 +394,21 @@ class VoiceStatusReporter:
             chars=len(prompt),
         )
 
+    def stop_request(self) -> None:
+        """Report that a spoken cancel request was heard for an in-flight task.
+
+        Emitted from the in-flight stop watch (``VoiceLoop.watch_for_stop``) so
+        the console and the JSONL both show why a ``THINKING`` task ended early.
+        No wording is carried: the vocabulary is a fixed constant matched in
+        code, and the transcript of a cancel request is not worth logging.
+        """
+        self._write(
+            "[VOICE] STOP REQUESTED — cancelling the running task",
+            "stop_request",
+            interaction_id=self.interaction_id,
+            voice_state=str(self.phase or ""),
+        )
+
     def thinking(self, report: ProviderReport | None = None) -> None:
         """Report the start of agent processing."""
         self.advance(VoicePhase.THINKING)

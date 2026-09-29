@@ -2,13 +2,19 @@
 
 The app must exist in ``settings.apps`` (name -> command).  Nothing is ever
 run through a shell and no user-supplied arguments reach the command line -
-the whole command string comes from the config allowlist.  ``verify()`` polls
-for a running process with a matching image name (best-effort; ``None`` when
-the process table is unavailable, e.g. on non-Windows CI).
+the whole command string comes from the config allowlist.  A configured bare
+name is *resolved to a real executable* first (``PATH`` then the Windows
+``App Paths`` registry), because ``subprocess.Popen(["chrome.exe"])`` fails on
+a stock install: Chrome is not on ``PATH``, only ``ShellExecute`` consults
+``App Paths``.  ``verify()`` polls for a running process with a matching image
+name (best-effort; ``None`` when the process table is unavailable, e.g. on
+non-Windows CI).
 """
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import time
 from typing import Any
@@ -58,6 +64,56 @@ def split_command(command: str) -> list[str]:
     return [part.strip('"') for part in parts]
 
 
+def _app_paths_lookup(name: str) -> str | None:
+    """Look ``name`` up in the Windows ``App Paths`` registry key.
+
+    This is the registry ``CreateProcess``/``ShellExecute`` consult for a
+    registered application that is not on ``PATH``.  Read-only, and behind an
+    import guard so the module still loads on non-Windows CI (where there is
+    simply nothing to resolve and the caller reports the failure honestly).
+    """
+    try:
+        import winreg
+    except ImportError:
+        return None
+    subkey = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{name}"
+    views = (
+        winreg.HKEY_CURRENT_USER,
+        winreg.HKEY_LOCAL_MACHINE,
+        winreg.HKEY_LOCAL_MACHINE | getattr(winreg, "KEY_WOW64_32KEY", 0),
+    )
+    for hive in views:
+        try:
+            with winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ) as key:
+                value, _kind = winreg.QueryValueEx(key, "")
+        except (OSError, ValueError):
+            continue
+        resolved = str(value).strip().strip('"')
+        if resolved and os.path.exists(resolved):
+            return resolved
+    return None
+
+
+def resolve_command(command: str) -> str | None:
+    """Resolve an allowlisted command to a launchable executable path.
+
+    Order: the configured string as given (absolute path, or a bare name that
+    ``shutil.which`` finds on ``PATH``), then Windows ``App Paths``.  Returns
+    ``None`` when nothing resolves.  Only *finds* the executable: the argument
+    vector still comes from the config allowlist alone and nothing is passed to
+    a shell.
+    """
+    candidate = command.strip()
+    if not candidate:
+        return None
+    if os.path.isabs(candidate):
+        return candidate if os.path.exists(candidate) else None
+    found = shutil.which(candidate)
+    if found:
+        return found
+    return _app_paths_lookup(candidate)
+
+
 def _run_open_app(args: OpenAppArgs, ctx: ToolContext) -> ToolResult:
     command = lookup_command(args.name, ctx)
     if command is None:
@@ -69,12 +125,25 @@ def _run_open_app(args: OpenAppArgs, ctx: ToolContext) -> ToolResult:
         )
     if ctx.dry_run:
         return ToolResult(ok=True, output=f"[dry-run] would open {args.name} ({command})")
+    argv = split_command(command)
+    executable = resolve_command(argv[0]) if argv else None
+    if executable is None:
+        return ToolResult(
+            ok=False,
+            error=(
+                f"could not find an executable for {args.name!r} ({command!r}); "
+                "give an absolute path in [apps]"
+            ),
+            data={"command": command},
+        )
     try:
-        proc = subprocess.Popen(split_command(command), close_fds=True)
+        proc = subprocess.Popen([executable, *argv[1:]], close_fds=True)
     except OSError as exc:
         return ToolResult(ok=False, error=f"failed to launch {command!r}: {exc}")
     return ToolResult(
-        ok=True, output=f"opened {args.name}", data={"command": command, "pid": proc.pid}
+        ok=True,
+        output=f"opened {args.name}",
+        data={"command": command, "resolved": executable, "pid": proc.pid},
     )
 
 
@@ -97,7 +166,10 @@ def process_running(command: str) -> bool:
 def _verify_open_app(args: OpenAppArgs, result: ToolResult, ctx: ToolContext) -> ToolResult:
     if not result.ok or ctx.dry_run:
         return result.model_copy(update={"verified": False if not result.ok else None})
-    command = str(result.data.get("command") or "")
+    # Prefer the resolved path: the image name of a bare PATH-solved command
+    # ("notepad.exe") and of an absolute one (config may store a full path) both
+    # reduce to the same basename, so one call covers both.
+    command = str(result.data.get("resolved") or result.data.get("command") or "")
     deadline = time.monotonic() + _VERIFY_SECONDS
     try:
         while time.monotonic() < deadline:

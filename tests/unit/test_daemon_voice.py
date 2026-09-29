@@ -782,3 +782,172 @@ class TestVoiceErrorStates:
         assert resp.daemon == "running"
         assert resp.voice == "error"
         assert resp.voice_reason == "no-audio-library"
+
+
+# ── Spoken stop + prompt shutdown (voice task wait) ─────────────────────
+
+
+class _StopWatchLoopStub(_VoiceLoopStub):
+    """Loop stub whose in-flight stop watch reports a spoken cancel.
+
+    ``cancel_on_call`` is the slice on which the user's "stop" is heard, so a
+    test can also prove a watch that hears nothing never cancels anything.
+    """
+
+    def __init__(self, *, cancel_on_call: int = 0) -> None:
+        super().__init__()
+        self.cancel_on_call = cancel_on_call
+        self.watch_calls = 0
+
+    def watch_for_stop(self, budget_s: float, keep_watching: Any = None) -> tuple[bool, bool]:
+        self.watch_calls += 1
+        if keep_watching is not None and not keep_watching():
+            return False, False  # e.g. a confirmation took the microphone
+        requested = self.watch_calls > self.cancel_on_call
+        if not requested:
+            # The real watch spends the slice reading real-time audio (bounded by
+            # wall clock), so a slice that heard nothing must take that long or
+            # the daemon's wait would spin on a stub that returns at once.
+            threading.Event().wait(budget_s)
+        return True, requested
+
+
+class _CancelledAwareServer(_VoiceBridgeServer):
+    """Server whose worker stops exactly like the graph does: on the token.
+
+    The real worker blocks inside ``graph.invoke`` and stops at the node gate
+    (``nodes.wrap``) the moment ``slot.cancel`` fires; here the worker waits on
+    that same token so the boundary itself is the thing under test.
+    """
+
+    def _worker_run(self, slot: TaskSlot) -> None:  # type: ignore[override]
+        self.worker_events.append("started")
+        deadline = time.monotonic() + 2.0
+        while not slot.cancel.cancelled and time.monotonic() < deadline:
+            time.sleep(0.005)  # test stand-in for the blocking graph run
+        if slot.cancel.cancelled:
+            self._finish_cancelled(slot)
+            self.worker_events.append("cancelled")
+        else:
+            slot.result_text = "ran to completion"
+            slot.done = True
+            slot.event.set()
+            self.worker_events.append("never-cancelled")
+
+
+class TestSpokenStopCancellation:
+    def test_stop_during_an_in_flight_task_cancels_it_without_waiting(self) -> None:
+        """A heard "stop" cancels at the token and returns control at once.
+
+        The voice loop must not block on the worker it just cancelled: a slow
+        provider is exactly what made the old wait hold the loop thread.
+        """
+        server = _CancelledAwareServer()
+        server.loop_stub = _StopWatchLoopStub(cancel_on_call=0)
+
+        started = time.monotonic()
+        outcome = server._voice_submit("open chrome", "voice")
+        elapsed = time.monotonic() - started
+
+        assert outcome.cancelled is True
+        assert outcome.error is None  # a stop is not an error to report
+        assert elapsed < 2.0  # returned without waiting for the worker
+        slot = server._active
+        assert slot is not None
+        assert slot.cancel.cancelled  # the graph's gate is armed
+        assert slot.cancelled and slot.done
+        assert slot.result_text is None
+        # The worker saw the token and stopped at its boundary.
+        for _ in range(200):
+            if "cancelled" in server.worker_events:
+                break
+            time.sleep(0.005)
+        assert server.worker_events == ["started", "cancelled"]
+        server._active = None  # cleanup, as the dispatch loop would do
+
+    def test_a_watch_that_hears_nothing_cancels_nothing(self) -> None:
+        """Slices that hear no cancel leave the task alone (bounded task wait)."""
+        server = _CancelledAwareServer()
+        server.loop_stub = _StopWatchLoopStub(cancel_on_call=10_000)
+
+        import jarvis.daemon.server as server_mod
+
+        original = server_mod.VOICE_SUBMIT_TIMEOUT_S
+        server_mod.VOICE_SUBMIT_TIMEOUT_S = 0.4
+        try:
+            outcome = server._voice_submit("open chrome", "voice")
+        finally:
+            server_mod.VOICE_SUBMIT_TIMEOUT_S = original
+
+        slot = server._active
+        assert slot is not None
+        assert slot.cancel.cancelled is False  # never cancelled
+        assert outcome.error and "timed out" in outcome.error  # honest failure
+        server._active = None
+
+    def test_watch_is_skipped_while_a_confirmation_owns_the_microphone(self) -> None:
+        """Exactly one microphone reader: no watch while a dialogue is pending."""
+        server = _VoiceBridgeServer(approve=True)
+        server.loop_stub = _StopWatchLoopStub()
+        slot = TaskSlot(task_id="t1", text="x", source="voice")
+
+        assert server._can_watch_for_stop(slot) is True
+        slot.confirm_payload = {"type": "confirm", "summary": "open chrome"}
+        assert server._can_watch_for_stop(slot) is False
+        slot.confirm_payload = None
+        slot.done = True
+        assert server._can_watch_for_stop(slot) is False
+
+    def test_no_live_voice_loop_means_no_watch(self) -> None:
+        server = _VoiceBridgeServer(approve=True)
+        server._ctx_voice_loop = lambda: None  # type: ignore[method-assign]
+        slot = TaskSlot(task_id="t1", text="x", source="voice")
+        assert server._can_watch_for_stop(slot) is False
+
+
+class TestShutdownDoesNotWaitForABlockedTask:
+    def test_voice_shutdown_returns_the_loop_thread_immediately(self) -> None:
+        """The regression behind "loop thread did not stop within 10s".
+
+        The voice-loop thread sits in ``_voice_submit`` while a task runs.  A
+        shutdown must cancel that wait instead of letting it hold the loop past
+        ``VoiceLoop.stop()``'s join, which is what produced the 10 s error line
+        on Ctrl+C.  The wait is unwedged by *seeing* the shutdown, not by
+        enlarging the timeout.
+        """
+        server = _CancelledAwareServer()
+        server.loop_stub = _StopWatchLoopStub(cancel_on_call=0)
+        server._voice_stopping.set()  # what _stop_voice() sets before it stops
+
+        started = time.monotonic()
+        outcome = server._voice_submit("open chrome", "voice")
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0  # far inside VoiceLoop.stop()'s 10 s join
+        assert outcome.cancelled is True
+        assert server.loop_stub.watch_calls == 0  # no new work while going down
+        slot = server._active
+        assert slot is not None and slot.cancel.cancelled
+        server._active = None
+
+    def test_stop_voice_sets_the_unwedge_flag_before_stopping_the_service(self) -> None:
+        """Flag first: the loop thread can only unwind once it can see it."""
+        seen: list[bool] = []
+
+        class _Service(_FakeVoiceService):
+            def stop(self) -> str:
+                seen.append(server._voice_stopping.is_set())
+                return super().stop()
+
+        server = DaemonServer(
+            settings=Settings(voice=VoiceSettings(enabled=False)), store=_FakeStore()
+        )
+        service = _Service()
+        service.active = True
+        service._state = "on"
+        server._voice_service = service
+
+        server._stop_voice()
+
+        assert seen == [True]
+        assert server._voice_stopping.is_set()

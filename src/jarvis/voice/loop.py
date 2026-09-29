@@ -43,9 +43,10 @@ No audio data ever leaves this module; only text is passed onward.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from jarvis.agent.answer import spoken_answer
@@ -71,6 +72,162 @@ logger = logging.getLogger(__name__)
 _STOP_LISTENING = {"stop listening", "stop", "turn off", "go to sleep"}
 _STOP_DICTATION = {"stop dictation", "stop dictating"}
 _RESUME_DICTATION = {"resume", "resume dictation"}
+
+#: Spoken phrases accepted as "cancel the task that is running right now".
+#: Deliberately a fixed, closed vocabulary matched in code: deciding that
+#: "stop" means stop must never be an LLM judgement, and none of these words
+#: can be a command on their own ("stop" is in :data:`_STOP_LISTENING` too, but
+#: that path only runs between interactions - see
+#: :meth:`VoiceLoop.watch_for_stop`).
+_CANCEL_REQUESTS = frozenset(
+    {
+        "stop",
+        "stop it",
+        "stop that",
+        "stop please",
+        "cancel",
+        "cancel it",
+        "cancel that",
+        "abort",
+        "never mind",
+        "nevermind",
+    }
+)
+
+#: Whole words that mean "cancel the running task", matched anywhere in a
+#: short utterance so "Hey Jarvis stop", "please stop" and "stop the task"
+#: all work without exact-phrase matching.  Any of these appearing in a
+#: *long* utterance is background speech, not an order, so the capture is
+#: bounded by :data:`_MAX_CANCEL_TOKENS`.
+_CANCEL_TOKENS = frozenset({"stop", "cancel", "abort"})
+
+#: Longest utterance still considered a cancel request.  A short "stop" or
+#: "Hey Jarvis, stop, I mean it" counts; a television playing a monologue
+#: containing the word "stop" does not.
+_MAX_CANCEL_TOKENS = 8
+
+#: Short commands that must survive the unusable-utterance check below even
+#: though they carry no intent verb ("yes" is not a verb, "lock" is).
+_SHORT_COMMAND_WORDS = frozenset({"yes", "no", "y", "n", "ok", "okay", "sure", "nope", "nah"})
+
+#: Deterministic intent signals: verbs, question words and the small set of
+#: function words that turn a fragment into a command.  Used only to reject
+#: *short* utterances that contain none of them ("shed on my system"), never as
+#: a general-purpose parser or a minimum word count.
+_INTENT_WORDS = frozenset(
+    {
+        # actions
+        "open",
+        "close",
+        "type",
+        "write",
+        "create",
+        "make",
+        "delete",
+        "remove",
+        "rename",
+        "copy",
+        "move",
+        "save",
+        "send",
+        "start",
+        "stop",
+        "cancel",
+        "abort",
+        "lock",
+        "unlock",
+        "restart",
+        "reboot",
+        "shut",
+        "shutdown",
+        "search",
+        "find",
+        "show",
+        "list",
+        "read",
+        "play",
+        "pause",
+        "turn",
+        "set",
+        "get",
+        "give",
+        "take",
+        "increase",
+        "decrease",
+        "volume",
+        "brightness",
+        "battery",
+        "screenshot",
+        "dictate",
+        "whatsapp",
+        "call",
+        "message",
+        "email",
+        "browse",
+        "google",
+        "answer",
+        "tell",
+        # questions / polite framings
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "how",
+        "is",
+        "are",
+        "was",
+        "were",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "would",
+        "should",
+        "will",
+        "please",
+        "help",
+        "explain",
+    }
+)
+
+#: Longest utterance still treated as a *fragment* by the no-intent check.
+#: Real commands of this length always contain at least one intent word; a
+#: longer utterance is a sentence and is routed rather than guessed at.
+_MAX_FRAGMENT_TOKENS = 5
+
+#: "lock my system" / "lock this computer" / … → the canonical request the
+#: whole system is calibrated around.  Rewrites only recognised natural
+#: variants of the *existing* `lock_computer` action; it never invents a tool
+#: and never touches the policy decision (the canonical text still goes through
+#: brain → validate → policy_gate → confirmation → act exactly as before).
+_LOCK_VARIANT_RE = re.compile(
+    r"^(?:please\s+)?lock\s+(?:my|this|the|your|our)\s+"
+    r"(?:system|computer|pc|machine|laptop|desktop|screen|workstation|it)$"
+)
+
+#: "shut down my system" / "shutdown my system" / …  There is **no** shutdown
+#: tool in the registry (``shutdown`` is a hard-blocked name fragment, docs/03),
+#: so recognising the phrasing deterministically means answering locally
+#: instead of spending an LLM round trip on a plan that cannot exist.
+_SHUTDOWN_VARIANT_RE = re.compile(
+    r"^(?:please\s+)?(?:shut\s*down|shut|power\s*(?:down|off)|turn\s+off)\s+"
+    r"(?:(?:my|this|the|your|our)\s+)?"
+    r"(?:system|computer|pc|machine|laptop|desktop|workstation)$"
+)
+
+#: Fixed local reply for the shutdown phrasing: honest, no LLM, no tool.
+SHUTDOWN_UNSUPPORTED_MSG = (
+    "Shutting down the computer is not something I can do. "
+    "You can shut down Windows from the Start menu."
+)
+
+#: Fixed, local acknowledgement spoken when an in-flight task is cancelled.
+#: A constant by design: the cancellation is deterministic, so its wording is
+#: owned by the loop rather than generated by the model it just interrupted.
+STOP_ACKNOWLEDGEMENT = "Stopped."
 
 #: Spoken words accepted as an approval to a low-risk confirmation prompt
 #: (Tier 1, no typed folder-name requirement).  Colloquial "go"/"ok"/"sure"
@@ -187,6 +344,22 @@ _MAX_SCRIPTLESS_TOKENS = 3
 #: console (truncated) and kept in the task result.
 DEFAULT_MAX_SPOKEN_CHARS = 300
 
+#: Wake-model frame length (80 ms at 16 kHz) - the chunk openWakeWord scores.
+_WAKE_CHUNK_FRAMES = 1280
+
+#: Longest utterance captured after an in-flight wake trigger when looking for
+#: a cancel request, and how long to wait for it to start.  Both are short on
+#: purpose: this is a cancel path, not a command window, and the loop must
+#: return to the task it is watching as soon as possible.
+_STOP_CAPTURE_MAX_S = 4.0
+_STOP_LISTEN_TIMEOUT_S = 5.0
+
+#: Consecutive speech-energy frames (~160 ms) the in-flight watch requires before
+#: it starts capturing.  One frame is a click, a door, a cough: two in a row is
+#: a voice.  Kept local to the watch rather than reusing the wake wait's own
+#: gate, which also has to *score* a model and so is much more expensive.
+_MIN_CANCEL_SPEECH_FRAMES = 2
+
 #: Pause before re-entering the wake wait after an idle timeout.  The idle
 #: deadline is measured in *audio* seconds, so a stream that delivers frames
 #: instantly (a test fake, or a device that replays a cached buffer) would
@@ -284,7 +457,12 @@ def _transcript_problem(text: str, wake_word: str) -> str | None:
       for the wake phrase on a quiet mic (an English-configured assistant
       cannot act on it, so it asks instead);
     * a transcript cut off mid-sentence ("what is the capacity of-"), detected
-      from whisper's own trailing hyphen/ellipsis or a dangling trailer word.
+      from whisper's own trailing hyphen/ellipsis or a dangling trailer word;
+    * a **short fragment with no intent word at all** ("shed on my system."):
+      within a few tokens a real command always carries a verb, a question
+      word or one of :data:`_SHORT_COMMAND_WORDS`, so a fragment without one
+      would be a guess.  This is deliberately *not* a minimum word count:
+      "stop", "yes", "lock" and "open notepad" all pass.
 
     Legitimate short commands ("lock my computer", "stop", "yes", "what time
     is it", "turn it on") match none of these and route unchanged.
@@ -311,7 +489,72 @@ def _transcript_problem(text: str, wake_word: str) -> str | None:
 
     if cleaned.endswith(_TRUNCATION_MARKERS) or tokens[-1] in _DANGLING_TRAILERS:
         return "transcript ended mid-sentence"
+
+    # Fail fast on an obvious fragment: a short utterance with no intent word
+    # and no whitelisted short command would only be guessed at by the planner
+    # (a whole LLM round trip to reach "Could you repeat that?" anyway).
+    if len(tokens) <= _MAX_FRAGMENT_TOKENS and not (
+        _SHORT_COMMAND_WORDS & set(tokens) or _INTENT_WORDS & set(tokens)
+    ):
+        return "transcript has no recognisable command"
     return None
+
+
+def _canonical_command(text: str) -> str:
+    """Rewrite a recognised natural variant to the canonical phrasing.
+
+    Deterministic and deliberately tiny: only the phrasings the live voice path
+    kept mis-routing are matched, and each maps to wording the system already
+    supports (``lock my system`` -> ``lock my computer`` -> the existing
+    ``lock_computer`` action).  The rewritten text still travels the normal
+    brain -> validate -> policy_gate -> confirmation -> act path, so nothing is
+    bypassed.  Anything unrecognised is returned unchanged - this is not a
+    general-purpose parser.
+    """
+    if _LOCK_VARIANT_RE.match(_normalise_speech(text)):
+        return "lock my computer"
+    return text
+
+
+def is_shutdown_request(text: str) -> bool:
+    """Whether ``text`` asks to power the machine off (no shutdown tool exists).
+
+    Recognising the phrasing in code lets the loop answer honestly and locally
+    instead of spending an LLM round trip on a plan that cannot exist:
+    ``shutdown`` is a hard-blocked tool-name fragment (docs/03), so there is
+    nothing to map it to.
+    """
+    return bool(_SHUTDOWN_VARIANT_RE.match(_normalise_speech(text)))
+
+
+def _is_cancel_request(text: str) -> bool:
+    """Whether a captured utterance is an order to cancel the running task.
+
+    Pure, fixed-vocabulary matching in code: deciding that "stop" means *stop
+    the task that is running right now* must never be an LLM judgement, and a
+    cancel request must never be submitted to the planner (that would start a
+    second task instead of stopping the first).
+
+    Two layers, deliberately narrow:
+
+    * the whole normalised utterance is in :data:`_CANCEL_REQUESTS` ("stop
+      that", "never mind"), so a bare order is unambiguous;
+    * otherwise a cancel *word* anywhere in a short utterance counts ("Hey
+      Jarvis stop", "please stop the task").  The length bound
+      (:data:`_MAX_CANCEL_TOKENS`) is what keeps background speech out: a
+      television monologue that happens to contain "stop" is not an order, and
+      a long utterance is not something this method gets to reinterpret.
+
+    Anything else - including an empty transcript - is ``False``, and the
+    caller leaves the running task alone.
+    """
+    normalised = _normalise_speech(text)
+    if not normalised:
+        return False
+    if normalised in _CANCEL_REQUESTS:
+        return True
+    tokens = normalised.split()
+    return len(tokens) <= _MAX_CANCEL_TOKENS and bool(_CANCEL_TOKENS & set(tokens))
 
 
 class VoiceLoop:
@@ -394,6 +637,11 @@ class VoiceLoop:
         self._stopped = threading.Event()
         self._audio_opened = False
         self._wake_frames_read = 0
+        #: True while an in-flight stop watch session has armed the detector.
+        #: See :meth:`watch_for_stop`: the detector must be re-armed once per
+        #: session (its rolling window is what scores the wake word), never
+        #: once per slice.
+        self._stop_watch_armed = False
         self._phase_state = "off"
         self._interaction_id = ""
 
@@ -446,9 +694,7 @@ class VoiceLoop:
         try:
             self._tts.speak(REPEAT_PROMPT)
         except Exception:
-            logger.exception(
-                "voice interaction failed at repeat-prompt tts; continuing to listen"
-            )
+            logger.exception("voice interaction failed at repeat-prompt tts; continuing to listen")
 
     def start(self) -> None:
         """Start the voice loop in a background thread (idempotent)."""
@@ -1099,6 +1345,9 @@ class VoiceLoop:
                 logger.debug("voice reset: wake detector re-armed")
             except Exception:
                 logger.debug("voice reset: wake detector reset failed", exc_info=True)
+        # Any in-flight stop watch session ends here too: the next task's watch
+        # must arm itself (flush + reset) instead of inheriting this window.
+        self._stop_watch_armed = False
         self._wake_frames_read = 0
         self._set_state("LISTENING")
         self._reporter.ready(self._wake_word)
@@ -1115,8 +1364,34 @@ class VoiceLoop:
         self._reset_voice_state()
         logger.info("voice boundary: re-armed for next wake")
 
-    def _read_command(self, max_samples: int) -> AudioSegment:
+    def _read_command(
+        self,
+        max_samples: int,
+        listen_timeout_s: float | None = None,
+        should_continue: Callable[[], bool] | None = None,
+        spoken_preroll: Sequence[float] = (),
+    ) -> AudioSegment:
         """Capture speech after the wake, ending on trailing silence.
+
+        ``listen_timeout_s`` overrides :attr:`_listen_timeout_s` for this call
+        (the in-flight cancel watch passes a much shorter window than a normal
+        command captures).
+
+        ``should_continue`` is an optional hand-over check, re-evaluated before
+        every frame.  The in-flight stop watch uses it so a confirmation
+        published by the worker thread can take the microphone back within one
+        frame instead of being raced by a capture that is already under way;
+        the ordinary command path passes nothing and behaves exactly as before.
+        A capture that stops early returns whatever was collected so far, which
+        is below every caller's speech threshold and therefore reads as "no
+        utterance" - the safe direction, because the caller refuses rather than
+        acting on a partial one.
+
+        ``spoken_preroll`` is audio the caller has *already* established is
+        speech - the in-flight watch's trigger frames, which would otherwise be
+        thrown away.  It seeds the capture in phase B (already speaking, end on
+        trailing silence) instead of phase A, so the utterance is not re-waited
+        for and its onset survives into the transcript.
 
         Phase A — wait for speech: after the "Yes?" ack the loop reads short
         chunks and discards pre-speech silence (keeping a ~200 ms pre-roll so
@@ -1136,23 +1411,30 @@ class VoiceLoop:
         arrived within the command window — the caller falls back to
         wake-listening.
         """
-        collected: list[float] = []
+        collected: list[float] = list(spoken_preroll)
         preroll: list[float] = []
         trailing = 0.0
-        speech_started = False
+        speech_started = bool(collected)
         sample_rate = 16_000
         wait_start = time.monotonic()
-        wait_deadline = wait_start + max(self._listen_timeout_s, 0.0)
+        timeout = self._listen_timeout_s if listen_timeout_s is None else listen_timeout_s
+        timeout = max(timeout, 0.0)
+        wait_deadline = wait_start + timeout
         last_heartbeat = wait_start
 
         while not self._stop_event.is_set() and len(collected) < max_samples:
+            if should_continue is not None and not should_continue():
+                # Another reader owns the microphone now: stop before consuming
+                # another frame so the hand-over happens on this frame.
+                logger.debug("voice boundary: command capture handed over")
+                break
             segment = self._audio.read(_CAPTURE_CHUNK_FRAMES)
             samples = segment.samples
             if len(samples) <= 0:
                 break
 
             if not speech_started:
-                if self._listen_timeout_s <= 0 or time.monotonic() >= wait_deadline:
+                if timeout <= 0 or time.monotonic() >= wait_deadline:
                     logger.info("voice boundary: command window expired without speech")
                     break
                 if _chunk_is_speech(segment, self._silence_threshold):
@@ -1186,6 +1468,176 @@ class VoiceLoop:
             samples=collected,
             sample_rate=sample_rate,
         )
+
+    def watch_for_stop(
+        self,
+        budget_s: float,
+        keep_watching: Callable[[], bool] | None = None,
+    ) -> tuple[bool, bool]:
+        """Listen for a spoken cancel request while a task is in flight.
+
+        Called by the daemon's task wait (``DaemonServer._voice_submit``) on the
+        **voice-loop thread** - the thread that already owns the microphone - so
+        there is exactly one reader on the audio device.  It spends one bounded
+        slice of audio looking for speech; any utterance short enough to be an
+        order is captured once and matched against the fixed cancel vocabulary
+        (data:`_CANCEL_REQUESTS` / :data:`_CANCEL_TOKENS`) - no LLM, no planner.
+
+        The trigger is ordinary speech energy, **not** the wake word.  A stop
+        request has to work while a task is running without the user first
+        saying "Hey Jarvis", and the watch never *scores* the detector, so its
+        rolling window is not fed frame by frame behind the loop's back.  The
+        detector is touched exactly once, when the session arms (see below), and
+        then again by the loop's ordinary :meth:`_rearm`, so the next
+        :meth:`_wait_for_wake` starts from the same window it always did.
+
+        Returns ``(watched, stop_requested)``:
+
+        * ``watched`` is True only when the slice was actually spent listening,
+          which lets the caller loop straight into the next slice instead of
+          also sleeping; it is always bounded by ``budget_s`` of wall time, so
+          a caller that trusts it can never spin the loop thread.
+        * ``watched`` is False when there was nothing to watch - a stop request
+          is already pending, no wake detector is available to restore
+          afterwards, or ``keep_watching`` says another reader owns the
+          microphone - and the caller must wait on its slot instead.
+
+        The first slice of a session flushes the tail of the command that
+        started the task and resets the wake detector's rolling window, so
+        that utterance can neither be scored as a cancel request nor linger in
+        the detector.  Arming is once per session, **not** per slice: the
+        daemon calls this every ``_VOICE_POLL_INTERVAL_S`` while a task runs,
+        and a per-slice reset would clear the window before it could ever fill.
+        The session ends when the watch hands the microphone back, and
+        :meth:`_reset_voice_state` ends it on the loop's own re-arm.
+
+        ``keep_watching`` is re-checked before every frame (and around the
+        capture) so the confirmation dialogue - which runs on the worker
+        thread - always wins the microphone, and a task that has finished ends
+        the watch immediately.  This is a *bounded* watch, not a listener: it
+        exists only while one task is in flight and ends with it.
+        """
+        if budget_s <= 0:
+            return False, False
+        if self._wake_detector is None:
+            # Nothing to restore afterwards: without a detector the loop cannot
+            # go back to wake-listening, so standing down keeps the failure
+            # honest instead of half-entering a watch.
+            logger.warning("stop watch standing down: no wake-word detector to re-arm")
+            return False, False
+        if not self._stop_watch_armed:
+            # First slice of this session: drop the tail of the command that
+            # started the task so it cannot be misheard as "stop", and clear
+            # the detector's rolling window of that same audio.
+            try:
+                self._audio.flush()
+                self._wake_detector.reset()
+            except Exception:
+                logger.exception("stop watch: could not arm; standing down")
+                self._stop_watch_armed = False
+                return False, False
+            self._stop_watch_armed = True
+
+        deadline = time.monotonic() + budget_s
+        speech_run = 0
+        preroll: list[float] = []
+        while time.monotonic() < deadline:
+            if self._stop_event.is_set():
+                # A stop request is already in progress (loop shutting down):
+                # hand the wait back rather than watching against it.
+                self._stop_watch_armed = False
+                return False, False
+            if keep_watching is not None and not keep_watching():
+                # Someone else is about to read the microphone (confirmation or
+                # a finished task): disarm so the next session starts fresh.
+                self._stop_watch_armed = False
+                return False, False
+            segment = self._audio.read(_WAKE_CHUNK_FRAMES)
+            if segment.duration_s < 0.05:
+                if not segment.samples:
+                    self._stop_event.wait(_EMPTY_READ_BACKOFF_S)
+                speech_run = 0
+                continue
+            if not _chunk_is_speech(segment, self._silence_threshold):
+                speech_run = 0
+                continue
+            # Two consecutive speech frames (~160 ms) so a click or a chair
+            # creak does not start a transcription of the room.
+            speech_run += 1
+            # Keep the frames that made up the run: they are the *onset* of the
+            # utterance, which is exactly what a transcript needs and what
+            # _read_command cannot recover because they were consumed here.
+            preroll.extend(segment.samples)
+            del preroll[: -_MIN_CANCEL_SPEECH_FRAMES * _WAKE_CHUNK_FRAMES]
+            if speech_run < _MIN_CANCEL_SPEECH_FRAMES:
+                continue
+            requested = self._capture_stop_request(keep_watching, preroll)
+            # The session stays armed: the daemon immediately spends the next
+            # slice on the same task, and re-arming per utterance would flush
+            # and reset the detector every time the room made a noise.  It ends
+            # when the microphone is handed back or the loop re-arms.
+            return True, requested
+        return True, False
+
+    def _capture_stop_request(
+        self,
+        keep_watching: Callable[[], bool] | None = None,
+        preroll: Sequence[float] = (),
+    ) -> bool:
+        """Read one short utterance and decide whether it is a cancel request.
+
+        Ownership first: ``keep_watching`` is re-checked before the capture,
+        before every frame inside it (``_read_command``'s ``should_continue``)
+        and once more before the transcription, so a confirmation published by
+        the worker thread takes the microphone back within one frame instead of
+        racing this read.
+
+        No second flush here: arming already dropped the command that started
+        the task, and the two trigger frames were consumed from the buffer to
+        find the speech, so a flush now would only discard the onset of the very
+        utterance that was just detected.  ``preroll`` is those trigger frames,
+        handed to :meth:`_read_command` as speech already spoken, so the
+        transcript starts where the voice did.
+
+        Deterministic and local: the transcript is matched against the fixed
+        cancel vocabulary by :func:`_is_cancel_request` and is never submitted
+        to the agent, so a "stop" can never be planned as a new task.  Any
+        failure (capture, STT, hand-over) is a ``False`` - the watch simply
+        stands down and the running task is left alone.
+        """
+        if keep_watching is not None and not keep_watching():
+            return False
+        try:
+            segment = self._read_command(
+                int(_STOP_CAPTURE_MAX_S * 16_000),
+                listen_timeout_s=_STOP_LISTEN_TIMEOUT_S,
+                should_continue=keep_watching,
+                spoken_preroll=preroll,
+            )
+        except Exception:
+            logger.exception("stop watch: capture failed")
+            return False
+        if segment.duration_s < 0.2:
+            return False
+        if keep_watching is not None and not keep_watching():
+            # The confirmation owns the microphone now; do not spend whisper on
+            # an utterance we can no longer act on ourselves.
+            return False
+        try:
+            text = self._stt.transcribe(segment).text
+        except Exception:
+            logger.exception("stop watch: transcription failed")
+            return False
+        if not _is_cancel_request(text):
+            logger.info(
+                "stop watch: heard %d chars that are not a cancel request; ignoring",
+                len(text),
+            )
+            return False
+        logger.info("VOICE STOP_REQUESTED")
+        logger.info("voice boundary: in-flight cancel request heard; cancelling the task")
+        self._reporter.stop_request()
+        return True
 
     def _rearm_wake_for_confirmation(self, timeout_s: float | None = None) -> bool:
         """Require the wake word again before a voice approval.
@@ -1225,6 +1677,12 @@ class VoiceLoop:
             self._running = False
             self._stop_event.set()
             return "Goodbye."
+
+        # Power-off phrasings have no tool behind them: answer locally rather
+        # than spend a planner round trip on a plan that cannot exist.
+        if is_shutdown_request(text):
+            logger.info("voice boundary: shutdown request answered locally (no tool exists)")
+            return SHUTDOWN_UNSUPPORTED_MSG
 
         # Stop dictation
         if normalised in _STOP_DICTATION:
@@ -1279,10 +1737,11 @@ class VoiceLoop:
             self._on_dictation(text)
             return None
 
-        # Submit to the agent
+        # Submit to the agent (recognised natural variants rewritten to the
+        # canonical phrasing; everything else reaches the planner untouched).
         if self._submit_task is not None:
             try:
-                outcome = self._submit_task(text, "voice")
+                outcome = self._submit_task(_canonical_command(text), "voice")
                 return self._extract_response(outcome)
             except Exception:
                 logger.exception("voice task submission failed")
@@ -1294,6 +1753,11 @@ class VoiceLoop:
         """Extract a spoken response from an agent outcome."""
         if outcome is None:
             return None
+        # A cancelled task is answered with the fixed local acknowledgement, not
+        # with the error text: the cancellation was requested and already
+        # reported when it was heard (see :meth:`watch_for_stop`).
+        if getattr(outcome, "cancelled", False):
+            return STOP_ACKNOWLEDGEMENT
         # Handle the confirmation case
         if hasattr(outcome, "confirmation") and outcome.confirmation is not None:
             return self._handle_voice_confirmation(outcome)
