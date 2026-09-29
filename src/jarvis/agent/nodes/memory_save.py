@@ -171,6 +171,12 @@ def _failure_record(state: dict[str, Any]) -> MemoryRecord | None:
     blocked later successful runs of the same task).  A tainted result is
     recorded with its output text dropped, since that text is the untrusted
     part.
+
+    The step's outcome is stored alongside the row (``step_state``) as
+    provenance, so the store can build an honest hint and so a later reader can
+    tell a genuine failure from an artefact of an older build.  Rows written
+    before this existed are handled by
+    :func:`jarvis.memory.db.migrate_failures`.
     """
     results: list[StepResult] = list(state.get("results") or [])
     bad = next(
@@ -193,6 +199,7 @@ def _failure_record(state: dict[str, Any]) -> MemoryRecord | None:
                 "id": bad.step_id,
                 "tainted": bad.tainted,
             },
+            "step_state": {"ok": bad.ok, "verified": bad.verified, "tainted": bad.tainted},
         },
     )
 

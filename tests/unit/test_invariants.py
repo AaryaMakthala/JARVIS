@@ -900,6 +900,69 @@ def test_invariant_8_nothing_secret_reaches_memory_db(tmp_path: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# A step that succeeded is never failure memory
+# ---------------------------------------------------------------------------
+
+
+def test_a_successful_step_can_never_become_a_failure_row(tmp_path: Any) -> None:
+    """An unverifiable success must not be remembered as a failure.
+
+    This is the shape that refused a real "lock my computer" for a week: the
+    step returned ``ok=True, verified=None`` and an older build filed it under
+    the failure log, so every later run started from "do not repeat that".  The
+    node in ``memory_save`` filters it, and ``FailureStore.record`` refuses it
+    again, so neither a future caller nor a     legacy row can bring it back.
+    """
+    from jarvis.memory import SqliteMemory, open_db
+
+    store = SqliteMemory(open_db(tmp_path / "m.db"), settings=Settings())
+
+    try:
+        step = {"tool": "lock_computer", "id": "s1", "tainted": False}
+        assert (
+            store.failures.record(
+                "lock the computer",
+                step,
+                "step s1 did not complete",
+                state={"ok": True, "verified": None, "tainted": False},
+            )
+            is None
+        )
+        assert store.failures.count() == 0
+        assert [r.text for r in store.retrieve("lock my computer")] == []
+
+        # The complement is a real failure and must survive: the action ran but
+        # verification failed.  The store's backstop is the exact negation of
+        # the node's "bad step" test, not a blanket "ok=True is a failure".
+        assert (
+            store.failures.record(
+                "lock the computer",
+                step,
+                "step s1 did not complete",
+                state={"ok": True, "verified": False, "tainted": False},
+            )
+            is not None
+        )
+        assert store.failures.count() == 1
+
+        # The genuine version of the same step is still remembered.
+        store.failures.record(
+            "lock the computer",
+            step,
+            "Access denied: the workstation is already locked",
+            state={"ok": False, "verified": False, "tainted": False},
+        )
+        assert store.failures.count() == 2
+        hinted = store.retrieve("lock my computer")
+        assert len(hinted) == 2
+        assert any("Access denied" in record.text for record in hinted)
+        # And it reads as advice, never as a refusal.
+        assert all("Do not repeat" not in record.text for record in hinted)
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 

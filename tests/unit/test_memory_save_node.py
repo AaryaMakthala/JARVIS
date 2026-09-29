@@ -310,6 +310,32 @@ def test_verified_false_enters_failure_memory_but_none_does_not(backend: SqliteM
     assert backend.counts()["failures"] == 1  # unchanged by the second run
 
 
+def test_the_recorded_failure_carries_the_step_outcome(backend: SqliteMemory) -> None:
+    """Provenance: the row says *which kind* of failure it was.
+
+    This is what lets a later reader (and the schema migration) tell a genuine
+    failure from a "succeeded but unverifiable" artefact, and it makes the hint
+    handed to the planner honest instead of generic.
+    """
+    memory_save(
+        _state(_plan(_step("lock_computer"), goal="lock my computer"), [_ok(verified=False)]),
+        _ctx(backend),
+    )
+    stored = backend.failures.recent()[0]
+    assert stored.state == {"ok": True, "verified": False, "tainted": False}
+    assert "did not verify at lock_computer" in stored.as_memory_text()
+    # ...and it is a real failure, so the migration must never withhold it.
+    assert backend.quarantined_failures() == 0
+    assert backend.failures.relevant("lock my computer", limit=3) != []
+
+
+def test_a_tainted_failure_records_its_provenance(backend: SqliteMemory) -> None:
+    memory_save(_state(results=[_ok(tainted=True)]), _ctx(backend))
+    stored = backend.failures.recent()[0]
+    assert stored.state == {"ok": True, "verified": True, "tainted": True}
+    assert "returned untrusted external text" in stored.as_memory_text()
+
+
 # --------------------------------------------------------------------- safety
 
 

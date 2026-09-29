@@ -154,6 +154,25 @@ class _Client:
             return None
         return json.loads(raw.decode("utf-8"))
 
+    def recv_next(self, timeout: float = 2.0) -> dict[str, Any] | None:
+        """Next message that is not an ``ack``, within one overall budget.
+
+        The server acknowledges *every* request (``kind="ack"``) before it
+        releases the worker.  A raw socket client has no use for that receipt -
+        the real :class:`~jarvis.daemon.client.DaemonClient` consumes it while
+        looking for its own - so these tests skip it and keep asserting what
+        they are about ("the final arrives promptly", "a mismatched hash never
+        executes") rather than transport bookkeeping.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            msg = self.recv_json(timeout=remaining)
+            if msg is None or msg.get("kind") != "ack":
+                return msg
+
     def close(self) -> None:
         self.writer.close()
         self.loop.run_until_complete(asyncio.sleep(0.05))
@@ -281,14 +300,14 @@ def test_confirm_flow_final_delivered_within_2s(harness: Any) -> None:
 
         t0 = time.monotonic()
         c.send(ChatMessage(text="echo hi", id="t1"))
-        req = c.recv_json(timeout=2)
+        req = c.recv_next(timeout=2)
         assert req is not None and req["type"] == "confirm_request", req
         assert req["action_hash"] == "a" * 64
 
         c.send(
             ConfirmResponse(task_id=req["task_id"], approved=True, action_hash=req["action_hash"])
         )
-        final = c.recv_json(timeout=2.0)
+        final = c.recv_next(timeout=2.0)
         elapsed = time.monotonic() - t0
         assert final is not None and final["type"] == "final", (
             f"final never arrived (after {elapsed:.2f}s) — dispatch loop was "
@@ -306,12 +325,12 @@ def test_denied_confirmation_never_executes_and_arrives_promptly(harness: Any) -
         c.send(AuthMessage(token=TEST_TOKEN))
         c.recv_json(timeout=2)
         c.send(ChatMessage(text="echo hi", id="t2"))
-        req = c.recv_json(timeout=2)
+        req = c.recv_next(timeout=2)
         assert req and req["type"] == "confirm_request"
         c.send(
             ConfirmResponse(task_id=req["task_id"], approved=False, action_hash=req["action_hash"])
         )
-        final = c.recv_json(timeout=2.0)
+        final = c.recv_next(timeout=2.0)
         assert final is not None and final["type"] == "final"
         assert "Refused" in final["text"]
     finally:
@@ -324,10 +343,10 @@ def test_tampered_hash_cannot_drive_resume_to_execution(harness: Any) -> None:
         c.send(AuthMessage(token=TEST_TOKEN))
         c.recv_json(timeout=2)
         c.send(ChatMessage(text="echo hi", id="t3"))
-        req = c.recv_json(timeout=2)
+        req = c.recv_next(timeout=2)
         assert req and req["type"] == "confirm_request"
         c.send(ConfirmResponse(task_id=req["task_id"], approved=True, action_hash="0" * 64))
-        final = c.recv_json(timeout=2.0)
+        final = c.recv_next(timeout=2.0)
         assert final is not None and final["type"] == "final"
         assert "Refused" in final["text"]  # mismatched hash → never executed
     finally:
@@ -347,7 +366,7 @@ def test_queued_task_result_delivered_after_promotion(harness: Any) -> None:
 
         # c1's task occupies the active slot and pauses at confirmation.
         c1.send(ChatMessage(text="echo hi", id="t1"))
-        req1 = c1.recv_json(timeout=2)
+        req1 = c1.recv_next(timeout=2)
         assert req1 and req1["type"] == "confirm_request"
 
         # c2's task is queued while t1 is active.
@@ -361,17 +380,17 @@ def test_queued_task_result_delivered_after_promotion(harness: Any) -> None:
         c1.send(
             ConfirmResponse(task_id=req1["task_id"], approved=True, action_hash=req1["action_hash"])
         )
-        final1 = c1.recv_json(timeout=2.0)
+        final1 = c1.recv_next(timeout=2.0)
         assert final1 and final1["type"] == "final" and final1["task_id"] == "t1"
 
-        req2 = c2.recv_json(timeout=2.0)
+        req2 = c2.recv_next(timeout=2.0)
         assert req2 and req2["type"] == "confirm_request" and req2["task_id"] == "t2", (
             "promoted task's confirm_request was not routed to its owner"
         )
         c2.send(
             ConfirmResponse(task_id=req2["task_id"], approved=True, action_hash=req2["action_hash"])
         )
-        final2 = c2.recv_json(timeout=2.0)
+        final2 = c2.recv_next(timeout=2.0)
         assert final2 and final2["type"] == "final" and final2["task_id"] == "t2"
     finally:
         c1.close()
@@ -386,10 +405,10 @@ def test_status_while_worker_running_uses_no_worker_wake(harness: Any) -> None:
         c.send(AuthMessage(token=TEST_TOKEN))
         c.recv_json(timeout=2)
         c.send(ChatMessage(text="echo hi", id="t9"))
-        req = c.recv_json(timeout=2)
+        req = c.recv_next(timeout=2)
         assert req and req["type"] == "confirm_request"  # worker is paused now
         c.send(StatusRequest())
-        resp = c.recv_json(timeout=2)
+        resp = c.recv_next(timeout=2)
         assert resp and resp["type"] == "status_response"
         assert resp["active_task"] == "t9"
     finally:
@@ -421,7 +440,7 @@ def test_direct_completion_final_delivered_promptly(direct_harness: Any) -> None
 
         t0 = time.monotonic()
         c.send(ChatMessage(text="open notepad", id="t10"))
-        final = c.recv_json(timeout=2.0)
+        final = c.recv_next(timeout=2.0)
         elapsed = time.monotonic() - t0
         assert final is not None and final["type"] == "final", (
             f"final never arrived (after {elapsed:.2f}s) for a Tier-0 task"

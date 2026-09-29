@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, TypeGuard
 
 from jarvis.config import daemon_runtime_file
 from jarvis.daemon.protocol import (
@@ -30,6 +30,11 @@ from jarvis.daemon.protocol import (
     VoiceToggleMessage,
 )
 from jarvis.logging_setup import get_logger
+
+#: Everything the daemon can push at a client that is *not* a reply to the
+#: request it just sent.  ``ack`` events are excluded on purpose: the client
+#: consumes those itself while looking for the one it is waiting for.
+ServerEvent = EventMessage | FinalMessage | ErrorMessage | ConfirmRequest | ClarificationRequest
 from jarvis.secrets import SecretStore
 
 logger = get_logger("daemon.client")
@@ -75,6 +80,18 @@ class DaemonClient:
     so the CLI doesn't need ``async``/``await`` at every call site.
     """
 
+    #: Upper bound on how many messages :meth:`_send_recv_ack` will set aside
+    #: while looking for its acknowledgement.  A daemon that never acks must
+    #: not turn into an unbounded memory growth; past this we report the
+    #: mismatch instead.
+    max_pending = 64
+
+    #: Seconds to wait for an acknowledgement before giving up.  The server
+    #: acks *before* it releases the worker, so this is generous: a longer
+    #: silence means the daemon is wedged, and saying so beats hanging the
+    #: terminal with no output.
+    ack_timeout = 30.0
+
     def __init__(
         self,
         *,
@@ -89,6 +106,12 @@ class DaemonClient:
         self._store = store or SecretStore()
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        #: Messages that arrived while a send was waiting for its ack.  They are
+        #: replayed by :meth:`wait_for_event` rather than dropped.
+        self._pending: list[DaemonMessage] = []
+        #: Human-readable text of the last chat-submission ack ("started" /
+        #: "queued"), for the CLI to show.  Empty until a chat is submitted.
+        self.last_ack_message: str = ""
 
     def connect(self) -> None:
         """Connect to the daemon, authenticate, and wait for ``auth_ok``."""
@@ -120,6 +143,7 @@ class DaemonClient:
 
     def close(self) -> None:
         """Close the connection."""
+        self._pending.clear()
         if self._writer is not None:
             try:
                 self._writer.close()
@@ -131,21 +155,19 @@ class DaemonClient:
     # ── send helpers ───────────────────────────────────────────────────
 
     def send_chat(self, text: str, *, source: str = "terminal", task_id: str = "") -> str:
-        """Submit a chat message.  Returns the task_id assigned by the server."""
-        msg = ChatMessage(id=task_id, text=text, source=source)
-        resp = self._send_recv_sync(msg)
-        if isinstance(resp, EventMessage):
-            return resp.task_id
-        if isinstance(resp, ErrorMessage):
-            raise DaemonError(code=resp.code, message=resp.message)
-        # Defensive: with the server's ack this should not happen, but a
-        # message consumed here is a message the CLI's ``wait_for_event``
-        # never sees - fail loudly instead of silently swallowing a
-        # ConfirmRequest (which used to make the prompt invisible).
-        raise DaemonError(
-            code="unexpected",
-            message=f"unexpected reply to chat submission: {type(resp).__name__}",
-        )
+        """Submit a chat message.  Returns the task_id assigned by the server.
+
+        The ack is read with :meth:`_send_recv_ack`, so a ``ConfirmRequest``
+        that the freshly started worker dispatches *before* the ack arrives is
+        buffered and replayed by :meth:`wait_for_event` instead of being
+        consumed and dropped here.  The ack's text ("started" / "queued") is
+        kept in :attr:`last_ack_message` so the terminal can show it: a request
+        that is *queued* is why a second command appears to do nothing, and that
+        used to be invisible.
+        """
+        ack = self._send_recv_ack(ChatMessage(id=task_id, text=text, source=source))
+        self.last_ack_message = str(ack.data.get("message") or "")
+        return ack.task_id
 
     def send_confirm(
         self,
@@ -164,23 +186,22 @@ class DaemonClient:
             password=password,
             typed_confirmation=typed_confirmation,
         )
-        resp = self._send_recv_sync(msg)
-        if isinstance(resp, ErrorMessage):
-            raise DaemonError(code=resp.code, message=resp.message)
+        self._send_recv_ack(msg)
 
     def send_clarification(self, task_id: str, *, answer: str) -> None:
         """Send the answered clarification text for a suspended task."""
         msg = ClarificationResponse(task_id=task_id, answer=answer or "")
-        resp = self._send_recv_sync(msg)
-        if isinstance(resp, ErrorMessage):
-            raise DaemonError(code=resp.code, message=resp.message)
+        self._send_recv_ack(msg)
 
-    def send_cancel(self, task_id: str) -> None:
-        """Cancel a task."""
-        msg = CancelMessage(task_id=task_id)
-        resp = self._send_recv_sync(msg)
-        if isinstance(resp, ErrorMessage):
-            raise DaemonError(code=resp.code, message=resp.message)
+    def send_cancel(self, task_id: str, *, ack_timeout: float | None = None) -> None:
+        """Cancel a task.
+
+        ``ack_timeout`` defaults to :attr:`ack_timeout`.  A caller that is
+        walking away (the CLI on Ctrl+C) passes a short one: the point is to
+        release the daemon's slot, and the cancel is already on the wire before
+        the receipt is read, so waiting a long time for it helps nobody.
+        """
+        self._send_recv_ack(CancelMessage(task_id=task_id), timeout=ack_timeout)
 
     def send_shutdown(self) -> None:
         """Ask the daemon to shut down gracefully."""
@@ -205,16 +226,21 @@ class DaemonClient:
             raise DaemonError(code=resp.code, message=resp.message)
         raise DaemonError(code="unexpected", message=f"unexpected response: {type(resp)}")
 
-    def wait_for_event(
-        self, *, timeout: float = 300.0
-    ) -> EventMessage | FinalMessage | ErrorMessage | ConfirmRequest | ClarificationRequest | None:
+    def wait_for_event(self, *, timeout: float = 300.0) -> ServerEvent | None:
         """Block until the next event, request, or error from the daemon.
 
         Requests (:class:`ConfirmRequest` / :class:`ClarificationRequest`)
         are returned to the caller so the CLI can answer them inline; they are
         matched by ``type`` here (not in the protocol union, which only covers
         client→server messages).
+
+        Anything that arrived while a send was waiting for its ack is replayed
+        from :attr:`_pending` first, in order, so no daemon message can be lost
+        to the read that consumed the ack.
         """
+        buffered = self._take_buffered()
+        if buffered is not None:
+            return buffered
         loop = _get_or_create_loop()
         try:
             msg = loop.run_until_complete(asyncio.wait_for(self._recv(), timeout=timeout))
@@ -241,6 +267,63 @@ class DaemonClient:
         if result is None:
             raise DaemonError(code="eof", message="daemon closed the connection")
         return result
+
+    def _send_recv_ack(self, msg: Any, *, timeout: float | None = None) -> EventMessage:
+        """Send a request and return *its* ack, without ever losing a message.
+
+        Every server reply the client waits for is an ``ack``: the chat
+        submission ("started" / "queued") and the responses (confirmation /
+        clarification / cancel).  The worker is released - and can dispatch the
+        next ``ConfirmRequest``, a progress line, or the ``FinalMessage`` on the
+        same connection - either before or after the ack, so the reply read here
+        is not necessarily the ack: anything that is not the ack is buffered on
+        :attr:`_pending` and handed back by :meth:`wait_for_event`, in order.
+
+        Dropping it instead is the bug from ``663d559`` one layer down - the
+        approval prompt silently disappears and the task then fails closed with
+        "confirmation expired".  An ``ErrorMessage`` reply raises, as it always
+        did; EOF, a missing ack (:attr:`ack_timeout` and :attr:`max_pending`)
+        and a read that outlasts :attr:`ack_timeout` all raise too, so a caller
+        can never mistake a silent daemon for a delivered request.
+        """
+        loop = _get_or_create_loop()
+        loop.run_until_complete(self._send(msg))
+        wait = self.ack_timeout if timeout is None else float(timeout)
+        for _ in range(self.max_pending):
+            try:
+                result = loop.run_until_complete(asyncio.wait_for(self._recv(), timeout=wait))
+            except TimeoutError as exc:
+                # Anything already buffered is still the caller's: it is
+                # replayed by wait_for_event, not thrown away with the error.
+                raise DaemonError(
+                    code="ack_timeout",
+                    message=(
+                        f"no acknowledgement for {type(msg).__name__} within"
+                        f" {wait:g}s; daemon is not responding"
+                    ),
+                ) from exc
+            if result is None:
+                raise DaemonError(code="eof", message="daemon closed the connection")
+            if isinstance(result, ErrorMessage):
+                raise DaemonError(code=result.code, message=result.message)
+            if _is_ack(result, msg):
+                return result
+            self._pending.append(result)
+        raise DaemonError(
+            code="no_ack",
+            message=f"no acknowledgement for {type(msg).__name__}; daemon is not responding",
+        )
+
+    def _take_buffered(self) -> ServerEvent | None:
+        """Pop the next messageable buffered message, skipping junk."""
+        while self._pending:
+            candidate = self._pending.pop(0)
+            if isinstance(
+                candidate,
+                (EventMessage, FinalMessage, ErrorMessage, ConfirmRequest, ClarificationRequest),
+            ):
+                return candidate
+        return None
 
     async def _send(self, msg: Any) -> None:
         if self._writer is None:
@@ -281,6 +364,26 @@ class DaemonClient:
                 code="bad_pid_file",
                 message=f"corrupt daemon.json: {exc}",
             ) from exc
+
+
+def _is_ack(msg: DaemonMessage, sent: Any) -> TypeGuard[EventMessage]:
+    """True when ``msg`` is the server's acknowledgement of ``sent``.
+
+    The server answers every request the client waits for with an ``ack`` event.
+    Matching on the dedicated ``ack`` kind and not on ``log`` matters: a
+    progress line about the same task must not be mistaken for the
+    acknowledgement, or the real ack would then arrive as a stray event on the
+    next read.
+
+    When the client supplied its own id the ack must match it.  When it did not
+    (``ChatMessage.id`` empty, so the server assigns one) the first ``ack`` on
+    the connection is necessarily ours: this client sends one request at a time
+    and blocks until each is acknowledged.
+    """
+    if not isinstance(msg, EventMessage) or msg.kind != "ack":
+        return False
+    requested = str(getattr(sent, "task_id", "") or getattr(sent, "id", "") or "")
+    return not requested or msg.task_id == requested
 
 
 def _parse_server_message(text: str) -> DaemonMessage | None:

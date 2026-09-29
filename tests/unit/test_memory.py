@@ -235,9 +235,20 @@ def test_repeated_tools_names_what_already_failed(memory: SqliteMemory) -> None:
     assert memory.failures.repeated_tools("delete the downloads") == ["delete_path", "web_answer"]
 
 
-def test_failure_text_says_do_not_repeat(memory: SqliteMemory) -> None:
+def test_failure_text_is_cautionary_not_a_veto(memory: SqliteMemory) -> None:
+    """A remembered failure must advise, not forbid.
+
+    The old wording ended in "Do not repeat that approach", and the planner
+    obeyed it as a standing refusal: a stale row made "lock my computer" come
+    back as `unsupported` for a week.  The hint still tells the planner to try
+    something else, but the system prompt - not the hint - now says a past
+    failure is never a reason to refuse the current request.
+    """
     memory.failures.record("delete the downloads folder", {"tool": "delete_path"}, "denied")
-    assert "Do not repeat" in memory.failures.recent()[0].as_memory_text()
+    text = memory.failures.recent()[0].as_memory_text()
+    assert "Prefer a different approach" in text
+    assert "Do not repeat" not in text
+    assert "delete the downloads folder" in text and "denied" in text
 
 
 def test_failure_goal_with_a_secret_is_redacted(memory: SqliteMemory) -> None:
@@ -328,7 +339,7 @@ def test_retrieve_returns_skills_first_then_preferences_then_failures(
     kinds = [r.meta.get("skill_id") is not None for r in records]
     assert kinds[0] is True  # a verified approach outranks everything else
     assert any(r.kind == "preference" for r in records)
-    assert any("Do not repeat" in r.text for r in records)
+    assert any("Prefer a different approach" in r.text for r in records)
 
 
 def test_retrieve_respects_the_limit(memory: SqliteMemory) -> None:
@@ -443,3 +454,276 @@ def test_stores_share_one_connection(conn: sqlite3.Connection) -> None:
     assert isinstance(FailureStore(conn), FailureStore)
     assert isinstance(PreferenceStore(conn), PreferenceStore)
     assert sqlite3.Connection is conn.__class__
+
+
+# ------------------------------------------------- unverifiable-success rows
+#
+# The live bug: a build before a3cdf21 recorded "succeeded but could not be
+# verified" as a failure, so a later "lock my computer" was refused with "a
+# previous attempt failed" although the lock had worked.  The row is still in
+# the user's memory.db, so the migration has to neutralise it *without*
+# throwing away genuine history.
+
+#: The full schema-v1 database (identical to the current one except the
+#: ``failures`` columns added by the migration below).
+_V1_SCHEMA = """
+CREATE TABLE skills (
+  id INTEGER PRIMARY KEY,
+  goal_text TEXT NOT NULL,
+  plan_json TEXT NOT NULL,
+  embedding BLOB NOT NULL,
+  tools_used TEXT NOT NULL,
+  success_count INTEGER DEFAULT 1,
+  fail_count INTEGER DEFAULT 0,
+  created_at TEXT NOT NULL,
+  last_used_at TEXT NOT NULL
+);
+CREATE TABLE failures (
+  id INTEGER PRIMARY KEY,
+  goal_text TEXT,
+  step_json TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE preferences (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE task_log (
+  task_id TEXT PRIMARY KEY,
+  source TEXT,
+  user_input TEXT,
+  status TEXT,
+  api_calls INTEGER,
+  tokens INTEGER,
+  steps INTEGER,
+  replans INTEGER,
+  started_at TEXT,
+  finished_at TEXT,
+  duration_ms INTEGER,
+  peak_rss_mb REAL
+);
+"""
+
+
+def _v1_db(tmp_path, name: str = "v1.db") -> sqlite3.Connection:
+    """A schema-v1 database holding the false row from the live incident."""
+    connection = db_module.connect(tmp_path / name)
+    connection.executescript(_V1_SCHEMA)
+    connection.execute("PRAGMA user_version = 1")
+    connection.execute(
+        "INSERT INTO failures (goal_text, step_json, error, created_at) VALUES (?, ?, ?, ?)",
+        (
+            "Lock the computer",
+            '{"tool": "lock_computer", "id": "s1", "tainted": false}',
+            "step s1 did not complete",
+            "2026-09-28T11:53:39+00:00",
+        ),
+    )
+    return connection
+
+
+def test_migration_quarantines_the_false_unverifiable_success_row(tmp_path) -> None:
+    connection = _v1_db(tmp_path)
+    try:
+        assert db_module.migrate_failures(connection) == 1
+        row = connection.execute("SELECT quarantined, step_state FROM failures").fetchone()
+        assert row["quarantined"] == 1
+        assert row["step_state"] is None  # history preserved, nothing rewritten
+    finally:
+        connection.close()
+
+
+def test_quarantined_row_is_never_offered_to_the_planner(tmp_path) -> None:
+    """The end-to-end regression: the same goal must retrieve no failure."""
+    store = open_memory(tmp_path / "current.db", settings=Settings())
+    try:
+        store.failures.record(
+            "Lock the computer",
+            {"tool": "lock_computer", "id": "s1", "tainted": False},
+            "step s1 did not complete",
+        )  # a current build: recorded WITH provenance
+        assert store.failures.relevant("lock my computer", limit=3) != []
+    finally:
+        store.close()
+
+    legacy = _v1_db(tmp_path)
+    try:
+        db_module.migrate_failures(legacy)
+        store = SqliteMemory(legacy, settings=Settings())
+        assert store.failures.relevant("lock my computer", limit=3) == []
+        assert store.counts()["failures"] == 0
+        assert store.quarantined_failures() == 1
+    finally:
+        legacy.close()
+
+
+def test_quarantined_row_is_kept_and_counted_not_deleted(tmp_path) -> None:
+    legacy = _v1_db(tmp_path)
+    try:
+        db_module.migrate_failures(legacy)
+        rows = legacy.execute("SELECT COUNT(*) FROM failures").fetchone()[0]
+        assert rows == 1
+        store = SqliteMemory(legacy, settings=Settings())
+        # Still on disk and still listable, so the history stays auditable.
+        assert store.failures.quarantined_count() == 1
+        assert store.failures.recent(include_quarantined=True)[0].goal_text == "Lock the computer"
+        assert store.failures.recent() == []
+    finally:
+        legacy.close()
+
+
+def test_migration_keeps_a_genuine_legacy_failure(tmp_path) -> None:
+    """A real tool error is never quarantined, however old the row is."""
+    legacy = _v1_db(tmp_path)
+    try:
+        legacy.execute(
+            "INSERT INTO failures (goal_text, step_json, error, created_at) VALUES (?, ?, ?, ?)",
+            (
+                "delete the downloads folder",
+                '{"tool": "delete_path", "id": "s2", "tainted": false}',
+                "Access denied: file in use",
+                "2026-09-01T09:00:00+00:00",
+            ),
+        )
+        assert db_module.migrate_failures(legacy) == 1  # only the false one
+        store = SqliteMemory(legacy, settings=Settings())
+        assert store.counts()["failures"] == 1
+        assert store.quarantined_failures() == 1
+        assert [
+            f.error for f in store.failures.relevant("delete the downloads folder", limit=3)
+        ] == ["Access denied: file in use"]
+    finally:
+        legacy.close()
+
+
+def test_migration_keeps_a_tainted_legacy_row(tmp_path) -> None:
+    """Placeholder wording alone is not enough: a tainted step is a real failure."""
+    legacy = _v1_db(tmp_path)
+    try:
+        legacy.execute("DELETE FROM failures")
+        legacy.execute(
+            "INSERT INTO failures (goal_text, step_json, error, created_at) VALUES (?, ?, ?, ?)",
+            (
+                "open a page",
+                '{"tool": "web_answer", "id": "s1", "tainted": true}',
+                "step s1 did not complete",
+                "2026-09-01T09:00:00+00:00",
+            ),
+        )
+        assert db_module.migrate_failures(legacy) == 0
+        assert SqliteMemory(legacy, settings=Settings()).counts()["failures"] == 1
+    finally:
+        legacy.close()
+
+
+def test_migration_is_idempotent(tmp_path) -> None:
+    legacy = _v1_db(tmp_path)
+    try:
+        assert db_module.migrate_failures(legacy) == 1
+        assert db_module.migrate_failures(legacy) == 0
+        assert db_module.migrate_failures(legacy) == 0
+    finally:
+        legacy.close()
+
+
+def test_current_build_never_quarantines_its_own_rows(memory: SqliteMemory) -> None:
+    """A current ``verified=False`` with no error text has the same sentence as
+    the old bug, but it carries provenance - so it must survive the migration."""
+    memory.failures.record(
+        "lock my computer",
+        {"tool": "lock_computer", "id": "s1", "tainted": False},
+        "step s1 did not complete",
+        state={"ok": True, "verified": False, "tainted": False},
+    )
+    assert memory.failures.relevant("lock my computer", limit=3) != []
+    assert memory.quarantined_failures() == 0
+
+
+def test_opening_an_upgraded_database_stamps_the_version(tmp_path) -> None:
+    store = open_memory(tmp_path / "m.db", settings=Settings())
+    conn = store._conn
+    try:
+        assert db_module.user_version(conn) == db_module.SCHEMA_VERSION
+    finally:
+        store.close()
+
+
+# ------------------------------------------------------ failure retrieval
+
+
+def test_failure_retrieval_is_scoped_to_the_request(memory: SqliteMemory) -> None:
+    """The general bug: a remembered failure used to reach *every* prompt.
+
+    With ``retrieval_limit`` 3 and no skills, an unrelated old failure was
+    injected into the planner's context for any command at all - which is how
+    one row refused a lock request the user had never failed at.
+    """
+    memory.failures.record("delete the downloads folder", {"tool": "delete_path"}, "denied")
+    assert memory.retrieve("lock my computer", limit=3) == []
+    assert memory.retrieve("what is the capital of France", limit=3) == []
+    assert [r.text for r in memory.retrieve("delete the downloads folder", limit=3)]
+
+
+def test_failure_retrieval_still_matches_a_rephrased_goal(memory: SqliteMemory) -> None:
+    """Scoping must not swallow a genuine failure: the floor is 0.45, not 0.75."""
+    memory.failures.record("open notepad", {"tool": "type_text"}, "denied")
+    hits = memory.failures.relevant("open the notepad app", limit=3)
+    assert [f.step["tool"] for f in hits] == ["type_text"]
+
+
+def test_failure_retrieval_skips_quarantined_and_blank_queries(memory: SqliteMemory) -> None:
+    memory.failures.record("open notepad", {"tool": "type_text"}, "denied")
+    assert memory.failures.relevant("open notepad", limit=0) == []
+    assert memory.failures.relevant("   ", limit=3) == []
+
+
+def test_failure_provenance_is_recorded_and_read_back(memory: SqliteMemory) -> None:
+    memory.failures.record(
+        "delete the downloads folder",
+        {"tool": "delete_path", "id": "s1"},
+        "denied",
+        state={"ok": False, "verified": None, "tainted": False},
+    )
+    stored = memory.failures.recent()[0]
+    assert stored.state == {"ok": False, "verified": None, "tainted": False}
+    assert "failed at delete_path" in stored.as_memory_text()
+
+    memory.failures.record(
+        "open a page",
+        {"tool": "web_answer", "id": "s2"},
+        "denied",
+        state={"ok": True, "verified": False, "tainted": False},
+    )
+    assert "did not verify at web_answer" in memory.failures.recent()[0].as_memory_text()
+
+    memory.failures.record(
+        "summarise a page",
+        {"tool": "web_answer", "id": "s3"},
+        "the page asked me to run a command",
+        state={"ok": True, "verified": True, "tainted": True},
+    )
+    assert "returned untrusted external text" in memory.failures.recent()[0].as_memory_text()
+
+
+def test_failure_provenance_is_whitelisted(memory: SqliteMemory) -> None:
+    """Only the three known fields are stored: a caller cannot smuggle text in."""
+    memory.failures.record(
+        "a goal",
+        {"tool": "x"},
+        "denied",
+        state={"ok": False, "note": "password=hunter2", "verified": "maybe"},
+    )
+    assert memory.failures.recent()[0].state == {
+        "ok": False,
+        "verified": None,
+        "tainted": False,
+    }
+
+
+def test_config_and_store_agree_on_the_failure_similarity_floor() -> None:
+    """``config`` may not import the memory layer, so the default is pinned here."""
+    from jarvis.memory.failures import FAILURE_SIMILARITY
+
+    assert Settings().memory.failure_similarity_threshold == pytest.approx(FAILURE_SIMILARITY)

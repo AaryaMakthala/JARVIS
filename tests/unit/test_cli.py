@@ -438,3 +438,154 @@ def test_init_config_keeps_existing_config(tmp_path: Path) -> None:
     )
     assert any("left untouched" in m for m in messages)
     assert "# custom" in config_path.read_text(encoding="utf-8")
+
+
+# ── daemon chat REPL: interruption, queueing and confirmation delivery ────
+#
+# Live bugs behind these tests (PROGRESS.md, "lock_computer follow-up"):
+#   * Ctrl+C anywhere inside a command - at a prompt, or while the daemon
+#     re-plans after an answer - unwound out of `jarvis chat` and killed the
+#     whole process instead of returning to the `you>` prompt.
+#   * The task kept the daemon's single active slot, so the next command was
+#     queued behind an abandoned run and the "queued" ack was never shown.
+#   * Answering a clarification printed nothing at all while the planner
+#     re-thought (rate limits made that ~45 s), which is what prompted the
+#     Ctrl+C in the first place.
+
+
+class _FakeDaemonClient:
+    """Scripted daemon client: serves messages, records what was sent."""
+
+    def __init__(
+        self,
+        messages: list[object],
+        *,
+        ack: str = "started",
+        interrupt_on_wait: int | None = None,
+    ) -> None:
+        self.messages = list(messages)
+        self.last_ack_message = ack
+        self.sent: list[tuple[str, dict]] = []
+        self.cancelled: list[str] = []
+        self.cancel_timeouts: list[float | None] = []
+        self.interrupt_on_wait = interrupt_on_wait
+        self.waits = 0
+
+    def send_chat(self, text: str, **kwargs: object) -> str:
+        self.sent.append(("chat", {"text": text}))
+        return "t1"
+
+    def send_confirm(self, task_id: str, **kwargs: object) -> None:
+        self.sent.append(("confirm", {"task_id": task_id, **kwargs}))
+
+    def send_clarification(self, task_id: str, *, answer: str) -> None:
+        self.sent.append(("clarification", {"task_id": task_id, "answer": answer}))
+
+    def send_cancel(self, task_id: str, *, ack_timeout: float | None = None) -> None:
+        self.cancelled.append(task_id)
+        self.cancel_timeouts.append(ack_timeout)
+
+    def wait_for_event(self, *, timeout: float = 300.0) -> object:
+        self.waits += 1
+        if self.waits == self.interrupt_on_wait:
+            raise KeyboardInterrupt
+        if not self.messages:
+            return None
+        return self.messages.pop(0)
+
+
+class TestDaemonChatSurvivesInterruption:
+    def test_ctrl_c_while_waiting_cancels_the_task_and_returns_empty(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        client = _FakeDaemonClient([], interrupt_on_wait=1)
+        assert cli._daemon_one_shot(client, "lock my computer") == ""
+        assert client.cancelled == ["t1"]
+        assert "cancelled" in capsys.readouterr().out
+
+    def test_the_abandoning_cancel_does_not_wait_on_a_wedged_daemon(self) -> None:
+        """Ctrl+C must not trade a silent hang for a 30 s one.
+
+        The cancel is on the wire before its receipt is read, so the receipt is
+        worth a moment and no more: the point of the call is to free the
+        daemon's slot, and the user has already asked to stop waiting.
+        """
+        client = _FakeDaemonClient([], interrupt_on_wait=1)
+        assert cli._daemon_one_shot(client, "lock my computer") == ""
+        assert client.cancel_timeouts == [cli._ABANDON_ACK_TIMEOUT]
+        assert cli._ABANDON_ACK_TIMEOUT < 5
+
+    def test_ctrl_c_at_the_answer_prompt_also_cancels(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from jarvis.daemon.protocol import ClarificationRequest
+
+        client = _FakeDaemonClient([ClarificationRequest(task_id="t1", question="Which one?")])
+        monkeypatch.setattr(cli, "_chat_prompt", lambda text: (_ for _ in ()).throw(EOFError()))
+        assert cli._daemon_one_shot(client, "lock my computer") == ""
+        assert client.cancelled == ["t1"]
+        assert "cancelled" in capsys.readouterr().out
+
+    def test_the_repl_keeps_going_after_an_interrupted_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The regression itself: the process used to exit to PowerShell."""
+        asked: list[str] = []
+
+        def prompt(text: str) -> str:
+            asked.append(text)
+            if len(asked) == 1:
+                return "lock my computer"
+            raise EOFError  # the user then closes the session
+
+        client = _FakeDaemonClient([], interrupt_on_wait=1)
+        monkeypatch.setattr(cli, "_chat_prompt", prompt)
+        cli._daemon_chat_loop(client)
+        # One command, one cancellation, and a second prompt before the exit.
+        assert len(asked) == 2
+        assert client.cancelled == ["t1"]
+
+    def test_a_queued_submission_is_shown_to_the_user(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from jarvis.daemon.protocol import FinalMessage
+
+        client = _FakeDaemonClient([FinalMessage(task_id="t1", text="locked")], ack="queued")
+        assert cli._daemon_one_shot(client, "lock my computer") == "locked"
+        assert "queued" in capsys.readouterr().out
+
+    def test_answering_a_clarification_shows_that_work_continues(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from jarvis.daemon.protocol import ClarificationRequest, FinalMessage
+
+        client = _FakeDaemonClient(
+            [
+                ClarificationRequest(task_id="t1", question="Lock now?"),
+                FinalMessage(task_id="t1", text="locked"),
+            ]
+        )
+        monkeypatch.setattr(cli, "_chat_prompt", lambda text: "y")
+        assert cli._daemon_one_shot(client, "lock my computer") == "locked"
+        out = capsys.readouterr().out
+        assert ("clarification", {"task_id": "t1", "answer": "y"}) in client.sent
+        assert "working" in out
+
+    def test_a_confirmation_is_answered_with_the_exact_action_hash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from jarvis.daemon.protocol import ConfirmRequest, FinalMessage
+
+        client = _FakeDaemonClient(
+            [
+                ConfirmRequest(task_id="t1", tier=1, summary="Lock the computer", action_hash="h1"),
+                FinalMessage(task_id="t1", text="locked"),
+            ]
+        )
+        monkeypatch.setattr(cli, "_chat_prompt", lambda text: "y")
+        assert cli._daemon_one_shot(client, "lock my computer") == "locked"
+        kind, payload = client.sent[-1]
+        assert kind == "confirm"
+        assert payload["action_hash"] == "h1"
+        assert payload["approved"] is True
+        assert payload["password"] is None

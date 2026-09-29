@@ -28,7 +28,7 @@ from typing import Any, Self
 from jarvis.memory import embeddings
 from jarvis.memory.base import MemoryRecord, NullMemory
 from jarvis.memory.db import open_db
-from jarvis.memory.failures import FailureStore
+from jarvis.memory.failures import FAILURE_SIMILARITY, FailureStore
 from jarvis.memory.prefs import PreferenceStore
 from jarvis.memory.skills import SkillStore
 from jarvis.memory.tasklog import TaskLogStore
@@ -57,7 +57,13 @@ class SqliteMemory:
             similarity_threshold=threshold,
             max_rows=int(getattr(memory, "max_skills", 500)),
         )
-        self.failures = FailureStore(conn, max_rows=int(getattr(memory, "max_failures", 200)))
+        self.failures = FailureStore(
+            conn,
+            max_rows=int(getattr(memory, "max_failures", 200)),
+            similarity_threshold=float(
+                getattr(memory, "failure_similarity_threshold", FAILURE_SIMILARITY)
+            ),
+        )
         self.preferences = PreferenceStore(
             conn, max_rows=int(getattr(memory, "max_preferences", 50))
         )
@@ -66,13 +72,18 @@ class SqliteMemory:
     # ------------------------------------------------------- MemoryBackend
 
     def retrieve(self, query: str, limit: int = 3) -> list[MemoryRecord]:
-        """Relevant skills, then preferences, then recent failures.
+        """Relevant skills, then preferences, then relevant recent failures.
 
         Ordering is deliberate: a verified earlier *approach* is the most
         useful thing for the planner, a preference is stable context, and a
-        failure is a "do not repeat" hint worth the least prompt space.  The
-        list is capped at ``limit`` here as well as in the node, so no caller
-        can exceed it.
+        failure is a "prefer another approach" hint worth the least prompt
+        space.  The list is capped at ``limit`` here as well as in the node, so
+        no caller can exceed it.
+
+        Every source is *scoped to ``query``**.  Failures used to be the most
+        recent N regardless of the request, which meant one remembered failure
+        was injected into every prompt and could refuse an unrelated command;
+        they are now filtered by goal similarity like the skills.
         """
         if limit <= 0 or not (query or "").strip():
             return []
@@ -80,7 +91,7 @@ class SqliteMemory:
         with self._lock:
             records.extend(self._skill_records(query, limit))
             records.extend(self._preference_records(limit - len(records)))
-            records.extend(self._failure_records(limit - len(records)))
+            records.extend(self._failure_records(query, limit - len(records)))
         return records[:limit]
 
     def remember(self, record: MemoryRecord) -> None:
@@ -149,7 +160,8 @@ class SqliteMemory:
         meta = record.meta or {}
         if meta.get(_FAILURE_META_KEY) is not None:
             step = meta.get("step") if isinstance(meta.get("step"), dict) else {}
-            self.failures.record(str(meta.get("goal_text") or ""), step, record.text)
+            state = meta.get("step_state") if isinstance(meta.get("step_state"), dict) else None
+            self.failures.record(str(meta.get("goal_text") or ""), step, record.text, state=state)
             return
         tools = meta.get("tools")
         self.skills.save(
@@ -193,11 +205,11 @@ class SqliteMemory:
             for pref in prefs
         ]
 
-    def _failure_records(self, limit: int) -> list[MemoryRecord]:
+    def _failure_records(self, query: str, limit: int) -> list[MemoryRecord]:
         if limit <= 0:
             return []
         try:
-            recent = self.failures.recent(limit=limit)
+            related = self.failures.relevant(query, limit=limit)
         except sqlite3.Error as exc:
             self._log.warning("failure retrieval failed: %s", exc)
             return []
@@ -207,7 +219,7 @@ class SqliteMemory:
                 text=failure.as_memory_text(),
                 meta={"failure_id": failure.id, "tool": failure.step.get("tool", "")},
             )
-            for failure in recent
+            for failure in related
         ]
 
     def close(self) -> None:
@@ -221,8 +233,10 @@ class SqliteMemory:
     def counts(self) -> dict[str, int]:
         """Row counts per table, for ``jarvis doctor`` / ``jarvis skills``.
 
-        Learned memory only.  The ``task_log`` is telemetry, not something the
-        user "learned", so it is reported through :meth:`task_metrics` instead.
+        Learned memory only, and only what the planner can still see: the
+        ``task_log`` is telemetry rather than something the user "learned", so
+        it is reported through :meth:`task_metrics` instead, and quarantined
+        failures are reported separately by :meth:`quarantined_failures`.
         """
         with self._lock:
             return {
@@ -230,6 +244,15 @@ class SqliteMemory:
                 "failures": self.failures.count(),
                 "preferences": self.preferences.count(),
             }
+
+    def quarantined_failures(self) -> int:
+        """Failure rows kept on disk but withheld from the planner."""
+        with self._lock:
+            try:
+                return self.failures.quarantined_count()
+            except sqlite3.Error as exc:
+                self._log.warning("quarantined failure count unreadable: %s", exc)
+                return 0
 
     def task_metrics(self) -> Any:
         """Aggregate task telemetry, or ``None`` when it cannot be read."""

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from unittest.mock import AsyncMock
 
 import pytest
@@ -334,7 +335,10 @@ class TestRequestAcks:
         data = json.loads(written)
         assert data["type"] == "event"
         assert data["task_id"] == "t1"
-        assert data["kind"] == "log"
+        # A dedicated kind, not a progress "log": the client has to be able to
+        # tell the submission receipt from a message about the same task.
+        assert data["kind"] == "ack"
+        assert data["data"]["message"] == "started"
         assert server._active is not None and server._active.task_id == "t1"
 
     def test_delivered_confirm_response_sends_an_ack(self) -> None:
@@ -357,6 +361,10 @@ class TestRequestAcks:
         data = json.loads(written)
         assert data["type"] == "event"
         assert data["task_id"] == "t1"
+        # A dedicated kind: the client must be able to tell the ack from a
+        # progress "log" for the same task while it waits for it.
+        assert data["kind"] == "ack"
+        assert data["data"]["message"] == "confirmation received"
 
     def test_delivered_clarification_sends_an_ack(self) -> None:
         from jarvis.daemon.protocol import ClarificationResponse
@@ -375,3 +383,97 @@ class TestRequestAcks:
         data = json.loads(written)
         assert data["type"] == "event"
         assert data["task_id"] == "t1"
+        assert data["kind"] == "ack"
+        assert data["data"]["message"] == "clarification received"
+
+    def test_cancel_sends_an_ack(self) -> None:
+        from jarvis.daemon.protocol import CancelMessage
+
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="setup", source="chat", owner_id="oid")
+        server._active = slot
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+
+        asyncio.run(server._handle_cancel(CancelMessage(task_id="t1"), conn))
+        data = json.loads(writer.write.call_args[0][0].decode("utf-8"))
+        assert data["type"] == "event"
+        assert data["task_id"] == "t1"
+        assert data["kind"] == "ack"
+        assert data["data"]["message"] == "cancelled"
+
+
+class TestAckPrecedesTheWorkerWakeup:
+    """The ack must be on the wire *before* the worker thread is released.
+
+    The client reads one message while waiting for its ack.  If the worker is
+    woken first it can dispatch the next ``ConfirmRequest`` (or the
+    ``FinalMessage``) on this same connection, and that request would be read as
+    the ack - the approval prompt would vanish and the task would fail closed
+    with "confirmation expired".
+    """
+
+    class _RecordingEvent:
+        """A ``threading.Event`` that appends to a shared order list on ``set``."""
+
+        def __init__(self, order: list[str]) -> None:
+            self._order = order
+            self._event = threading.Event()
+
+        def set(self) -> None:
+            self._order.append("worker-woken")
+            self._event.set()
+
+        def is_set(self) -> bool:
+            return self._event.is_set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            return self._event.wait(timeout)
+
+        def clear(self) -> None:
+            self._event.clear()
+
+    def _run_handler(self, server, slot, handler) -> list[str]:
+        order: list[str] = []
+        original_send = ClientConnection.send
+
+        async def spy_send(self, message):
+            order.append("ack")
+            await original_send(self, message)
+
+        slot.event = self._RecordingEvent(order)
+        conn = ClientConnection(writer=AsyncMock(), reader=AsyncMock())
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(ClientConnection, "send", spy_send, raising=True)
+            asyncio.run(handler(conn))
+        return order
+
+    def test_confirm_acks_before_waking_the_worker(self) -> None:
+        from jarvis.daemon.protocol import ConfirmResponse
+
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="lock", source="chat", owner_id="oid")
+        server._active = slot
+        order = self._run_handler(
+            server,
+            slot,
+            lambda conn: server._handle_confirm(
+                ConfirmResponse(task_id="t1", approved=True, action_hash="h"), conn
+            ),
+        )
+        assert order == ["ack", "worker-woken"]
+
+    def test_clarification_acks_before_waking_the_worker(self) -> None:
+        from jarvis.daemon.protocol import ClarificationResponse
+
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="lock", source="chat", owner_id="oid")
+        server._active = slot
+        order = self._run_handler(
+            server,
+            slot,
+            lambda conn: server._handle_clarification(
+                ClarificationResponse(task_id="t1", answer="y"), conn
+            ),
+        )
+        assert order == ["ack", "worker-woken"]

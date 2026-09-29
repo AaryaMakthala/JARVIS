@@ -23,6 +23,8 @@ Design rules that matter for safety:
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 import sqlite3
 from collections.abc import Sequence
@@ -34,7 +36,9 @@ __all__ = [
     "connect",
     "init_schema",
     "insert_task_log",
+    "is_unverifiable_success_row",
     "looks_secret",
+    "migrate_failures",
     "prune_failures",
     "prune_skills",
     "prune_task_log",
@@ -47,10 +51,11 @@ __all__ = [
 ]
 
 #: Bumped when the schema changes.  ``init_schema`` applies the statements in
-#: :data:`SCHEMA` (all ``IF NOT EXISTS``) and records the version in
-#: ``PRAGMA user_version`` so a future migration can branch on it.  Existing
-#: databases are never dropped: skills and preferences outlive upgrades.
-SCHEMA_VERSION = 1
+#: :data:`SCHEMA` (all ``IF NOT EXISTS``), runs :func:`migrate_failures`, and
+#: records the version in ``PRAGMA user_version`` so a future migration can
+#: branch on it.  Existing databases are never dropped: skills and preferences
+#: outlive upgrades.
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS skills (
@@ -70,7 +75,9 @@ CREATE TABLE IF NOT EXISTS failures (
   goal_text TEXT,
   step_json TEXT,
   error TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  step_state TEXT,
+  quarantined INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS preferences (
@@ -262,15 +269,106 @@ def connect(path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
 
 
 def init_schema(conn: sqlite3.Connection) -> sqlite3.Connection:
-    """Create every table/index if missing and stamp the schema version.
+    """Create every table/index if missing and bring the DB to the current schema.
 
     Idempotent: safe to call on every open, and safe on a database written by
     an older build (all statements are ``IF NOT EXISTS``, so no data is lost).
+    The ``failures`` migration is additive - see :func:`migrate_failures`.
     """
     conn.executescript(SCHEMA)
+    migrate_failures(conn)
     if user_version(conn) < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     return conn
+
+
+#: The sentence ``memory_save._failure_record`` falls back to when a bad step
+#: carried no error text.  Used by :func:`is_unverifiable_success_row` only.
+_PLACEHOLDER_STEP_ERROR = re.compile(r"^step \S+ did not complete$")
+
+
+def is_unverifiable_success_row(error: str | None, step_json: str | None) -> bool:
+    """True when a *legacy* failure row is almost certainly a false record.
+
+    Before the ``verified=None`` fix (commit ``a3cdf21``) the failure log
+    treated "the step succeeded but nothing could independently confirm it" as
+    a failure, and wrote this exact placeholder sentence when the step carried
+    no error string.  A row matching both halves of that signature therefore
+    cannot be trusted to mean "this approach failed".
+
+    The signature is deliberately narrow, because the alternative - quarantining
+    every old row - would throw away genuine history:
+
+    * the error is *exactly* the placeholder sentence (a real tool error
+      ("Access denied: file in use") is never this string), and
+    * the step is not tainted (a tainted step is a real failure and keeps its
+      full force).
+
+    Known limitation, stated honestly: a legacy ``verified=False`` step with no
+    error text produces the same sentence, so one such row is over-quarantined.
+    Nothing is deleted - the row stays in the table, is counted and listed by
+    ``jarvis skills``, and :meth:`~jarvis.memory.store.SqliteMemory.
+    quarantined_failures` reports it - it is only withheld from the planner.
+    There is no per-row undo yet; ``jarvis skills clear`` is the escape hatch.
+    """
+    if not _PLACEHOLDER_STEP_ERROR.match((error or "").strip()):
+        return False
+    try:
+        step = json.loads(step_json or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(step, dict):
+        return False
+    return not bool(step.get("tainted"))
+
+
+def _failure_columns(conn: sqlite3.Connection) -> set[str]:
+    """Column names currently present on ``failures``."""
+    return {str(row[1]) for row in conn.execute("PRAGMA table_info(failures)")}
+
+
+def migrate_failures(conn: sqlite3.Connection) -> int:
+    """Bring ``failures`` up to schema v2; return rows newly quarantined.
+
+    Two additive steps, both safe to re-run:
+
+    1. ``ALTER TABLE ... ADD COLUMN`` for ``step_state`` and ``quarantined`` -
+       ``CREATE TABLE IF NOT EXISTS`` in :data:`SCHEMA` cannot add a column to
+       a table that already exists, so an upgraded database needs this
+       explicitly.
+    2. Quarantine the false failures written by the pre-``a3cdf21`` build
+       (see :func:`is_unverifiable_success_row`).  Only rows with **no**
+       ``step_state`` are considered: a row written by a current build always
+       carries the step's real outcome, so genuine failures are never touched.
+
+    The rows are flagged, not deleted, so the history stays auditable and the
+    operation is reversible.
+    """
+    present = _failure_columns(conn)
+    if "step_state" not in present:
+        conn.execute("ALTER TABLE failures ADD COLUMN step_state TEXT")
+    if "quarantined" not in present:
+        conn.execute("ALTER TABLE failures ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0")
+
+    rows = conn.execute(
+        "SELECT id, error, step_json FROM failures"
+        " WHERE step_state IS NULL AND COALESCE(quarantined, 0) = 0"
+    ).fetchall()
+    stale = [
+        int(row["id"])
+        for row in rows
+        if is_unverifiable_success_row(row["error"], row["step_json"])
+    ]
+    if not stale:
+        return 0
+    placeholders = ", ".join("?" for _ in stale)
+    conn.execute(f"UPDATE failures SET quarantined = 1 WHERE id IN ({placeholders})", stale)
+    logging.getLogger("jarvis.memory.db").info(
+        "quarantined %d unverifiable-success failure row(s) from an older build; "
+        "they are kept in the database but no longer shown to the planner",
+        len(stale),
+    )
+    return len(stale)
 
 
 def open_db(path: str | Path) -> sqlite3.Connection:

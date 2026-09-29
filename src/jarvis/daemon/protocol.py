@@ -140,11 +140,17 @@ class AuthOk(BaseModel):
 
 
 class EventMessage(BaseModel):
-    """Streaming event while a task is running (plan, step_start, step_result, log)."""
+    """Streaming event while a task is running (plan, step_start, step_result, log).
+
+    ``ack`` is separate from ``log`` on purpose: an ack is the server confirming
+    that it *received* a response (confirmation, clarification answer, cancel),
+    and a client blocked waiting for it must be able to tell the two apart from a
+    progress line about the same task.
+    """
 
     type: Literal["event"] = "event"
     task_id: str
-    kind: Literal["plan", "step_start", "step_result", "log"] = "log"
+    kind: Literal["plan", "step_start", "step_result", "log", "ack"] = "log"
     data: dict[str, Any] = Field(default_factory=dict)
 
 

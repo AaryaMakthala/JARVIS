@@ -991,7 +991,7 @@ class DaemonServer:
                 await conn.send(
                     EventMessage(
                         task_id=task_id,
-                        kind="log",
+                        kind="ack",
                         data={"message": "queued", "position": len(self._queue)},
                     )
                 )
@@ -1011,7 +1011,7 @@ class DaemonServer:
                 await conn.send(
                     EventMessage(
                         task_id=task_id,
-                        kind="log",
+                        kind="ack",
                         data={"message": "started"},
                     )
                 )
@@ -1331,15 +1331,19 @@ class DaemonServer:
             answer["typed_confirmation"] = msg.typed_confirmation
 
         slot.resume_answer = answer
-        slot.event.set()  # wake the worker thread
-        # Ack the response (``send_confirm`` blocks on the next server
-        # message; without an ack it would consume the eventual
-        # FinalMessage and the terminal would print nothing).
+        # Ack the response **before** waking the worker, not after: the worker
+        # runs the graph on another thread and can dispatch the next
+        # ConfirmRequest (or the FinalMessage) on this same connection the
+        # instant the event is set.  The client is blocked reading one message
+        # for the ack, so a request arriving first would be consumed as if it
+        # were the ack - the approval prompt would vanish and the task would
+        # then time out.  (Same failure mode as 663d559, one layer down.)
         await conn.send(
             EventMessage(
-                task_id=slot.task_id, kind="log", data={"message": "confirmation received"}
+                task_id=slot.task_id, kind="ack", data={"message": "confirmation received"}
             )
         )
+        slot.event.set()  # wake the worker thread
 
     async def _handle_clarification(
         self, msg: ClarificationResponse, conn: ClientConnection
@@ -1360,13 +1364,13 @@ class DaemonServer:
         # non-string / empty resume into "No clarification received." (fail
         # closed).  Never the password, never a confirmation flag.
         slot.resume_answer = msg.answer if isinstance(msg.answer, str) else ""
-        slot.event.set()  # wake the worker thread
-        # Ack the response (same reason as _handle_confirm above).
+        # Ack before waking the worker - see the note in _handle_confirm.
         await conn.send(
             EventMessage(
-                task_id=slot.task_id, kind="log", data={"message": "clarification received"}
+                task_id=slot.task_id, kind="ack", data={"message": "clarification received"}
             )
         )
+        slot.event.set()  # wake the worker thread
 
     # ── cancel ─────────────────────────────────────────────────────────
 
@@ -1377,18 +1381,19 @@ class DaemonServer:
                 self._active_cancel.cancel()
                 self._active.error = "cancelled by user"
                 self._active.done = True
+                # Ack before waking the worker - see the note in _handle_confirm.
+                await conn.send(
+                    EventMessage(task_id=msg.task_id, kind="ack", data={"message": "cancelled"})
+                )
                 self._active.event.set()  # wake worker if waiting
                 self._task_event.set()
-                await conn.send(
-                    EventMessage(task_id=msg.task_id, kind="log", data={"message": "cancelled"})
-                )
                 return
             for i, slot in enumerate(self._queue):
                 if slot.task_id == msg.task_id:
                     self._queue.pop(i)
                     await conn.send(
                         EventMessage(
-                            task_id=msg.task_id, kind="log", data={"message": "removed from queue"}
+                            task_id=msg.task_id, kind="ack", data={"message": "removed from queue"}
                         )
                     )
                     return

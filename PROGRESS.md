@@ -2015,3 +2015,152 @@ plus a derived context), which is a Phase 10 hardening item, not a one-line flag
 - A global `jarvis --dry-run` flag. Only `jarvis run --dry-run` exists today.
 - `jarvis undo` (the undo log is written by the delete path; there is no command to
   surface it yet).
+
+## Session: "lock my computer" was silently refused for a week (WSL run, no commit)
+
+### Symptom
+`jarvis run "lock my computer"` never reached a confirmation. The daemon log showed the
+request, a clarification, the answer being delivered, the graph resuming, and then ~30s of
+silence; the result was dropped. Repeating the request changed nothing.
+
+### Root causes (three, all real)
+1. **A false row in failure memory became a planner veto.** The log contained
+   `lock_computer ok=True verified=None` (success, nothing to independently confirm), and a
+   build before `a3cdf21` filed it as a failure with the placeholder text
+   `step s1 did not complete`. `SqliteMemory.retrieve` injected the most recent N failures
+   into *every* prompt regardless of the request, and the hint ended in "Do not repeat that
+   approach." One row, one goal, and the planner refused the same command forever.
+2. **`FailureStore.record` accepted a success.** Only `memory_save._failure_record` filtered
+   `verified is None`, so the invariant lived in one call site with nothing enforcing it.
+3. **The clarification/confirm round trip had three delivery holes**, all in the 12:18-12:19
+   window: the CLI printed nothing between the answer and the result (looked hung); Ctrl+C or
+   EOF escaped `_daemon_one_shot` and killed the client, leaving the task running and holding
+   the daemon's single slot, so the next request was silently queued; and `_handle_confirm` /
+   `_handle_clarification` / `_handle_cancel` woke the worker *before* sending the
+   acknowledgement, so a client blocked on a synchronous send could lose the response message.
+
+### Fixes
+**Memory (`schema v2`)**
+- `failures.step_state` records *why* a step was bad (`ok`/`verified`/`tainted`), so the
+  sentence shown to the planner is honest and a later reader can audit the row.
+- `failures.quarantined` withholds a row from the planner **without deleting it**.
+  `db.migrate_failures()` quarantines only legacy rows (`step_state IS NULL`) whose error is
+  *exactly* the old placeholder sentence and whose step is not tainted. A real tool error
+  ("Access denied: file in use") is never that string, so genuine history survives.
+- `FailureStore.record` now refuses an unverifiable success as a second line of defence. The
+  predicate `_is_unverified_success` is written as the exact negation of the node's "bad step"
+  test, so the two cannot drift: `verified=False` is still remembered as a genuine failure.
+- `FailureStore.relevant()` scores the stored `goal_text` against the request with the same
+  offline embedding `SkillStore.find` uses, at `FAILURE_SIMILARITY = 0.45`
+  (`[memory] failure_similarity_threshold`). Failure hints are now **relevance-scoped**, so
+  an unrelated remembered failure can no longer touch an unrelated command. Measured: the
+  real request scored `0.844` against the stale row, an unrelated goal `0.000`.
+
+**Language**
+- The hint is advisory, not a prohibition: "Prefer a different approach, or check the state
+  first before repeating it."
+- `PLANNER_SYSTEM` rule 8 states that remembered failures are background, not a reason to
+  refuse the current request. (Prompts do not enforce anything; the store is what decides.)
+
+**Daemon**
+- `_handle_confirm` / `_handle_clarification` / `_handle_cancel` send the ack *before* setting
+  the resume event, so a blocked reader cannot miss the response.
+- `DaemonClient` keeps a `_pending` buffer (`max_pending = 64`): `wait_for_event` replays
+  buffered messages first, and `send_chat` / `send_confirm` / `send_clarification` /
+  `send_cancel` skip non-ack messages instead of dropping them. An IPC client can no longer
+  lose a `ConfirmRequest` or a `FinalMessage`. `last_ack_message` exposes the ack text.
+- **The ack got its own wire kind.** `EventMessage.kind` gained `"ack"`, and every receipt the
+  client waits for (chat submission "started"/"queued", confirmation, clarification, cancel) now
+  uses it instead of `"log"`. Matching the ack by `task_id` alone was not enough: a progress
+  `log` for the same task would be taken for the receipt, and the real ack would then resurface
+  as a stray event on the next read. `_is_ack` is a `TypeGuard` so the narrowed type is exact.
+- **`send_chat` had the same loss bug one layer up.** The server starts the worker thread
+  *before* it acks the submission, so for a fast Tier-1 action the `ConfirmRequest` can overtake
+  the ack. `send_chat` now reads its ack through the same non-losing path, so the prompt is
+  replayed instead of consumed and dropped. This is the exact live symptom ("confirmation
+  expired", no prompt shown), and it was still possible after the first round of fixes.
+- **The ack wait is bounded** (`DaemonClient.ack_timeout = 30.0`, `asyncio.wait_for`). An
+  unbounded read meant a daemon that accepted a request and then said nothing froze the terminal
+  forever - the very class of silent hang this session is about. The CLI passes
+  `_ABANDON_ACK_TIMEOUT = 2.0` when cancelling a task the user interrupted, so Ctrl+C cannot
+  trade an infinite hang for a 30 s one.
+
+**CLI**
+- `_daemon_one_shot` catches `KeyboardInterrupt`/`EOFError`, best-effort cancels the task
+  (so the daemon slot is released) and prints `cancelled`.
+- A shared `_daemon_event_loop` handles queued submissions, clarifications, confirmations and
+  the final message for both `run` and `chat`, printing the daemon's acknowledgement
+  (`queued (task N)` / `started`) and `(working...)` after an answer. A dropped connection
+  used to look like a hang.
+- `_abandon_task` cancels with a short ack timeout, because the point of the call is to free the
+  daemon's slot, not to wait for a receipt.
+
+### Two real defects found by these checks (not by inspection)
+1. **`_clean_state(None)` raised `AttributeError`.** It was only ever called with a dict, so
+   `FailureStore.record(..., state=None)` - the default, used by every other caller - crashed.
+   Found by the new store-level refusal calling it with the raw argument. It now takes
+   `dict | None`, and 21 tests that had been passing failed loudly on the way.
+2. **`_send_recv_ack` waited forever for the ack.** Same root cause as the original bug (a read
+   with no bound, so silence looked like progress). Found because the test fake's reader blocks
+   forever once its script runs out, which is exactly what a wedged daemon does.
+
+### `test_daemon_wake.py` was already red at HEAD - now green
+The previous commit (`663d559`) made the server ack every request, but the raw-socket tests in
+`test_daemon_wake.py` still read "the next message" after a submission, so they received the ack
+where they expected a `confirm_request` or a `final`. Verified as pre-existing by putting the
+HEAD versions of `daemon/{server,protocol,client}.py` back in place: **6 failures at HEAD, the
+same 6 with this session's changes**. Fixed by adding `_Client.recv_next()` - "next non-ack
+message, one overall budget" - and using it where a test wants the `confirm_request`, the
+`final` or the `status_response`. The assertions themselves are unchanged: the tampered-hash
+test still requires that a mismatched `action_hash` never executes, and the timing bounds are
+untouched. 3 consecutive runs: 0 failures.
+
+### Verification
+- `pytest` on the affected set (`test_memory*`, `test_daemon_client`, `test_daemon_protocol`,
+  `test_daemon_server`, `test_daemon_wake`, `test_cli`, `test_run_cli`, `test_skills_cli`,
+  `test_config`, `test_task_runtime`, `test_invariants`) -> **331 passed**, 14 pre-existing
+  `AsyncMock` warnings. Full suite, voice suite, integration and benchmarks not run (by
+  instruction).
+- `ruff check` clean on every touched file; `ruff format --check` clean except
+  `src/jarvis/cli.py`, which was already unformatted at HEAD (`benchmark_report`, and one
+  pre-existing `console.print` wrap) and was left alone. `mypy src/jarvis/policy`: Success.
+  `mypy src/jarvis/daemon/client.py` was diffed against HEAD's file error-for-error: **identical**,
+  so the new code adds no type debt (`mypy` is only *required* to be clean for `policy/`).
+  `mypy src/jarvis/memory`: only the two pre-existing `type-arg` errors in untouched code
+  (`db.insert_task_log`, `base.py`).
+- Against a **copy** of the real `memory.db`; the original was copied read-only, never opened
+  for write, and its md5 was identical before and after. Windows was never locked.
+  - On the first copy the live file was still schema **1**: `user_version` 1 -> 2, both columns
+    added, the stale row still on disk, `counts()["failures"]` 0, `quarantined_failures()` 1,
+    `retrieve("lock my computer")` -> `[]`.
+  - The live database has since been migrated **by the running daemon** (it is now `user_version`
+    2 with `quarantined = 1`, `step_state = NULL` on that row). Re-verifying a fresh copy of it
+    is a no-op: same version, same result, so the migration is idempotent on real data.
+  - A throwaway DB confirms the *other* direction, so this is not a blanket mute: a real error
+    ("Access denied: the workstation is already locked") and a `verified=False` step are both
+    kept, a tainted step is kept, and each is surfaced only for a related request.
+- `tests/unit/test_invariants.py::test_a_successful_step_can_never_become_a_failure_row` is the
+  new standing test for this bug class, and it pins both halves of the rule: an unverifiable
+  success can never become a row, and a *failed verification* still can.
+
+### Known limitations (honest)
+- A legacy `verified=False` row with no error text produces the same placeholder sentence, so
+  one such row would be over-quarantined. None exists in the live DB.
+- There is **no per-row undo** for a quarantine: the row is preserved, counted and listed by
+  `jarvis skills list`, and `jarvis skills clear` is the only escape hatch. A
+  `jarvis skills restore <id>` is the obvious follow-up and is deliberately not built here.
+- The original client disconnect was never reproduced interactively. The log establishes
+  resume, silence and disconnect; whether the user pressed Ctrl+C or hit another client-side
+  exception is still unconfirmed.
+- `send_voice_toggle` and `get_status` still use the old single-read path with a `log` reply.
+  They are status calls that no worker can race, so they are correct as they are; if a future
+  change lets a task dispatch a message while they are waiting, they need the same treatment.
+
+### Manual tests for the PC (do not run from pytest)
+```
+jarvis daemon --foreground          # terminal 1
+jarvis run "lock my computer"       # terminal 2 -> expect "started", then Tier-1 confirm showing the exact action
+jarvis skills list                  # expect "1 unverifiable failures withheld", and the lock row NOT listed as a failure
+jarvis run "lock my computer"       # again -> must reach the same Tier-1 confirm, not refuse
+# then unlock the session and approve once, by hand
+```

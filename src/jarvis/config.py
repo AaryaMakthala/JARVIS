@@ -319,6 +319,12 @@ class MemorySettings(BaseModel):
     it off JARVIS still *reads* past examples but never records new ones.
     ``similarity_threshold`` is the cosine floor for a stored example to be
     considered relevant at all (docs/02 section 9, default 0.75).
+    ``failure_similarity_threshold`` is the same floor for remembered failures
+    and is deliberately lower (0.45): with the offline lexical encoder a genuine
+    rephrasing of a past goal scores around 0.55, and missing a real failure is
+    worse than showing a loose one - unrelated goals still score below 0.2.
+    It mirrors ``jarvis.memory.failures.FAILURE_SIMILARITY`` (``config`` does not
+    import the memory layer; a test keeps the two in step).
     ``max_*`` values bound each table so ``memory.db`` cannot grow forever;
     ``max_task_log`` bounds the per-task telemetry rows (the Observability
     requirement in docs/01 section "Targets"), which are written even when
@@ -329,6 +335,7 @@ class MemorySettings(BaseModel):
     enabled: bool = True
     save_skills: bool = True
     similarity_threshold: float = 0.75
+    failure_similarity_threshold: float = 0.45
     max_skills: int = 500
     max_failures: int = 200
     max_preferences: int = 50

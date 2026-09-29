@@ -17,10 +17,8 @@ from __future__ import annotations
 
 import getpass
 import logging
-import re
 import traceback
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -1100,6 +1098,12 @@ def _print_outcome(outcome: Any) -> None:
         console.print("[dim](no answer)[/dim]")
 
 
+#: Seconds to wait for the daemon's cancel receipt when abandoning a task the
+#: user interrupted.  The cancel is on the wire before the receipt is read, so a
+#: wedged daemon must not turn Ctrl+C into a long silence.
+_ABANDON_ACK_TIMEOUT = 2.0
+
+
 def _daemon_chat_loop(client: Any) -> None:
     """Interactive REPL that talks to the daemon over IPC."""
     console.print("[dim]JARVIS chat via daemon (Ctrl+C to exit)[/dim]")
@@ -1118,12 +1122,62 @@ def _daemon_chat_loop(client: Any) -> None:
 def _daemon_one_shot(client: Any, line: str) -> str:
     """Send one command to the daemon and print events until it finishes.
 
-    Returns the final text (empty when the daemon reported an error or the wait
-    timed out).  Shared by the chat REPL and ``jarvis run`` so the one-shot
-    command cannot be more permissive than the interactive session: both go
-    through the same ``ConfirmRequest`` / ``ClarificationRequest`` handling and
-    the same password prompt.
+    Returns the final text (empty when the daemon reported an error, the wait
+    timed out, or the user interrupted).  Shared by the chat REPL and
+    ``jarvis run`` so the one-shot command cannot be more permissive than the
+    interactive session: both go through the same ``ConfirmRequest`` /
+    ``ClarificationRequest`` handling and the same password prompt.
+
+    ``Ctrl+C`` anywhere in here - at a prompt, or while the daemon re-plans
+    after an answer - returns to the caller instead of unwinding out of
+    ``jarvis chat``: it used to kill the whole REPL, and because the task kept
+    the daemon's single active slot the *next* command was then silently queued
+    behind an abandoned run, which is what "typed it again and nothing
+    happened" looked like.
     """
+    from jarvis.daemon.client import DaemonError
+
+    try:
+        task_id = client.send_chat(line)
+    except DaemonError as exc:
+        console.print(f"[red]{exc.message}[/red]")
+        return ""
+
+    _show_submission_ack(client)
+    try:
+        return _daemon_event_loop(client, task_id)
+    except (KeyboardInterrupt, EOFError):
+        _abandon_task(client, task_id)
+        console.print("[dim]cancelled[/dim]")
+        return ""
+
+
+def _show_submission_ack(client: Any) -> None:
+    """Tell the user whether the request started now or was queued behind one."""
+    note = str(getattr(client, "last_ack_message", "") or "").strip()
+    if note:
+        console.print(f"[dim]{note}[/dim]")
+
+
+def _abandon_task(client: Any, task_id: str) -> None:
+    """Best-effort cancel of a task the user walked away from.
+
+    Without this the daemon keeps the slot until its 30 s confirmation window
+    elapses, and the user's next command waits in the queue.  The short ack
+    timeout matters too: the user just pressed Ctrl+C, so the cancel must not
+    trade a silent hang for a 30 s one.
+    """
+    cancel = getattr(client, "send_cancel", None)
+    if not task_id or not callable(cancel):
+        return
+    try:
+        cancel(task_id, ack_timeout=_ABANDON_ACK_TIMEOUT)
+    except Exception:
+        logging.getLogger("jarvis.cli").debug("cancelling the abandoned task failed", exc_info=True)
+
+
+def _daemon_event_loop(client: Any, task_id: str) -> str:
+    """Print daemon events for ``task_id`` until it produces a final answer."""
     from jarvis.daemon.client import DaemonError
     from jarvis.daemon.protocol import (
         ClarificationRequest,
@@ -1132,12 +1186,6 @@ def _daemon_one_shot(client: Any, line: str) -> str:
         EventMessage,
         FinalMessage,
     )
-
-    try:
-        task_id = client.send_chat(line)
-    except DaemonError as exc:
-        console.print(f"[red]{exc.message}[/red]")
-        return ""
 
     while True:
         msg = client.wait_for_event(timeout=300)
@@ -1148,45 +1196,13 @@ def _daemon_one_shot(client: Any, line: str) -> str:
             console.print(f"[green]{msg.text}[/green]")
             return msg.text
         if isinstance(msg, ConfirmRequest):
-            # Display confirmation
-            from jarvis.policy import tiers as _tiers
-
-            console.print(
-                "".join(
-                    (
-                        "[yellow]approval needed[/yellow] (",
-                        _tiers.tier_label(msg.tier),
-                        ")",
-                    )
-                )
-            )
-            console.print(msg.summary or "(no summary)")
-            if msg.untrusted:
-                console.print("[red]NOTE: this action was derived from untrusted content[/red]")
-            answer = _chat_prompt("Approve?")
-            agreed = (answer or "").strip().lower() in ("y", "yes")
-            typed: str | None = None
-            if agreed and msg.typed_confirmation:
-                typed = _chat_prompt(f"Type this exactly to confirm: {msg.typed_confirmation}")
-            password: str | None = None
-            if agreed and msg.needs_password:
-                password = _chat_password_prompt("JARVIS password: ")
-
-            try:
-                client.send_confirm(
-                    task_id,
-                    approved=agreed,
-                    action_hash=msg.action_hash,
-                    password=password,
-                    typed_confirmation=typed,
-                )
-            except DaemonError as exc:
-                console.print(f"[red]{exc.message}[/red]")
+            _handle_confirm_request(client, task_id, msg)
         elif isinstance(msg, ClarificationRequest):
             console.print(f"[yellow]clarification needed: {msg.question}[/yellow]")
             answer = _chat_prompt("Your answer:")
             try:
                 client.send_clarification(task_id, answer=answer or "")
+                console.print("[dim](working...)[/dim]")
             except DaemonError as exc:
                 console.print(f"[red]{exc.message}[/red]")
         elif isinstance(msg, ErrorMessage):
@@ -1197,6 +1213,44 @@ def _daemon_one_shot(client: Any, line: str) -> str:
             data = msg.data
             if msg.kind == "log" and "message" in data:
                 console.print(f"[dim]{data['message']}[/dim]")
+
+
+def _handle_confirm_request(client: Any, task_id: str, msg: Any) -> None:
+    """Show a Tier confirmation, collect the answer, and send it back.
+
+    The ``action_hash`` is echoed verbatim, so the daemon can re-check that the
+    approval belongs to the exact action it interrupted on (invariant 7).  The
+    password, if asked for, goes to the daemon and never into the graph.
+    """
+    from jarvis.daemon.client import DaemonError
+    from jarvis.policy import tiers as _tiers
+
+    console.print(
+        "".join(("[yellow]approval needed[/yellow] (", _tiers.tier_label(msg.tier), ")"))
+    )
+    console.print(msg.summary or "(no summary)")
+    if msg.untrusted:
+        console.print("[red]NOTE: this action was derived from untrusted content[/red]")
+    answer = _chat_prompt("Approve?")
+    agreed = (answer or "").strip().lower() in ("y", "yes")
+    typed: str | None = None
+    if agreed and msg.typed_confirmation:
+        typed = _chat_prompt(f"Type this exactly to confirm: {msg.typed_confirmation}")
+    password: str | None = None
+    if agreed and msg.needs_password:
+        password = _chat_password_prompt("JARVIS password: ")
+
+    try:
+        client.send_confirm(
+            task_id,
+            approved=agreed,
+            action_hash=msg.action_hash,
+            password=password,
+            typed_confirmation=typed,
+        )
+        console.print("[dim](working...)[/dim]")
+    except DaemonError as exc:
+        console.print(f"[red]{exc.message}[/red]")
 
 
 @app.command()
@@ -1779,6 +1833,18 @@ def _close_memory_backend(ctx: Any) -> None:
     _close_store(getattr(ctx, "memory", None))
 
 
+def _quarantined_failures(memory: Any) -> int:
+    """How many failure rows are withheld from the planner (0 if unknown)."""
+    count = getattr(memory, "quarantined_failures", None)
+    if not callable(count):
+        return 0
+    try:
+        return int(count())
+    except Exception:
+        logging.getLogger("jarvis.cli").debug("quarantined count failed", exc_info=True)
+        return 0
+
+
 def _close_store(memory: Any) -> None:
     """Close a memory backend (or a store opened directly by a command)."""
     close = getattr(memory, "close", None)
@@ -1832,11 +1898,17 @@ def skills_list(
                 # not console markup, and must never be swallowed or styled.
                 console.print(row, markup=False, highlight=False)
         if counts:
-            console.print(
+            summary = (
                 f"[dim]{counts.get('skills', 0)} skills, "
                 f"{counts.get('failures', 0)} recorded failures, "
-                f"{counts.get('preferences', 0)} preferences[/dim]"
+                f"{counts.get('preferences', 0)} preferences"
             )
+            # Honest accounting: rows quarantined by the unverifiable-success
+            # fix are still in memory.db, just not offered to the planner.
+            withheld = _quarantined_failures(memory)
+            if withheld:
+                summary += f", {withheld} unverifiable failures withheld"
+            console.print(summary + "[/dim]")
 
 
 @skills_app.command("show")
@@ -2028,7 +2100,7 @@ def _benchmark_llm(settings: Any) -> Any:
         selection = build_llm_client(
             settings, secret_module.SecretStore(), logger=logging.getLogger("jarvis.cli")
         )
-    except Exception as exc:  # noqa: BLE001 - a missing/broken provider is a clean error
+    except Exception as exc:
         console.print(f"[red]could not load settings or provider: {exc}[/red]")
         raise typer.Exit(code=1) from exc
     if selection.client is None:
