@@ -54,7 +54,7 @@ def run_voice_doctor(
 
     if mic:
         checks.extend(_probe_audio(settings))
-    checks.extend(_probe_wake(vs.wake_word))
+    checks.extend(_probe_wake(vs.wake_word, vs.wake_threshold))
     if stt:
         checks.append(_probe_stt(vs.stt_model))
     if tts:
@@ -130,7 +130,7 @@ def _input_device_name(input_device: int | str | None) -> tuple[str | None, str 
         return None, f"no usable input device: {_sanitize(exc)}"
 
 
-def _probe_wake(wake_word: str) -> list[Check]:
+def _probe_wake(wake_word: str, threshold: float) -> list[Check]:
     """Load the wake model and run one inference on silence.
 
     When the factory returns ``None`` the underlying import failure (if any) is
@@ -142,7 +142,7 @@ def _probe_wake(wake_word: str) -> list[Check]:
     from jarvis.voice.wake import create as create_wake
     from jarvis.voice.wake import import_error as wake_import_error
 
-    wake = create_wake(model_name=wake_word)
+    wake = create_wake(model_name=wake_word, threshold=threshold)
     if wake is None:
         reason = wake_import_error()
         if reason is not None:
@@ -163,7 +163,7 @@ def _probe_wake(wake_word: str) -> list[Check]:
         logger.debug("voice doctor: wake inference failed", exc_info=exc)
         return [_check("wake_detection", "FAIL", f"inference failed: {_sanitize(exc)}")]
     return [
-        _check("wake_model", "PASS", f"model '{wake_word}' loaded"),
+        _check("wake_model", "PASS", f"model '{wake_word}' loaded (threshold {threshold:.2f})"),
         _check(
             "wake_detection",
             "PASS",

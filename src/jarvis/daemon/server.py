@@ -610,7 +610,10 @@ class DaemonServer:
         try:
             from jarvis.voice.wake import create as create_wake
 
-            wake = create_wake(model_name=self._settings.voice.wake_word)
+            wake = create_wake(
+                model_name=self._settings.voice.wake_word,
+                threshold=self._settings.voice.wake_threshold,
+            )
         except Exception:
             logger.debug("wake-word unavailable", exc_info=True)
 

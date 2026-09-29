@@ -213,3 +213,35 @@ class TestCreate:
         result = detector.detect(AudioSegment(samples=[0.5]))
         assert result.detected
         assert result.confidence == pytest.approx(0.7)
+
+
+class TestThresholdCalibration:
+    def test_default_threshold_matches_the_measured_score_range(self) -> None:
+        """Calibrated from real-model measurements, not a guess.
+
+        The library's 0.5 never fired (a real human "hey jarvis" through the dev
+        PC's mic peaked at 0.4363) and 0.25 still missed a degraded far-field
+        utterance.  The default must sit inside the measured empty band: above
+        the non-wake near-miss ceiling (~0.087 for "hey service") and below the
+        genuine wake peak.  0.44 / 0.30 / 0.20 are the close, far and notably
+        degraded cases; 0.09 is the measured non-wake ceiling.
+        """
+        from jarvis import config
+        from jarvis.voice import wake as wake_module
+
+        # The configured default and the code default must not drift apart:
+        # the daemon and doctor both read the setting.
+        assert config.Settings().voice.wake_threshold == wake_module._DEFAULT_THRESHOLD
+        assert 0.087 < wake_module._DEFAULT_THRESHOLD < 0.4363
+
+        def detected(score: float) -> bool:
+            detector = OpenWakeWordDetector(
+                _RecordingModel({"hey_jarvis": score}), model_name="hey_jarvis"
+            )
+            return detector.detect(AudioSegment(samples=[0.0] * 1280)).detected
+
+        assert detected(0.44)  # normal close-range speech
+        assert detected(0.30)  # degraded / far-field speech
+        assert detected(0.20)  # notably degraded far-field speech
+        assert not detected(0.09)  # measured non-wake near-miss ceiling (0.0866)
+        assert not detected(0.05)  # plainly non-wake audio

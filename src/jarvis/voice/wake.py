@@ -21,7 +21,27 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MODEL = "hey_jarvis"
 
 # Minimum confidence threshold for a positive detection.
-_DEFAULT_THRESHOLD = 0.5
+#
+# openWakeWord's own examples use 0.5, but that is a starting point, not a
+# calibrated value.  Measured on the dev PC with the real model and real audio:
+#
+#   * the pipeline is level-invariant: a genuine "hey jarvis" scores ~0.999 all
+#     the way from int16 RMS ~2100 down to ~2 (-60 dB).  A quiet or far-field
+#     signal is therefore NOT attenuated by this code and needs no gain/AGC -
+#     the old "the score scales with microphone gain" note was wrong.
+#   * through this laptop mic a real human "hey jarvis" peaked at 0.4363, so the
+#     original 0.5 boundary never fired at all.
+#   * non-wake speech scores ~0.0000; the closest-sounding non-wake phrase
+#     measured ("hey service") peaks at 0.0866, while the next one ("hey
+#     Charles") is already 0.39 and triggers at any threshold below that.
+#
+# A far-field miss is a genuinely lower model score, so the threshold is the
+# only lever.  0.15 sits inside the empty band between the measured non-wake
+# ceiling (0.0866) and the phrase family that already triggers, giving ~1.7x
+# margin over measured non-wake audio while leaving ~40% more headroom than 0.25
+# for a degraded far-field utterance.  Raise it with ``[voice] wake_threshold``
+# in a room that false-triggers.
+_DEFAULT_THRESHOLD = 0.15
 
 #: How often the per-frame score is sampled into the INFO-level log (~2 s).
 _INFO_SCORE_INTERVAL_S = 2.0
