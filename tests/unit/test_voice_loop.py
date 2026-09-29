@@ -44,8 +44,10 @@ from jarvis.voice.loop import (
     _CAPTURE_CHUNK_FRAMES,
     _LOOSE_YES_WORDS,
     _STRICT_YES_WORDS,
+    REPEAT_PROMPT,
     VoiceLoop,
     _approval_words,
+    _transcript_problem,
 )
 from jarvis.voice.states import VoicePhase
 from jarvis.voice.status import VoiceStatusReporter
@@ -2202,3 +2204,65 @@ class TestVoiceLevelDiagnostics:
         assert len(wake.detect_calls) > len(heartbeat_lines) or not heartbeat_lines
         assert len(wake.detect_calls) >= 20
         assert all("audio_rms=" in line or "elapsed_s=" in line for line in heartbeat_lines)
+
+
+# ── STT usability gate (runs before THINKING) ───────────────────────────
+
+
+class TestTranscriptUsabilityGate:
+    """A transcript is refused *before* THINKING when acting would be a guess.
+
+    Live bugs: the wake phrase leaked into the command window (whisper returned
+    the wake-like "هداريس") and a 0.7 s pause truncated "what is the capacity
+    of the battery" to "Capacity of-".  Both were sent to the planner, which
+    answered confidently instead of asking.  The gate refuses them locally, and
+    a legitimate short command must still route unchanged.
+    """
+
+    def test_wake_phrase_and_fragments_are_refused(self) -> None:
+        for text, fragment in (
+            ("", "empty"),
+            ("   ", "empty"),
+            ("...", "no recognisable words"),
+            ("Hey Jarvis", "wake phrase"),
+            ("hey jarvis.", "wake phrase"),
+            ("hey charvis", "wake phrase"),
+            ("هداريس", "not recognisable"),
+            ("What is the Capacity of-", "mid-sentence"),
+            ("what is the capacity of", "mid-sentence"),
+        ):
+            problem = _transcript_problem(text, "hey_jarvis")
+            assert problem is not None, f"{text!r} should be refused"
+            assert fragment in problem, f"{text!r} -> {problem!r}"
+
+    def test_legitimate_short_commands_are_routed(self) -> None:
+        """No minimum word count and no over-validation: these all pass."""
+        for text in (
+            "lock my computer",
+            "stop",
+            "yes",
+            "no thanks",
+            "what time is it",
+            "What is 2x2?",
+            "turn it on",
+            "open notepad",
+        ):
+            assert _transcript_problem(text, "hey_jarvis") is None, text
+
+    def test_unusable_transcript_asks_to_repeat_without_submitting(self) -> None:
+        submitted: list[str] = []
+
+        def submit(text: str, source: str) -> Any:
+            submitted.append(text)
+            return type(
+                "Outcome", (), {"final_answer": "ok", "confirmation": None, "error": None}
+            )()
+
+        loop, _audio, _wake, _stt, tts = _make_loop(
+            stt_results=[STTResult(text="Hey Jarvis")],
+            submit_task=submit,
+            audio_segments=[make_speech("x", duration_s=0.5), make_silence(2.0)],
+        )
+        loop._run_interaction()
+        assert submitted == []  # the planner/tools were never reached
+        assert tts.spoken == ["Yes?", REPEAT_PROMPT]

@@ -90,10 +90,15 @@ port = 0
 [voice]
 enabled = false
 wake_word = "hey_jarvis"
+# openWakeWord score at/above which the wake word counts as detected.  Lower
+# than the library's 0.5 default on purpose: the score scales with microphone
+# gain, and 0.25 was chosen from the measured peak on the dev PC.  Raise it in
+# a room that false-triggers.
+wake_threshold = 0.25
 stt_model = "base"
 tts_backend = "piper"
 silence_threshold = 0.01
-silence_timeout_s = 0.7
+silence_timeout_s = 1.2
 max_segment_s = 30.0
 listen_timeout_s = 30.0
 idle_timeout_s = 120.0
@@ -268,11 +273,22 @@ class VoiceSettings(BaseModel):
 
     enabled: bool = False
     wake_word: str = "hey_jarvis"
+    #: openWakeWord score at/above which ``wake_word`` counts as detected.
+    #: Deliberately below the library default (0.5): the score scales with
+    #: microphone gain, so a fixed 0.5 is not calibrated for every machine.
+    #: 0.25 is derived from the measured peak on the dev PC (see
+    #: :mod:`jarvis.voice.wake`); raise it in a room that false-triggers.
+    wake_threshold: float = 0.25
     stt_model: str = "base"
     tts_backend: str = "piper"
     input_device: int | str | None = None
     silence_threshold: float = 0.01
-    silence_timeout_s: float = 0.7
+    #: Trailing silence that ends a captured command.  Raised from 0.7 s: an
+    #: ordinary mid-sentence pause was ending capture early, so "what is the
+    #: capacity of the battery" arrived as the truncated "what is the capacity
+    #: of-".  1.2 s clears a normal breath/pause; ``max_segment_s`` still caps
+    #: the whole utterance.
+    silence_timeout_s: float = 1.2
     max_segment_s: float = 30.0
     listen_timeout_s: float = 30.0
     idle_timeout_s: float = 120.0

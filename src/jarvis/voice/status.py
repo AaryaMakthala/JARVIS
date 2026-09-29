@@ -378,6 +378,22 @@ class VoiceStatusReporter:
             voice_state=str(self.phase or ""),
         )
 
+    def retry_prompt(self, prompt: str) -> None:
+        """Report the local "please repeat" prompt (console + JSONL).
+
+        Emitted instead of ``TRANSCRIBING -> THINKING`` when the transcript
+        cannot be used, so the console shows why no answer followed.  The
+        prompt is a constant owned by the loop: no LLM ever generates it, and
+        nothing transcript-shaped reaches this sink.
+        """
+        self._write(
+            f'[VOICE] RETRY: "{prompt}"',
+            "stt_retry",
+            interaction_id=self.interaction_id,
+            voice_state=str(self.phase or ""),
+            chars=len(prompt),
+        )
+
     def thinking(self, report: ProviderReport | None = None) -> None:
         """Report the start of agent processing."""
         self.advance(VoicePhase.THINKING)

@@ -36,6 +36,7 @@ from jarvis.voice.loop import (
     DEFAULT_MAX_SESSION_S,
     DEFAULT_MAX_SPOKEN_CHARS,
     DEFAULT_REARM_QUIET_GATE_S,
+    DEFAULT_SILENCE_TIMEOUT_S,
     VoiceLoop,
 )
 from jarvis.voice.status import VoiceStatusReporter
@@ -108,7 +109,7 @@ class VoiceService:
         listen_timeout_s: float = 30.0,
         max_session_s: float = DEFAULT_MAX_SESSION_S,
         max_dictation_chars: int = DEFAULT_MAX_DICTATION_CHARS,
-        silence_timeout_s: float = 0.7,
+        silence_timeout_s: float = DEFAULT_SILENCE_TIMEOUT_S,
         max_segment_s: float = 30.0,
         silence_threshold: float = 0.01,
         rearm_quiet_gate_s: float = DEFAULT_REARM_QUIET_GATE_S,

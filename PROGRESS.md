@@ -2,6 +2,178 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-09-29 — FIX: post-wake command capture + incomplete-STT handling (no commit)
+
+### Case 1 — wake phrase reaching the planner (STT "هداريس" → "Hello! How can I help?")
+
+**Root cause: not a stale-buffer bug.** Capture already flushes the mic *after* the "Yes?"
+ack and immediately before `_read_command`, so neither pre-ack audio nor the wake tail can
+enter the utterance; the pre-roll only keeps post-flush audio. The leak is a *new* wake-like
+utterance: the detector fires mid-"Hey Jarvis" (or the ack is missed), the user repeats the
+wake phrase, and that repeat was accepted as a command because only *empty* text was rejected.
+
+### Case 2 — "What is the Capacity of-" → battery answer
+
+**Root cause: a single 0.7 s endpoint threshold.** `VoiceLoop.silence_timeout_s` ended
+capture on an ordinary mid-sentence hesitation (~1.5 s of audio captured), and the truncated
+transcript was routed to the planner, which guessed an intent instead of asking.
+
+### Fix
+
+- `voice/loop.py`
+  - `DEFAULT_SILENCE_TIMEOUT_S = 1.2` (was hard-coded 0.7): a breath/pause no longer ends the
+    command; `max_segment_s` still caps the whole utterance and remains the outer bound.
+  - `_transcript_problem(text, wake_word)`: deterministic STT usability gate that runs
+    **before `THINKING`**, so no task is ever submitted for it. Refuses empty/punctuation-only,
+    the wake phrase (exact, or within edit distance 2 — "hey charvis"), a short fragment with no
+    Latin letter/digit (whisper's "هداريس"), and a mid-sentence cut (trailing `-`/`…` or a
+    dangling article/conjunction/preposition). No minimum word count; `on`/`in`/`up`/`out`/`it`
+    are deliberately excluded so "turn it on" / "turn the volume up" still pass.
+  - `_ask_to_repeat(reason)`: speaks the constant `REPEAT_PROMPT` ("Could you repeat that?") —
+    local, never LLM-generated — reports `RECOVERING`, and returns. The caller's existing single
+    re-arm (`flush → quiet drain → reset → READY`) discards the prompt echo, so this is one clean
+    transition, not a retry loop, and nothing is re-executed.
+- `voice/status.py`: `retry_prompt()` console + JSONL (`stt_retry`) line; no phase jump, so the
+  interaction state machine stays legal (`TRANSCRIBING → RECOVERING → RESETTING → READY`).
+- `voice/service.py` + `config.py`: same 1.2 s default (including `DEFAULT_CONFIG_TOML`).
+- `tests/unit/test_voice_cli.py`: default assertion 0.7 → 1.2.
+
+### Checks (minimum)
+
+`ruff check` on the 6 touched files (clean); `pytest -q` on `TestTranscriptUsabilityGate` + the
+three capture/re-arm tests + `TestVoiceConfig::test_voice_settings_defaults` + `test_config.py`
+→ 21 passed. Direct sanity check: default = 1.2 s; a 1.0 s mid-sentence pause now captures 4.0 s
+across 4 reads (at 0.7 s it ended at 1.50 s — exactly the live symptom); the four live
+transcripts are refused with the right reason while "lock my computer", "stop", "yes",
+"what time is it" and "turn it on" still route. No full suite.
+
+### Preserved
+
+Wake threshold 0.25, OpenWakeWord, quiet-start/re-arm gate, wake-triggered listening, STT/TTS,
+daemon lifecycle, LLM routing, lock and text chat are all unchanged. No polling, retry loop,
+background worker, AGC, commit or push.
+
+### Remaining limitation
+
+Not validated with live speech here (no mic run). `silence_timeout_s` remains the single
+endpoint knob; the "no Latin letter" rule asks to repeat for short non-English utterances,
+which is the safe direction for an English-configured assistant.
+
+## Session 2026-09-29 — FIX: wake-word sensitivity (threshold calibration) (no commit)
+
+### Symptom
+
+Live wake wait never fired: `model=hey_jarvis threshold=0.50 max_score=0.4363 last_score≈0.0000`,
+`audio_rms≈1e-4`, mic open with `blocks_dropped=0`; daemon and text chat healthy.
+
+### Root cause
+
+Neither audio scaling nor the model. `audio_input._block_to_float` divides int16 by 32768 and
+`wake.detect` scales back with `×32767` into the int16 PCM openWakeWord requires — amplitude-exact,
+no attenuation. The wait loop feeds exactly 1280-sample (80 ms) frames and `reset()` runs once per
+re-arm, not per frame. The single bottleneck: the fixed threshold **0.50 sat above the highest score
+a genuine "hey jarvis" reached** on this low-gain mic (0.4363), so detection could never fire.
+
+### Fix (smallest correction; architecture unchanged)
+
+- `voice/wake.py`: `_DEFAULT_THRESHOLD` 0.5 → **0.25**, with the measured basis documented (below the
+  0.4363 genuine peak, far above the ~0.0000 non-wake floor).
+- `config.py`: new `[voice] wake_threshold` setting (default 0.25) + `DEFAULT_CONFIG_TOML` entry, so a
+  noisier room can raise it without a code change.
+- `daemon/server.py`: `_build_voice_service` passes `settings.voice.wake_threshold` to the detector.
+- `voice/doctor.py`: `_probe_wake(wake_word, threshold)` and the PASS line now reports the value.
+
+Re-arm/quiet-start gate, debounce, wake→listening→STT→TTS flow, daemon lifecycle and the text/LLM
+path are untouched. No polling, retry loop, background worker or AGC added.
+
+### Checks (minimum)
+
+`ruff check` on the 4 touched files + test (clean); `pytest -q test_voice_wake.py
+test_voice_doctor.py test_config.py` → 43 passed; direct check on the real backend: configured
+threshold 0.25, detector built with 0.25, silence probe confidence 0.0000 / not detected. No full
+suite.
+
+**New test** `test_voice_wake.py::TestThresholdCalibration` — config default == code default, and the
+boundary detects 0.44 (normal) and 0.30 (quiet) while refusing 0.05 (non-wake).
+
+### Remaining limitation
+
+Still needs a real utterance on a weak mic; if quiet speech misses at 0.25, set `wake_threshold = 0.20`
+in `%LOCALAPPDATA%\jarvis\jarvis\config.toml`. Not validated with live speech here (no mic run).
+
+## Session 2026-09-29 — FIX: lock verification wording + `wake-model-missing` root cause (no commit)
+
+### Issue 1 — `jarvis run "lock my computer"` reported a verification shortfall
+
+**Root cause.** The lock itself was fine. `lock_computer.verify()` returns `verified=None`
+(docs/04 §2.4 "Best effort"), and `respond.py` rendered every `verified is None` step with the generic
+caveat `(1 step(s) succeeded, but completion could not be independently verified)` — which reads like
+a shortfall for an action whose completion is *not observable at all*.
+
+**Why not "just verify it".** `LockWorkStation` returns before winlogon switches to the secure
+desktop, and the locked state is not readable from a user-mode process. Any immediate probe would be
+a false negative; polling/sleeping/retrying is forbidden. Independent verification is therefore not
+reliably possible, so the wording had to change — `verified=True` was never faked.
+
+**Fix (reporting path only).** `ToolResult.verify_note` / `StepResult.verify_note` carry a
+tool-declared, human-facing reason for `verified=None` (propagated by `apply_verify` → `verify` node
+→ `act`). `_verify_lock_computer` sets it to "best-effort action: the Windows lock screen cannot be
+observed from this process". `respond._unverified_hint` prefers those notes when *every* unverifiable
+step has one, and keeps the generic cautious wording otherwise (so `test_respond_marks_unverified_success_honestly` still passes unchanged). Confirmation and the lock call are untouched.
+
+Final answer is now: `Windows workstation locked (best-effort action: the Windows lock screen cannot
+be observed from this process)`.
+
+### Issue 2 — `voice: error (wake-model-missing)`
+
+**Root cause (proven, not guessed).** The `hey_jarvis` model is present
+(`.venv/Lib/site-packages/openwakeword/resources/models/hey_jarvis_v0.1.onnx`) and the config is
+correct (`wake_word = "hey_jarvis"`). The failure is one level down: `import onnxruntime` raises
+`ImportError: DLL load failed while importing onnxruntime_pybind11_state: The specified module could
+not be found.` `openwakeword/__init__.py` imports `vad.py`, which imports onnxruntime, so
+`import openwakeword.model` fails; `wake.create()` caught the `ImportError` and mislabelled it
+"openwakeword not installed", returned `None`, and `VoiceService._missing_component_code` produced
+`wake-model-missing`. Environment: **the Microsoft Visual C++ 2015-2022 Redistributable (x64) is not
+installed** — `System32` has only the .NET CLR variants (`*_clr0400.dll`); `vcruntime140.dll`,
+`vcruntime140_1.dll`, `msvcp140.dll` are absent. Nothing to do with OneDrive paths or the `hey_jarvis`
+resource lookup (pre-trained models ship inside the package; the failing path is a native DLL load).
+
+**Fix (report the truth; architecture untouched).** `wake.create()` now distinguishes
+`ModuleNotFoundError` for `openwakeword` itself (genuinely absent) from a broken transitive import,
+logging the real traceback. New `wake.import_error()` returns the actual exception string;
+`voice doctor`'s `_probe_wake` uses it so the FAIL reads `openwakeword could not be imported
+(ImportError: DLL load failed ... onnxruntime_pybind11_state); on Windows this is usually the
+Microsoft Visual C++ 2015-2022 Redistributable (x64) being absent` instead of telling the user to
+install a package that is already there. OpenWakeWord architecture, wake-triggered listening,
+STT/TTS, quiet re-arm and daemon lifecycle unchanged; no model-download loop, no polling.
+
+**Required manual action (not run here):** install the VC++ 2015-2022 x64 Redistributable, then
+`jarvis voice doctor` PASSes and `jarvis on` works. JARVIS cannot install a system component.
+
+### Storage — runtime data vs the OneDrive repo
+
+JARVIS runtime paths are already correct: `platformdirs` puts config/logs/SQLite/checkpoints/PID under
+`%LOCALAPPDATA%\jarvis\jarvis\` (outside OneDrive); voice models live in installed packages;
+benchmark output in the gitignored `benchmarks/results/`. Only repo clutter was found: the tracked
+dev artifacts `final-results.xml` and `server_diff_review.txt`, plus `.hypothesis/`. `.gitignore` now
+covers them (the two tracked files still need a one-off `git rm --cached` to take effect).
+
+### Tests (minimum only)
+
+Added `test_agent.py::test_respond_uses_a_best_effort_verify_note_when_present`; extended
+`test_tools_lock_computer.py` with the note assertions;
+`test_voice_doctor.py::test_wake_model_failure_names_the_real_import_error`;
+`test_voice_wake.py::test_import_error_reports_a_broken_transitive_dependency`. Ran ruff on the 12
+touched files (clean) and `pytest -q` on `test_agent.py test_tools_lock_computer.py
+test_voice_doctor.py test_voice_wake.py` → 51 passed, plus one real
+`run_voice_doctor(mic=False, stt=False, tts=False)` showing the true cause. No full suite, no voice
+hardware, no integration/benchmarks.
+
+### Not covered
+
+The real Windows lock (needs a desktop session); the VC++ runtime install (external). No loops,
+recursive retries, polling or background processes were added.
+
 ## Session 2026-09-28 — FIX: `verified=None` was recorded as a task failure (no commit)
 
 ### Symptom

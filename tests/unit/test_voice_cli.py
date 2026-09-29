@@ -266,7 +266,7 @@ class TestVoiceConfig:
         assert settings.voice.stt_model == "base"
         assert settings.voice.tts_backend == "piper"
         assert settings.voice.silence_threshold == 0.01
-        assert settings.voice.silence_timeout_s == 0.7
+        assert settings.voice.silence_timeout_s == 1.2
         assert settings.voice.max_segment_s == 30.0
         assert settings.voice.listen_timeout_s == 30.0
         assert settings.voice.idle_timeout_s == 120.0
