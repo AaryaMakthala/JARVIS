@@ -378,6 +378,34 @@ class VoiceStatusReporter:
             voice_state=str(self.phase or ""),
         )
 
+    def confirmation_answer(self, kind: str, text: str, *, outcome: str) -> None:
+        """Report what a wake-free window heard and how it resolved.
+
+        Without this, a refused confirmation is indistinguishable from a
+        successful one on the console: the loop only logged a character count,
+        so the owner could not tell silence from a misheard answer.  Follows
+        :meth:`transcript` exactly - the console (opted into via
+        ``echo_transcript``) shows the words, and the **log record carries the
+        length and the outcome only, never the words**.  A refusal is
+        therefore diagnosable from the log without putting arbitrary speech
+        into it.
+        """
+        heard = text.strip()
+        label = kind.upper()
+        shown = (
+            f'[VOICE] {label} ANSWER: "{heard}" -> {outcome}'
+            if self._echo_transcript
+            else f"[VOICE] {label} ANSWER: <{len(heard)} chars> -> {outcome}"
+        )
+        self._write(
+            shown,
+            f"{kind}_answer",
+            interaction_id=self.interaction_id,
+            voice_state=str(self.phase or ""),
+            chars=len(heard),
+            outcome=outcome,
+        )
+
     def retry_prompt(self, prompt: str) -> None:
         """Report the local "please repeat" prompt (console + JSONL).
 

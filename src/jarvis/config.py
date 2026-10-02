@@ -110,6 +110,11 @@ max_dictation_chars = 20000
 # wake word, and a timeout is a refusal (fail closed).
 confirm_window_s = 8.0
 
+# D22 (overrides ROADMAP_V2.1_AMENDMENTS section E): a bare "stop", with no
+# wake word, also cuts JARVIS off while it is SPEAKING.  Gates only that new
+# speaking-state capability; the in-flight watch already accepted a bare cancel.
+bare_stop_while_busy = true
+
 [whatsapp]
 app_name = "WhatsApp"
 max_per_hour = 10
@@ -311,6 +316,13 @@ class VoiceSettings(BaseModel):
     #: value and by the trailing-silence end in ``_read_command``.  No wake word
     #: is required inside it (docs/03 §7.8), and silence/timeout is a refusal.
     confirm_window_s: float = 8.0
+    #: Owner decision **D22** (overrides ROADMAP_V2.1_AMENDMENTS section E): a
+    #: bare ``"stop"`` with no wake word must also cut JARVIS off **while it is
+    #: speaking**, not only while a task is in flight.  This flag gates only
+    #: that new speaking-state capability; the in-flight (THINKING) watch
+    #: already accepted a bare cancel before this flag existed, so it behaves
+    #: identically either way.  ``False`` restores wake-word-only barge-in.
+    bare_stop_while_busy: bool = True
     #: Print the ``[VOICE]``/``[LLM]`` lifecycle lines to the console.  The
     #: JSONL log is written either way; turning this off only silences the
     #: terminal, never the diagnostics.

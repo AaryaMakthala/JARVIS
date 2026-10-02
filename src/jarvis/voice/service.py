@@ -117,6 +117,7 @@ class VoiceService:
         silence_threshold: float = 0.01,
         rearm_quiet_gate_s: float = DEFAULT_REARM_QUIET_GATE_S,
         confirm_window_s: float = DEFAULT_CONFIRM_WINDOW_S,
+        bare_stop_while_busy: bool = True,
         max_spoken_chars: int = DEFAULT_MAX_SPOKEN_CHARS,
         report_status: bool = True,
         echo_transcript: bool = True,
@@ -140,6 +141,7 @@ class VoiceService:
         self._silence_threshold = silence_threshold
         self._rearm_quiet_gate_s = rearm_quiet_gate_s
         self._confirm_window_s = confirm_window_s
+        self._bare_stop_while_busy = bool(bare_stop_while_busy)
         self._max_spoken_chars = max_spoken_chars
         self._report_status = report_status
         self._echo_transcript = echo_transcript
@@ -222,6 +224,7 @@ class VoiceService:
                 silence_threshold=self._silence_threshold,
                 rearm_quiet_gate_s=self._rearm_quiet_gate_s,
                 confirm_window_s=self._confirm_window_s,
+                bare_stop_while_busy=self._bare_stop_while_busy,
                 max_spoken_chars=self._max_spoken_chars,
                 report_status=self._report_status,
                 echo_transcript=self._echo_transcript,

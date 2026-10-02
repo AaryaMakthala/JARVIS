@@ -606,12 +606,14 @@ class DaemonServer:
         focus = None
         logger.info(
             "voice backends: silence_timeout_s=%.2f max_segment_s=%.1f "
-            "rearm_quiet_gate_s=%.2f confirm_window_s=%.1f max_spoken_chars=%d",
+            "rearm_quiet_gate_s=%.2f confirm_window_s=%.1f max_spoken_chars=%d "
+            "bare_stop_while_busy=%s",
             self._settings.voice.silence_timeout_s,
             self._settings.voice.max_segment_s,
             self._settings.voice.rearm_quiet_gate_s,
             self._settings.voice.confirm_window_s,
             self._settings.voice.max_spoken_chars,
+            self._settings.voice.bare_stop_while_busy,
         )
 
         try:
@@ -673,6 +675,7 @@ class DaemonServer:
             silence_threshold=self._settings.voice.silence_threshold,
             rearm_quiet_gate_s=self._settings.voice.rearm_quiet_gate_s,
             confirm_window_s=self._settings.voice.confirm_window_s,
+            bare_stop_while_busy=self._settings.voice.bare_stop_while_busy,
             max_spoken_chars=self._settings.voice.max_spoken_chars,
             report_status=self._settings.voice.status,
             echo_transcript=self._settings.voice.echo_transcript,

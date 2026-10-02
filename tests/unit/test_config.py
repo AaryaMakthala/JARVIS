@@ -104,6 +104,24 @@ def test_voice_enabled_false_loaded_from_toml(tmp_path: Path) -> None:
     assert settings.voice.enabled is False
 
 
+def test_bare_stop_while_busy_defaults_to_true() -> None:
+    """D22: a bare "stop" cancels while speaking unless the owner opts out.
+
+    Pinned in both places the default lives, so the shipped ``config.toml`` and
+    the model cannot disagree about what a fresh install does.
+    """
+    assert config.VoiceSettings().bare_stop_while_busy is True
+    voice = tomllib.loads(config.DEFAULT_CONFIG_TOML)["voice"]
+    assert voice["bare_stop_while_busy"] is True
+
+
+def test_bare_stop_while_busy_can_be_turned_off(tmp_path: Path) -> None:
+    """``false`` restores wake-word-only barge-in while speaking."""
+    toml = tmp_path / "config.toml"
+    toml.write_text("[voice]\nbare_stop_while_busy = false\n", encoding="utf-8")
+    assert config.load_settings(toml).voice.bare_stop_while_busy is False
+
+
 def test_env_override_wins_over_toml_true_to_false(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

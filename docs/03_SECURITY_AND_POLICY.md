@@ -124,10 +124,32 @@ The **summary shown to the user is generated from the validated args**, not from
 
 ### 7.2 Barge-in and half-duplex audio
 
-- While speaking an answer, the voice loop keeps the *same* microphone open and scores it for the wake word only. On a detection it purges the queued speech (`SAPI.SpVoice.Purge`) and re-arms; it never opens a second capture stream.
+- While speaking an answer, the voice loop keeps the *same* microphone open and scores it for the wake word. On a detection it purges the queued speech (`SAPI.SpVoice.Purge`) and re-arms; it never opens a second capture stream.
 - A short **onset guard** (`0.35 s`) after speech starts prevents the answer's own echo from triggering a self-interrupt. This is a heuristic, not a solution: on open speakers the guard can be exceeded and JARVIS may cut itself off.
 - **Use headphones** for reliable barge-in. On speakers, say "stop listening" instead — that is the voice-off phrase, not a cancel.
 - Only engines that expose the optional async pair (`start_speaking` / `is_speaking`) can be interrupted. SAPI can; the Piper and pyttsx3 fallbacks speak to completion, and the log records that barge-in was unavailable for that answer.
+
+#### 7.2.1 Bare "stop" while busy (owner decision D22)
+
+**D22 supersedes `ROADMAP_V2.1_AMENDMENTS.md.md` section E**, which specified that barge-in responds to the wake word only. A bare `"stop"` — spoken with **no wake word** — now cancels in both busy states:
+
+| State | Trigger | Bound | Effect |
+|-------|---------|-------|--------|
+| THINKING (task in flight) | speech energy, no wake word | `_STOP_CAPTURE_MAX_S` (4 s) | `CancelToken` cancels the task; says `"Stopped."` |
+| SPEAKING (answer playing) | speech energy, no wake word | `BARE_CANCEL_MAX_S` (2 s) | TTS purged, loop returns to `READY`, **nothing submitted** |
+
+Rules that make this safe:
+
+- **The wake word still works, unchanged, and is checked first.** The onset trigger is strictly additive and strictly after both wake detection and the `0.35 s` guard, so it can neither delay nor displace wake-word barge-in.
+- **Onset-triggered, never scored.** A bare "stop" has no wake-word score, so the trigger is ordinary RMS energy — the same `_chunk_is_speech` gate the in-flight watch uses — and it requires 2 consecutive speech frames, so a click or a creak cannot start a transcription. The onset trigger fires only after the `0.35 s` guard.
+- **A non-cancel utterance changes nothing.** It is logged as `stop watch: heard N chars that are not a cancel request; ignoring` (length only) and the answer keeps playing; nothing is purged and the wake detector is not reset.
+- **Fixed vocabulary, no LLM.** The utterance is matched by `_is_cancel_request` against `_CANCEL_REQUESTS` / `_CANCEL_TOKENS` in code, so a stop can never be planned as a new task. Nothing either state hears is submitted to the agent.
+- **One microphone, one reader.** The trigger reads no audio itself — it consumes the segments the loop is already reading. The confirmation/clarification window still owns the microphone exclusively (worker thread); the in-flight watch stands down within one frame, and the speaking trigger only runs while no confirmation is pending.
+- **Purge first, then re-arm.** On a cancel the engine is purged before returning, and the caller's re-arm then flushes the microphone, quiet-drains back to baseline, and resets the wake detector's rolling window.
+- **Bounded.** Both paths are bounded by wall clock as well as by audio, so a wedged engine or a stalled microphone cannot hold the voice thread.
+- **No transcript at INFO.** Neither path logs the words it heard; only a character count.
+
+Configuration: `[voice] bare_stop_while_busy` (default `true`) gates **only** the speaking-state capability. The in-flight watch accepted a bare cancel before this setting existed, so THINKING behaves identically either way; `false` restores wake-word-only barge-in while speaking.
 
 Confirmation text format (example):
 ```

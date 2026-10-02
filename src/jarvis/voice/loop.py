@@ -75,6 +75,7 @@ from jarvis.voice.status import (
     ProviderReport,
     VoiceStatusReporter,
 )
+from jarvis.voice.stopwatch import BARE_CANCEL_MAX_S, OnsetTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -678,6 +679,7 @@ class VoiceLoop:
         silence_threshold: float = _SILENCE_RMS,
         rearm_quiet_gate_s: float = _REARM_QUIET_GATE_S,
         confirm_window_s: float = DEFAULT_CONFIRM_WINDOW_S,
+        bare_stop_while_busy: bool = True,
         idle_backoff_s: float = _IDLE_BACKOFF_S,
         reporter: VoiceStatusReporter | None = None,
         report_status: bool = True,
@@ -706,6 +708,9 @@ class VoiceLoop:
         #: Bounded wake-free window for a spoken answer (see
         #: :data:`DEFAULT_CONFIRM_WINDOW_S`).
         self._confirm_window_s = max(confirm_window_s, 0.0)
+        #: D22: also honour a bare "stop" while speaking.  Gates only the
+        #: speaking-state capability; the in-flight watch is unconditional.
+        self._bare_stop_while_busy = bool(bare_stop_while_busy)
         #: Pause between a non-fatal idle timeout and the next wake wait.
         self._idle_backoff_s = max(idle_backoff_s, 0.0)
         #: Longest utterance handed to TTS (see :func:`spoken_answer`).
@@ -908,6 +913,10 @@ class VoiceLoop:
 
         answer = self._capture_spoken_answer(window_s, kind="confirmation")
         if answer is None:
+            # Distinct from a user refusal on purpose: nothing usable came back
+            # from the window (silence, too short, or an empty transcript).
+            # Both refuse, but only this one is the system's own doing.
+            logger.info("voice confirmation refused: no usable answer in the window")
             callback({"approved": False, "action_hash": action_hash})
             return CONFIRMATION_REFUSED
 
@@ -916,7 +925,7 @@ class VoiceLoop:
         if approved:
             logger.info("voice confirmation approved")
             return "Approved."
-        logger.info("voice confirmation refused by user")
+        logger.info("voice confirmation refused by user: answer is not an approval word")
         return "Cancelled."
 
     def _capture_spoken_answer(self, window_s: float, *, kind: str) -> str | None:
@@ -933,6 +942,11 @@ class VoiceLoop:
         speech, too short, transcription error, empty transcript).  ``None`` is
         always the *refusing* direction for both callers, so a window that
         mishears something fails closed.
+
+        Every ``None`` is reported to the console with the reason it happened.
+        A refusal is a safety decision the owner has to be able to audit, and
+        "heard nothing" and "transcribed to nothing" are different failures
+        that used to collapse into the same silent refusal.
         """
         logger.info("voice boundary: %s window open (%.1fs, no wake word)", kind, window_s)
         try:
@@ -950,20 +964,42 @@ class VoiceLoop:
             )
         except Exception:
             logger.exception("%s window: capture failed", kind)
+            self._report_window_answer(kind, "", outcome="capture failed")
             return None
         if segment.duration_s < 0.3:
-            logger.info("voice boundary: %s window heard nothing", kind)
+            reason = "no speech detected" if segment.duration_s <= 0.0 else "too short to use"
+            logger.info("voice boundary: %s window heard nothing (%s)", kind, reason)
+            self._report_window_answer(kind, "", outcome=reason)
             return None
         try:
             result = self._stt.transcribe(segment)
         except Exception:
             logger.exception("%s window: transcription failed", kind)
+            self._report_window_answer(kind, "", outcome="transcription failed")
             return None
         answer = _normalise_speech(result.text)
         logger.info("voice boundary: %s window closed (answer=%d chars)", kind, len(answer))
         if not answer:
+            # Speech reached the recogniser but came back empty: a distinct
+            # failure from silence, and the one that makes a short spoken
+            # "no" indistinguishable from not having spoken at all.
+            logger.info("voice boundary: %s window: speech captured but nothing recognised", kind)
+            self._report_window_answer(kind, "", outcome="speech heard, nothing recognised")
             return None
+        self._report_window_answer(kind, answer, outcome="captured")
         return answer
+
+    def _report_window_answer(self, kind: str, answer: str, *, outcome: str) -> None:
+        """Show one wake-free window's answer and outcome on the console.
+
+        The words never reach the log (see
+        :meth:`~jarvis.voice.status.VoiceStatusReporter.confirmation_answer`);
+        reporting must never break the window, so any failure here is swallowed.
+        """
+        try:
+            self._reporter.confirmation_answer(kind, answer, outcome=outcome)
+        except Exception:
+            logger.debug("%s window: answer reporting failed", kind, exc_info=True)
 
     def capture_free_text(
         self,
@@ -1359,7 +1395,10 @@ class VoiceLoop:
             completed = self._speak_with_barge_in(spoken)
             logger.info("VOICE TTS_COMPLETE")
             if not completed:
-                logger.info("voice boundary: answer cut short by a wake word; returning to wake")
+                # Cause-agnostic on purpose: ``_speak_with_barge_in`` already
+                # logged *why* the answer stopped (wake word, bare "stop", voice
+                # off, or the ceiling), so this line must not name one.
+                logger.info("voice boundary: answer cut short; returning to wake")
                 return
             logger.info("voice boundary: tts response speech done")
         except Exception:
@@ -1402,11 +1441,12 @@ class VoiceLoop:
         return type(self._tts).__name__
 
     def _speak_with_barge_in(self, text: str) -> bool:
-        """Speak *text*, purging it if the wake word is heard while it plays.
+        """Speak *text*, purging it if the wake word or a bare "stop" is heard.
 
         Returns ``True`` when the answer was spoken to the end and ``False``
-        when the user barged in with the wake word, in which case the caller
-        returns to wake-listening and says nothing further.
+        when the user barged in - with the wake word, or under **D22** with a
+        bare ``"stop"`` - in which case the caller returns to wake-listening and
+        says nothing further.  Neither submits anything to the agent.
 
         Two engine shapes are supported:
 
@@ -1423,6 +1463,13 @@ class VoiceLoop:
         Bounded three ways, so a wedged engine can never hold the voice thread
         (and the microphone) forever: the engine reporting completion,
         ``_stop_event``, and the :data:`_BARGE_IN_MAX_S` wall-clock ceiling.
+
+        **D22.**  When ``bare_stop_while_busy`` is on, the same loop also feeds
+        every post-guard segment to an :class:`~jarvis.voice.stopwatch.OnsetTrigger`
+        so a bare ``"stop"`` can cut the answer off.  It is strictly additive
+        and strictly *after* both the wake detection and the guard, so it can
+        neither delay nor displace wake-word barge-in; a non-cancel utterance
+        purges nothing and resets nothing.
         """
         start = getattr(self._tts, "start_speaking", None)
         speaking = getattr(self._tts, "is_speaking", None)
@@ -1438,8 +1485,17 @@ class VoiceLoop:
         start(text)
         deadline = time.monotonic() + _BARGE_IN_MAX_S
         guard_until = time.monotonic() + _BARGE_IN_GUARD_S
+        onset = (
+            OnsetTrigger(lambda seg: _chunk_is_speech(seg, self._silence_threshold))
+            if self._bare_stop_while_busy
+            else None
+        )
         while speaking():
-            if self._stop_event.is_set() or time.monotonic() >= deadline:
+            if self._stop_event.is_set():
+                logger.info("barge-in: voice stopped; purging the answer")
+                self._purge_speech()
+                return False
+            if time.monotonic() >= deadline:
                 logger.warning("barge-in: speech ceiling reached; purging the answer")
                 self._purge_speech()
                 return False
@@ -1451,12 +1507,40 @@ class VoiceLoop:
             except Exception:
                 logger.debug("barge-in: wake detection failed", exc_info=True)
                 continue
-            if not detected:
+            if detected:
+                logger.info("VOICE TTS_INTERRUPTED")
+                logger.info("voice boundary: wake word heard during speech; purging the answer")
+                self._purge_speech()
+                return False
+            if onset is None:
                 continue
-            logger.info("VOICE TTS_INTERRUPTED")
-            logger.info("voice boundary: wake word heard during speech; purging the answer")
-            self._purge_speech()
-            return False
+            # Additive, strictly after the wake check and the onset guard: the
+            # wake detector has already seen this segment, so a bare cancel can
+            # never delay or displace wake-word barge-in.
+            samples = onset.feed(segment)
+            if samples is None:
+                continue
+            if self._capture_stop_request(
+                preroll=samples,
+                max_s=BARE_CANCEL_MAX_S,
+                listen_timeout_s=BARE_CANCEL_MAX_S,
+                where="speaking",
+            ):
+                # _capture_stop_request already logged VOICE STOP_REQUESTED,
+                # the "bare cancel heard while speaking" line and the status
+                # event.  All that is left here is the console-level fact that
+                # speech was cut off, then the purge.
+                logger.info("VOICE TTS_INTERRUPTED")
+                logger.info("voice boundary: answer cut short by a bare stop; returning to wake")
+                # Purge before returning: the caller's re-arm flushes the mic
+                # and quiet-drains, which must happen on a silenced engine.
+                self._purge_speech()
+                return False
+            # Not a cancel ("stop watch: heard N chars ... ignoring" was logged
+            # by the capture).  Nothing is purged and the detector is not reset,
+            # so the answer plays on and the wake word still works.  Re-arm the
+            # onset trigger only: that utterance has been consumed.
+            onset.reset()
         return True
 
     def _purge_speech(self) -> None:
@@ -1786,7 +1870,7 @@ class VoiceLoop:
             del preroll[: -_MIN_CANCEL_SPEECH_FRAMES * _WAKE_CHUNK_FRAMES]
             if speech_run < _MIN_CANCEL_SPEECH_FRAMES:
                 continue
-            requested = self._capture_stop_request(keep_watching, preroll)
+            requested = self._capture_stop_request(keep_watching, preroll, where="thinking")
             # The session stays armed: the daemon immediately spends the next
             # slice on the same task, and re-arming per utterance would flush
             # and reset the detector every time the room made a noise.  It ends
@@ -1798,6 +1882,10 @@ class VoiceLoop:
         self,
         keep_watching: Callable[[], bool] | None = None,
         preroll: Sequence[float] = (),
+        *,
+        max_s: float = _STOP_CAPTURE_MAX_S,
+        listen_timeout_s: float = _STOP_LISTEN_TIMEOUT_S,
+        where: str = "thinking",
     ) -> bool:
         """Read one short utterance and decide whether it is a cancel request.
 
@@ -1819,13 +1907,19 @@ class VoiceLoop:
         to the agent, so a "stop" can never be planned as a new task.  Any
         failure (capture, STT, hand-over) is a ``False`` - the watch simply
         stands down and the running task is left alone.
+
+        ``max_s``/``listen_timeout_s`` default to the in-flight watch's bounds.
+        The speaking state passes :data:`~jarvis.voice.stopwatch.BARE_CANCEL_MAX_S`
+        instead, because it shares the microphone with wake-word barge-in and
+        has to hand it back promptly.  ``where`` only selects the wording of the
+        log line so the two callers are distinguishable in the JSONL.
         """
         if keep_watching is not None and not keep_watching():
             return False
         try:
             segment = self._read_command(
-                int(_STOP_CAPTURE_MAX_S * 16_000),
-                listen_timeout_s=_STOP_LISTEN_TIMEOUT_S,
+                int(max_s * 16_000),
+                listen_timeout_s=listen_timeout_s,
                 should_continue=keep_watching,
                 spoken_preroll=preroll,
             )
@@ -1850,7 +1944,13 @@ class VoiceLoop:
             )
             return False
         logger.info("VOICE STOP_REQUESTED")
-        logger.info("voice boundary: in-flight cancel request heard; cancelling the task")
+        if where == "speaking":
+            # Wording only; the purge and the return-to-READY belong to
+            # _speak_with_barge_in, which owns the TTS engine.
+            logger.info("stop watch: bare cancel heard while speaking; purging")
+        else:
+            logger.info("stop watch: bare cancel heard while thinking; cancelling")
+            logger.info("voice boundary: in-flight cancel request heard; cancelling the task")
         self._reporter.stop_request()
         return True
 

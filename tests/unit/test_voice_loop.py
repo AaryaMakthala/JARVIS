@@ -5,6 +5,7 @@ Tests the VoiceLoop's lifecycle, routing, and edge cases using fakes.
 
 from __future__ import annotations
 
+import io
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -180,6 +181,7 @@ def _make_loop(
     on_dictation: Any | None = None,
     focus: FakeFocusChecker | None = None,
     audio_segments: list[AudioSegment] | None = None,
+    bare_stop_while_busy: bool = True,
 ) -> tuple[VoiceLoop, FakeAudioInput, FakeWakeWord, FakeSTT, FakeTTS | FakeAsyncTTS]:
     """Build a VoiceLoop with all fakes for testing."""
     if audio_segments is None:
@@ -199,6 +201,7 @@ def _make_loop(
         focus_checker=focus,
         submit_task=submit_task,
         on_dictation=on_dictation,
+        bare_stop_while_busy=bare_stop_while_busy,
     )
     return loop, audio, wake, stt, tts
 
@@ -2356,6 +2359,26 @@ class TestInFlightStopWatch:
         assert submitted == []  # the cancel never became a task for the agent
         assert len(stt.transcribe_calls) == 1  # exactly one captured utterance
 
+    def test_a_bare_stop_while_thinking_is_logged_as_thinking(self, caplog: Any) -> None:
+        """D22 kept this path: THINKING was always wake-free.
+
+        The wording distinguishes it from the speaking-state cancel, so a JSONL
+        slice says *which* state ended - and the in-flight line the daemon's
+        console has always shown is still there.
+        """
+        import logging
+
+        spy = _PhaseSpy()
+        loop, _audio, _stt, submitted = self._loop(transcript="stop", spy=spy)
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+
+        assert loop.watch_for_stop(1.0) == (True, True)
+        assert submitted == []
+        assert caplog.text.count("bare cancel heard while thinking; cancelling") == 1
+        assert "voice boundary: in-flight cancel request heard; cancelling the task" in caplog.text
+        # The speaking wording belongs to the other state and must not appear.
+        assert "bare cancel heard while speaking" not in caplog.text
+
     def test_other_utterances_are_dropped_and_the_task_keeps_running(self) -> None:
         spy = _PhaseSpy()
         loop, _audio, _stt, submitted = self._loop(transcript="open notepad", spy=spy)
@@ -2651,6 +2674,53 @@ class TestBargeIn:
         assert tts.stop_calls == 0
         assert tts.completed is True
 
+    def test_voice_stop_purges_and_is_not_logged_as_a_wake_word(
+        self, monkeypatch: Any, caplog: Any
+    ) -> None:
+        """Shutdown stops the answer, but is not reported as a speech ceiling.
+
+        Both conditions used to share one branch, so stopping the voice was
+        logged as a wake-word barge-in even though no wake word was heard.
+        """
+        import logging
+
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 0.0)
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_MAX_S", 300.0)
+        tts = FakeAsyncTTS(slices=6)
+        loop, _audio, wake, _stt, _ = _make_loop(tts=tts)
+        # No wake word at all, and no expired ceiling: only the stop event.
+        wake._detect_fn = _scripted_wake([False] * 10)
+        loop._stop_event.set()
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+
+        assert loop._speak_with_barge_in("a long answer") is False
+        assert tts.stop_calls == 1
+        assert tts.completed is False
+        # The detector was never even consulted: shutdown is not barge-in.
+        assert wake.detect_calls == []
+        assert "barge-in: voice stopped" in caplog.text
+        assert "speech ceiling reached" not in caplog.text
+        assert "VOICE TTS_INTERRUPTED" not in caplog.text
+
+    def test_speech_ceiling_purges_the_answer(self, monkeypatch: Any, caplog: Any) -> None:
+        """A wedged engine is still bounded by the wall-clock ceiling."""
+        import logging
+
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 0.0)
+        # A zero ceiling is already expired on the first poll.
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_MAX_S", 0.0)
+        tts = FakeAsyncTTS(slices=6)
+        loop, _audio, wake, _stt, _ = _make_loop(tts=tts)
+        wake._detect_fn = _scripted_wake([False] * 10)
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+
+        assert loop._speak_with_barge_in("a long answer") is False
+        assert tts.stop_calls == 1
+        assert tts.completed is False
+        assert "barge-in: speech ceiling reached" in caplog.text
+        assert "barge-in: voice stopped" not in caplog.text
+        assert "VOICE TTS_INTERRUPTED" not in caplog.text
+
     def test_blocking_engine_falls_back_without_barge_in(self) -> None:
         """A protocol-only engine (no start_speaking) still speaks the answer."""
         tts = FakeTTS()
@@ -2658,8 +2728,299 @@ class TestBargeIn:
         wake._detect_fn = _scripted_wake([True] + [True] * 10)
 
         assert loop._speak_with_barge_in("a long answer") is True
-        assert tts.spoken == ["a long answer"]
         assert tts.stop_calls == 0
+
+
+class TestBareStopWhileSpeaking:
+    """D22: a bare ``"stop"`` - no wake word - also cuts the answer short.
+
+    Overrides ``ROADMAP_V2.1_AMENDMENTS.md.md`` section E, which made barge-in
+    respond to the wake word only.  ``voice.bare_stop_while_busy`` gates this
+    speaking-state capability; the in-flight (THINKING) watch accepted a bare
+    cancel before the flag existed and is covered by
+    :class:`TestInFlightStopWatch`.
+
+    The properties pinned here are the ones D22 could plausibly break: the wake
+    word still works and is never delayed, nothing is heard before the onset
+    guard, a non-cancel utterance changes nothing, and the words stay out of the
+    INFO log.
+    """
+
+    @staticmethod
+    def _loop(
+        *,
+        transcript: str,
+        slices: int = 6,
+        bare_stop_while_busy: bool = True,
+        wake: list[bool] | None = None,
+    ) -> tuple[VoiceLoop, FakeAudioInput, FakeWakeWord, FakeSTT, FakeAsyncTTS]:
+        """A speaking loop whose every utterance transcribes to ``transcript``.
+
+        ``transcribe_fn`` (not a scripted list) so a *second* onset in the same
+        answer transcribes the same way instead of silently becoming "".
+        """
+        tts = FakeAsyncTTS(slices=slices)
+        audio = FakeAudioInput(segments=[make_speech("x", duration_s=0.5)] * 40)
+        detector = FakeWakeWord(detect_fn=_scripted_wake(wake or []))
+        stt = FakeSTT(transcribe_fn=lambda _segment: STTResult(text=transcript))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=detector,
+            stt=stt,
+            tts=tts,
+            bare_stop_while_busy=bare_stop_while_busy,
+        )
+        return loop, audio, detector, stt, tts
+
+    @pytest.mark.parametrize("utterance", ["stop", " stop ", "Stop!", "stop.", "Stop."])
+    def test_a_bare_stop_while_speaking_purges_the_answer(
+        self, monkeypatch: Any, caplog: Any, utterance: str
+    ) -> None:
+        import logging
+
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 0.0)
+        loop, _audio, _wake, _stt, tts = self._loop(transcript=utterance)
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+
+        assert loop._speak_with_barge_in("a long answer") is False
+        # Purged, and stopped before the engine could finish on its own.
+        assert tts.stop_calls == 1
+        assert tts.completed is False
+        assert "VOICE STOP_REQUESTED" in caplog.text
+        assert "stop watch: bare cancel heard while speaking; purging" in caplog.text
+        assert "VOICE TTS_INTERRUPTED" in caplog.text
+        assert "voice boundary: answer cut short by a bare stop; returning to wake" in caplog.text
+        # Not barge-in, and not the ceiling: neither claim is made.
+        assert "wake word heard during speech" not in caplog.text
+        assert "speech ceiling reached" not in caplog.text
+
+    def test_one_purging_line_per_cancel(self, monkeypatch: Any, caplog: Any) -> None:
+        """Exactly one report per cancel, so the JSONL stays countable."""
+        import logging
+
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 0.0)
+        loop, _audio, _wake, _stt, _tts = self._loop(transcript="stop")
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+
+        loop._speak_with_barge_in("a long answer")
+
+        assert caplog.text.count("bare cancel heard while speaking; purging") == 1
+        assert caplog.text.count("VOICE STOP_REQUESTED") == 1
+        assert caplog.text.count("VOICE TTS_INTERRUPTED") == 1
+
+    def test_non_cancel_speech_while_speaking_is_ignored(
+        self, monkeypatch: Any, caplog: Any
+    ) -> None:
+        """Room noise costs a count in the log and nothing else.
+
+        No purge, no detector reset, and the answer keeps playing - the mic has
+        to stay useful for the wake word for the rest of the answer.
+        """
+        import logging
+
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 0.0)
+        loop, _audio, wake, stt, tts = self._loop(transcript="open the garage door", slices=3)
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+
+        assert loop._speak_with_barge_in("a long answer") is True
+        assert tts.stop_calls == 0
+        assert tts.completed is True
+        # The utterance really was captured and really was rejected.
+        assert len(stt.transcribe_calls) == 1
+        assert "stop watch: heard 20 chars that are not a cancel request; ignoring" in caplog.text
+        # Nothing was purged and the detector's window was left alone: it keeps
+        # being fed, which is what makes a later "Hey Jarvis" still work.
+        assert wake.reset_calls == 1  # only the one reset at the start of speech
+        assert len(wake.detect_calls) > 2
+
+    def test_the_heard_words_never_reach_the_info_log(self, monkeypatch: Any, caplog: Any) -> None:
+        """Counts only at INFO, like every other transcript in the loop."""
+        import logging
+
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 0.0)
+        loop, _audio, _wake, _stt, _tts = self._loop(transcript="banana", slices=3)
+        caplog.set_level(logging.INFO)
+
+        loop._speak_with_barge_in("a long answer")
+
+        assert "banana" not in caplog.text
+        assert "stop watch: heard 6 chars that are not a cancel request; ignoring" in caplog.text
+
+    def test_the_wake_word_still_wins_and_costs_no_transcription(
+        self, monkeypatch: Any, caplog: Any
+    ) -> None:
+        """The additive path may not delay or displace wake-word barge-in."""
+        import logging
+
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 0.0)
+        loop, _audio, _wake, stt, tts = self._loop(transcript="stop", wake=[False, True])
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+
+        assert loop._speak_with_barge_in("a long answer") is False
+        assert tts.stop_calls == 1
+        # The wake word landed on the frame that would also have started the
+        # onset, and it short-circuited: no transcription was spent at all.
+        assert stt.transcribe_calls == []
+        assert "wake word heard during speech; purging the answer" in caplog.text
+        assert "bare cancel heard while speaking" not in caplog.text
+
+    def test_nothing_is_captured_before_the_onset_guard(
+        self, monkeypatch: Any, caplog: Any
+    ) -> None:
+        """The answer's own echo cannot become a cancel: the guard runs first."""
+        import logging
+
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 30.0)
+        loop, _audio, _wake, stt, tts = self._loop(transcript="stop")
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+
+        assert loop._speak_with_barge_in("a long answer") is True
+        assert tts.stop_calls == 0
+        assert stt.transcribe_calls == []
+        assert "VOICE STOP_REQUESTED" not in caplog.text
+
+    def test_the_flag_off_restores_wake_only_barge_in(self, monkeypatch: Any, caplog: Any) -> None:
+        """``bare_stop_while_busy = False`` is the pre-D22 behaviour, exactly."""
+        import logging
+
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 0.0)
+        loop, _audio, _wake, stt, tts = self._loop(transcript="stop", bare_stop_while_busy=False)
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+
+        assert loop._speak_with_barge_in("a long answer") is True
+        assert tts.stop_calls == 0
+        # Not even a transcription: the trigger never runs, so the mic is never
+        # borrowed for the answer's sake.
+        assert stt.transcribe_calls == []
+        assert "bare cancel heard while speaking" not in caplog.text
+
+
+class TestConfirmationRefusalIsObservable:
+    """A refused confirmation must be auditable, not a silent refusal.
+
+    Live evidence (2026-10-02, ``jarvis.jsonl``): the owner said "no" and could
+    not tell what happened, because every way of failing produced no output at
+    all — the ``answer is None`` branch logged nothing, and an empty transcript
+    was indistinguishable from silence.  ``voice confirmation refused by user``
+    had **zero** occurrences in the entire log.
+
+    These tests pin the *observability* only.  The refuse direction, the
+    callback shape, the strict word set and the timeout are unchanged.
+    """
+
+    @staticmethod
+    def _reporter(echo_transcript: bool = True) -> tuple[VoiceStatusReporter, io.StringIO]:
+        stream = io.StringIO()
+        return (
+            VoiceStatusReporter(
+                stream=stream, wake_word="Hey Jarvis", echo_transcript=echo_transcript
+            ),
+            stream,
+        )
+
+    def _confirm(
+        self,
+        *,
+        stt_results: list[STTResult],
+        audio_segments: list[AudioSegment] | None = None,
+        echo_transcript: bool = True,
+    ) -> tuple[str, list[dict[str, Any]], str]:
+        reporter, stream = self._reporter(echo_transcript)
+        loop, _audio, _wake, _stt, _ = _make_loop(
+            audio_segments=audio_segments or [make_speech("x", duration_s=0.5)] * 60,
+            stt_results=stt_results,
+        )
+        loop._reporter = reporter
+        answers: list[dict[str, Any]] = []
+        said = loop.confirm_by_voice(
+            {"tier": 1, "summary": "create file", "action_hash": "abc"},
+            on_confirmation=answers.append,
+        )
+        return said, answers, stream.getvalue()
+
+    def test_a_non_yes_word_refuses_and_says_so(self, caplog: Any) -> None:
+        """A heard-but-not-approval answer is a *user* refusal, and is named."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+        said, answers, console = self._confirm(stt_results=[STTResult(text="no")])
+
+        assert said == "Cancelled."
+        assert answers == [{"approved": False, "action_hash": "abc"}]
+        assert "voice confirmation refused by user" in caplog.text
+        # Distinct from the system's own "nothing usable came back" refusal.
+        assert "no usable answer in the window" not in caplog.text
+        assert 'CONFIRMATION ANSWER: "no"' in console
+        assert "-> captured" in console
+
+    def test_silence_refuses_and_names_its_own_reason(self, caplog: Any) -> None:
+        """Nothing spoken is the *system's* refusal, and it is logged."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+        said, answers, console = self._confirm(
+            stt_results=[],
+            audio_segments=[make_silence(duration_s=0.5) for _ in range(40)],
+        )
+
+        assert said == "No response received. Action cancelled."
+        assert answers == [{"approved": False, "action_hash": "abc"}]
+        assert "voice confirmation refused: no usable answer in the window" in caplog.text
+        assert "refused by user" not in caplog.text
+        assert "no speech detected" in console
+
+    def test_an_empty_transcript_is_not_reported_as_silence(self, caplog: Any) -> None:
+        """Speech that transcribes to nothing is its own, visible failure.
+
+        This is the case that made a short spoken "no" look like not speaking.
+        """
+        import logging
+
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+        said, answers, console = self._confirm(stt_results=[STTResult(text="   ")])
+
+        assert said == "No response received. Action cancelled."
+        assert answers == [{"approved": False, "action_hash": "abc"}]
+        assert "speech heard, nothing recognised" in console
+        assert "no speech detected" not in console
+        assert "no usable answer in the window" in caplog.text
+
+    def test_an_approved_answer_is_also_visible(self) -> None:
+        """The passing case shows the word too, so the operator can trust it."""
+        said, answers, console = self._confirm(stt_results=[STTResult(text=" Yes. ")])
+
+        assert said == "Approved."
+        assert answers == [{"approved": True, "action_hash": "abc"}]
+        assert 'CONFIRMATION ANSWER: "yes"' in console
+        assert "-> captured" in console
+
+    def test_the_words_never_reach_the_log(self, caplog: Any) -> None:
+        """Only the length and outcome are logged, matching ``transcript()``."""
+        import logging
+
+        # Root level, so the status reporter's record is checked too: the words
+        # must reach neither the loop's log nor the JSONL event record.
+        caplog.set_level(logging.INFO)
+        self._confirm(stt_results=[STTResult(text="banana")])
+
+        assert "banana" not in caplog.text
+        assert "chars=6" in caplog.text
+        assert "outcome=captured" in caplog.text
+
+    def test_the_console_hides_the_words_when_echo_is_off(self) -> None:
+        """``echo_transcript=False`` must hide the words, as ``transcript()`` does.
+
+        The refusal must still be visible — only the words are withheld, so the
+        owner is never left with a silent refusal.
+        """
+        said, _answers, console = self._confirm(
+            stt_results=[STTResult(text="banana")], echo_transcript=False
+        )
+
+        assert said == "Cancelled."
+        assert "banana" not in console
+        assert "CONFIRMATION ANSWER: <6 chars>" in console
+        assert "-> captured" in console
 
     def test_no_wake_detector_falls_back_to_blocking_speech(self) -> None:
         tts = FakeAsyncTTS(slices=2)
