@@ -32,6 +32,7 @@ from jarvis.voice.interfaces import (
     WindowFocusChecker,
 )
 from jarvis.voice.loop import (
+    DEFAULT_CONFIRM_WINDOW_S,
     DEFAULT_MAX_DICTATION_CHARS,
     DEFAULT_MAX_SESSION_S,
     DEFAULT_MAX_SPOKEN_CHARS,
@@ -65,7 +66,10 @@ VOICE_HINTS: dict[str, str] = {
     "mic-open-failed": "check that a microphone is connected and enabled in Windows",
     "wake-model-missing": "install openwakeword or set [voice] wake_word in config.toml",
     "stt-model-missing": "install faster-whisper or set [voice] stt_model in config.toml",
-    "tts-unavailable": "install piper-tts / pyttsx3 or set [voice] tts_backend in config.toml",
+    "tts-unavailable": (
+        "install piper-tts (plus a model path) or pywin32 for SAPI, "
+        "or set [voice] tts_backend in config.toml"
+    ),
     "loop-crashed": "see the daemon log for the loop traceback; text and CLI keep working",
 }
 
@@ -102,7 +106,6 @@ class VoiceService:
         tts: TextToSpeech | None = None,
         focus_checker: WindowFocusChecker | None = None,
         submit_task: Any | None = None,
-        on_confirmation: Any | None = None,
         on_dictation: Any | None = None,
         wake_word: str = "hey jarvis",
         idle_timeout_s: float = 120.0,
@@ -113,6 +116,7 @@ class VoiceService:
         max_segment_s: float = 30.0,
         silence_threshold: float = 0.01,
         rearm_quiet_gate_s: float = DEFAULT_REARM_QUIET_GATE_S,
+        confirm_window_s: float = DEFAULT_CONFIRM_WINDOW_S,
         max_spoken_chars: int = DEFAULT_MAX_SPOKEN_CHARS,
         report_status: bool = True,
         echo_transcript: bool = True,
@@ -125,7 +129,6 @@ class VoiceService:
         self._tts = tts
         self._focus_checker = focus_checker
         self._submit_task = submit_task
-        self._on_confirmation = on_confirmation
         self._on_dictation = on_dictation
         self._wake_word = wake_word
         self._idle_timeout_s = idle_timeout_s
@@ -136,6 +139,7 @@ class VoiceService:
         self._max_segment_s = max_segment_s
         self._silence_threshold = silence_threshold
         self._rearm_quiet_gate_s = rearm_quiet_gate_s
+        self._confirm_window_s = confirm_window_s
         self._max_spoken_chars = max_spoken_chars
         self._report_status = report_status
         self._echo_transcript = echo_transcript
@@ -207,7 +211,6 @@ class VoiceService:
                 tts=self._tts,
                 focus_checker=self._focus_checker,
                 submit_task=self._submit_task,
-                on_confirmation=self._on_confirmation,
                 on_dictation=self._on_dictation,
                 wake_word=self._wake_word,
                 listen_timeout_s=self._listen_timeout_s,
@@ -218,6 +221,7 @@ class VoiceService:
                 max_segment_s=self._max_segment_s,
                 silence_threshold=self._silence_threshold,
                 rearm_quiet_gate_s=self._rearm_quiet_gate_s,
+                confirm_window_s=self._confirm_window_s,
                 max_spoken_chars=self._max_spoken_chars,
                 report_status=self._report_status,
                 echo_transcript=self._echo_transcript,

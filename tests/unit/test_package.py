@@ -56,7 +56,6 @@ def test_version_installed_distribution() -> None:
         "jarvis.voice.wake",
         "jarvis.voice.stt",
         "jarvis.voice.tts",
-        "jarvis.voice.vad",
         "jarvis.memory.db",
         "jarvis.memory.skills",
         "jarvis.memory.failures",

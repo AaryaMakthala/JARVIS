@@ -1,4 +1,4 @@
-"""Voice pipeline: wake word, STT, TTS, VAD (optional extra, Phase 5).
+"""Voice pipeline: wake word, STT, TTS (optional extra).
 
 Audio never leaves the machine; only text goes to LLM APIs.
 
@@ -13,7 +13,6 @@ from jarvis.voice.interfaces import (
     SpeechToText,
     STTResult,
     TextToSpeech,
-    VoiceCommand,
     WakeWordDetector,
     WakeWordResult,
     WindowFocusChecker,
@@ -25,7 +24,6 @@ __all__ = [
     "STTResult",
     "SpeechToText",
     "TextToSpeech",
-    "VoiceCommand",
     "WakeWordDetector",
     "WakeWordResult",
     "WindowFocusChecker",

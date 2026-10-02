@@ -105,6 +105,10 @@ listen_timeout_s = 30.0
 idle_timeout_s = 120.0
 max_session_s = 1800.0
 max_dictation_chars = 20000
+# Bounded window for a spoken "yes"/"no" on a Tier 1 confirmation and for a
+# spoken clarification answer.  It opens after the prompt is spoken, needs no
+# wake word, and a timeout is a refusal (fail closed).
+confirm_window_s = 8.0
 
 [whatsapp]
 app_name = "WhatsApp"
@@ -301,6 +305,12 @@ class VoiceSettings(BaseModel):
     #: of *audio* (0 disables).  Keeps the second/third wake as detectable as
     #: the first by making the detector re-arm under the same quiet baseline.
     rearm_quiet_gate_s: float = 0.5
+    #: How long the microphone stays open for a spoken yes/no (Tier 1
+    #: confirmation) or a spoken clarification answer, in seconds.  The window
+    #: opens *after* the prompt has been spoken and is bounded twice: by this
+    #: value and by the trailing-silence end in ``_read_command``.  No wake word
+    #: is required inside it (docs/03 §7.8), and silence/timeout is a refusal.
+    confirm_window_s: float = 8.0
     #: Print the ``[VOICE]``/``[LLM]`` lifecycle lines to the console.  The
     #: JSONL log is written either way; turning this off only silences the
     #: terminal, never the diagnostics.

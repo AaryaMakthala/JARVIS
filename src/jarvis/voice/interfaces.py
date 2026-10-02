@@ -1,7 +1,7 @@
 """Voice pipeline interfaces (protocols and data classes).
 
 Every hardware/OS dependency (sounddevice, openWakeWord, faster-whisper,
-piper-tts, pyttsx3, pywinauto) is behind a protocol so tests use fakes.
+piper-tts, win32com/SAPI, pywinauto) is behind a protocol so tests use fakes.
 Real implementations live in sibling modules and are lazy-imported only
 when the ``voice`` extra is installed.
 
@@ -11,7 +11,6 @@ Audio never leaves the machine; only text goes to LLM APIs.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -51,39 +50,7 @@ class STTResult:
     duration_s: float = 0.0
 
 
-@dataclass
-class VoiceCommand:
-    """Parsed voice command after STT."""
-
-    raw_text: str
-    intent: str = ""  # e.g. "open_notepad", "dictate", "stop_listening", "unknown"
-    target_app: str = ""
-    parameters: dict[str, str] = field(default_factory=dict)
-
-
 # ── protocols ───────────────────────────────────────────────────────────
-
-
-@runtime_checkable
-class VoiceActivityDetector(Protocol):
-    """Pure voice-activity detection over audio frames it is *given*.
-
-    Implementations must **not** own a microphone stream.  They receive
-    chunks (via the ``read_chunk`` callable supplied by the caller) and
-    return the contiguous speech segment once the utterance ends — so the
-    single :class:`AudioInput` stream is owned by exactly one component.
-    """
-
-    def listen_for_speech(
-        self,
-        read_chunk: Callable[[int], AudioSegment],
-    ) -> AudioSegment:
-        """Return one spoken segment, read via *read_chunk* (blocking)."""
-        ...
-
-    def close(self) -> None:
-        """Release any resources held by the detector."""
-        ...
 
 
 @runtime_checkable
@@ -139,7 +106,16 @@ class SpeechToText(Protocol):
 
 @runtime_checkable
 class TextToSpeech(Protocol):
-    """Speaks text aloud through the speakers."""
+    """Speaks text aloud through the speakers.
+
+    ``speak``/``stop`` are the whole mandatory contract.  An engine may
+    *additionally* offer the optional barge-in pair ``start_speaking(text)`` and
+    ``is_speaking()``: with it, speech is queued asynchronously so the voice loop
+    can keep the microphone open and purge the answer on a wake word; without
+    it, the loop speaks blocking.  The pair is discovered by capability
+    (``getattr``), never required, so an engine that only implements this
+    protocol is always usable - just not interruptible.
+    """
 
     def speak(self, text: str) -> None:
         """Speak *text* synchronously (blocks until done)."""

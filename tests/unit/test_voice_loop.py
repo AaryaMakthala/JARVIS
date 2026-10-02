@@ -12,6 +12,9 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
+import pytest
+
+import jarvis.voice.loop as loop_mod
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import open_sqlite_checkpointer
 from jarvis.agent.runner import run_task
@@ -27,6 +30,7 @@ from jarvis.llm.models import ModelSpec, model_spec
 from jarvis.llm.multi import MultiProviderClient
 from jarvis.llm.provider import ProviderInfo
 from jarvis.voice.fakes import (
+    FakeAsyncTTS,
     FakeAudioInput,
     FakeFocusChecker,
     FakeSTT,
@@ -44,14 +48,17 @@ from jarvis.voice.loop import (
     _CAPTURE_CHUNK_FRAMES,
     _LOOSE_YES_WORDS,
     _STRICT_YES_WORDS,
+    CONFIRMATION_PROMPT,
+    DEFAULT_CONFIRM_WINDOW_S,
     REPEAT_PROMPT,
+    SHUTDOWN_UNSUPPORTED_MSG,
     STOP_ACKNOWLEDGEMENT,
     VoiceLoop,
     _approval_words,
     _transcript_problem,
 )
 from jarvis.voice.states import VoicePhase
-from jarvis.voice.status import VoiceStatusReporter
+from jarvis.voice.status import VoiceStatusReporter, wake_phrase
 from support import brain_conversation
 
 # ── helpers ─────────────────────────────────────────────────────────────
@@ -168,13 +175,12 @@ def _make_loop(
     *,
     wake_results: list[WakeWordResult] | None = None,
     stt_results: list[STTResult] | None = None,
-    tts: FakeTTS | None = None,
+    tts: FakeTTS | FakeAsyncTTS | None = None,
     submit_task: Any | None = None,
-    on_confirmation: Any | None = None,
     on_dictation: Any | None = None,
     focus: FakeFocusChecker | None = None,
     audio_segments: list[AudioSegment] | None = None,
-) -> tuple[VoiceLoop, FakeAudioInput, FakeWakeWord, FakeSTT, FakeTTS]:
+) -> tuple[VoiceLoop, FakeAudioInput, FakeWakeWord, FakeSTT, FakeTTS | FakeAsyncTTS]:
     """Build a VoiceLoop with all fakes for testing."""
     if audio_segments is None:
         # Enough speech segments for wake + command capture
@@ -192,7 +198,6 @@ def _make_loop(
         tts=tts,
         focus_checker=focus,
         submit_task=submit_task,
-        on_confirmation=on_confirmation,
         on_dictation=on_dictation,
     )
     return loop, audio, wake, stt, tts
@@ -407,13 +412,50 @@ class TestVoiceLoopRouting:
 
 
 class TestVoiceLoopConfirmation:
-    def test_tier1_voice_confirmation_approve(self) -> None:
+    """A Tier 1 confirmation is answered by voice in a wake-free window.
+
+    The loop itself no longer runs a confirmation dialogue from a submitted
+    task outcome: the daemon publishes the pending confirmation and calls
+    :meth:`VoiceLoop.confirm_by_voice` from its own worker thread.  These
+    tests drive that entry point directly, which is the production path.
+    """
+
+    def test_tier1_voice_confirmation_approve_without_a_wake_word(self) -> None:
         confirmation_answers: list[dict[str, Any]] = []
+        loop, _audio, wake, stt, tts = _make_loop(
+            audio_segments=[make_speech("fake", duration_s=0.5)] * 100,
+        )
+        stt._results = [STTResult(text="yes")]
+        stt._idx = 0
 
-        def on_confirm(answer: dict[str, Any]) -> str:
-            confirmation_answers.append(answer)
-            return "approved"
+        said = loop.confirm_by_voice(
+            {"tier": 1, "summary": "create file", "action_hash": "abc"},
+            on_confirmation=confirmation_answers.append,
+        )
 
+        assert said == "Approved."
+        assert confirmation_answers == [{"approved": True, "action_hash": "abc"}]
+        # No wake word was needed: the detector was never consulted.
+        assert wake.detect_calls == []
+        assert tts.spoken and "yes to continue" in tts.spoken[0]
+
+    def test_tier2_rejected_by_voice(self) -> None:
+        confirmation_answers: list[dict[str, Any]] = []
+        loop, _, _, _, _ = _make_loop()
+        said = loop.confirm_by_voice(
+            {"tier": 2, "summary": "delete files", "action_hash": "def"},
+            on_confirmation=confirmation_answers.append,
+        )
+        assert "terminal confirmation" in said
+        assert confirmation_answers == [{"approved": False, "action_hash": "def"}]
+
+    def test_outcome_confirmation_is_ignored_and_fails_closed(self) -> None:
+        """A confirmation that arrives on the loop's own thread is refused.
+
+        Only the daemon's worker thread owns a resume callback, so a
+        confirmation on this thread is unhandled by design: nothing is spoken
+        and the graph's own policy gate denies the step.
+        """
         outcome = type(
             "Outcome",
             (),
@@ -423,41 +465,9 @@ class TestVoiceLoopConfirmation:
                 "confirmation": {"tier": 1, "summary": "create file", "action_hash": "abc"},
             },
         )()
-
-        def fake_submit(text: str, source: str) -> Any:
-            return outcome
-
-        loop, _audio, _, stt, _tts = _make_loop(
-            submit_task=fake_submit,
-            on_confirmation=on_confirm,
-            audio_segments=[make_speech("fake", duration_s=0.5)] * 100,
-        )
-        # Pre-load STT with "yes" for the confirmation
-        stt._results = [STTResult(text="yes")]
-        stt._idx = 0
-
-        loop._route("create file")
-        # The response should include the confirmation handling
-        assert len(confirmation_answers) == 1
-        assert confirmation_answers[0]["approved"] is True
-
-    def test_tier2_rejected_by_voice(self) -> None:
-        outcome = type(
-            "Outcome",
-            (),
-            {
-                "final_answer": None,
-                "error": None,
-                "confirmation": {"tier": 2, "summary": "delete files", "action_hash": "def"},
-            },
-        )()
-
-        def fake_submit(text: str, source: str) -> Any:
-            return outcome
-
-        loop, _, _, _, _ = _make_loop(submit_task=fake_submit)
-        response = loop._route("delete files")
-        assert "terminal confirmation" in response
+        loop, _, _, _, tts = _make_loop(submit_task=lambda text, source: outcome)
+        assert loop._route("create file") is None
+        assert tts.spoken == []
 
 
 # ── focus verification tests ────────────────────────────────────────────
@@ -971,13 +981,13 @@ class TestRearmQuietStartGate:
         assert submitted == ["open notepad", "open notepad"]
         assert wake.reset_calls == 3
 
-    def test_confirmation_rearm_flushes_prompt_echo_before_listening(self) -> None:
-        """Confirmation re-arm order is prompt → flush → reset → listen.
+    def test_confirmation_window_never_consults_the_wake_detector(self) -> None:
+        """The answer window is wake-free: prompt → flush → capture, no detect.
 
-        Resetting before the prompt was spoken would leave the prompt's own
-        "Say hey jarvis to confirm." echo in the very windows the user's
-        confirming wake word is scored in, so the flush and reset must happen
-        after the prompt, before any read.
+        This is the Stage 1 fix for "yes" not approving a Tier 1 action: the
+        window must not depend on the wake detector at all, and the flush must
+        happen *after* the prompt so the prompt's own echo can never be
+        transcribed as the answer.
         """
         events: list[str] = []
 
@@ -998,11 +1008,38 @@ class TestRearmQuietStartGate:
         loop = VoiceLoop(
             audio=_EventAudio(segments=[make_speech("x", duration_s=0.5)] * 10),
             wake_detector=_EventWake(detect_fn=_scripted_wake([True])),
-            stt=FakeSTT(),
+            stt=FakeSTT(results=[STTResult(text="yes")]),
             tts=FakeTTS(speak_fn=lambda _text: events.append("speak")),
+            confirm_window_s=1.0,
         )
-        assert loop._rearm_wake_for_confirmation(timeout_s=1.0)
-        assert events == ["speak", "flush", "reset", "detect"]
+        answers: list[dict[str, Any]] = []
+        said = loop.confirm_by_voice(
+            {"tier": 1, "summary": "create file", "action_hash": "abc"},
+            on_confirmation=answers.append,
+        )
+        assert said == "Approved."
+        assert answers == [{"approved": True, "action_hash": "abc"}]
+        # The prompt is spoken first, the mic is flushed before any read, and
+        # the wake detector is never asked to score anything.
+        assert events[0] == "speak"
+        assert "flush" in events
+        assert "detect" not in events
+
+    def test_confirmation_window_is_bounded_and_refuses_on_silence(self) -> None:
+        """No answer inside the window is a refusal, never an approval."""
+        loop, audio, _, _, _ = _make_loop(
+            audio_segments=[make_silence(duration_s=0.5) for _ in range(40)],
+        )
+        answers: list[dict[str, Any]] = []
+        said = loop.confirm_by_voice(
+            {"tier": 1, "summary": "create file", "action_hash": "abc"},
+            on_confirmation=answers.append,
+        )
+        assert said == "No response received. Action cancelled."
+        assert answers == [{"approved": False, "action_hash": "abc"}]
+        # Bounded: the window asked for at most confirm_window_s of audio.
+        assert audio.read_calls
+        assert max(audio.read_calls) <= int(DEFAULT_CONFIRM_WINDOW_S * 16_000)
 
 
 # ── first wake after a quiet startup (service starts → detector armed → wake) ──
@@ -1578,7 +1615,10 @@ class TestTranscriptRedaction:
         import logging
 
         submitted: list[str] = []
-        transcript = "my secret dozen 98765"
+        # Long enough to carry an intent word, so this exercises log redaction
+        # rather than the short-fragment gate (which is covered by
+        # ``TestTranscriptGating``).
+        transcript = "send the secret report to 98765"
         self._drive_one_transcript(caplog, logging.INFO, transcript, submitted)
         assert submitted == [transcript]
         text = caplog.text  # type: ignore[attr-defined]
@@ -2157,8 +2197,6 @@ class TestVoiceLevelDiagnostics:
         """The wake-listening heartbeat carries an audio_rms field."""
         import logging
 
-        import jarvis.voice.loop as loop_mod
-
         monkeypatch.setattr(loop_mod, "_WAKE_HEARTBEAT_S", 0.0)  # type: ignore[attr-defined]
         caplog.set_level(logging.INFO, logger="jarvis.voice.loop")  # type: ignore[attr-defined]
         audio = FakeAudioInput(segments=[make_speech("x", duration_s=0.2)] * 60)
@@ -2309,7 +2347,7 @@ class TestInFlightStopWatch:
         return loop, audio, stt, submitted
 
     def test_cancel_word_cancels_locally_and_never_submits(self) -> None:
-        """"stop" is matched in code: reported once, no planner, no task."""
+        """ "stop" is matched in code: reported once, no planner, no task."""
         spy = _PhaseSpy()
         loop, _audio, stt, submitted = self._loop(transcript=" Stop! ", spy=spy)
 
@@ -2381,7 +2419,6 @@ class TestInFlightStopWatch:
         assert wake.reset_calls == 3  # session 1 (1) + loop re-arm (2) + session 2 (3)
 
 
-
 class TestCancelledInteraction:
     """A task the daemon cancelled is answered locally and re-arms once.
 
@@ -2439,3 +2476,198 @@ class TestCancelledInteraction:
         assert spy.phases[-2:] == ["RESETTING", "READY"]
         assert spy.illegal_transitions == []
         assert wake.reset_calls >= 1
+
+
+# -- Stage 1: spoken wake name, stop semantics, barge-in -------------------
+
+
+class TestSpokenWakeName:
+    """1a: the wake name is never read out as the configured machine token.
+
+    ``hey_jarvis`` is what openWakeWord is configured with; a person says "Hey
+    Jarvis".  Anything spoken or shown to the user goes through
+    :func:`jarvis.voice.status.wake_phrase`, and no spoken prompt may contain the
+    raw token at all.
+    """
+
+    @pytest.mark.parametrize(
+        ("configured", "spoken"),
+        [
+            ("hey_jarvis", "Hey Jarvis"),
+            ("hey jarvis", "Hey Jarvis"),
+            ("", "Hey Jarvis"),
+            ("jarvis", "Jarvis"),
+        ],
+    )
+    def test_wake_phrase_renders_the_human_name(self, configured: str, spoken: str) -> None:
+        assert wake_phrase(configured) == spoken
+
+    def test_no_spoken_prompt_contains_the_raw_token(self) -> None:
+        spoken_prompts = (
+            CONFIRMATION_PROMPT,
+            REPEAT_PROMPT,
+            STOP_ACKNOWLEDGEMENT,
+            SHUTDOWN_UNSUPPORTED_MSG,
+            "Goodbye.",
+        )
+        for prompt in spoken_prompts:
+            assert "_" not in prompt, f"prompt reads out a machine token: {prompt!r}"
+
+
+class TestStopSemantics:
+    """1c: cancel, voice off, and sleep are three different things.
+
+    A bare "stop"/"cancel"/"never mind" cancels the current speech and task and
+    leaves the microphone open; only an explicit voice-off phrase ends the loop;
+    "go to sleep" is a Stage 2 mode change and must reach neither branch.
+    """
+
+    @pytest.mark.parametrize(
+        "utterance",
+        ["stop", "Stop.", "stop!", "cancel", "cancel it", "never mind", "abort"],
+    )
+    def test_bare_stop_cancels_and_keeps_listening(self, utterance: str) -> None:
+        submitted: list[str] = []
+        loop, _, _, _, tts = _make_loop(
+            submit_task=lambda text, source: submitted.append(text),
+        )
+        response = loop._route(utterance)
+        assert response == STOP_ACKNOWLEDGEMENT
+        # Voice is still on (the stop event is what ends the loop) and nothing
+        # was sent to the planner.
+        assert not loop._stop_event.is_set()
+        assert submitted == []
+        assert tts.stop_calls == 1
+
+    @pytest.mark.parametrize(
+        "utterance",
+        [
+            "stop listening",
+            "Stop listening.",
+            "turn off voice",
+            "Turn off voice.",
+            "jarvis off",
+            "disable voice",
+        ],
+    )
+    def test_explicit_voice_off_phrases_stop_the_loop(self, utterance: str) -> None:
+        loop, _, _, _, _ = _make_loop()
+        assert loop._route(utterance) == "Goodbye."
+        assert not loop.is_active()
+        assert loop._stop_event.is_set()
+
+    def test_turn_off_on_its_own_is_a_normal_command(self) -> None:
+        """ "turn off the lights" is a task, not a voice command."""
+        submitted: list[str] = []
+
+        def fake_submit(text: str, source: str) -> Any:
+            submitted.append(text)
+            return type("Outcome", (), {"final_answer": "done", "confirmation": None})()
+
+        loop, _, _, _, _ = _make_loop(submit_task=fake_submit)
+        assert loop._route("turn off the lights") == "done"
+        assert submitted == ["turn off the lights"]
+        assert not loop._stop_event.is_set()
+
+    def test_go_to_sleep_is_not_voice_off(self) -> None:
+        """Sleep is a Stage 2 mode change: it must not switch voice off."""
+        submitted: list[str] = []
+
+        def fake_submit(text: str, source: str) -> Any:
+            submitted.append(text)
+            return type("Outcome", (), {"final_answer": "ok", "confirmation": None})()
+
+        loop, _, _, _, _ = _make_loop(submit_task=fake_submit)
+        assert loop._route("go to sleep") == "ok"
+        assert not loop._stop_event.is_set()
+
+    def test_stop_reaches_the_router_instead_of_the_planner(self) -> None:
+        """The Stage 0 regression: "Stop." was normalised without its period,
+        missed every branch, and was submitted to the LLM."""
+        submitted: list[str] = []
+        loop, _, _, _, _ = _make_loop(
+            submit_task=lambda text, source: submitted.append(text),
+        )
+        assert loop._route("Stop.") == STOP_ACKNOWLEDGEMENT
+        assert submitted == []
+
+    def test_cancel_words_survive_the_fragment_gate(self) -> None:
+        """ "cancel"/"never mind" carry no intent verb, so the unusable-utterance
+        gate must not reject them as fragments before routing sees them."""
+        for utterance in ("stop", "cancel", "never mind", "jarvis off", "stop listening"):
+            assert _transcript_problem(utterance, "hey_jarvis") is None, utterance
+
+    def test_bare_stop_while_dictating_stops_dictation(self) -> None:
+        loop, _, _, _, _ = _make_loop(on_dictation=lambda text: None)
+        loop.start_dictation()
+        assert loop._route("stop") == "Dictation stopped."
+        assert not loop.is_dictating
+
+
+class TestBargeIn:
+    """1d: a wake word heard *while* the answer speaks purges it.
+
+    The engine speaks asynchronously while the loop thread keeps the
+    microphone, so "Hey Jarvis" cuts the answer short and the loop returns to
+    wake-listening.  Without the optional barge-in pair the loop falls back to
+    blocking speech rather than failing.
+    """
+
+    def test_wake_word_during_speech_purges_the_answer(self, monkeypatch: Any) -> None:
+        # The onset guard is wall-clock, and fake audio is instant, so it is
+        # disabled here; :meth:`TestBargeIn.test_post_speech_guard_ignores_the
+        # answer_onset` covers the guard itself.
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 0.0)
+        tts = FakeAsyncTTS(slices=6)
+        loop, _audio, wake, _stt, _ = _make_loop(tts=tts)
+        # One wake detection True arrives while the answer is still playing.
+        wake._detect_fn = _scripted_wake([False, False, False, True])
+
+        assert loop._speak_with_barge_in("a long answer") is False
+        assert tts.stop_calls == 1
+        # Speech never ran to completion, and the detector was consulted.
+        assert tts.completed is False
+        assert len(wake.detect_calls) >= 1
+
+    def test_answer_is_spoken_to_the_end_without_a_wake_word(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 0.0)
+        tts = FakeAsyncTTS(slices=3)
+        loop, _audio, wake, _stt, _ = _make_loop(tts=tts)
+        wake._detect_fn = _scripted_wake([])
+
+        assert loop._speak_with_barge_in("a long answer") is True
+        assert tts.stop_calls == 0
+        assert tts.completed is True
+        assert tts.spoken == ["a long answer"]
+
+    def test_post_speech_guard_ignores_the_answer_onset(self) -> None:
+        """The first 350 ms of the answer cannot trigger barge-in."""
+        tts = FakeAsyncTTS(slices=4)
+        loop, _audio, wake, _stt, _ = _make_loop(tts=tts)
+        # A detection on the very first polled chunk must be ignored.
+        wake._detect_fn = _scripted_wake([True] + [False] * 10)
+
+        assert loop._speak_with_barge_in("a long answer") is True
+        assert tts.stop_calls == 0
+        assert tts.completed is True
+
+    def test_blocking_engine_falls_back_without_barge_in(self) -> None:
+        """A protocol-only engine (no start_speaking) still speaks the answer."""
+        tts = FakeTTS()
+        loop, _audio, wake, _stt, _ = _make_loop(tts=tts)
+        wake._detect_fn = _scripted_wake([True] + [True] * 10)
+
+        assert loop._speak_with_barge_in("a long answer") is True
+        assert tts.spoken == ["a long answer"]
+        assert tts.stop_calls == 0
+
+    def test_no_wake_detector_falls_back_to_blocking_speech(self) -> None:
+        tts = FakeAsyncTTS(slices=2)
+        loop = VoiceLoop(
+            audio=FakeAudioInput(segments=[make_speech("x", duration_s=0.5)] * 20),
+            wake_detector=None,
+            stt=FakeSTT(),
+            tts=tts,
+        )
+        assert loop._speak_with_barge_in("a long answer") is True
+        assert tts.stop_calls == 0

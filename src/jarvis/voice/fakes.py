@@ -13,7 +13,6 @@ from typing import Any
 from jarvis.voice.interfaces import (
     AudioSegment,
     STTResult,
-    VoiceCommand,
     WakeWordResult,
 )
 
@@ -163,24 +162,44 @@ class FakeFocusChecker:
         return self._foreground
 
 
-class FakeVoiceCommandParser:
-    """Parses text into VoiceCommand with a scripted sequence."""
+class FakeAsyncTTS:
+    """Fake TTS that speaks in a bounded number of polls, so barge-in is testable.
 
-    def __init__(
-        self,
-        commands: list[VoiceCommand] | None = None,
-    ) -> None:
-        self._commands = list(commands or [])
-        self._idx = 0
-        self.parse_calls: list[str] = []
+    Exposes the *optional* barge-in pair the voice loop looks for
+    (``start_speaking`` / ``is_speaking``): the queued text counts as playing
+    for ``slices`` polls of :meth:`is_speaking`, and :meth:`stop` purges it.
+    With no wake word in the scripted audio the answer is spoken to the end;
+    with one, the loop must purge and return to wake-listening.
+    """
 
-    def parse(self, text: str) -> VoiceCommand:
-        self.parse_calls.append(text)
-        if self._idx < len(self._commands):
-            cmd = self._commands[self._idx]
-            self._idx += 1
-            return cmd
-        return VoiceCommand(raw_text=text, intent="unknown")
+    def __init__(self, *, slices: int = 3) -> None:
+        self._slices = max(int(slices), 0)
+        self._remaining = 0
+        self.spoken: list[str] = []
+        self.stop_calls: int = 0
+        self.polls: int = 0
+        self.completed: bool = False
+
+    def speak(self, text: str) -> None:
+        """Blocking path (used when the loop does not barge in)."""
+        self.spoken.append(text)
+        self.completed = True
+
+    def start_speaking(self, text: str) -> None:
+        self.spoken.append(text)
+        self._remaining = self._slices
+
+    def is_speaking(self) -> bool:
+        self.polls += 1
+        if self._remaining <= 0:
+            self.completed = True
+            return False
+        self._remaining -= 1
+        return True
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self._remaining = 0
 
 
 def make_silence(duration_s: float = 1.0, sample_rate: int = 16_000) -> AudioSegment:

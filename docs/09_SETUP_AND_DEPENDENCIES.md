@@ -109,7 +109,8 @@ pip install -e ".[ml]"             # Phase 8
 ### Known install gotchas (record the outcome in `PROGRESS.md`)
 
 - **openWakeWord**: use the ONNX inference backend on Windows; it needs its pre-trained model files downloaded once (check its docs/`openwakeword.utils.download_models`). The "hey jarvis" model ships as one of the pre-trained wake words.
-- **Piper**: the maintained PyPI package `piper-tts` (from OHF-Voice/piper1-gpl) is GPL-3.0-or-later, and Windows install/run success on your Python version is unconfirmed. If it fails `verify_env.py`, use the SAPI fallback (`pyttsx3`) and keep the `TTS` interface unchanged.
+- **Piper**: the maintained PyPI package `piper-tts` (from OHF-Voice/piper1-gpl) is GPL-3.0-or-later, and Windows install/run success on your Python version is unconfirmed. It also needs a downloaded voice `model_path`; without one it is skipped. Backend order is **Piper → Windows SAPI (`win32com`) → `pyttsx3`**, and only the SAPI backend can be interrupted for barge-in, so SAPI is the practical default. Keep the `TTS` interface unchanged if a backend fails.
+- **SAPI via `pywin32`**: already a required Windows dependency, so it needs no new install. `verify_env.py` now runs a `SAPI.SpVoice` dispatch check — a machine with no installed SAPI voice cannot speak and cannot be interrupted.
 - **openWakeWord on Windows** uses only the onnxruntime backend (no tflite, no Speex noise suppression); the pre-trained "hey jarvis" can be over-sensitive, so tune the threshold and measure false triggers.
 - Full findings, fallbacks and licences: `docs/12_DEPENDENCY_VERIFICATION.md`.
 - **faster-whisper**: CPU with `compute_type="int8"`; first run downloads the model (needs internet once, then works offline).

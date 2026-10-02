@@ -2,6 +2,370 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## Session 2026-10-02 — ROADMAP_V2 Stage 1: voice correctness (wake-free confirmation, stop semantics, interruptible SAPI, dead code) — code complete, focused tests green except 1 pre-existing failure, LIVE TESTS PENDING OWNER
+
+Stage 1 items 1a-1e of `ROADMAP_V2.1_AMENDMENTS.md.md` are implemented and uncommitted.
+**No full `pytest -q` was run** (Stage 10 only). Nothing in `policy/` changed, so the policy
+invariants are untouched by this session.
+
+### What changed
+
+- **1a wake-free confirmation.** `VoiceLoop.confirm_by_voice` speaks
+  `CONFIRMATION_PROMPT` ("Say yes to continue, or no to cancel.") — no raw config
+  `wake_phrase` is ever spoken — then flushes, drains the echo, and opens one bounded
+  wake-free window (`VoiceSettings.confirm_window_s = 8.0`, new `[voice]` key).
+  `_rearm_wake_for_confirmation` and `_handle_voice_confirmation` are gone. The
+  `on_confirmation` callback is now **required** and stays owned by the daemon's
+  `_run_voice_confirmation` worker, so the existing pending/`action_hash` path is unchanged.
+  A window that yields anything outside the short-command set is "no" (fail closed, no fuzzy
+  match, no LLM). `capture_free_text` (clarification) uses the same window and still calls
+  `on_answer` exactly once, including with `""` on failure.
+- **1b stop semantics.** `_STOP_LISTENING` is now explicit voice-off only ("stop listening",
+  "stop listening jarvis", "turn off voice", "turn off jarvis", "disable voice", "jarvis off").
+  Bare `stop` / `cancel` / `abort` / `never mind` **cancel the current task** (purges TTS,
+  stays awake, nothing is submitted). `"turn off the lights"` and `"go to sleep"` are ordinary
+  tasks. `_SHORT_COMMAND_WORDS` grew to cover the cancel/off vocabulary so the fragment gate
+  cannot swallow those commands.
+- **1c barge-in.** `SapiTTSEngine` now uses `win32com` `SAPI.SpVoice` per utterance with
+  explicit `CoInitialize`, async `Speak`, `WaitUntilDone`, and `Purge` on `stop()`. The loop
+  detects the optional `start_speaking` / `is_speaking` pair, keeps the **same** microphone
+  open while speaking, resets the detector, and honours a `0.35 s` onset guard plus a `300 s`
+  watchdog. A wake detection during speech purges the answer and re-arms. No second mic, no
+  second unbounded thread. `Pyttsx3TTSEngine` remains as a non-interruptible last-resort
+  fallback; `PiperTTSEngine` gained `stop()` but stays non-interruptible.
+- **1d dead code.** Deleted `voice/vad.py`, `VoiceCommand`, `VoiceActivityDetector`,
+  `FakeVoiceCommandParser`, and the `on_confirmation` plumbing in `VoiceLoop`/`VoiceService`.
+  `tests/unit/test_voice_wiring.py` keeps the historical single-mic regression by injecting a
+  legacy VAD module and using a local stream-owning detector.
+- **Docs/env.** `docs/03_SECURITY_AND_POLICY.md` §7.1 (voice confirmation window) and §7.2
+  (barge-in, half-duplex, **use headphones**) are new; `docs/02` tree and `docs/09` TTS
+  fallback order (Piper → SAPI `win32com` → pyttsx3) updated. `scripts/verify_env.py` gained
+  `check_sapi_tts()` — a real `SAPI.SpVoice` dispatch, reporting **2 voice(s) installed** here.
+
+### Validation actually run
+
+| Check | Result |
+|---|---|
+| `ruff check` on 8 touched source files + 4 test files + `verify_env.py` | **PASS** |
+| `ruff format --check` on all touched files | **PASS** ("10 files already formatted") |
+| `mypy src/jarvis/policy` | **PASS** (6 source files, nothing in `policy/` changed) |
+| `pytest tests/unit/test_voice_loop.py test_daemon_voice.py test_voice_wiring.py test_voice_contracts.py test_voice_status.py test_package.py test_config.py` | **152 tests: 151 passed, 1 failed** (the pre-existing failure below) |
+| `.venv\Scripts\python.exe scripts\verify_env.py --phase 5` | SAPI probe PASS, 2 voices |
+| live microphone / SAPI speech / barge-in | **NOT RUN** — needs the owner at the PC |
+
+### Known failure — pre-existing, NOT caused by this session
+
+- `tests/unit/test_voice_loop.py::TestRearmQuietStartGate::test_response_echo_drained_before_detector_reopens`
+  times out after 5 s. **Verified pre-existing**: `git stash push -- src tests` reproduces the
+  same failure at `HEAD`, so it is not a Stage 1 regression.
+  - What actually happens: cycle 1 completes, re-arm happens, cycle 2's wake is detected, but its
+    capture sees an **exhausted** `FakeAudioInput` script (`capture done (duration_s=0.000)`) and
+    waits out the real 5 s capture timeout, tripping the test's own 5 s deadline.
+  - The invariant the test exists to protect **is** intact. A throwaway instrumented probe of the
+    same script showed reads served in exactly this order:
+    `wake_1, cmd_1a, cmd_1b, end_1, echo_a, echo_b, quiet, wake_2, cmd_2a, cmd_2b, end_2`
+    — the re-arm drain consumes only `echo_a, echo_b, quiet` and the echo never reaches the
+    detector. Widening the fixture tones from 0.2 s to 0.5 s did not change the outcome, so the
+    cause is in the scripted-audio/idle-timeout interaction, not the echo gate.
+  - Left unfixed on purpose: it predates Stage 1 and is outside items 1a-1e. It matches the
+    known gap already recorded in this file ("the full `test_voice_loop.py` file was never run in
+    one process"). Fix it before Stage 10, not during Stage 1.
+- `TestTranscriptRedaction::test_info_level_has_char_count_only` was also failing at `HEAD`
+  (verified by the same stash). Its fixture transcript `"my secret dozen 98765"` is 4 tokens with
+  no intent word, so the **short-fragment gate** correctly rejects it — the fixture predates the
+  gate. Changed the transcript to `"send the secret report to 98765"`; the test still asserts
+  INFO-level redaction only and the gate is untouched. **Fixed.**
+
+### Live checks for the owner (not run by the agent)
+
+Use **headphones**, otherwise the answer's own echo can trip the `0.35 s` guard.
+
+1. `.venv\Scripts\ruff check .` then
+   `.venv\Scripts\python -m pytest -q tests/unit/test_voice_loop.py tests/unit/test_daemon_voice.py tests/unit/test_voice_wiring.py tests/unit/test_voice_contracts.py`
+2. Restart the daemon (`.venv\Scripts\python -m jarvis daemon --foreground`), then:
+   - **Wake-free confirmation:** trigger a Tier 1 confirmation and answer `yes` **without saying
+     "Hey Jarvis"** once. It must approve. Repeat with `no`, then with silence: silence must be
+     treated as "no" and the action must not run.
+   - **Unrelated speech must not confirm:** while the window is open, say something with no
+     yes/no word. It must be refused.
+   - **Stop while idle vs. mid-task:** say `stop` alone after a task started — the task is
+     cancelled, voice stays on, and the next "Hey Jarvis" still works. Say `stop listening` and
+     confirm the loop exits and the daemon reports voice off.
+   - **`"turn off the lights"`** must be executed as a task, not switch voice off.
+   - **Barge-in:** ask for a long answer (e.g. "explain recursion"), then say "Hey Jarvis" while
+     it is still speaking. Speech must cut off mid-sentence and the loop must re-arm.
+     Check `jarvis.jsonl` shows no `transcript` text, only `chars=`/`words=`.
+3. `.venv\Scripts\python -c "import win32com.client as c; v=c.Dispatch('SAPI.SpVoice'); print(v.GetVoices().Count)"`
+
+Suggested commit: `fix(voice): wake-free confirmation, honest stop semantics, interruptible SAPI`
+
+## Live baseline 2026-10-02 — ROADMAP_V2 Stage 0 (live verification) — PARTIAL: agent-side checks done, hardware tests 1-9 PENDING OWNER
+
+## Live baseline 2026-10-02 — ROADMAP_V2 Stage 0 (live verification) — PARTIAL: agent-side checks done, hardware tests 1-9 PENDING OWNER
+
+Active stage is **Stage 0** (ROADMAP_V2 §5, no code changes). All tracker boxes in
+`ROADMAP_V2.md.md` §9 and amendments §H are still unticked and `HEAD = 99de4c2` contains no
+ROADMAP_V2 work, so nothing of Stage 0 was started before this session. **No source file was
+modified in this session.**
+
+### Done — agent-side setup checks (this PC, real hardware/real providers)
+
+| Command | Result |
+|---|---|
+| `jarvis doctor --live` | **PASS**, exit 0. Platform/python/64-bit/config/keyring PASS; all 5 keys present; groq, openrouter, nvidia, gemini models resolve and **all four probed reachable** (fast models: `openai/gpt-oss-20b`, `openrouter/free`, `nvidia/nemotron-3.5-lightning-30b-a3b`, `gemini-3.7-flash`). 2 expected WARNs: `strict_zero_cost` disabled (owner's setting) and `vision not wired` (Stage 5a). A transient `Gemini HTTP 503; retrying` happened and recovered. |
+| `jarvis voice doctor` | **PASS** 8/8. mic `Microphone Array (Intel Smart Sound, 4 ch)`, 16 000 samples (1.00 s) read; wake model `hey_jarvis` loaded **threshold 0.15** (new code default is live, config has no override); silence probe confidence 0.00; STT `C:\Users\aarya\models\faster-whisper-base` loaded; **TTS = `SapiTTSEngine`** — `piper backend requested but no model_path provided; falling back to SAPI`. |
+| `jarvis benchmark run` (amendment §A import check) | **FAIL — the reported bug is REAL, not unverified.** See finding 1 below. |
+| `jarvis status` | daemon **not running** (`no daemon.json`). Must be restarted before tests 1-9 to pick up threshold 0.15. |
+
+### Findings (evidence, not guesses)
+
+1. **`jarvis benchmark run` crashes — confirmed.** `src/jarvis/cli.py:2097` does
+   `from jarvis.llm.client import build_llm_client`, but `build_llm_client` is defined in
+   `src/jarvis/llm/provider.py` (signature `(settings, store, *, logger=None) -> ProviderSelection`).
+   `jarvis.llm.client` does not export it (`cli.py:50-54` already imports the correct symbol at
+   module level, so the function-local import is both wrong and redundant). Because the import sits
+   **outside** the `try` in `_benchmark_llm`, it escapes as an unhandled traceback instead of the
+   intended "could not load settings or provider" message. **NOT fixed this session — owner decision
+   (2026-10-02): no code change, the owner will fix it.** Suggested one-liner for the owner:
+   `from jarvis.llm.provider import build_llm_client`.
+2. **Stage 1b's premise is confirmed live.** `jarvis.jsonl` contains
+   `confirmation by voice refused: wake word not re-detected` **4 times on 2026-09-29**
+   (09:43:39, 09:44:22, 09:46:10, 10:56:33 UTC). Confirmation by voice does require the wake word
+   again — Stage 0 test 6 is effectively already observed FAIL from log evidence.
+3. **TTS is SAPI and therefore uninterruptible.** `TTS sapi … runAndWait start` in the log; no Piper
+   model is configured although `config.toml` says `tts_backend = "piper"`. This is exactly the
+   Stage 1d precondition (pick SAPI-via-`win32com` vs a Piper model in ANALYZE) and predicts Stage 0
+   test 5 (stop during speaking) fails until 1d lands.
+4. **Wake detection works at 0.15:** `wake word detected: model=hey_jarvis score=0.223 threshold=0.15`.
+5. **Latency is provider-bound, confirmed again:** Groq `429 Too Many Requests` bursts with 1/2/4 s
+   backoff produced a `phase_ms=45109` THINKING phase and `voice task still waiting (elapsed=31.3s)`;
+   the successful call itself was `llm_latency … latency_ms=1180 attempts=0` (groq,
+   `openai/gpt-oss-120b`). Relevant to Stage 5 (key pools) and Stage 9 (latency).
+6. **New observation, unexplained:** `agent event=brain request_type=unsupported actions=0` for one
+   live request (2026-09-29 10:57:38). Not traced; no transcript exists (STT logs carry
+   `chars`/`words` only, by design).
+
+Log inspected: `%LOCALAPPDATA%\jarvis\jarvis\logs\jarvis.jsonl`, 3451 lines, last live session
+2026-09-29 10:53–10:58 UTC. Full `-Tail 200` was read; the markers above are the relevant extracts
+(the tail is dominated by 2 s-interval `wake detector sample …` heartbeats).
+
+### Test 0 (prerequisite) — daemon startup — PASS (owner, 2026-10-02)
+
+- Prerequisite state was clean beforehand: `jarvis status` reported `no daemon.json` and no stale PID
+  file, so there was no stale-state conflict.
+- `jarvis status` after startup (verbatim):
+  `daemon: running` / `voice: on` / `unlocked: False` / `queue: 0` / `version: 0.1.0`.
+- Daemon console began `[VOICE] STARTING` → `[VOICE] READY — waiting for "Hey Jarvis"` and stayed up.
+- Unscheduled warm-up interactions exercised the full documented lifecycle end to end with clear
+  spoken output: `WAKE DETECTED → LISTENING → CAPTURE COMPLETE → TRANSCRIBING → STT → THINKING →
+  LLM provider/model → ANSWER → SPEAKING → RESETTING → READY`.
+- Observed live STT results included `"What is the time right now?"`, `"What is the capital of
+  America?"`, `"Who kept here this now?"` (the last is a misrecognition; see the note below).
+- Daemon was then stopped with `Ctrl+C`, so **it is not running now** — a fresh daemon is required
+  before the official test 1.
+- **Informal observation, not a Stage 0 verdict:** stopping while JARVIS was speaking did **not**
+  interrupt the speech. This is the documented Stage 1d target (interruptible TTS + barge-in) and
+  matches finding 3 (SAPI `runAndWait` is uninterruptible). **No source change made; Stage 1 is not
+  started.** Formal Stage 0 test 5 still needs its own recorded run.
+- No latency is claimed from these warm-up runs; timing is measured only in the official tests 2 and 4.
+- The misheard `"Who kept here this now?"` produced a spoken reply rather than "Could you repeat
+  that?" — recorded as an observation for the official test 8, **not** as a test 8 result.
+
+### Still incomplete in Stage 0 (needs the owner + microphone)
+
+Daemon must be restarted first: `jarvis daemon --foreground` (picks up threshold 0.15). Then, recording
+seconds / provider / exact spoken text for each:
+
+1. Wake → command → answer, **three times in a row without restart**.
+2. "what is 2 plus 2": seconds from the STT line to the spoken answer; which provider answered.
+3. "open chrome", "open calculator".
+4. Stop while thinking: slow question, then "Hey Jarvis … stop" (expect "Stopped.").
+5. Stop while speaking (expected **FAIL** until Stage 1d; log should show `TTS sapi`).
+6. Confirmation: "create a file test.txt with hello" — exact prompt, is the wake word needed,
+   is "yes" heard. (Log already shows refusals; see finding 2.)
+7. Bare "stop": "Hey Jarvis" → "stop" → `jarvis status` (suspected: voice turns off).
+8. Garbled input → expect "Could you repeat that?".
+9. Idle 2+ min, then wake again.
+
+Attach `Get-Content "$env:LOCALAPPDATA\jarvis\jarvis\logs\jarvis.jsonl" -Tail 200` afterwards.
+
+**Stage 0 cannot be ticked until tests 1-9 have recorded PASS/FAIL.** Per §5, failures found here are
+fixed in Stage 1 before any new feature.
+
+### Official test results (owner-observed, 2026-10-02) + read-only log corroboration
+
+Log state when inspected: `jarvis.jsonl` = 3807 lines, **one** daemon session today
+(2026-10-02 **09:15:03 → 09:16:52 UTC**, `daemon ready 09:15:21`, `127.0.0.1:58372`, pid 13188,
+`daemon: interrupted by the user` at the end). No rotation, no `.1` backup file, nothing after
+09:16:52. That session contains **exactly three** voice interactions and all three were
+`request_type=conversation` / `clarification` with `actions=0`.
+
+| # | Test | Owner observation | Read-only log corroboration |
+|---|---|---|---|
+| 1 | Wake → command → answer ×3, no restart | Daemon processed real interactions through the full lifecycle, clear speech | **3 consecutive wake→answer interactions in one session, no restart:** i1 wake 09:15:28.958 → READY 09:15:42.308; i2 wake 09:15:44.657 → READY 09:15:57.631; i3 wake 09:15:59.986 → READY 09:16:47.895. Captures 2.8 s / 3.2 s / 2.6 s; STT 27 chars 6 words / 31 chars 6 words / 23 chars 5 words. Provider `groq`, model `openai/gpt-oss-120b`, `latency_ms=1158 / 1164 / 4318`. **Caveat:** the spoken commands were the prerequisite warm-up set, not the exact test-1 phrases given, so treat as PASS-by-equivalent-evidence pending owner confirmation |
+| 2 | "what is 2 plus 2" | Correct answer spoken | **PASS (owner).** No latency/provider/spoken wording claimed: no log entry can be attributed to this prompt (transcripts are deliberately not logged). For reference only, the three conversation answers logged today took 1158 / 1164 / 4318 ms on groq `openai/gpt-oss-120b` |
+| 3 | open chrome / open calculator | Chrome opened; **calculator did not** | **Chrome PASS / calculator FAIL (owner).** Log has **0** occurrences of `chrome` or `calc` anywhere (all 3807 lines) and **0** `tool start`/`tool end` lines today; the only `open_app` records in the file are 2026-09-29 (`ok=False` then `ok=True`). So the calculator failure has **no captured cause yet** — cause unknown, not guessed |
+| 4 | Stop while thinking | "stop" did not stop the task | **FAIL (owner).** Log has **0** `stop_request` events ever → the stop utterance never reached the daemon. Consistent with the documented single-microphone-reader design (the loop thread is inside the task while THINKING) |
+| 5 | Stop while speaking | Speech was not interrupted | **FAIL (owner).** Matches finding 3: `TTS sapi … runAndWait start/done`, `backend=SapiTTSEngine` — SAPI is uninterruptible. Stage 1d |
+| 6 | Tier-1 confirmation | JARVIS asked for confirmation; saying "yes" did not complete it; the wake phrase was demanded again | **FAIL (owner).** Today's log has 0 `policy` lines and no confirmation dispatch, so today's confirmation request was not captured; the wake-word demand is corroborated by the 4 historical `confirmation by voice refused: wake word not re-detected` (2026-09-29, finding 2) |
+| 8 | Garbled input | Garbled/wrong speech **takes a long time**; JARVIS **eventually asks for clarification** | **Corroborated.** i3: STT 23 chars/5 words → groq 429 at 09:16:05.625, retry 1.0 s, 429 again, retry 2.0 s, 200 OK 09:16:09.807 → `llm_latency latency_ms=4318` → `request_type=clarification`, `question_chars=61` → `voice task still waiting (elapsed=32.0s)` → 09:16:42.718 `confirmation by voice refused: wake word not re-detected` → task finished `elapsed_s=37.3`, `final_answer_chars=83`, `phase_ms=37343`. **No semantic cause claimed** for the long wait beyond the two recorded 429 retries. Note the clarification free-text path also demands the wake word (same Stage 1b defect) |
+| 7 | Bare "stop" | Transcript was `"Stop."` → went to **THINKING/LLM** (groq `openai/gpt-oss-120b`) and answered `"Clarification needed: What would you like me to stop?"`. `jarvis status` still reported `voice: on` | **FAIL (owner), root-caused below.** No `stop_request` log line: the cancel vocabulary was never consulted, because the stop arrived as a *new command*, not as an in-flight cancel |
+
+### Test 3 follow-up observation (kept separate from the Test 3 result above)
+
+After the Test 7 interaction the owner said **"Open Calculator."** and **Calculator opened
+successfully**; JARVIS answered `"opened calculator"`. This is **additional live evidence**, not a
+retraction: Test 3's official result stays **Chrome PASS / calculator FAIL**, and this later
+single-sample success is recorded beside it. The earlier calculator failure therefore has **no
+reproduced cause** and may have been a one-off; it is not re-classified without a log-captured rerun.
+
+### Test 7 root cause (read-only investigation, no code changed)
+
+**Exact routing path taken by `"Stop."`:**
+
+1. `VoiceLoop._run_interaction` → capture (observed `audio=1.70s`) → `FasterWhisperSTT.transcribe`
+   → text `"Stop."`.
+2. `_transcript_problem("Stop.", wake_word)` → **passes** (single token `stop` is in
+   `_INTENT_WORDS`, `loop.py:134`), so no "Could you repeat that?".
+3. `_canonical_command("Stop.")` (`loop.py:503`) → unchanged (only the `lock my system` variant is
+   rewritten).
+4. `VoiceLoop._route("Stop.")` (`loop.py:1671`):
+   - `normalised = text.lower().strip()` → **`"stop."`** (`loop.py:1673`)
+   - `"stop." in _STOP_LISTENING` → **False** (`loop.py:1676`) → the voice-off branch is skipped.
+   - `is_shutdown_request` → False. `"stop." in _STOP_DICTATION` → False.
+     `"stop." in _RESUME_DICTATION` → False. Not dictating.
+   - falls through to `self._submit_task(_canonical_command(text), "voice")` (`loop.py:1744`).
+5. `DaemonServer._voice_submit` (`server.py:1048`) → worker → graph → brain → LLM
+   (groq `openai/gpt-oss-120b`) → `clarification` → spoken `"Clarification needed: What would you
+   like me to stop?"`. Exactly the observed console.
+
+**Exact reason the stop vocabulary did not catch it: punctuation.** `_route` normalises with
+`text.lower().strip()`, which **keeps** punctuation, so STT's trailing period survives and
+`"stop." ∉ {"stop listening", "stop", "turn off", "go to sleep"}`. Every other vocabulary check in the
+module uses `_normalise_speech` (`loop.py:~480`), which maps non-alphanumeric characters to spaces,
+so the *same* text normalises to `"stop"` there. Concretely:
+
+- `_is_cancel_request("Stop.")` (`loop.py:530`) **would return True** (`_normalise_speech` →
+  `"stop"` ∈ `_CANCEL_REQUESTS`).
+- But `_is_cancel_request` is only reachable from `VoiceLoop._capture_stop_request`
+  (`loop.py:1582`) / `watch_for_stop` (`loop.py:1472`), which the daemon calls from
+  `_voice_submit`/`_watch_for_stop` (`server.py:1102`, `1167`) **only while a task is already in
+  flight**. A stop typed as the *command* of a new interaction never enters that path — by design,
+  since that path must not start a second task.
+- Therefore the two vocabularies disagree, and the `_route` one is the stricter of the two.
+
+**Punctuation is involved, and it is not hypothetical:** faster-whisper returns a trailing period on
+ordinary sentences in this session (`"Stop."`, `"Open Calculator."`).
+
+**Defect or expected?** An **existing implementation defect**, not intended behaviour: ROADMAP_V2 §2
+lists "bare 'stop' kills the voice loop" as a defect, and `_STOP_LISTENING` containing `"stop"` is
+what Stage 1c rewrites. The punctuation mismatch is an additional, unlisted defect in the same
+function. Two distinct consequences:
+
+- Because the match failed, the loop did **not** switch itself off — hence `voice: on`. The
+  roadmap's predicted "bare stop turns the voice off" was **not** observed *because of* this same
+  mismatch; with an unpunctuated `stop` transcript it would have been.
+- The closed vocabularies `"stop listening"`, `"turn off"`, `"go to sleep"`,
+  `"stop dictation"`, `"resume"` in `_route` are all currently unreachable for punctuated speech.
+
+**Existing tests do not cover this:** `tests/unit/test_voice_loop.py:235`
+(`test_stop_listening_command`) only exercises the exact unpunctuated `"stop listening"`; there is no
+`_route` test for a bare `"stop"` and none for a punctuated phrase.
+`tests/unit/test_daemon_voice.py::TestSpokenStopCancellation` covers only the **in-flight** stop
+(`server.py` path), which is why this command-position stop slipped through.
+
+**Roadmap owner of the fix:** **Stage 1c** ("stop semantics": `"stop"`/`"cancel"`/`"never mind"` =
+cancel current speech and task and **never** exit the loop; `"stop listening"`/`"turn off voice"` =
+voice off). The **Stage 1d** barge-in work is a separate concern (interrupting speech already being
+spoken, tests 4/5). Note for Stage 1c: `test_stop_listening_command` currently pins
+`not loop.is_active()` after `"stop listening"`; the intended new behaviour keeps voice-off for that
+phrase, but a bare `"stop"` must no longer stop the loop, so that test must be **deliberately**
+updated, not "fixed" to make a failure disappear.
+
+**Smallest surface a later fix would touch (not touched now):**
+- `src/jarvis/voice/loop.py::_route` (`loop.py:1671-1696`) — normalise with `_normalise_speech`
+  instead of `text.lower().strip()`; split the stop vocabulary per Stage 1c.
+- `src/jarvis/voice/loop.py` constants `loop.py:72-74` (`_STOP_LISTENING`, `_STOP_DICTATION`,
+  `_RESUME_DICTATION`) if the phrase list changes.
+- `tests/unit/test_voice_loop.py::TestVoiceLoopRouting` — punctuated-form cases + bare-`stop`
+  behaviour.
+- No daemon, policy, confirmation or hash logic is involved; the safety chain was never touched by
+  this defect (the utterance became an ordinary Tier-0 conversation/clarification, which is safe).
+| 9 | Idle 2+ min then wake | Daemon stayed up through the idle period; "Hey Jarvis" detected afterwards; `"What time is it?"` captured (2.40 s) and answered through the full pipeline; **no restart needed** | **PASS (owner).** Console: `WAKE DETECTED → LISTENING → CAPTURE COMPLETE audio=2.40s → TRANSCRIBING → STT "What time is it?" → THINKING → groq / openai/gpt-oss-120b → ANSWER "It's currently 3:45 PM." → SPEAKING → RESETTING → READY`. Idle duration was not stated by the owner and is not invented here |
+
+**Additional observation, NOT a Stage 0 voice-pipeline failure:** the spoken time in test 9 was
+**incorrect** (`"It's currently 3:45 PM."`). This is a **capability gap, not a pipeline defect**: the
+architecture has no deterministic time tool, so the planner/LLM answered conversationally and got it
+wrong. Assigned to **Stage 4** (`get_time`, deterministic local clock, Tier 0). Nothing implemented
+in Stage 0.
+
+**Discrepancy to resolve (log cannot corroborate tests 2-6).** The only daemon session in the log
+today is 09:15:03-09:16:52 UTC, and it contains no tool execution, no stop request and no policy
+confirmation — so tests 3, 4, 5 and 6 have owner observations but **no captured session**. Either
+they were run against a daemon whose log was not written to this file, or they were run while no
+daemon was up. Their results are recorded as the owner's ground truth; the missing evidence is a
+**re-run with the daemon up** if Stage 0 needs log-level proof for them. Not treated as a code defect.
+
+### New observation from this session (not previously recorded)
+
+- **Groq rejected JSON-schema structured output.** i1's first call returned
+  `HTTP/1.1 400 Bad Request` and `llm.client` logged
+  `model openai/gpt-oss-120b rejected json_schema (Groq unsupported_capability after 1 attempt(s));
+  using JSON mode for the rest of the session`. The session then used JSON mode. Relevant to Stage 5a
+  (provider capability handling), not a failure.
+- **Groq 429 retry sequence reproduced today:** 1.0 s then 2.0 s bounded backoff, third attempt 200 OK
+  (confirms finding 5).
+- i1/i2/i3 each logged `result for <task_id> dropped: client disconnected` — the `jarvis status`
+  probe's short-lived IPC client, expected and harmless.
+
+### Stage 0 result — COMPLETE (all nine tests have a recorded PASS/FAIL)
+
+Acceptance criterion (ROADMAP_V2 §5 Stage 0): *"every test has a recorded PASS/FAIL/observation"* —
+satisfied. Tracker box "Stage 0: Live verification recorded" is ticked; the amendment §H box "Stage 0
+includes `jarvis benchmark run` import check" is ticked (bug confirmed real, owner fixing out of band).
+
+| # | Test | Result | Class |
+|---|---|---|---|
+| 0 | daemon prerequisite | PASS | — |
+| 1 | wake → answer ×3, no restart | PASS (equivalent evidence; caveat noted) | — |
+| 2 | "what is 2 plus 2" | PASS | — |
+| 3 | open chrome / open calculator | Chrome PASS, calculator FAIL | **confirmed live failure** (cause not captured) |
+| 4 | stop while thinking | FAIL | **confirmed live failure** |
+| 5 | stop while speaking | FAIL | **confirmed live failure** |
+| 6 | Tier-1 confirmation by voice | FAIL | **confirmed live failure** |
+| 7 | bare "stop" | FAIL | **confirmed live failure, root-caused** |
+| 8 | garbled input | PASS (asks for clarification, but slow) | observation |
+| 9 | idle then wake | PASS | — |
+
+**Confirmed live failures and their owning stage:**
+
+| Failure | Owning stage | Notes |
+|---|---|---|
+| Bare "stop" reaches the LLM instead of the local stop path (`"Stop."` punctuation) | **Stage 1c** | root-caused in this file, see Test 7 section; defect, not intended behaviour |
+| Stop while JARVIS is speaking does not interrupt speech (SAPI `runAndWait`) | **Stage 1d** | barge-in; also the Stage 0 prerequisite observation |
+| Stop while thinking did not stop the task (no `stop_request` ever logged) | **Stage 1c/1d** | single-microphone ownership: the loop thread is inside the task while THINKING; needs the 1d design decision |
+| Tier-1 confirmation demands the wake phrase again; "yes" does not complete it | **Stage 1b** (implementation) and **Stage 3** (plan/proceed, readback) | 4 historical `confirmation by voice refused: wake word not re-detected` lines corroborate |
+| Spoken wake-word name uses the raw config name `hey_jarvis` | **Stage 1a** | `loop.py:1653` `f"Say {self._wake_word} to confirm."` — not separately observed live, but read in code |
+| `jarvis benchmark run` crashes (`build_llm_client` imported from the wrong module) | out of band | owner fixing; `cli.py:2097` |
+| Spoken time was wrong | **Stage 4** | capability gap: no deterministic `get_time` tool |
+| Voice backlog: 45 s THINKING phases from Groq 429 bursts | **Stage 5a** (key pools) / Stage 9 (latency) | 429 retries observed again today |
+
+**Observations with insufficient log evidence (not treated as code defects):**
+- Test 3's calculator failure — no `tool start`/`tool end` line anywhere in the log for that day, and a
+  later single-sample "Open Calculator." succeeded. Needs a log-captured rerun before any conclusion.
+- Tests 2 and 6 — owner observations only; the day's single logged session contains no tool execution
+  and no policy confirmation, so no provider/latency/wording is attributed to them.
+
+**Later capability gaps recorded, not Stage 0 failures:** no deterministic time tool (Stage 4);
+`vision` not wired (Stage 5a); Groq rejected `json_schema` and the session fell back to JSON mode
+(Stage 5a capability handling).
+
+### Next
+
+Stage 1 (voice correctness: 1a spoken wake name, 1b wake-free confirmation window, 1c stop semantics,
+1d interruptible TTS + barge-in, 1e dead-code deletion). Findings 2 and 3 above are its live
+preconditions. The owner also intends to fix the benchmark import bug (finding 1) out of band.
+
 ## Session 2026-09-29 — FIX: "open chrome" latency, spoken stop, prompt shutdown (no commit)
 
 ### Root causes (evidence: `%LOCALAPPDATA%/jarvis/jarvis/logs/jarvis.jsonl`, task `v1790675197245`)

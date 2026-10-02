@@ -1,15 +1,20 @@
-"""Daemon voice wiring regression (Stage 1 h).
+"""Daemon voice wiring regression (single-microphone-owner rule).
 
-The daemon must hand the voice loop a real :class:`AudioInput` — never the
-VAD, which owns its own ``sd.InputStream`` and cannot share a microphone
-with the loop (Phase 5 single-owner rule).
+The daemon must hand the voice loop a real :class:`AudioInput` — never a
+stream-owning voice-activity detector, which cannot share a microphone with the
+loop (single-owner rule).  Endpointing is owned by
+:meth:`VoiceLoop._read_command`; the standalone VAD module is gone.
 
 This is the exact regression that produced the original crash: the server
 from ``756b953^`` (``326727b``) built ``audio = create_vad(...)`` and passed
-a :class:`SoundDeviceVAD` into :class:`VoiceService` as the ``audio``
+the resulting stream-owning detector into :class:`VoiceService` as the ``audio``
 argument.  The test below extracts that old method verbatim from git and
 shows its output violates the current ``AudioInput`` contract; the current
 server satisfies it.
+
+``_StreamOwningDetector`` stands in for the deleted ``SoundDeviceVAD``: the
+shape is what matters (it owns a stream and cannot be read like an
+:class:`AudioInput`), not the class that used to ship it.
 """
 
 from __future__ import annotations
@@ -17,20 +22,33 @@ from __future__ import annotations
 import inspect
 import logging
 import subprocess
+import sys
 import textwrap
 from collections.abc import Callable
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 from jarvis.config import Settings, VoiceSettings
 from jarvis.daemon.server import DaemonServer
 from jarvis.voice.audio_input import SoundDeviceAudioInput
 from jarvis.voice.fakes import FakeFocusChecker, FakeSTT, FakeTTS, FakeWakeWord
-from jarvis.voice.interfaces import AudioInput
-from jarvis.voice.vad import SoundDeviceVAD
+from jarvis.voice.interfaces import AudioInput, AudioSegment
 
 _TOKEN = "voicetest-token-000000000000"
+
+
+class _StreamOwningDetector:
+    """A voice-activity detector that owns its own input stream (legacy shape)."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def listen_for_speech(self) -> AudioSegment:
+        return AudioSegment(samples=[0.0] * 1600, sample_rate=16_000)
+
+    def close(self) -> None:
+        return None
 
 
 class _FakeStore:
@@ -89,7 +107,7 @@ def _load_legacy_voice_builder(tmp_path: Path) -> Callable[[Any], Any]:
 
 
 class TestCurrentWiring:
-    def test_built_audio_is_audio_input_and_never_a_vad(self, monkeypatch: Any) -> None:
+    def test_built_audio_is_audio_input_and_never_a_stream_owner(self, monkeypatch: Any) -> None:
         _patch_factories(monkeypatch)
         server = DaemonServer(
             settings=Settings(voice=VoiceSettings(enabled=True)), store=_FakeStore()
@@ -99,7 +117,7 @@ class TestCurrentWiring:
         assert audio is not None
         # Runtime structural check against the AudioInput protocol.
         assert isinstance(audio, AudioInput)
-        assert not isinstance(audio, SoundDeviceVAD)
+        assert not isinstance(audio, _StreamOwningDetector)
         # Parameter-list comparison vs the protocol, method by method.
         for name in ("open", "read", "close", "is_open"):
             protocol_params = inspect.signature(getattr(AudioInput, name)).parameters
@@ -107,14 +125,14 @@ class TestCurrentWiring:
             missing = {p for p in protocol_params if p != "self"} - set(real_params)
             assert not missing, f"{type(audio).__name__}.{name} lacks {sorted(missing)}"
 
-    def test_voice_service_holds_no_sounddevice_vad_instance(self, monkeypatch: Any) -> None:
+    def test_voice_service_holds_no_stream_owning_detector(self, monkeypatch: Any) -> None:
         _patch_factories(monkeypatch)
         service = DaemonServer(
             settings=Settings(voice=VoiceSettings(enabled=True)), store=_FakeStore()
         )._build_voice_service()
         for attr in ("_audio", "_wake_detector", "_stt", "_tts"):
             comp = getattr(service, attr)
-            assert not isinstance(comp, SoundDeviceVAD), f"{attr} is a VAD"
+            assert not isinstance(comp, _StreamOwningDetector), f"{attr} owns a stream"
 
 
 class TestLegacyWiringRegression:
@@ -124,7 +142,12 @@ class TestLegacyWiringRegression:
         """The pre-fix server passed a VAD as the loop's audio — must never
         satisfy today's AudioInput contract (that is why it crashed)."""
         _patch_factories(monkeypatch)
-        monkeypatch.setattr("jarvis.voice.vad.create", lambda **kw: SoundDeviceVAD(object()))
+        # The legacy method imports ``jarvis.voice.vad`` lazily; that module is
+        # deleted now, so the committed source is given a stand-in module with
+        # the same factory.  The regression runs the *old wiring*, unchanged.
+        legacy_vad = ModuleType("jarvis.voice.vad")
+        legacy_vad.create = lambda **kw: _StreamOwningDetector(object())  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "jarvis.voice.vad", legacy_vad)
         builder = _load_legacy_voice_builder(tmp_path)
         legacy_self = SimpleNamespace(
             _settings=Settings(voice=VoiceSettings(enabled=True)),
@@ -133,9 +156,10 @@ class TestLegacyWiringRegression:
         service = builder(legacy_self)
         legacy_audio = service._audio
         assert legacy_audio is not None
-        # Regression recorded: the old wiring produced a VAD, which the loop
-        # cannot read from (no open/read/is_open) → not an AudioInput.
-        assert isinstance(legacy_audio, SoundDeviceVAD)
+        # Regression recorded: the old wiring produced a stream-owning
+        # detector, which the loop cannot read from (no open/read/is_open)
+        # → not an AudioInput.
+        assert isinstance(legacy_audio, _StreamOwningDetector)
         assert not hasattr(legacy_audio, "open")
         assert not hasattr(legacy_audio, "read")
         assert not isinstance(legacy_audio, AudioInput)

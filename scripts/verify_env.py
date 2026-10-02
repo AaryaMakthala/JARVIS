@@ -410,6 +410,38 @@ def check_audio() -> None:
         add("onnxruntime CPU provider", "FAIL", str(e), "pip install onnxruntime", 5)
 
 
+def check_sapi_tts() -> None:
+    """Prove Windows SAPI can be dispatched and reports a usable voice.
+
+    SAPI is the default TTS backend (no Piper model configured) and the only
+    one that can be interrupted for barge-in, so a missing voice is a real
+    blocker rather than a cosmetic warning.
+    """
+    if not IS_WIN:
+        add("sapi tts (win32com)", "SKIP", "Windows-only", "", 5)
+        return
+    try:
+        import win32com.client
+
+        voice = win32com.client.Dispatch("SAPI.SpVoice")
+        n = voice.GetVoices().Count
+        add(
+            "sapi tts (win32com)",
+            "PASS" if n else "FAIL",
+            f"{n} voice(s) installed",
+            "" if n else "Install a SAPI voice in Settings > Time & language > Speech",
+            5,
+        )
+    except Exception as e:  # noqa: BLE001
+        add(
+            "sapi tts (win32com)",
+            "FAIL",
+            f"{type(e).__name__}: {e}",
+            "pip install pywin32 (the venv must be the one running jarvis)",
+            5,
+        )
+
+
 def check_live_groq() -> None:
     name = "groq API reachable + model list"
     key = os.environ.get("GROQ_API_KEY")
@@ -480,6 +512,7 @@ def main() -> int:
     check_windows_tools()
     check_recycle_bin()
     check_audio()
+    check_sapi_tts()
     if a.live:
         check_live_groq()
 

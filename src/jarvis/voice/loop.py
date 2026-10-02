@@ -1,16 +1,26 @@
-"""Voice loop: wake → capture → STT → route → TTS (Phase 5).
+"""Voice loop: wake → capture → STT → route → TTS.
 
 Runs in a background thread.  The loop:
 
-1. Waits for the wake word (or falls back to voice-activity detection).
-2. Captures a speech segment via the VAD.
+1. Waits for the wake word.
+2. Captures a speech segment with the trailing-silence endpoint in
+   :meth:`VoiceLoop._read_command` (there is no separate VAD stage; see
+   :data:`_SILENCE_RMS`).
 3. Transcribes via STT.
-4. Routes the transcript:
-   - ``"stop listening"`` → stops the loop.
-   - ``"stop dictation"`` → stops the active dictation session.
-   - Tier 1 confirmation (yes/no) → answers directly.
-   - Other → submits to the agent as a voice-sourced task.
-5. Speaks the response via TTS.
+4. Routes the transcript against a fixed vocabulary *in code*, never the
+   planner:
+   - ``"stop listening"`` / ``"turn off voice"`` / ``"jarvis off"`` → voice off;
+   - ``"stop"`` / ``"cancel"`` / ``"never mind"`` → cancel the current speech
+     and task, then keep listening (never exits the loop);
+   - ``"stop dictation"`` → stops the active dictation session;
+   - anything else → submitted to the agent as a voice-sourced task.
+5. Speaks the response via TTS, and a ``"Hey Jarvis"`` heard *while* it speaks
+   purges the answer (:meth:`VoiceLoop._speak_with_barge_in`).
+
+A Tier 1 confirmation is answered in a bounded **wake-free window**
+(:meth:`VoiceLoop.confirm_by_voice`) that the *daemon's* worker thread opens
+while this thread waits inside the task submission; the loop never runs a
+confirmation dialogue itself.
 
 Reliability contract (this is the part that matters most)
 ----------------------------------------------------------
@@ -68,17 +78,37 @@ from jarvis.voice.status import (
 
 logger = logging.getLogger(__name__)
 
-# Voice commands (case-insensitive, exact match after stripping).
-_STOP_LISTENING = {"stop listening", "stop", "turn off", "go to sleep"}
+# Voice commands (case-insensitive, matched against the *normalised* utterance:
+# lower-cased, punctuation removed, whitespace collapsed - so "Stop." matches).
+#
+# Two vocabularies that must never be mixed:
+#   * voice OFF (:data:`_STOP_LISTENING`): the user wants JARVIS to stop
+#     listening altogether.  These are the explicit phrasings - the ones the CLI
+#     advertises plus "turn off voice".  A bare "turn off" is deliberately NOT
+#     here: "turn off the lights" is an ordinary command, not a voice command.
+#   * cancel (:data:`_CANCEL_REQUESTS`): "stop"/"cancel"/"never mind" cancel the
+#     current speech and the current task and leave the loop listening.
+#
+# "go to sleep" is absent from both on purpose: sleep is a *mode* change owned
+# by Stage 2, so it must never fall through to the voice-off branch here.
+_STOP_LISTENING = {
+    "stop listening",
+    "stop listening jarvis",
+    "turn off voice",
+    "turn off jarvis",
+    "disable voice",
+    "jarvis off",
+}
 _STOP_DICTATION = {"stop dictation", "stop dictating"}
 _RESUME_DICTATION = {"resume", "resume dictation"}
 
 #: Spoken phrases accepted as "cancel the task that is running right now".
 #: Deliberately a fixed, closed vocabulary matched in code: deciding that
 #: "stop" means stop must never be an LLM judgement, and none of these words
-#: can be a command on their own ("stop" is in :data:`_STOP_LISTENING` too, but
-#: that path only runs between interactions - see
-#: :meth:`VoiceLoop.watch_for_stop`).
+#: can be a command on their own.  A bare "stop" at the *command* position
+#: (:meth:`VoiceLoop._route`) cancels the speech and the task and returns to
+#: wake-listening - it never switches the voice off; while a task is in flight
+#: the same vocabulary is matched by :meth:`VoiceLoop.watch_for_stop`.
 _CANCEL_REQUESTS = frozenset(
     {
         "stop",
@@ -107,8 +137,34 @@ _CANCEL_TOKENS = frozenset({"stop", "cancel", "abort"})
 _MAX_CANCEL_TOKENS = 8
 
 #: Short commands that must survive the unusable-utterance check below even
-#: though they carry no intent verb ("yes" is not a verb, "lock" is).
-_SHORT_COMMAND_WORDS = frozenset({"yes", "no", "y", "n", "ok", "okay", "sure", "nope", "nah"})
+#: though they carry no intent verb ("yes" is not a verb, "lock" is).  The
+#: stop/cancel/voice-off words are here for the same reason: they are matched in
+#: code by :meth:`VoiceLoop._route` and must never be rejected as a fragment
+#: before routing sees them, and a fragment gate must never be the reason a
+#: user's "stop" is ignored.  Multi-word entries are matched token-wise, so
+#: "stop" covers "stop listening" and "never" + "mind" cover "never mind".
+_SHORT_COMMAND_WORDS = frozenset(
+    {
+        "yes",
+        "no",
+        "y",
+        "n",
+        "ok",
+        "okay",
+        "sure",
+        "nope",
+        "nah",
+        "stop",
+        "cancel",
+        "abort",
+        "never",
+        "mind",
+        "nevermind",
+        "listening",
+        "disable",
+        "off",
+    }
+)
 
 #: Deterministic intent signals: verbs, question words and the small set of
 #: function words that turn a fragment into a command.  Used only to reject
@@ -229,6 +285,24 @@ SHUTDOWN_UNSUPPORTED_MSG = (
 #: owned by the loop rather than generated by the model it just interrupted.
 STOP_ACKNOWLEDGEMENT = "Stopped."
 
+#: Spoken prompt for a Tier 1 confirmation.  It names *only* what the user has
+#: to say, never the configured wake token: the answer is given inside a
+#: wake-free window (see :meth:`VoiceLoop._capture_spoken_answer`), so asking
+#: for the wake word here would be asking for something the window does not
+#: listen for.  A constant, like the cancellation acknowledgement.
+CONFIRMATION_PROMPT = "Say yes to continue, or no to cancel."
+
+#: Spoken when the wake-free window produced no usable answer.  Fixed wording,
+#: and always a refusal (fail closed, docs/03 §7.8).
+CONFIRMATION_REFUSED = "No response received. Action cancelled."
+
+#: Bounded window for a spoken answer: a Tier 1 yes/no, or a clarification.
+#: It opens *after* the prompt has been spoken, so the prompt is never
+#: transcribed as the answer, and it needs no wake word.  Bounded twice - by
+#: this value and by the trailing-silence end in ``_read_command`` - and an
+#: empty/timeout/garbled answer is always a refusal.
+DEFAULT_CONFIRM_WINDOW_S = 8.0
+
 #: Spoken words accepted as an approval to a low-risk confirmation prompt
 #: (Tier 1, no typed folder-name requirement).  Colloquial "go"/"ok"/"sure"
 #: are allowed here because nothing destructive or sensitive can reach this
@@ -289,6 +363,25 @@ _REARM_QUIET_GATE_S = DEFAULT_REARM_QUIET_GATE_S
 
 #: RMS (float samples in [-1, 1]) below which a chunk counts as silence.
 _SILENCE_RMS = 0.01
+
+#: Chunk read from the microphone while the answer is being spoken, so the wake
+#: detector can score a barge-in ("Hey Jarvis") over the speakers.  Same 100 ms
+#: granularity the wake wait uses, so barge-in latency matches wake latency.
+_BARGE_IN_CHUNK_FRAMES = _CAPTURE_CHUNK_FRAMES
+
+#: Grace period after speech starts during which a wake detection is ignored.
+#: The first words of the answer are the most likely to be mistaken for a wake
+#: (an answer that starts "Hey..." or simply the speaker's own onset), so
+#: barge-in is armed only once the answer is actually under way.  This is a
+#: short guard, not echo cancellation: with speakers on, the wake model can
+#: still score the answer itself, so headphones are recommended (docs/09).
+_BARGE_IN_GUARD_S = 0.35
+
+#: Hard wall-clock ceiling on one spoken answer under barge-in.  The loop is
+#: normally released by the engine reporting that speech finished, but a wedged
+#: engine must never hold the voice thread (and the microphone) forever: at the
+#: ceiling the speech is purged and the loop moves on.
+_BARGE_IN_MAX_S = 300.0
 
 #: Default end-of-command silence.  Was 0.7 s, which ended capture on a normal
 #: mid-sentence hesitation ("what is the capacity of" + 0.7 s pause shipped
@@ -573,7 +666,6 @@ class VoiceLoop:
         tts: TextToSpeech,
         focus_checker: WindowFocusChecker | None = None,
         submit_task: Callable[[str, str], Any] | None = None,
-        on_confirmation: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         on_dictation: Callable[[str], None] | None = None,
         on_exit: Callable[[str | None], None] | None = None,
         wake_word: str = "hey jarvis",
@@ -585,6 +677,7 @@ class VoiceLoop:
         max_segment_s: float = DEFAULT_MAX_SEGMENT_S,
         silence_threshold: float = _SILENCE_RMS,
         rearm_quiet_gate_s: float = _REARM_QUIET_GATE_S,
+        confirm_window_s: float = DEFAULT_CONFIRM_WINDOW_S,
         idle_backoff_s: float = _IDLE_BACKOFF_S,
         reporter: VoiceStatusReporter | None = None,
         report_status: bool = True,
@@ -598,7 +691,6 @@ class VoiceLoop:
         self._tts = tts
         self._focus_checker = focus_checker
         self._submit_task = submit_task
-        self._on_confirmation = on_confirmation
         self._on_dictation = on_dictation
         self._on_exit = on_exit
         self._wake_word = wake_word
@@ -611,6 +703,9 @@ class VoiceLoop:
         self._silence_threshold = max(silence_threshold, 0.0)
         #: Bounded quiet-start drain length, 0 disables it (see the constant).
         self._rearm_quiet_gate_s = max(rearm_quiet_gate_s, 0.0)
+        #: Bounded wake-free window for a spoken answer (see
+        #: :data:`DEFAULT_CONFIRM_WINDOW_S`).
+        self._confirm_window_s = max(confirm_window_s, 0.0)
         #: Pause between a non-fatal idle timeout and the next wake wait.
         self._idle_backoff_s = max(idle_backoff_s, 0.0)
         #: Longest utterance handed to TTS (see :func:`spoken_answer`).
@@ -774,53 +869,101 @@ class VoiceLoop:
         self,
         payload: dict[str, Any],
         *,
-        on_confirmation: Callable[[dict[str, Any]], Any] | None = None,
+        on_confirmation: Callable[[dict[str, Any]], Any],
         rearm_timeout_s: float | None = None,
     ) -> str:
-        """Ask the user to approve/reject a confirmation via voice.
+        """Ask the user to approve/reject a confirmation by voice.
 
-        Re-arms the wake word before listening so an ambient "yes" cannot
-        approve an action that was not addressed to JARVIS.  Fails closed:
-        a missing detector, timeout, or unrecognised answer is a refusal.
+        The prompt is spoken, and only then does a **bounded wake-free window**
+        open (see :meth:`_capture_spoken_answer`): no wake word is required to
+        answer, which is what makes a spoken confirmation usable at all.  The
+        window is opened *after* the prompt so the answer cannot be the prompt's
+        own echo, and every failure mode is a refusal - a missing callback, an
+        action that may not be confirmed by voice, silence, a timeout, or an
+        answer that is not an approval word.
 
-        ``on_confirmation`` (defaults to the loop's callback) receives the
-        resume answer ``{"approved": bool, "action_hash": str}``.
+        ``on_confirmation`` is **required** and receives the resume answer
+        ``{"approved": bool, "action_hash": str}`` exactly once.  There is no
+        loop-level fallback callback: only the caller that published the
+        pending confirmation can consume the answer, so a confirmation can never
+        be approved by a listener that is not waiting for it.
         """
         payload = dict(payload or {})
         summary = payload.get("summary") or ""
         action_hash = payload.get("action_hash") or ""
-        callback = on_confirmation if on_confirmation is not None else self._on_confirmation
+        callback = on_confirmation
 
         if not self.can_confirm_by_voice(payload):
-            if callback is not None:
-                callback({"approved": False, "action_hash": action_hash})
+            logger.info("voice confirmation refused: action is not Tier 1")
+            callback({"approved": False, "action_hash": action_hash})
             return f"Action requires terminal confirmation: {summary}"
 
-        if not self._rearm_wake_for_confirmation(timeout_s=rearm_timeout_s):
-            if callback is not None:
-                callback({"approved": False, "action_hash": action_hash})
-            return "No response received. Action cancelled."
+        window_s = self._confirm_window_s if rearm_timeout_s is None else max(rearm_timeout_s, 0.0)
+        try:
+            self._tts.speak(f"{summary}. {CONFIRMATION_PROMPT}" if summary else CONFIRMATION_PROMPT)
+        except Exception:
+            logger.exception("voice confirmation prompt failed; refusing")
+            callback({"approved": False, "action_hash": action_hash})
+            return CONFIRMATION_REFUSED
 
-        self._tts.speak(f"{summary}. Please say yes or no.")
-        logger.info("voice boundary: confirmation listening for yes/no")
-        # Discard audio captured before the prompt: stale ambient audio must
-        # never be used to approve an action.
-        self._audio.flush()
-        seg = self._read_command(int(self._listen_timeout_s * 16_000))
-        if seg.duration_s < 0.3:
-            if callback is not None:
-                callback({"approved": False, "action_hash": action_hash})
-            return "No response received. Action cancelled."
-        result = self._stt.transcribe(seg)
-        answer = result.text.lower().strip()
+        answer = self._capture_spoken_answer(window_s, kind="confirmation")
+        if answer is None:
+            callback({"approved": False, "action_hash": action_hash})
+            return CONFIRMATION_REFUSED
+
         approved = answer in _approval_words(payload)
-        if callback is not None:
-            callback({"approved": approved, "action_hash": action_hash})
+        callback({"approved": approved, "action_hash": action_hash})
         if approved:
             logger.info("voice confirmation approved")
             return "Approved."
         logger.info("voice confirmation refused by user")
         return "Cancelled."
+
+    def _capture_spoken_answer(self, window_s: float, *, kind: str) -> str | None:
+        """Capture one spoken answer inside a bounded, wake-free window.
+
+        ``kind`` is only for the log ("confirmation" / "clarification").  The
+        window is bounded twice - by ``window_s`` of wall clock/samples and by
+        the trailing-silence end in :meth:`_read_command` - and the microphone
+        is flushed and drained back to a quiet baseline first, so neither the
+        prompt's own echo nor stale ambient audio can be transcribed as the
+        answer.
+
+        Returns the normalised answer, or ``None`` for every failure (no
+        speech, too short, transcription error, empty transcript).  ``None`` is
+        always the *refusing* direction for both callers, so a window that
+        mishears something fails closed.
+        """
+        logger.info("voice boundary: %s window open (%.1fs, no wake word)", kind, window_s)
+        try:
+            self._audio.flush()
+        except Exception:
+            logger.debug("%s window: audio flush failed", kind, exc_info=True)
+        try:
+            self._quiet_start_drain()
+        except Exception:
+            logger.debug("%s window: quiet drain failed", kind, exc_info=True)
+        try:
+            segment = self._read_command(
+                int(window_s * 16_000),
+                listen_timeout_s=window_s,
+            )
+        except Exception:
+            logger.exception("%s window: capture failed", kind)
+            return None
+        if segment.duration_s < 0.3:
+            logger.info("voice boundary: %s window heard nothing", kind)
+            return None
+        try:
+            result = self._stt.transcribe(segment)
+        except Exception:
+            logger.exception("%s window: transcription failed", kind)
+            return None
+        answer = _normalise_speech(result.text)
+        logger.info("voice boundary: %s window closed (answer=%d chars)", kind, len(answer))
+        if not answer:
+            return None
+        return answer
 
     def capture_free_text(
         self,
@@ -831,29 +974,33 @@ class VoiceLoop:
     ) -> str:
         """Ask a question and capture a spoken free-text answer.
 
-        Used for clarification interrupts.  Re-arms the wake word first so an
-        ambient utterance cannot be mistaken for an answer.  Fails closed:
-        a missing detector, timeout, or an empty transcript returns ``""`` —
-        the caller resumes the graph with empty text and the clarify node
-        reports "No clarification received.".
+        Used for clarification interrupts, and the same bounded wake-free
+        window as a confirmation: the prompt is spoken, then the window opens.
+        Fails closed: silence, a timeout, a transcription error or an empty
+        transcript returns ``""`` - the caller resumes the graph with empty
+        text and the clarify node reports "No clarification received.".
 
-        ``on_answer`` (defaults to nothing) receives the transcript once.
+        ``on_answer`` (optional) receives the transcript once, including the
+        empty string when the window failed closed, so callers can rely on
+        exactly one callback per prompt.
         """
-        if not self._rearm_wake_for_confirmation(timeout_s=rearm_timeout_s):
-            return ""
+        window_s = self._confirm_window_s if rearm_timeout_s is None else max(rearm_timeout_s, 0.0)
 
-        self._tts.speak(prompt)
-        logger.info("voice boundary: clarification listening for free text")
-        self._audio.flush()
-        seg = self._read_command(int(self._listen_timeout_s * 16_000))
-        if seg.duration_s < 0.3:
+        def report(answer: str) -> None:
+            if on_answer is not None:
+                on_answer(answer)
+
+        try:
+            self._tts.speak(prompt)
+        except Exception:
+            logger.exception("voice clarification prompt failed; answering empty (fail closed)")
+            report("")
             return ""
-        result = self._stt.transcribe(seg)
-        answer = result.text.strip()
-        if on_answer is not None:
-            on_answer(answer)
-        if not answer:
-            logger.info("voice clarification dropped: no speech captured")
+        answer = self._capture_spoken_answer(window_s, kind="clarification")
+        if answer is None:
+            report("")
+            return ""
+        report(answer)
         return answer
 
     # ── main loop (runs in background thread) ───────────────────────────
@@ -1209,8 +1356,11 @@ class VoiceLoop:
         try:
             logger.info("VOICE TTS_START")
             logger.info("voice boundary: tts response speech starting")
-            self._tts.speak(spoken)
+            completed = self._speak_with_barge_in(spoken)
             logger.info("VOICE TTS_COMPLETE")
+            if not completed:
+                logger.info("voice boundary: answer cut short by a wake word; returning to wake")
+                return
             logger.info("voice boundary: tts response speech done")
         except Exception:
             # A TTS failure is isolated: the answer was produced, the log says
@@ -1250,6 +1400,71 @@ class VoiceLoop:
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return type(self._tts).__name__
+
+    def _speak_with_barge_in(self, text: str) -> bool:
+        """Speak *text*, purging it if the wake word is heard while it plays.
+
+        Returns ``True`` when the answer was spoken to the end and ``False``
+        when the user barged in with the wake word, in which case the caller
+        returns to wake-listening and says nothing further.
+
+        Two engine shapes are supported:
+
+        * an engine that exposes the non-blocking ``start_speaking`` /
+          ``is_speaking`` pair (``SapiSpVoiceEngine``).  The engine then speaks
+          on the audio device while *this* thread keeps reading the
+          microphone, so "Hey Jarvis" can purge the answer.  The microphone
+          still has exactly one owner (this thread) and no extra Python thread
+          is created;
+        * any other engine keeps the blocking ``speak()`` the
+          :class:`~jarvis.voice.interfaces.TextToSpeech` protocol guarantees.
+          Its answers cannot be cut short; the fallback is logged, never hidden.
+
+        Bounded three ways, so a wedged engine can never hold the voice thread
+        (and the microphone) forever: the engine reporting completion,
+        ``_stop_event``, and the :data:`_BARGE_IN_MAX_S` wall-clock ceiling.
+        """
+        start = getattr(self._tts, "start_speaking", None)
+        speaking = getattr(self._tts, "is_speaking", None)
+        if self._wake_detector is None or not callable(start) or not callable(speaking):
+            if not callable(start) or not callable(speaking):
+                logger.info("voice tts: engine cannot be interrupted; speaking without barge-in")
+            self._tts.speak(text)
+            return True
+        try:
+            self._wake_detector.reset()
+        except Exception:
+            logger.debug("barge-in: wake detector reset failed", exc_info=True)
+        start(text)
+        deadline = time.monotonic() + _BARGE_IN_MAX_S
+        guard_until = time.monotonic() + _BARGE_IN_GUARD_S
+        while speaking():
+            if self._stop_event.is_set() or time.monotonic() >= deadline:
+                logger.warning("barge-in: speech ceiling reached; purging the answer")
+                self._purge_speech()
+                return False
+            segment = self._audio.read(_BARGE_IN_CHUNK_FRAMES)
+            if segment.duration_s < 0.05 or time.monotonic() < guard_until:
+                continue
+            try:
+                detected = self._wake_detector.detect(segment).detected
+            except Exception:
+                logger.debug("barge-in: wake detection failed", exc_info=True)
+                continue
+            if not detected:
+                continue
+            logger.info("VOICE TTS_INTERRUPTED")
+            logger.info("voice boundary: wake word heard during speech; purging the answer")
+            self._purge_speech()
+            return False
+        return True
+
+    def _purge_speech(self) -> None:
+        """Stop any in-progress speech, swallowing engine failures."""
+        try:
+            self._tts.stop()
+        except Exception:
+            logger.debug("voice tts: stop failed", exc_info=True)
 
     def _prepare_spoken(self, response: str) -> str:
         """Return the bounded, leak-free text that TTS will actually speak.
@@ -1639,40 +1854,28 @@ class VoiceLoop:
         self._reporter.stop_request()
         return True
 
-    def _rearm_wake_for_confirmation(self, timeout_s: float | None = None) -> bool:
-        """Require the wake word again before a voice approval.
-
-        Prevents an un-addressed "yes" in the room from approving a pending
-        action.  Fails closed: without a wake detector, or when the wake word
-        is not re-detected within the timeout, the confirmation is refused.
-        """
-        if self._wake_detector is None:
-            logger.warning("confirmation by voice refused: no wake-word detector to re-arm")
-            return False
-        timeout = self._listen_timeout_s if timeout_s is None else timeout_s
-        self._tts.speak(f"Say {self._wake_word} to confirm.")
-        # Discard the prompt's own acoustic echo from the mic, then reset the
-        # detector so its rolling window is clean when listening begins.  This
-        # must happen AFTER the prompt: resetting first would leave the prompt
-        # echo to fill the very windows the confirmation wake is scored in.
-        self._audio.flush()
-        self._wake_detector.reset()
-        deadline = time.monotonic() + timeout
-        chunk_frames = 1280
-        while not self._stop_event.is_set() and time.monotonic() < deadline:
-            segment = self._audio.read(chunk_frames)
-            if segment.duration_s < 0.05:
-                continue
-            if self._wake_detector.detect(segment).detected:
-                return True
-        logger.warning("confirmation by voice refused: wake word not re-detected")
-        return False
-
     def _route(self, text: str) -> str | None:
-        """Route a voice transcript and return a spoken response (or None)."""
-        normalised = text.lower().strip()
+        """Route a voice transcript and return a spoken response (or None).
 
-        # Stop listening
+        The command vocabulary is matched against the *normalised* utterance, so
+        punctuation from speech recognition ("Stop.", "cancel ?") lands on the
+        same branch as the bare word.  The three stop-ish branches are
+        deliberately distinct and are checked in this order:
+
+        1. voice OFF (:data:`_STOP_LISTENING`) - stop listening for good;
+        2. cancel (:data:`_CANCEL_REQUESTS`) - cancel the current speech and the
+           current task, then keep listening (never exits the loop);
+        3. dictation - see below.
+
+        A cancel request matches the *whole* utterance only, unlike the in-flight
+        watch (:meth:`watch_for_stop`) which also accepts a cancel word inside a
+        short utterance.  At the command position there is no task to cancel
+        yet, and a loose match would swallow a real request such as "stop the
+        music".
+        """
+        normalised = _normalise_speech(text)
+
+        # Stop listening entirely.
         if normalised in _STOP_LISTENING:
             self._running = False
             self._stop_event.set()
@@ -1683,6 +1886,24 @@ class VoiceLoop:
         if is_shutdown_request(text):
             logger.info("voice boundary: shutdown request answered locally (no tool exists)")
             return SHUTDOWN_UNSUPPORTED_MSG
+
+        # Cancel: stop any speech and abandon the current task, but keep the
+        # microphone open.  Reaching this branch means nothing was submitted yet
+        # (a task already in flight is cancelled by ``watch_for_stop``), so the
+        # acknowledgement is the whole answer and the loop returns to
+        # wake-listening.  A bare "stop" here must NEVER switch voice off.
+        if normalised in _CANCEL_REQUESTS:
+            logger.info("VOICE STOP_REQUESTED")
+            logger.info("voice boundary: cancel request at command position; loop stays active")
+            try:
+                self._tts.stop()
+            except Exception:
+                logger.debug("cancel: tts stop failed", exc_info=True)
+            if self._dictating:
+                self.stop_dictation()
+                return "Dictation stopped."
+            self._reporter.stop_request()
+            return STOP_ACKNOWLEDGEMENT
 
         # Stop dictation
         if normalised in _STOP_DICTATION:
@@ -1758,17 +1979,17 @@ class VoiceLoop:
         # reported when it was heard (see :meth:`watch_for_stop`).
         if getattr(outcome, "cancelled", False):
             return STOP_ACKNOWLEDGEMENT
-        # Handle the confirmation case
-        if hasattr(outcome, "confirmation") and outcome.confirmation is not None:
-            return self._handle_voice_confirmation(outcome)
+        # A confirmation never reaches this thread: the daemon publishes the
+        # pending confirmation and answers it on its own worker thread
+        # (``DaemonServer._run_voice_confirmation`` -> ``confirm_by_voice``),
+        # which is the only path that owns a resume callback.  If one ever
+        # arrives here it is unhandled by design, so fail closed: say nothing
+        # and let the graph's own policy gate deny the step.
+        if getattr(outcome, "confirmation", None) is not None:
+            logger.warning("voice outcome carried an unhandled confirmation; ignoring")
+            return None
         if hasattr(outcome, "final_answer") and outcome.final_answer:
             return outcome.final_answer
         if hasattr(outcome, "error") and outcome.error:
             return f"Error: {outcome.error}"
         return None
-
-    def _handle_voice_confirmation(self, outcome: Any) -> str | None:
-        """Handle a confirmation request via voice (Tier 1 only)."""
-        conf = outcome.confirmation
-        payload = conf if isinstance(conf, dict) else dict(conf or {})
-        return self.confirm_by_voice(payload)

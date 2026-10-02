@@ -77,7 +77,7 @@ jarvis/
 │  │   ├─ server.py          # asyncio TCP server, auth, task queue, worker thread
 │  │   ├─ client.py          # DaemonClient used by CLI
 │  │   └─ autostart.py       # Task Scheduler create/delete/status
-│  ├─ voice/                 # wake.py stt.py tts.py vad.py loop.py
+│  ├─ voice/                 # wake.py stt.py tts.py loop.py service.py status.py fakes.py
 │  ├─ memory/                # db.py skills.py failures.py prefs.py embeddings.py
 │  ├─ audit/                 # checks.py report.py
 │  └─ ml/                    # risk_classifier inference wrapper (Phase 8)

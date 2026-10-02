@@ -114,6 +114,21 @@ The **summary shown to the user is generated from the validated args**, not from
 7. Confirmations time out (default 60 s) → treated as "no".
 8. Voice may answer yes/no for Tier 1 only, and JARVIS repeats the action aloud first. Tier 2 requires the terminal or dialog.
 
+### 7.1 Voice confirmation window (Tier 1 only)
+
+- After the action is spoken, the microphone opens a **wake-free** window (`[voice] confirm_window_s`, default `8.0`) and expects exactly one short answer.
+- The window is **not** gated on the wake word: repeating "Hey Jarvis" mid-window does not restart it, so the user never has to say the wake phrase twice in a row.
+- The answer is accepted only if it normalises to a member of the short-command set (`yes`, `yeah`, `yep`, `y`, `ok`, `okay`, `sure`, `confirm`, `approve`, `do it`, `go ahead`, `no`, `nope`, `nah`, `n`, `cancel`, `stop`, `wait`, `abort`). **Anything else fails closed** — silence, background speech, a repeated question, or a sentence containing a command are all "no". There is no fuzzy matching and no LLM involvement.
+- A voice "yes" is *advisory input*, not authority: the daemon still re-checks the `action_hash` against the pending request, so a stale or hijacked window cannot approve a different action.
+- Confirmation text is spoken with a wake-free prompt that never names the wake phrase.
+
+### 7.2 Barge-in and half-duplex audio
+
+- While speaking an answer, the voice loop keeps the *same* microphone open and scores it for the wake word only. On a detection it purges the queued speech (`SAPI.SpVoice.Purge`) and re-arms; it never opens a second capture stream.
+- A short **onset guard** (`0.35 s`) after speech starts prevents the answer's own echo from triggering a self-interrupt. This is a heuristic, not a solution: on open speakers the guard can be exceeded and JARVIS may cut itself off.
+- **Use headphones** for reliable barge-in. On speakers, say "stop listening" instead — that is the voice-off phrase, not a cancel.
+- Only engines that expose the optional async pair (`start_speaking` / `is_speaking`) can be interrupted. SAPI can; the Piper and pyttsx3 fallbacks speak to completion, and the log records that barge-in was unavailable for that answer.
+
 Confirmation text format (example):
 ```
 ⚠ Tier 2 — Delete 3 files (moved to Recycle Bin)

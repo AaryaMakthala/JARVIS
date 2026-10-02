@@ -1,13 +1,8 @@
-"""Contract tests: every real voice class vs its Protocol (Stage 1 i).
+"""Contract tests: every real voice class vs its Protocol.
 
 For each real implementation the public method names and parameters must
 match the Protocol's signature (via :mod:`inspect`), so a caller built
 against the Protocol can drive the real class without surprises.
-
-One *recorded* gap: :class:`SoundDeviceVAD` still owns a stream and its
-``listen_for_speech`` takes no ``read_chunk`` argument.  Stage 3 migrates
-it to a pure detector; the test below pins the gap explicitly instead of
-pretending conformance.
 """
 
 from __future__ import annotations
@@ -18,19 +13,17 @@ from typing import Any
 import pytest
 
 from jarvis.voice.audio_input import SoundDeviceAudioInput
-from jarvis.voice.fakes import FakeAudioInput
+from jarvis.voice.fakes import FakeAsyncTTS, FakeAudioInput
 from jarvis.voice.focus import WindowFocusChecker as RealFocusChecker
 from jarvis.voice.interfaces import (
     AudioInput,
     SpeechToText,
     TextToSpeech,
-    VoiceActivityDetector,
     WakeWordDetector,
     WindowFocusChecker,
 )
 from jarvis.voice.stt import FasterWhisperSTT
-from jarvis.voice.tts import PiperTTSEngine, SapiTTSEngine
-from jarvis.voice.vad import SoundDeviceVAD
+from jarvis.voice.tts import PiperTTSEngine, Pyttsx3TTSEngine, SapiTTSEngine
 from jarvis.voice.wake import OpenWakeWordDetector
 
 
@@ -48,6 +41,9 @@ CONFORMING: list[tuple[type[Any], type[Any]]] = [
     (FasterWhisperSTT, SpeechToText),
     (PiperTTSEngine, TextToSpeech),
     (SapiTTSEngine, TextToSpeech),
+    (Pyttsx3TTSEngine, TextToSpeech),
+    (FakeAudioInput, AudioInput),
+    (FakeAsyncTTS, TextToSpeech),
     (RealFocusChecker, WindowFocusChecker),
 ]
 
@@ -82,27 +78,30 @@ def _instantiate(cls: type[Any]) -> Any:
         return cls(object())
     if cls is PiperTTSEngine:
         return cls("test-model-path")
-    if cls is SapiTTSEngine:
+    if cls in (SapiTTSEngine, Pyttsx3TTSEngine, FakeAsyncTTS):
+        return cls()
+    if cls is FakeAudioInput:
         return cls()
     if cls is RealFocusChecker:
         return cls()
     raise AssertionError(f"no dummy-construction implemented for {cls.__name__}")
 
 
-class TestRecordedVADGap:
-    """SoundDeviceVAD is intentionally NOT yet protocol-conformant."""
+class TestBargeInCapability:
+    """The barge-in pair is an optional capability, not part of the protocol.
 
-    def test_vad_methods_exist_but_listen_for_speech_lacks_read_chunk(self) -> None:
-        assert hasattr(SoundDeviceVAD, "listen_for_speech")
-        assert hasattr(SoundDeviceVAD, "close")
-        # Stage 3 will make the VAD pure: chunks come via read_chunk and the
-        # detector owns no stream.  Until then this gap is recorded, not hidden.
-        assert "read_chunk" not in _params(SoundDeviceVAD.listen_for_speech)
+    ``TextToSpeech`` only requires ``speak``/``stop``, so an engine without the
+    pair is still conformant — it just cannot be interrupted.  The loop probes
+    for it, so the pair must exist on the engine that ships interruptible
+    speech, and must not be required of the others.
+    """
 
-    def test_vad_passes_runtime_structure_check_only(self) -> None:
-        # runtime_checkable isinstance cannot see signatures — this passes
-        # today, and is exactly why the inspect-level gap above must stay.
-        assert isinstance(SoundDeviceVAD(object()), VoiceActivityDetector)
+    def test_only_the_sapi_engine_is_interruptible(self) -> None:
+        assert hasattr(SapiTTSEngine, "start_speaking")
+        assert hasattr(SapiTTSEngine, "is_speaking")
+        # Documented non-capable engines: still conformant, blocking only.
+        for cls in (PiperTTSEngine, Pyttsx3TTSEngine):
+            assert not hasattr(cls, "start_speaking"), f"{cls.__name__} grew a barge-in pair"
 
 
 class TestFakeStrictness:
