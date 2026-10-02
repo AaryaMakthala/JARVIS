@@ -129,6 +129,59 @@ at 11:42:09Z). Every judgement below is read from lines **8084+**.
   outside git's view. It makes review impossible and should be fixed as its own mechanical commit
   (normalise the touched files back to LF) **before** the Stage 1 commit, not inside it.
 
+### Live result: **L3 FAILED** (first run) — read-only diagnosis, then ONE minimal fix
+
+**L3 = interaction `i4`, lines 8467-8499** (`12:12:32.826` -> `12:12:49.459`, 16.6 s of speech). The
+owner said "Hey Jarvis" four times and the answer played to the end.
+
+| Question | Evidence (read-only) | Verdict |
+|---|---|---|
+| `stop watch: heard N chars that are not a cancel request; ignoring` | **appears 6x in lines 8084+**; 4 of them inside L3: line **8478** (33 chars), **8483** (11), **8488** (11), **8492** (12) | **YES — it swallowed the wake phrase** |
+| `wake word heard during speech` | **0 occurrences** in the whole 8084+ slice | **NO — never fired** |
+| end of the answer | `VOICE TTS_COMPLETE` + `voice boundary: tts response speech done` (8493-8494), **no** `TTS sapi purge requested` | played to completion |
+| wake word detected elsewhere in the run | 6x (`wake word detected`), all in `WAKE_WAIT`, none in `SPEAKING` | wake works; it just never sees the phrase |
+
+("Hey Jarvis" is 11 characters — the 11/11/12-char captures are the owner's attempts.)
+
+**Root cause (Stage 1 code, D22 regression).** The bare-cancel capture borrows the microphone for up
+to `BARE_CANCEL_MAX_S` (2 s) and, by design, never scores those frames — `_read_command` does not
+feed the detector. openWakeWord needs a *contiguous* ~1.5 s window, so a wake phrase spoken inside a
+borrowed window reaches it as a gap and can never reach threshold. The D22 capture therefore
+**deafened wake-word barge-in** for the duration of every capture attempt.
+
+**L3b passed in the same run** (`i3`, lines 8379-8392): the first capture at line 8374 rejected a
+29-char utterance (the wake phrase, again swallowed), and the next attempt captured a bare cancel ->
+`stop watch: bare cancel heard while speaking; purging` -> `VOICE STOP_REQUESTED` ->
+`VOICE TTS_INTERRUPTED` -> `answer cut short by a bare stop` -> `VOICE TTS_COMPLETE` -> `VOICE
+WAKE_REARM` -> READY. Note the same swallow happened first; it was harmless only because a bare
+stop followed.
+
+**Fix (one, minimal).** `src/jarvis/voice/loop.py`:
+
+- new `_mentions_wake_word(text, wake_word)` — punctuation-stripped containment of the configured
+  wake phrase, or a whole-utterance near miss within `_WAKE_MATCH_MAX_DISTANCE` (2), the same
+  tolerance `_transcript_problem` uses. Matching when wrong costs only a purged answer, never an
+  action.
+- `_capture_stop_request`: a **speaking-state-only** branch, before the "not a cancel request" log —
+  a captured wake phrase logs `VOICE TTS_INTERRUPTED` + `voice boundary: wake word heard during
+  speech; purging the answer` and returns True. The in-flight (THINKING) watch is deliberately
+  unchanged: a wake word there is still dropped.
+- the cause-specific lines moved into `_capture_stop_request` so each cause of an interrupted answer
+  names itself **exactly once**; `_speak_with_barge_in` keeps only the purge and `return False`.
+  L3b's evidence lines are unchanged.
+
+Test: `TestBareStopWhileSpeaking.test_a_wake_phrase_the_capture_swallowed_still_barges_in`.
+
+| Check (this fix) | Result |
+|---|---|
+| `ruff check` + `ruff format --check` (`voice/loop.py`, `test_voice_loop.py`) | clean |
+| `pytest tests/unit/test_voice_loop.py -k "stop or BargeIn or confirm or FreeText or free_text"` | **68 passed** |
+| `pytest tests/unit/test_daemon_voice.py -k "Stop"` | **5 passed** |
+| `pytest test_voice_stopwatch.py` + adjacent loop selections (Transcription/Redaction/Routing/SpokenWakeName) | green |
+
+**L3 retest PENDING OWNER.** New baseline: `jarvis.jsonl` = **8675 lines**; the retest is judged from
+**8676+**.
+
 ### Live tests pending: L5, L2, L1, L3, L3b, L4 — procedure handed to the owner, not run by the agent.
 
 ## Live test 1 of 5 (2026-10-02) — controlled rerun — **INCONCLUSIVE — confirmation never reached; blocker is the planner's path clarification, NOT the provider and NOT voice**

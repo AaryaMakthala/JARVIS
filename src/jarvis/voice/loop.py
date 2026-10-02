@@ -594,6 +594,37 @@ def _transcript_problem(text: str, wake_word: str) -> str | None:
     return None
 
 
+def _mentions_wake_word(text: str, wake_word: str) -> bool:
+    """Whether a captured utterance contains the configured wake phrase.
+
+    The speaking-state bare-cancel capture borrows the microphone for up to
+    :data:`~jarvis.voice.stopwatch.BARE_CANCEL_MAX_S` and, by design, never
+    scores those frames — so a wake phrase spoken inside that window reaches
+    openWakeWord as a *gap*, never as a detection, and the answer plays on.
+    That is exactly the live L3 failure (2026-10-02, ``jarvis.jsonl`` 8478-8492:
+    four captures, all rejected, no ``wake word heard during speech``).  The
+    transcript is all the trigger has, so it recognises the phrase itself.
+
+    Tolerance matches :func:`_transcript_problem`: punctuation-stripped
+    containment, or a whole-utterance near miss within
+    :data:`_WAKE_MATCH_MAX_DISTANCE` - what the detector would have accepted.
+    Matching costs nothing when it is wrong: the effect is to purge an answer
+    and return to wake-listening, never to run anything.
+    """
+    wake = _normalise_speech(wake_word)
+    spoken = _normalise_speech(text)
+    if not wake or not spoken:
+        return False
+    squashed = wake.replace(" ", "")
+    if squashed and squashed in spoken.replace(" ", ""):
+        return True
+    return (
+        _edit_distance(spoken.replace(" ", ""), squashed) <= _WAKE_MATCH_MAX_DISTANCE
+        if squashed
+        else False
+    )
+
+
 def _canonical_command(text: str) -> str:
     """Rewrite a recognised natural variant to the canonical phrasing.
 
@@ -1526,14 +1557,11 @@ class VoiceLoop:
                 listen_timeout_s=BARE_CANCEL_MAX_S,
                 where="speaking",
             ):
-                # _capture_stop_request already logged VOICE STOP_REQUESTED,
-                # the "bare cancel heard while speaking" line and the status
-                # event.  All that is left here is the console-level fact that
-                # speech was cut off, then the purge.
-                logger.info("VOICE TTS_INTERRUPTED")
-                logger.info("voice boundary: answer cut short by a bare stop; returning to wake")
-                # Purge before returning: the caller's re-arm flushes the mic
-                # and quiet-drains, which must happen on a silenced engine.
+                # The capture logged which request it matched (bare cancel or a
+                # swallowed wake phrase) and VOICE STOP_REQUESTED or
+                # VOICE TTS_INTERRUPTED.  All that is left is the purge, before
+                # returning: the caller's re-arm flushes the mic and
+                # quiet-drains, which must happen on a silenced engine.
                 self._purge_speech()
                 return False
             # Not a cancel ("stop watch: heard N chars ... ignoring" was logged
@@ -1911,8 +1939,12 @@ class VoiceLoop:
         ``max_s``/``listen_timeout_s`` default to the in-flight watch's bounds.
         The speaking state passes :data:`~jarvis.voice.stopwatch.BARE_CANCEL_MAX_S`
         instead, because it shares the microphone with wake-word barge-in and
-        has to hand it back promptly.  ``where`` only selects the wording of the
-        log line so the two callers are distinguishable in the JSONL.
+        has to hand it back promptly.  ``where`` selects the wording of the log
+        lines so the two callers are distinguishable in the JSONL, and gates one
+        extra rule that belongs to ``speaking`` alone: a captured wake phrase
+        (:func:`_mentions_wake_word`) counts as a barge-in, because the window
+        this call borrows is exactly the window openWakeWord never saw.  The
+        in-flight watch has no such rule - a wake word there is still dropped.
         """
         if keep_watching is not None and not keep_watching():
             return False
@@ -1937,6 +1969,13 @@ class VoiceLoop:
         except Exception:
             logger.exception("stop watch: transcription failed")
             return False
+        if where == "speaking" and _mentions_wake_word(text, self._wake_word):
+            # A wake phrase the borrowed capture window swallowed.  Identical
+            # effect to a detection - purge, back to wake, nothing submitted -
+            # because from here the phrase *is* the barge-in.
+            logger.info("VOICE TTS_INTERRUPTED")
+            logger.info("voice boundary: wake word heard during speech; purging the answer")
+            return True
         if not _is_cancel_request(text):
             logger.info(
                 "stop watch: heard %d chars that are not a cancel request; ignoring",
@@ -1945,12 +1984,16 @@ class VoiceLoop:
             return False
         logger.info("VOICE STOP_REQUESTED")
         if where == "speaking":
-            # Wording only; the purge and the return-to-READY belong to
-            # _speak_with_barge_in, which owns the TTS engine.
+            # Wording only; the purge belongs to _speak_with_barge_in, which
+            # owns the TTS engine.  Logged here so each cause of an interrupted
+            # answer names itself exactly once.
             logger.info("stop watch: bare cancel heard while speaking; purging")
-        else:
-            logger.info("stop watch: bare cancel heard while thinking; cancelling")
-            logger.info("voice boundary: in-flight cancel request heard; cancelling the task")
+            logger.info("VOICE TTS_INTERRUPTED")
+            logger.info("voice boundary: answer cut short by a bare stop; returning to wake")
+            self._reporter.stop_request()
+            return True
+        logger.info("stop watch: bare cancel heard while thinking; cancelling")
+        logger.info("voice boundary: in-flight cancel request heard; cancelling the task")
         self._reporter.stop_request()
         return True
 

@@ -2894,6 +2894,35 @@ class TestBareStopWhileSpeaking:
         assert stt.transcribe_calls == []
         assert "bare cancel heard while speaking" not in caplog.text
 
+    def test_a_wake_phrase_the_capture_swallowed_still_barges_in(
+        self, monkeypatch: Any, caplog: Any
+    ) -> None:
+        """Live L3 (2026-10-02, ``jarvis.jsonl`` 8478-8492) — regression.
+
+        The owner said "Hey Jarvis" four times during a 16.6 s answer.  The
+        bare-cancel capture had borrowed the microphone for each attempt and
+        never scored those frames, so openWakeWord's rolling window never
+        filled: four captures were all rejected and the answer played to the
+        end.  A speaking-state capture that *contains* the wake phrase is a
+        barge-in, with the same effect as a detection and nothing submitted.
+        """
+        import logging
+
+        monkeypatch.setattr(loop_mod, "_BARGE_IN_GUARD_S", 0.0)
+        loop, _audio, _wake, _stt, tts = self._loop(transcript="Hey Jarvis")
+        caplog.set_level(logging.INFO, logger="jarvis.voice.loop")
+
+        assert loop._speak_with_barge_in("a long answer") is False
+        assert tts.stop_calls == 1
+        assert tts.completed is False
+        assert "wake word heard during speech; purging the answer" in caplog.text
+        assert caplog.text.count("VOICE TTS_INTERRUPTED") == 1
+        # It is a barge-in, not a cancel: no stop was requested, and the
+        # utterance is not written off as "not a cancel request" either.
+        assert "VOICE STOP_REQUESTED" not in caplog.text
+        assert "stop watch: heard" not in caplog.text
+        assert "bare cancel heard while speaking" not in caplog.text
+
 
 class TestConfirmationRefusalIsObservable:
     """A refused confirmation must be auditable, not a silent refusal.
