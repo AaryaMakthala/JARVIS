@@ -343,8 +343,8 @@ Live test: the common commands feel instant; errors are spoken clearly.
 ## 9. Progress tracker (tick when done AND logged in PROGRESS.md)
 
 - [x] Stage 0: Live verification recorded
-- [ ] Stage 1: Voice correctness (wake name, wake-free confirm, stop semantics, TTS barge-in, dead code)
-      — code + focused tests done 2026-10-02 (1a-1e); **live tests 4-7 still PENDING OWNER**, so not ticked
+- [x] Stage 1: Voice correctness (wake name, wake-free confirm, stop semantics, TTS barge-in, dead code)
+      — code + focused tests done 2026-10-02 (1a-1e); closed; L1 not exercisable (see PROGRESS.md)
 - [ ] Stage 2: AUTO / sleep modes, unified state vocabulary
 - [ ] Stage 3: Plan announce, "proceed", plan-level approval, Tier 2 by voice (opt-in)
 - [ ] Stage 4: Time, apps scan, list windows, open_in_app, Notepad, small VS Code code

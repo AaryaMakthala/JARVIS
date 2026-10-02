@@ -2,6 +2,131 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## STAGE 1 CLOSE-OUT (2026-10-02) — **Stage 1 CLOSED.** L3 PASS after `04bfc11`; L4 PASS-WITH-CAVEAT; L1 NOT EXERCISABLE. No Stage 2 work started.
+
+Every verdict below is read from `jarvis.jsonl`. The two daemon runs after the previous baseline
+(8675 lines) are **run 1 = lines 8676-8799** (the L3 retest, one interaction `i1` started at 8711) and
+**run 2 = lines 8800-8890** (the "stop listening" run, one interaction `i1` started at 8832).
+`jarvis.jsonl` is now **8890 lines**; the next live baseline is 8891.
+
+| Test | Result | Evidence |
+|---|---|---|
+| Test 1 — wake-free Tier-1 confirmation | **PASS-WITH-CAVEAT** | see this file's line 3374 (log 4691-5467: window opened without a wake word, `approved=True`, action hash matched; the `type_text` failure *after* approval is an independent act-time issue) |
+| Test 2 — refusals distinguishable, nothing approved | **PASS** | **7114** `voice confirmation refused: no usable answer in the window` (silence, fail-closed) and **7210** `voice confirmation refused by user: answer is not an approval word` |
+| L5 | **PASS** (owner-reported) | the L1-L5 procedure was handed over in chat and is not recorded in this file, so there is no line range to cite |
+| L2 | **PASS** (owner-reported) | as L5 |
+| L1 — bare "stop" while THINKING | **NOT EXERCISABLE** | see below — **not** PASS, **not** FAIL |
+| L3b — bare "stop" while SPEAKING | **PASS** | `i3` (**8312**): **8374** wake phrase swallowed and ignored → **8379/8380** `VOICE STOP_REQUESTED` + `bare cancel heard while speaking; purging` → **8382** `TTS_INTERRUPTED` → **8384** purge → **8385** `TTS_COMPLETE` → **8387** `WAKE_REARM` → **8392** READY |
+| L3 — "Hey Jarvis" while SPEAKING | **PASS after `04bfc11`** | run 1, **8766-8778** |
+| L4 — "stop listening" | **PASS-WITH-CAVEAT** | run 2, **8868-8890** |
+
+### L3 — PASS, and the fix is demonstrably what fired
+
+| Required line | Log line | Value |
+|---|---|---|
+| `VOICE TTS_START` | **8766** | `12:26:30.929`, 281 chars |
+| `VOICE TTS_INTERRUPTED` | **8773** | **exactly one** (count in run 1 = 1) |
+| `voice boundary: wake word heard during speech; purging the answer` | **8774** | present, once |
+| `TTS sapi purge requested` | **8775** | present, once |
+| `VOICE TTS_COMPLETE` | **8776** | `12:26:35.928` |
+| `voice boundary: answer cut short; returning to wake` | **8777** | present |
+| `VOICE WAKE_REARM` → READY | **8778** → **8784** | `voice event=ready` |
+
+**`TTS_START` → `TTS_COMPLETE` = 4.999 s, and the interrupt was mid-speech.**
+`VOICE TTS_INTERRUPTED` is logged from inside the `while speaking()` loop, so it cannot fire after
+the engine finished on its own; for scale, the 262-char answer of the failed first attempt ran
+**16.6 s** to completion, so 5.0 s is roughly the first third of a 281-char answer. The owner's report
+("the speech stopped in the middle") matches.
+
+Both must-NOT lines are absent from run 1: `speech ceiling reached` = **0**, `barge-in: voice stopped;
+purging the answer` = **0**. `stop watch: heard … not a cancel request` = **0** in run 1 too, which is
+the extra signal that the **new** branch fired instead of the old reject path: the wake phrase was
+captured by Whisper (**8771** `Processing audio with duration 00:01.600`) and matched by
+`_mentions_wake_word` *before* the "not a cancel request" log was reachable. There is no `wake word
+detected` inside the speech window (the run's only one, **8705**, started the interaction), so the
+barge-in came from the capture branch — **`04bfc11` is what made L3 pass**, not the direct detector.
+
+### L4 — behaviour PASS, one named telemetry line MISSING
+
+| Criterion | Log | Result |
+|---|---|---|
+| farewell spoken | **8868** `response ready (chars=8)` → **8876** `TTS sapi async speak start (chars=8)` | "Goodbye." is 8 chars; spoken |
+| voice actually off | **8888** `microphone closed`; no `WAKE_WAIT_START` after **8887**; owner saw `voice: off` | yes |
+| daemon did not exit | `daemon ready` **8818**; `client authenticated` **8889** (that is the `jarvis status` call); `daemon shut down cleanly` = **0** and `daemon: interrupted by the user` = **0** in run 2 | daemon alive, as required |
+| `voice loop stopped` | **ABSENT** (count in run 2 = **0**), and `voice event=stopping` = **0** too | explained below |
+
+**Why that line is missing, and why it is not a behavioural failure.** `voice loop stopped` is logged
+at the *end* of `VoiceLoop.stop()` (`voice/loop.py:860`), and `stop()` starts with
+`if not self._running: return` (`voice/loop.py:850`). The `_STOP_LISTENING` branch sets
+`_running = False` **from inside the loop thread** before the farewell is spoken, so when the voice-off
+path later calls `stop()`, the loop already looks stopped: it returns before `self._reporter.stopping()`
+and before the log line. Run 1 is the contrast — there the owner pressed Ctrl+C while the loop was
+still `_running`, so **8796** `voice event=stopping` and **8797** `voice loop stopped` were logged
+normally. Every behaviour Stage 1 asked for is present; what is missing is one log line on the
+`stop listening` path.
+
+**New finding, recorded NOT fixed** (no source changes in this close-out). **8877** `barge-in: voice
+stopped; purging the answer`, 50 ms after the SAPI start: the voice-off path sets the stop event
+*before* speaking, so the 8-char farewell is purged at its first syllable. The owner heard "Goodbye."
+and voice did go off, so this is cosmetic — but the farewell should be allowed to finish before the
+loop stops. It belongs to 1b's `_STOP_LISTENING`, not to 1f's D22; carry it forward as its own item.
+
+Also in run 2: **8856** `Detected language 'hi' with probability 0.43` / **8859** `stt done (chars=14
+language=hi)` — another instance of the known Whisper-`base` language auto-detect problem (already
+out of stage; previously seen as "la").
+
+### L1 — NOT EXERCISABLE (explicitly **not** PASS)
+
+Groq answers in 1-2 s, so THINKING left no window in which the owner could land a bare "stop". The
+in-flight watch is demonstrably live: **5791-5793** and **5804-5806** are in-flight captures during
+THINKING (`Processing audio 00:01.560` → `Detected language 'en'` → `stop watch: heard 4/13 chars
+that are not a cancel request; ignoring`) — the mic is captured and bare speech is correctly rejected,
+so the only missing ingredient was timing. The mechanism is unit-tested (`TestInFlightStopWatch`).
+L1 can be neither PASS nor FAIL from this log; it stays **NOT EXERCISABLE**.
+
+### D22 — the standing override
+
+D22 — a bare `"stop"`, no wake word, cancels while JARVIS is **THINKING *and* SPEAKING** —
+**overrides `ROADMAP_V2.1_AMENDMENTS.md.md` section E**, which had said barge-in responds to
+"Hey Jarvis", not "stop", while speaking. Section E predates the decision and must not be re-read as
+the spec; `docs/03_SECURITY_AND_POLICY.md` §7.2.1 documents D22 and says so in its first line. Gated
+by `[voice] bare_stop_while_busy` (default `true`) for SPEAKING only; THINKING is unconditional.
+
+### Stage 1 commits
+
+`8b2d2d3` (wake-free confirmation, honest stop semantics, interruptible SAPI) → `07de703` (D22 bare
+stop while speaking, observable confirmation refusals) → `04bfc11` (wake phrase heard by the bare-stop
+capture still barges in — the L3 fix).
+
+### Known pre-existing failure — untouched
+
+`TestRearmQuietStartGate::test_response_echo_drained_before_detector_reopens` — untouched,
+unattributed, and matched by none of the focused selections run in these sessions.
+
+### Out of stage — recorded, NOT fixed
+
+- LLM-written *spoken* refusal text is inaccurate for silence (the log line is honest; the sentence is not).
+- Whisper `base` misrecognition and language auto-detect ("la", now "hi" at **8856**): forcing English or a larger model needs owner approval.
+- `type_text` focus failure, and `tools/base.py:128` does not log `result.error` (this is Test 1's caveat).
+- `"not bad"` → notepad mapping is most likely the **planner** (`lookup_command` is exact-match).
+- `start_dictation` defaults `target_app` to notepad (`voice/loop.py:835`, `tools/dictation.py:30`).
+- `ROADMAP_V2.md.md` / `ROADMAP_V2.1_AMENDMENTS.md.md` are committed with the doubled `.md.md` extension and need a separate rename commit (not done here).
+- Local fast path / `get_time` gap — **Stage 4**.
+- **New:** the `stop listening` farewell is purged 50 ms after it starts (**8877**).
+- **New:** `voice loop stopped` and `voice event=stopping` never appear on the `stop listening` path (`voice/loop.py:850` early return) — a telemetry gap, not a behavioural one.
+
+### Working-tree line endings — still open, unchanged
+
+Every file touched in recent sessions is **CRLF** while the committed blobs are **LF**, so `git diff`
+shows whole files as changed. It needs its own mechanical commit; the close-out commit touches only
+`PROGRESS.md` and `ROADMAP_V2.md.md`, staged by path.
+
+### What remains
+
+Stage 1 is closed. Open/not started: the `stop listening` farewell cut-off, the missing
+`voice loop stopped` line, CRLF normalisation, the `.md.md` rename, Stage 2 (AUTO / sleep modes and
+the unified state vocabulary), and Stages 3-10.
+
 ## Session 2026-10-02 — ROADMAP_V2 Stage 1 item **1f "bare stop while busy" (owner decision D22)** — code complete, focused tests green, LIVE TESTS L1-L5 + L3b PENDING OWNER
 
 ### The decision, and what it overrides
