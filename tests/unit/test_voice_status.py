@@ -315,3 +315,13 @@ class TestStateMachineVocabulary:
         assert first == "i1"
         assert second == "i2"
         reset_interaction_ids()
+
+
+class TestVoiceStatusMode:
+    """Mode appears in status."""
+
+    def test_status_includes_mode(self) -> None:
+        from jarvis.daemon import protocol
+
+        resp = protocol.StatusResponse(mode="AUTO")
+        assert resp.mode == "AUTO"

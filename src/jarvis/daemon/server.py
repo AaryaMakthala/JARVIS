@@ -668,6 +668,7 @@ class DaemonServer:
             wake_word=self._settings.voice.wake_word,
             listen_timeout_s=self._settings.voice.listen_timeout_s,
             idle_timeout_s=self._settings.voice.idle_timeout_s,
+            auto_idle_timeout_s=self._settings.voice.auto_idle_timeout_s,
             max_session_s=self._settings.voice.max_session_s,
             max_dictation_chars=self._settings.voice.max_dictation_chars,
             silence_timeout_s=self._settings.voice.silence_timeout_s,
@@ -1556,6 +1557,7 @@ class DaemonServer:
             active_id = self._active.task_id if self._active and not self._active.done else None
         voice_status = "off"
         voice_reason: str | None = None
+        voice_mode = "NORMAL"
         if self._voice_service is not None:
             state = self._service_state(self._voice_service)
             if state == "error":
@@ -1565,11 +1567,23 @@ class DaemonServer:
                 voice_status = "starting"
             elif state == "on":
                 voice_status = "on"
+            try:
+                loop = getattr(self._voice_service, "_loop", None)
+                if loop is not None:
+                    mode = getattr(loop, "mode", None)
+                    if mode is not None:
+                        try:
+                            voice_mode = mode.value
+                        except Exception:  # noqa: BLE001 - best effort
+                            voice_mode = str(mode)
+            except Exception:  # noqa: BLE001, S110 - best effort
+                pass
         await conn.send(
             StatusResponse(
                 daemon="running",
                 voice=voice_status,
                 voice_reason=voice_reason,
+                mode=voice_mode,
                 unlocked=self._unlock.is_unlocked(),
                 queue=queue_len,
                 active_task=active_id,

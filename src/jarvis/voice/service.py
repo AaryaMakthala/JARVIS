@@ -109,6 +109,7 @@ class VoiceService:
         on_dictation: Any | None = None,
         wake_word: str = "hey jarvis",
         idle_timeout_s: float = 120.0,
+        auto_idle_timeout_s: float = 300.0,
         listen_timeout_s: float = 30.0,
         max_session_s: float = DEFAULT_MAX_SESSION_S,
         max_dictation_chars: int = DEFAULT_MAX_DICTATION_CHARS,
@@ -133,6 +134,7 @@ class VoiceService:
         self._on_dictation = on_dictation
         self._wake_word = wake_word
         self._idle_timeout_s = idle_timeout_s
+        self._auto_idle_timeout_s = auto_idle_timeout_s
         self._listen_timeout_s = listen_timeout_s
         self._max_session_s = max_session_s
         self._max_dictation_chars = max_dictation_chars
@@ -217,6 +219,7 @@ class VoiceService:
                 wake_word=self._wake_word,
                 listen_timeout_s=self._listen_timeout_s,
                 idle_timeout_s=self._idle_timeout_s,
+                auto_idle_timeout_s=self._auto_idle_timeout_s,
                 max_session_s=self._max_session_s,
                 max_dictation_chars=self._max_dictation_chars,
                 silence_timeout_s=self._silence_timeout_s,

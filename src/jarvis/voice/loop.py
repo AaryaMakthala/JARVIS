@@ -69,7 +69,12 @@ from jarvis.voice.interfaces import (
     WakeWordDetector,
     WindowFocusChecker,
 )
-from jarvis.voice.states import VoicePhase, next_interaction_id
+from jarvis.voice.modes import VoiceMode, classify_mode_phrase
+from jarvis.voice.states import (
+    VoicePhase,
+    check_transition,
+    next_interaction_id,
+)
 from jarvis.voice.status import (
     DEFAULT_WAKE_WORD,
     ProviderReport,
@@ -703,6 +708,7 @@ class VoiceLoop:
         wake_word: str = "hey jarvis",
         listen_timeout_s: float = 30.0,
         idle_timeout_s: float = 120.0,
+        auto_idle_timeout_s: float = 300.0,
         max_session_s: float = DEFAULT_MAX_SESSION_S,
         max_dictation_chars: int = DEFAULT_MAX_DICTATION_CHARS,
         silence_timeout_s: float = DEFAULT_SILENCE_TIMEOUT_S,
@@ -729,6 +735,7 @@ class VoiceLoop:
         self._wake_word = wake_word
         self._listen_timeout_s = listen_timeout_s
         self._idle_timeout_s = idle_timeout_s
+        self._auto_idle_timeout_s = max(auto_idle_timeout_s, 0.0)
         self._max_session_s = max_session_s
         self._max_dictation_chars = max_dictation_chars
         self._silence_timeout_s = max(silence_timeout_s, 0.0)
@@ -775,6 +782,12 @@ class VoiceLoop:
         self._stop_watch_armed = False
         self._phase_state = "off"
         self._interaction_id = ""
+        self._mode = VoiceMode.NORMAL
+        self._auto_idle_deadline: float | None = None
+        self._auto_idle_reset_at_interaction_end = False
+        self._in_confirmation = False
+        self._thinking = False
+        self._speaking_now = False
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -788,17 +801,62 @@ class VoiceLoop:
         """Id of the interaction currently running (empty between wakes)."""
         return self._interaction_id
 
-    def _set_state(self, state: str) -> None:
-        """Record and log a voice-phase transition.
+    @property
+    def mode(self) -> VoiceMode:
+        return self._mode
 
-        The state string is one of a fixed set (LISTENING / WAKE_DETECTED /
-        CAPTURING / TRANSCRIBING / PROCESSING / SPEAKING / RESETTING) so a
-        session's ``jarvis.jsonl`` shows exactly which phase each interaction
-        is in and whether it ever returns to wake-listening.  No audio
-        content or transcript wording is ever included.
-        """
-        self._phase_state = state
-        logger.info("VOICE state=%s", state)
+    def _set_mode(self, mode: VoiceMode, reason: str) -> None:
+        if self._mode == mode:
+            return
+        self._mode = mode
+        logger.info("voice mode=%s reason=%s", mode.value, reason)
+        if mode == VoiceMode.AUTO:
+            self._reset_auto_idle()
+        else:
+            self._auto_idle_deadline = None
+
+    def _reset_auto_idle(self) -> None:
+        if self._auto_idle_timeout_s > 0 and self._mode == VoiceMode.AUTO:
+            self._auto_idle_deadline = time.monotonic() + self._auto_idle_timeout_s
+
+    def _check_auto_idle(self) -> bool:
+        if self._mode != VoiceMode.AUTO or self._auto_idle_deadline is None:
+            return False
+        if self._thinking or self._speaking_now or self._in_confirmation:
+            return False
+        return time.monotonic() >= self._auto_idle_deadline
+
+    def _set_state(self, state: str | VoicePhase) -> None:
+        """Record and log a voice-phase transition using VoicePhase."""
+        if isinstance(state, str):
+            try:
+                phase = VoicePhase(state)
+            except Exception:  # noqa: BLE001 - defensive
+                try:
+                    phase = (
+                        VoicePhase(state.upper())
+                        if hasattr(VoicePhase, state.upper())
+                        else VoicePhase.RECOVERING
+                    )
+                except Exception:  # noqa: BLE001 - defensive
+                    phase = VoicePhase.RECOVERING
+        else:
+            phase = state
+        try:
+            current = (
+                VoicePhase(self._phase_state)
+                if isinstance(self._phase_state, str) and self._phase_state != "off"
+                else VoicePhase.STARTING
+            )
+        except Exception:  # noqa: BLE001 - defensive
+            current = VoicePhase.STARTING
+        try:
+            if not check_transition(current, phase):
+                logger.warning("voice state transition invalid: %s -> %s", current, phase)
+        except Exception:  # noqa: BLE001 - defensive
+            logger.warning("voice state transition check failed: %s -> %s", current, phase)
+        self._phase_state = phase.value
+        logger.info("VOICE state=%s", phase.value)
 
     def _recover(self, reason: str) -> None:
         """Report an isolated failure that the loop will recover from.
@@ -942,7 +1000,11 @@ class VoiceLoop:
             callback({"approved": False, "action_hash": action_hash})
             return CONFIRMATION_REFUSED
 
-        answer = self._capture_spoken_answer(window_s, kind="confirmation")
+        self._in_confirmation = True
+        try:
+            answer = self._capture_spoken_answer(window_s, kind="confirmation")
+        finally:
+            self._in_confirmation = False
         if answer is None:
             # Distinct from a user refusal on purpose: nothing usable came back
             # from the window (silence, too short, or an empty transcript).
@@ -1063,7 +1125,11 @@ class VoiceLoop:
             logger.exception("voice clarification prompt failed; answering empty (fail closed)")
             report("")
             return ""
-        answer = self._capture_spoken_answer(window_s, kind="clarification")
+        self._in_confirmation = True
+        try:
+            answer = self._capture_spoken_answer(window_s, kind="clarification")
+        finally:
+            self._in_confirmation = False
         if answer is None:
             report("")
             return ""
@@ -1086,13 +1152,39 @@ class VoiceLoop:
             self._reporter.state(VoicePhase.STARTING)
             self._audio.open()
             self._audio_opened = True
-            self._set_state("LISTENING")
+            self._set_state(
+                VoicePhase.WAITING_FOR_WAKE
+                if self._mode == VoiceMode.NORMAL
+                else VoicePhase.LISTENING
+            )
             if self._wake_detector is not None:
                 self._wake_detector.reset()
             self._reporter.ready(self._wake_word)
 
             while self._running and not self._stop_event.is_set():
                 # Phase 1: Wait for wake word (or voice activity)
+                if self._mode == VoiceMode.AUTO:
+                    # In AUTO, skip wake detector - check auto idle
+                    if self._check_auto_idle():
+                        logger.info("voice mode=%s reason=%s", VoiceMode.NORMAL.value, "idle")
+                        self._set_mode(VoiceMode.NORMAL, reason="idle")
+                        self._tts.speak("Going back to sleep.")
+                        self._quiet_start_drain()
+                        self._set_state(
+                            VoicePhase.WAITING_FOR_WAKE
+                            if self._mode == VoiceMode.NORMAL
+                            else VoicePhase.LISTENING
+                        )
+                        continue
+                    # Run interaction directly in AUTO
+                    try:
+                        self._run_interaction()
+                    except Exception:
+                        logger.exception(
+                            "voice interaction failed; resetting and continuing to listen"
+                        )
+                        self._recover("unexpected failure inside the interaction")
+                    continue
                 logger.info("VOICE WAKE_WAIT_RESTART")
                 if not self._wait_for_wake():
                     if self._idle_timed_out:
@@ -1177,11 +1269,14 @@ class VoiceLoop:
         logger.info("VOICE WAKE_WAIT_START")
         self._idle_timed_out = False
         self._reporter.waiting_for_wake()
+        self._set_state(
+            VoicePhase.WAITING_FOR_WAKE if self._mode == VoiceMode.NORMAL else VoicePhase.LISTENING
+        )
         if self._wake_detector is None:
             # No wake-word model; use a simple voice-activity gate.
             segment = self._audio.read(4800)  # 300 ms
             if segment.duration_s > 0 and not self._stop_event.is_set():
-                self._set_state("WAKE_DETECTED")
+                self._set_state(VoicePhase.WAKE_DETECTED)
                 self._reporter.wake_detected()
             return segment.duration_s > 0 and not self._stop_event.is_set()
 
@@ -1244,7 +1339,7 @@ class VoiceLoop:
                 logger.info("VOICE wake_detected")
                 logger.info("VOICE WAKE_DETECTED")
                 logger.info("voice boundary: wake trigger; entering interaction")
-                self._set_state("WAKE_DETECTED")
+                self._set_state(VoicePhase.WAKE_DETECTED)
                 self._reporter.wake_detected()
                 return True
         return False
@@ -1306,7 +1401,7 @@ class VoiceLoop:
 
         # Phase 2: Acknowledge wake.  The state is still WAKE_DETECTED so the
         # JSONL shows the required sequence LISTENING → WAKE_DETECTED → "Yes?"
-        # → CAPTURING; the transition to CAPTURING happens only when speech
+        # → LISTENING/CAPTURE; the transition to capture happens when speech
         # capture (Phase 3) actually begins.
         logger.info("voice boundary: wake ack speech starting")
         try:
@@ -1320,7 +1415,7 @@ class VoiceLoop:
         # Phase 3: Capture speech.  Discard audio buffered before/during the
         # acknowledgement so the spoken command is read fresh and TTS output is
         # never mistaken for a follow-up command.
-        self._set_state("CAPTURING")
+        self._set_state(VoicePhase.LISTENING)
         self._reporter.listening()
         self._reporter.capture_start(max_segment_s=self._max_segment_s)
         try:
@@ -1345,6 +1440,7 @@ class VoiceLoop:
             segment.duration_s,
             len(segment.samples),
         )
+        self._set_state(VoicePhase.CAPTURE_COMPLETE)
         self._reporter.capture_end(
             duration_s=segment.duration_s,
             samples=len(segment.samples),
@@ -1359,7 +1455,7 @@ class VoiceLoop:
             return  # too short, likely noise
 
         # Phase 4: Transcribe
-        self._set_state("TRANSCRIBING")
+        self._set_state(VoicePhase.TRANSCRIBING)
         self._reporter.transcribing()
         logger.info("VOICE STT_START")
         logger.info("voice boundary: stt start (audio_s=%.3f)", segment.duration_s)
@@ -1383,6 +1479,41 @@ class VoiceLoop:
         logger.info("voice transcript: %d chars", len(text))
         logger.debug("voice transcript: %r", redact(text))
         self._reporter.transcript(text, language=result.language or "")
+
+        # Check mode phrases BEFORE gate
+        mode_cmd = classify_mode_phrase(text)
+        if mode_cmd and not self._dictating:
+            if mode_cmd == "activate_auto":
+                if self._mode == VoiceMode.AUTO:
+                    spoken = "Already in auto mode."
+                else:
+                    self._set_mode(VoiceMode.AUTO, reason="phrase")
+                    spoken = "Auto mode on."
+                self._reporter.answer(spoken)
+                self._set_state(VoicePhase.SPEAKING)
+                self._speaking_now = True
+                try:
+                    self._tts.speak(spoken)
+                finally:
+                    self._speaking_now = False
+                self._reset_auto_idle()
+                return
+            if mode_cmd == "sleep":
+                if self._mode == VoiceMode.NORMAL:
+                    spoken = "Auto mode is off."
+                else:
+                    self._set_mode(VoiceMode.NORMAL, reason="phrase")
+                    spoken = "Okay, sleeping."
+                self._reporter.answer(spoken)
+                self._set_state(VoicePhase.SPEAKING)
+                self._speaking_now = True
+                try:
+                    self._tts.speak(spoken)
+                finally:
+                    self._speaking_now = False
+                self._reset_auto_idle()
+                return
+
         if not text:
             logger.info("voice boundary: stt empty — no command; returning to wake")
             self._reporter.stt_empty()
@@ -1398,7 +1529,8 @@ class VoiceLoop:
             return
 
         # Phase 5: Route
-        self._set_state("PROCESSING")
+        self._set_state(VoicePhase.THINKING)
+        self._thinking = True
         self._reporter.thinking()
         logger.info("VOICE ROUTING_START")
         logger.info("voice boundary: routing command")
@@ -1418,24 +1550,30 @@ class VoiceLoop:
         logger.info("voice boundary: response ready (chars=%d)", len(spoken))
         self._reporter.answer(spoken)
 
-        self._set_state("SPEAKING")
+        self._thinking = False
+        self._set_state(VoicePhase.SPEAKING)
+        self._speaking_now = True
         self._reporter.speaking(backend=self._tts_backend(), chars=len(spoken))
         try:
             logger.info("VOICE TTS_START")
             logger.info("voice boundary: tts response speech starting")
             completed = self._speak_with_barge_in(spoken)
             logger.info("VOICE TTS_COMPLETE")
+            self._speaking_now = False
             if not completed:
                 # Cause-agnostic on purpose: ``_speak_with_barge_in`` already
                 # logged *why* the answer stopped (wake word, bare "stop", voice
                 # off, or the ceiling), so this line must not name one.
                 logger.info("voice boundary: answer cut short; returning to wake")
+                self._reset_auto_idle()
                 return
             logger.info("voice boundary: tts response speech done")
+            self._reset_auto_idle()
         except Exception:
             # A TTS failure is isolated: the answer was produced, the log says
             # so, and the loop still returns to READY.  Voice must never go
             # permanently deaf because a speech engine hiccuped.
+            self._speaking_now = False
             logger.exception("voice interaction failed at tts-response; continuing to listen")
             self._recover("speech synthesis failed")
             return
@@ -1655,7 +1793,7 @@ class VoiceLoop:
         exception.  Exceptions inside the reset are swallowed per component so
         a partial reset can never kill the loop.
         """
-        self._set_state("RESETTING")
+        self._set_state(VoicePhase.RESETTING)
         self._reporter.resetting()
         try:
             self._audio.flush()
@@ -1676,7 +1814,7 @@ class VoiceLoop:
         # must arm itself (flush + reset) instead of inheriting this window.
         self._stop_watch_armed = False
         self._wake_frames_read = 0
-        self._set_state("LISTENING")
+        self._set_state(VoicePhase.READY)
         self._reporter.ready(self._wake_word)
 
     def _rearm(self) -> None:
@@ -1764,6 +1902,8 @@ class VoiceLoop:
                 if timeout <= 0 or time.monotonic() >= wait_deadline:
                     logger.info("voice boundary: command window expired without speech")
                     break
+                if self._mode == VoiceMode.AUTO and self._check_auto_idle():
+                    break  # auto-idle triggered
                 if _chunk_is_speech(segment, self._silence_threshold):
                     speech_started = True
                     sample_rate = segment.sample_rate or 16_000
@@ -2017,6 +2157,21 @@ class VoiceLoop:
         music".
         """
         normalised = _normalise_speech(text)
+        # In AUTO mode, strip leading wake phrase
+        if self._mode == VoiceMode.AUTO:
+            # Common wake phrases
+            wake_prefixes = [
+                self._wake_word.lower(),
+                "hey jarvis",
+                "jarvis",
+            ]
+            for prefix in wake_prefixes:
+                prefix_norm = _normalise_speech(prefix)
+                if prefix_norm and normalised.startswith(prefix_norm):
+                    normalised = normalised[len(prefix_norm) :].strip()
+                    break
+            if not normalised:
+                return None  # keep listening silently
 
         # Stop listening entirely.
         if normalised in _STOP_LISTENING:
@@ -2047,6 +2202,20 @@ class VoiceLoop:
                 return "Dictation stopped."
             self._reporter.stop_request()
             return STOP_ACKNOWLEDGEMENT
+
+        # Mode phrases (D-B): match after stop/cancel, before dictation.
+        # Mode phrases are NOT evaluated while dictation is active.
+        mode_cmd = classify_mode_phrase(text)
+        if mode_cmd == "activate_auto" and not self._dictating:
+            if self._mode == VoiceMode.AUTO:
+                return "Already in auto mode."
+            self._set_mode(VoiceMode.AUTO, reason="phrase")
+            return "Auto mode on."
+        if mode_cmd == "sleep" and not self._dictating:
+            if self._mode == VoiceMode.NORMAL:
+                return "Auto mode is off."
+            self._set_mode(VoiceMode.NORMAL, reason="phrase")
+            return "Okay, sleeping."
 
         # Stop dictation
         if normalised in _STOP_DICTATION:

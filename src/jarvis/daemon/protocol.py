@@ -209,12 +209,14 @@ class StatusResponse(BaseModel):
     ``jarvis.voice.service.VOICE_ERROR_CODES``) exactly when
     ``voice == "error"``, so ``jarvis status`` can surface the same reason
     that ``jarvis on`` reported.
+    ``mode`` is the current voice mode: ``NORMAL`` or ``AUTO``.
     """
 
     type: Literal["status_response"] = "status_response"
     daemon: str = "running"
     voice: str = "off"
     voice_reason: str | None = None
+    mode: str = "NORMAL"
     unlocked: bool = False
     queue: int = 0
     active_task: str | None = None

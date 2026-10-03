@@ -778,6 +778,11 @@ def status() -> None:
                 console.print(f"[red]voice:[/red] {resp.voice} ({resp.voice_reason})")
             else:
                 console.print(f"[green]voice:[/green] {resp.voice}")
+            try:
+                if hasattr(resp, "mode"):
+                    console.print(f"[green]mode:[/green] {resp.mode}")
+            except Exception:  # noqa: BLE001, S110 - best effort
+                pass
             console.print(f"[green]unlocked:[/green] {resp.unlocked}")
             console.print(f"[green]queue:[/green] {resp.queue}")
             if resp.active_task:
@@ -1225,9 +1230,7 @@ def _handle_confirm_request(client: Any, task_id: str, msg: Any) -> None:
     from jarvis.daemon.client import DaemonError
     from jarvis.policy import tiers as _tiers
 
-    console.print(
-        "".join(("[yellow]approval needed[/yellow] (", _tiers.tier_label(msg.tier), ")"))
-    )
+    console.print("".join(("[yellow]approval needed[/yellow] (", _tiers.tier_label(msg.tier), ")")))
     console.print(msg.summary or "(no summary)")
     if msg.untrusted:
         console.print("[red]NOTE: this action was derived from untrusted content[/red]")
@@ -2181,9 +2184,9 @@ def benchmark_run(
 
 @benchmark_app.command("report")
 def benchmark_report(
-    results: Annotated[
-        Path, typer.Argument(help="A results CSV, or a directory of them.")
-    ] = Path("benchmarks/results"),
+    results: Annotated[Path, typer.Argument(help="A results CSV, or a directory of them.")] = Path(
+        "benchmarks/results"
+    ),
     markdown: Annotated[
         bool, typer.Option("--markdown", help="Emit Markdown for the project report.")
     ] = False,

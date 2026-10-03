@@ -105,6 +105,7 @@ listen_timeout_s = 30.0
 idle_timeout_s = 120.0
 max_session_s = 1800.0
 max_dictation_chars = 20000
+auto_idle_timeout_s = 300.0
 # Bounded window for a spoken "yes"/"no" on a Tier 1 confirmation and for a
 # spoken clarification answer.  It opens after the prompt is spoken, needs no
 # wake word, and a timeout is a refusal (fail closed).
@@ -304,6 +305,7 @@ class VoiceSettings(BaseModel):
     max_segment_s: float = 30.0
     listen_timeout_s: float = 30.0
     idle_timeout_s: float = 120.0
+    auto_idle_timeout_s: float = 300.0
     max_session_s: float = 1800.0
     max_dictation_chars: int = 20000
     #: Bounded quiet-start drain applied before every wake re-arm, in seconds
