@@ -2,6 +2,41 @@
 
 > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## STAGE 2 CLOSE-OUT (2026-10-04) — **AUTO mode and sleep.**
+
+Commits: `fd8b24d` (AUTO, `modes.py`, status), leave-phrase fix, `6e98afa` (voice-off in
+confirmation/clarification windows, AUTO wake-prefix strip, tests).
+
+**Built:** `voice/modes.py` (`VoiceMode` NORMAL/AUTO; mode-phrase matching in code, never the
+planner). The mode check runs before the transcript gate. `auto_idle_timeout_s` (default 300) is
+separate from `idle_timeout_s`. `jarvis status` shows `mode`. State vocabulary unified on
+`VoicePhase`. AUTO is never persisted: voice off or restart starts in NORMAL.
+
+### Live results
+
+| Test | Result | Note |
+|---|---|---|
+| A1 enter AUTO | **PASS** | |
+| A2 commands without wake word | **PASS** | |
+| A3 Tier 1 confirmation in AUTO | **PASS-WITH-CAVEAT** | confirmation worked; `type_text` focus failure is out of stage |
+| A3b silence refuses | **PASS** | |
+| A4 bare stop in AUTO stays in AUTO | **PASS** | |
+| A5 / A5b sleep in AUTO / NORMAL | **PASS** | |
+| A8 "turn off voice" in AUTO | **PASS-WITH-CAVEAT** | Goodbye spoken, mode reset; `voice: off` not shown in status |
+| Prefix strip in AUTO | **PASS-WITH-CAVEAT** | depends on STT accuracy |
+| A6 idle auto-sleep | **PASS** / <fill in after the run> | |
+
+### Open items (not blocking Stage 3)
+
+1. `VoiceLoop.stop()` early-return: voice-off paths also skip `voice loop stopped` (same as Stage 1
+   item 2).
+2. Test `TestRearmQuietStartGate::test_response_echo_drained_before_detector_reopens` still fails at
+   HEAD.
+3. Out of stage: STT garbles "Hey Jarvis" and "Notepad"; no `get_time` tool (Stage 4); LLM-written
+   refusal text (Stage 1 item 7).
+4. Test coverage: the 13-item table was audited by the agent; the final six-file pytest run was cut
+   off by memory limits. Last full result: **262 passed, 1 known failure**. Re-run once at Stage 10.
+
 ## STAGE 1 CLOSE-OUT (2026-10-02) — **Stage 1 CLOSED.** L3 PASS after `04bfc11`; L4 PASS-WITH-CAVEAT; L1 NOT EXERCISABLE. No Stage 2 work started.
 
 Every verdict below is read from `jarvis.jsonl`. The two daemon runs after the previous baseline
