@@ -693,6 +693,31 @@ def _is_cancel_request(text: str) -> bool:
     return len(tokens) <= _MAX_CANCEL_TOKENS and bool(_CANCEL_TOKENS & set(tokens))
 
 
+def _strip_leading_wake_phrase(text: str, wake_word: str) -> str:
+    """Remove one leading wake phrase from ``text``, leaving the rest untouched.
+
+    AUTO needs no wake word, but users still say one out of habit, so it has to
+    come off before the planner sees the request.  The phrase is *matched* on
+    its normalised words (so "Hey Jarvis, what time is it" and "hey jarvis what
+    time is it" both match) while the *original* characters are what get
+    sliced - case, punctuation and wording all survive into the submission.
+    Stripping the normalised string instead would hand the agent a lowercased,
+    punctuation-free copy of what the user actually said.
+
+    Returns the remainder, or ``""`` when the utterance was nothing but the wake
+    phrase (the caller then keeps listening instead of submitting).
+    """
+    for prefix in (wake_word, DEFAULT_WAKE_WORD, "jarvis"):
+        words = _normalise_speech(prefix).split()
+        if not words:
+            continue
+        pattern = r"^\s*" + r"\W+".join(re.escape(word) for word in words) + r"\b[\s,;:!?.\-]*"
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match is not None:
+            return text[match.end() :].strip()
+    return text.strip()
+
+
 class VoiceLoop:
     """Orchestrates the voice pipeline in a background thread.
 
@@ -2240,21 +2265,20 @@ class VoiceLoop:
         short utterance.  At the command position there is no task to cancel
         yet, and a loose match would swallow a real request such as "stop the
         music".
+
+        In AUTO the leading wake phrase is stripped from the submitted request
+        as well as from the vocabulary checks
+        (:func:`_strip_leading_wake_phrase`), and an utterance that was *only*
+        the wake phrase submits nothing at all.
         """
         normalised = _normalise_speech(text)
-        # In AUTO mode, strip leading wake phrase
+        #: What the planner is handed.  In AUTO it is the *original* utterance
+        #: with the leading wake phrase removed; in NORMAL it is ``text`` itself.
+        #: Never the normalised string: the agent should see what the user said.
+        command = text
         if self._mode == VoiceMode.AUTO:
-            # Common wake phrases
-            wake_prefixes = [
-                self._wake_word.lower(),
-                "hey jarvis",
-                "jarvis",
-            ]
-            for prefix in wake_prefixes:
-                prefix_norm = _normalise_speech(prefix)
-                if prefix_norm and normalised.startswith(prefix_norm):
-                    normalised = normalised[len(prefix_norm) :].strip()
-                    break
+            command = _strip_leading_wake_phrase(text, self._wake_word)
+            normalised = _normalise_speech(command)
             if not normalised:
                 return None  # keep listening silently
 
@@ -2357,7 +2381,7 @@ class VoiceLoop:
         # canonical phrasing; everything else reaches the planner untouched).
         if self._submit_task is not None:
             try:
-                outcome = self._submit_task(_canonical_command(text), "voice")
+                outcome = self._submit_task(_canonical_command(command), "voice")
                 return self._extract_response(outcome)
             except Exception:
                 logger.exception("voice task submission failed")

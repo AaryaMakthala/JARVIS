@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
 from tests.unit.test_daemon_voice import _FakeStore
 from tests.unit.test_voice_loop import (
+    _WAIT_TIMEOUT_S,
     FakeAsyncTTS,
     FakeAudioInput,
     FakeSTT,
@@ -18,6 +20,7 @@ from tests.unit.test_voice_loop import (
     _make_loop,
     _run_scripted,
     _scripted_wake,
+    _wait_for,
     make_silence,
     make_speech,
 )
@@ -28,6 +31,7 @@ from jarvis.daemon.server import DaemonServer
 from jarvis.voice.loop import (
     CONFIRMATION_PROMPT,
     CONFIRMATION_REFUSED,
+    REPEAT_PROMPT,
     VoiceLoop,
 )
 from jarvis.voice.modes import VoiceMode
@@ -578,3 +582,385 @@ class TestVoiceOff:
         loop._set_mode(VoiceMode.AUTO, reason="test")
         asyncio.run(server._handle_status(conn))
         assert conn.sent[-1].mode == "AUTO"
+
+
+class _FakeClock:
+    """A monotonic clock the test advances by hand.
+
+    Idle deadlines are wall-clock, so a real ``auto_idle_timeout_s=0.2`` would
+    make the test a race.  The clock is installed over ``loop.time.monotonic``
+    only, so nothing else in the process is affected.
+    """
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TestAutoSleepOnAFakeClock:
+    """Item 3: auto-sleep speaks, does not stop the loop, and is time-driven."""
+
+    def test_auto_sleep_speaks_and_does_not_stop_the_loop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = _FakeClock()
+        monkeypatch.setattr(loop_mod.time, "monotonic", clock)
+        tts = FakeTTS()
+        stop_calls: list[str] = []
+        loop = VoiceLoop(
+            audio=FakeAudioInput(segments=[make_silence(0.2)] * 400),
+            wake_detector=FakeWakeWord(detect_fn=_scripted_wake([False] * 500)),
+            stt=FakeSTT(transcribe_fn=lambda _seg: STTResult(text="what time is it")),
+            tts=tts,
+            submit_task=lambda _t, _s: _ok_answer("noon"),
+            auto_idle_timeout_s=600.0,
+            idle_timeout_s=0.0,
+        )
+        monkeypatch.setattr(loop, "stop", lambda: stop_calls.append("stop"))
+        loop._set_mode(VoiceMode.AUTO, reason="test")
+        assert loop._auto_idle_deadline == clock.now + 600.0
+
+        # Not yet: the deadline has not been reached.
+        assert loop._check_auto_idle() is False
+
+        loop.start()
+        try:
+            clock.advance(601.0)
+            deadline = time.monotonic() + _WAIT_TIMEOUT_S
+            while loop.mode == VoiceMode.AUTO and time.monotonic() < deadline:
+                time.sleep(0.005)
+        finally:
+            loop._thread.join(timeout=_WAIT_TIMEOUT_S)
+
+        assert loop.mode == VoiceMode.NORMAL
+        assert "Going back to sleep." in tts.spoken
+        assert stop_calls == [], "auto-sleep is a mode change, not a loop shutdown"
+        assert loop._auto_idle_deadline is None
+
+
+class TestNonInteractionKeepsTheSessionAlive:
+    """Item 4: an idle wait is not an interaction, in either mode."""
+
+    def test_a_shortwake__idle_timeout_never_ends_auto(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AUTO never waits for a wake word, so ``idle_timeout_s`` cannot fire."""
+        clock = _FakeClock()
+        monkeypatch.setattr(loop_mod.time, "monotonic", clock)
+        submitted: list[str] = []
+
+        def fake_submit(t: str, s: str) -> Any:
+            submitted.append(t)
+            return _ok_answer("ok")
+
+        audio = FakeAudioInput(
+            segments=[make_speech("cmd", duration_s=0.2), make_silence(1.3)] * 60
+        )
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=FakeWakeWord(detect_fn=_scripted_wake([False] * 500)),
+            stt=FakeSTT(transcribe_fn=lambda _seg: STTResult(text="what time is it")),
+            tts=FakeTTS(),
+            submit_task=fake_submit,
+            # The NORMAL idle budget is tiny; it must be inert in AUTO.
+            idle_timeout_s=0.01,
+            auto_idle_timeout_s=0.0,
+        )
+        loop._set_mode(VoiceMode.AUTO, reason="test")
+        loop.start()
+        try:
+            _wait_for(lambda: len(submitted) >= 3, _WAIT_TIMEOUT_S)
+            clock.advance(3_600.0)  # an hour of "idle"
+            time.sleep(0.05)
+        finally:
+            loop.stop()
+
+        assert len(submitted) >= 3, "AUTO stopped treating the idle timeout as terminal"
+        assert loop.mode == VoiceMode.AUTO
+        assert audio.flush_calls > 0, "each interaction must flush before it captures"
+
+    def test_a_short_auto_idle_timeout_never_fires_in_normal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = _FakeClock()
+        monkeypatch.setattr(loop_mod.time, "monotonic", clock)
+        tts = FakeTTS()
+        loop = VoiceLoop(
+            audio=FakeAudioInput(segments=[make_silence(0.2)] * 400),
+            wake_detector=FakeWakeWord(detect_fn=_scripted_wake([False] * 500)),
+            stt=FakeSTT(transcribe_fn=lambda _seg: STTResult(text="what time is it")),
+            tts=FakeTTS(),
+            idle_timeout_s=0.0,
+            auto_idle_timeout_s=1.0,
+        )
+        loop.start()
+        try:
+            clock.advance(3_600.0)
+            time.sleep(0.05)
+        finally:
+            loop.stop()
+
+        assert loop.mode == VoiceMode.NORMAL
+        assert "Going back to sleep." not in tts.spoken
+        assert loop._auto_idle_deadline is None
+
+
+class TestHalfDuplex:
+    """Item 2: one reader, and the answer's own audio never reaches the STT."""
+
+    def test_nothing_is_transcribed_while_the_answer_is_speaking(self) -> None:
+        """Speaking an answer must not put audio into the recogniser.
+
+        The loop and the recogniser are the same thread, so "half duplex" here
+        means the answer is never re-read as input: the STT call count is
+        identical either side of a spoken answer.
+        """
+        audio = FakeAudioInput(
+            segments=[make_speech("cmd", duration_s=0.2), make_silence(1.3)] * 60
+        )
+        stt = FakeSTT(transcribe_fn=lambda _seg: STTResult(text="what time is it"))
+        tts = FakeTTS()
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=FakeWakeWord(detect_fn=_scripted_wake([False] * 500)),
+            stt=stt,
+            tts=tts,
+            submit_task=lambda _t, _s: _ok_answer("half past four"),
+            auto_idle_timeout_s=0.0,
+        )
+        loop._set_mode(VoiceMode.AUTO, reason="test")
+        before = len(stt.transcribe_calls)
+        loop.start()
+        try:
+            _wait_for(lambda: "half past four" in tts.spoken, _WAIT_TIMEOUT_S)
+        finally:
+            loop.stop()
+
+        assert "half past four" in tts.spoken
+        assert len(stt.transcribe_calls) == before + 1, (
+            "the answer was transcribed as a command: not half duplex"
+        )
+
+    def test_the_buffer_is_flushed_before_every_capture(self) -> None:
+        """TTS echo can never be transcribed as the next command."""
+        audio = FakeAudioInput(
+            segments=[make_speech("cmd", duration_s=0.2), make_silence(1.3)] * 60
+        )
+        stt = FakeSTT(transcribe_fn=lambda _seg: STTResult(text="what time is it"))
+        loop = VoiceLoop(
+            audio=audio,
+            wake_detector=FakeWakeWord(detect_fn=_scripted_wake([False] * 500)),
+            stt=stt,
+            tts=FakeTTS(),
+            submit_task=lambda _t, _s: _ok_answer("half past four"),
+            auto_idle_timeout_s=0.0,
+        )
+        loop._set_mode(VoiceMode.AUTO, reason="test")
+        loop.start()
+        try:
+            _wait_for(lambda: audio.flush_calls >= 3, _WAIT_TIMEOUT_S)
+        finally:
+            loop.stop()
+
+        # One flush per interaction: capture never starts on buffered audio.
+        assert audio.flush_calls >= 3
+        assert len(stt.transcribe_calls) == audio.flush_calls
+
+
+class TestConfirmationAnswersStayInTheConfirmation:
+    """Item 6: yes / no / silence belong to the confirmation, not the pipeline."""
+
+    @pytest.mark.parametrize(
+        ("answer", "approved"),
+        [("yes", True), ("yeah", True), ("no", False), ("", False)],
+    )
+    def test_answers_reach_the_confirmation_only(self, answer: str, approved: bool) -> None:
+        loop, _, _, stt, _ = _make_loop(audio_segments=[make_speech("x", duration_s=0.5)] * 6)
+        submitted: list[str] = []
+
+        def spy(text: str, source: str) -> Any:
+            submitted.append(text)
+            return _ok_answer("should not happen")
+
+        loop._submit_task = spy
+        stt._transcribe_fn = lambda _seg: STTResult(text=answer or "...")
+        loop._set_mode(VoiceMode.AUTO, reason="test")
+
+        seen: list[dict] = []
+        # Silence never reaches the recogniser, so "..." becomes an empty answer
+        # and the window fails closed - both paths must refuse or approve the
+        # confirmation and never call the planner.
+        loop.confirm_by_voice(
+            {"tier": 1, "summary": "lock my computer", "action_hash": "h"},
+            on_confirmation=seen.append,
+            rearm_timeout_s=1.0,
+        )
+
+        assert len(seen) == 1
+        assert seen[0]["action_hash"] == "h"
+        assert submitted == []
+        assert loop._voice_off_requested is False
+        assert loop.mode == VoiceMode.AUTO
+
+
+class TestPolicyGateLevel:
+    """Item 7: the gate's own decision is what voice honours."""
+
+    def test_tier_1_reaches_voice_confirmation_and_tier_3_does_not(self) -> None:
+        from jarvis.agent.nodes.policy_gate import confirmation_payload
+        from jarvis.agent.state import Decision
+
+        loop, _, _, _, tts = _make_loop()
+        tier1 = Decision(
+            step_id="s1",
+            tier=1,
+            allowed=True,
+            needs_confirm=True,
+            needs_unlock=False,
+            summary="lock my computer",
+            action_hash="h" * 64,
+        )
+        tier3 = Decision(
+            step_id="s2",
+            tier=3,
+            allowed=False,
+            needs_confirm=False,
+            needs_unlock=False,
+            summary="disable the firewall",
+            action_hash="j" * 64,
+            reasons=["Tier 3 is blocked in code"],
+        )
+
+        # Tier 3 is refused by the gate, so no payload is ever published.
+        assert tier3.allowed is False
+        assert tier3.needs_confirm is False
+
+        # Tier 1 is published, and the voice loop is willing to ask about it.
+        payload = confirmation_payload(tier1, untrusted=False)
+        assert payload["tier"] == 1
+        assert loop.can_confirm_by_voice(payload) is True
+
+        # Were a Tier 3 payload ever published, the loop still refuses it.
+        assert loop.can_confirm_by_voice(confirmation_payload(tier3, untrusted=False)) is False
+
+        # And a Tier 1 confirmation really is offered by voice, not just allowed.
+        seen: list[dict] = []
+        loop.confirm_by_voice(payload, on_confirmation=seen.append, rearm_timeout_s=1.0)
+        assert len(seen) == 1
+        assert seen[0]["approved"] is False, "silence must never approve"
+        assert any(CONFIRMATION_PROMPT in text for text in tts.spoken)
+
+
+class TestStateVocabularyIsClosed:
+    """Item 11: the phase vocabulary is exactly VoicePhase, with no synonyms."""
+
+    def test_no_capturing_or_processing_anywhere_in_the_tree(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        offenders: list[str] = []
+        for path in sorted(
+            [*root.joinpath("src").rglob("*.py"), *root.joinpath("tests").rglob("*.py")]
+        ):
+            body = path.read_text(encoding="utf-8", errors="ignore").lower()
+            for banned in ("capturing", "processing"):
+                if banned in body:
+                    offenders.append(f"{path.relative_to(root)}: {banned}")
+        assert offenders == []
+
+    def test_every_reported_phase_is_a_voice_phase(self) -> None:
+        loop, _, _, _, _ = _make_loop(
+            stt_results=[STTResult(text="what time is it")],
+            submit_task=lambda _t, _s: _ok_answer("done"),
+        )
+        loop._reporter = _PhaseRecorder()
+        loop._run_interaction()
+        allowed = {phase.value for phase in VoicePhase}
+        assert [n for n in loop._reporter.phases if n not in allowed] == []  # type: ignore[attr-defined]
+
+
+class TestWakePrefixReachesThePlannerStripped:
+    """Item 12: the wake phrase comes off the *submitted* request in AUTO."""
+
+    def test_regression_the_wake_phrase_never_reaches_the_planner(self) -> None:
+        submitted: list[str] = []
+
+        def fake_submit(t: str, s: str) -> Any:
+            submitted.append(t)
+            return _ok_answer("half past four")
+
+        loop, _, _, _, _ = _make_loop(submit_task=fake_submit)
+        loop._route("activate auto mode")
+
+        assert loop._route("hey jarvis what time is it") == "half past four"
+        assert submitted == ["what time is it"]
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("jarvis what time is it", "what time is it"),
+            ("Hey Jarvis, what's the time?", "what's the time?"),
+            ("  jarvis   Lock  My  System ", "Lock  My  System"),
+            ("What time is it", "What time is it"),
+        ],
+    )
+    def test_case_and_punctuation_survive_the_strip(self, text: str, expected: str) -> None:
+        submitted: list[str] = []
+        loop, _, _, _, _ = _make_loop(
+            submit_task=lambda t, s: submitted.append(t) or _ok_answer("ok")
+        )
+        loop._route("activate auto mode")
+        loop._route(text)
+        assert submitted == [expected]
+
+    def test_normal_mode_submits_the_text_untouched(self) -> None:
+        submitted: list[str] = []
+        loop, _, _, _, _ = _make_loop(
+            submit_task=lambda t, s: submitted.append(t) or _ok_answer("ok")
+        )
+        assert loop.mode == VoiceMode.NORMAL
+        loop._route("hey jarvis what time is it")
+        assert submitted == ["hey jarvis what time is it"]
+
+    @pytest.mark.parametrize("text", ["jarvis", "hey jarvis", "Hey Jarvis."])
+    def test_a_bare_wake_phrase_submits_nothing(self, text: str) -> None:
+        submitted: list[str] = []
+        loop, _, _, _, _ = _make_loop(
+            submit_task=lambda t, s: submitted.append(t) or _ok_answer("ok")
+        )
+        loop._route("activate auto mode")
+        assert loop._route(text) is None
+        assert submitted == []
+        assert loop.mode == VoiceMode.AUTO, "keep listening, do not leave AUTO"
+
+
+class TestNoiseIsNotAnInteraction:
+    """Item 5: captured noise must not buy the session more time."""
+
+    def test_rejected_audio_leaves_the_auto_deadline_where_it_was(self) -> None:
+        loop, _audio, _, stt, tts = _make_loop(
+            audio_segments=[make_speech("x", duration_s=0.4)] * 8,
+            submit_task=lambda _t, _s: pytest.fail("noise reached the planner"),
+        )
+        loop._auto_idle_timeout_s = 600.0
+        loop._set_mode(VoiceMode.AUTO, reason="test")
+        loop._auto_idle_deadline = time.monotonic() + 600.0
+        deadline = loop._auto_idle_deadline
+
+        # Unusable audio: below the usability gate, so nothing is answered.
+        stt._transcribe_fn = lambda _seg: STTResult(text="uh")
+        loop._run_interaction()
+
+        assert len(stt.transcribe_calls) == 1, "the noise was never captured"
+        assert loop._auto_idle_deadline == deadline, "noise postponed the auto sleep"
+        assert REPEAT_PROMPT in " ".join(tts.spoken)
+        assert loop.mode == VoiceMode.AUTO
+
+        # A second unusable capture is equally harmless.
+        loop._run_interaction()
+        assert len(stt.transcribe_calls) == 2
+        assert loop._auto_idle_deadline == deadline
+        assert loop._check_auto_idle() is False, "the deadline must still be live"
