@@ -1481,7 +1481,7 @@ class VoiceLoop:
         self._reporter.transcript(text, language=result.language or "")
 
         # Check mode phrases BEFORE gate
-        mode_cmd = classify_mode_phrase(text)
+        mode_cmd = classify_mode_phrase(text, self._mode)
         if mode_cmd and not self._dictating:
             if mode_cmd == "activate_auto":
                 if self._mode == VoiceMode.AUTO:
@@ -2205,7 +2205,7 @@ class VoiceLoop:
 
         # Mode phrases (D-B): match after stop/cancel, before dictation.
         # Mode phrases are NOT evaluated while dictation is active.
-        mode_cmd = classify_mode_phrase(text)
+        mode_cmd = classify_mode_phrase(text, self._mode)
         if mode_cmd == "activate_auto" and not self._dictating:
             if self._mode == VoiceMode.AUTO:
                 return "Already in auto mode."

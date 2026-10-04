@@ -2,23 +2,20 @@
 
 from __future__ import annotations
 
-import logging
-import re
-
-from jarvis.voice.loop import VoiceLoop
-from jarvis.voice.modes import VoiceMode
+import pytest
 from tests.unit.test_voice_loop import (
-    FakeAsyncTTS,
     FakeAudioInput,
     FakeSTT,
     FakeTTS,
     FakeWakeWord,
     STTResult,
     _make_loop,
-    _run_scripted,
     _scripted_wake,
     make_speech,
 )
+
+from jarvis.voice.loop import VoiceLoop
+from jarvis.voice.modes import VoiceMode
 
 
 class TestModeSwitching:
@@ -41,8 +38,8 @@ class TestModeSwitching:
         for phrase in ("enter auto mode", "start auto mode"):
             submitted: list[str] = []
 
-            def fake_submit(text: str, source: str):
-                submitted.append(text)
+            def fake_submit(text: str, source: str, _seen: list[str] = submitted):
+                _seen.append(text)
                 return type("Outcome", (), {"final_answer": "ok", "confirmation": None})()
 
             loop, _, _, _, _ = _make_loop(submit_task=fake_submit)
@@ -106,9 +103,7 @@ class TestAutoBehavior:
             submitted.append(text)
             return type("Outcome", (), {"final_answer": f"ok:{text}", "confirmation": None})()
 
-        audio = FakeAudioInput(
-            segments=[make_speech("test", duration_s=0.2)] * 40
-        )
+        audio = FakeAudioInput(segments=[make_speech("test", duration_s=0.2)] * 40)
         wake = FakeWakeWord(detect_fn=_scripted_wake([False, False, False, False]))
         loop = VoiceLoop(
             audio=audio,
@@ -145,3 +140,135 @@ class TestModeEdgeCases:
         from jarvis.voice import modes
 
         assert modes.classify_mode_phrase("what is auto mode in cars") is None
+
+
+class TestBareSleepLeaveAUTO:
+    """The short ways a user says "leave AUTO", and the sentences that must not.
+
+    Live evidence (Stage 2): in AUTO, "Jaro Sleep" and "Sleep." were rejected
+    by the usability gate and "Auto-mod off" went to the planner, because only
+    the fixed three-word phrases matched.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Sleep.",
+            "Jaro Sleep",
+            "Jarwae sleep",
+            "Auto-mod off",
+            "auto mode off",
+            "auto mod off",
+            "auto mood off",
+            "turn off auto mode",
+            "exit auto mode",
+            "leave auto mode",
+            "stop auto mode",
+        ],
+    )
+    def test_leave_phrases_match_in_auto(self, text: str) -> None:
+        from jarvis.voice import modes
+
+        assert modes.classify_mode_phrase(text, VoiceMode.AUTO) == "sleep"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "i cant sleep",
+            "what is sleep mode",
+            "how long should i sleep",
+        ],
+    )
+    def test_ordinary_sentences_never_match_in_auto(self, text: str) -> None:
+        from jarvis.voice import modes
+
+        assert modes.classify_mode_phrase(text, VoiceMode.AUTO) is None
+
+    @pytest.mark.parametrize("text", ["Sleep.", "sleep", "Jaro Sleep"])
+    def test_bare_sleep_is_unmatched_in_normal(self, text: str) -> None:
+        from jarvis.voice import modes
+
+        assert modes.classify_mode_phrase(text, VoiceMode.NORMAL) is None
+
+    def test_auto_mode_off_still_answers_in_normal(self) -> None:
+        """ "auto mode off" is unambiguous in NORMAL too: say it is already off."""
+        from jarvis.voice import modes
+
+        assert modes.classify_mode_phrase("auto mode off", VoiceMode.NORMAL) == "sleep"
+
+
+class TestBareSleepRouting:
+    """End-to-end through _route: the mode changes, and the gate is not reached."""
+
+    def test_bare_sleep_leaves_auto(self) -> None:
+        submitted: list[str] = []
+
+        def fake_submit(text: str, source: str):
+            submitted.append(text)
+            return type("Outcome", (), {"final_answer": "ok", "confirmation": None})()
+
+        loop, _, _, _, _ = _make_loop(submit_task=fake_submit)
+        loop._route("activate auto mode")
+        assert loop.mode == VoiceMode.AUTO
+        assert loop._route("Sleep.") == "Okay, sleeping."
+        assert loop.mode == VoiceMode.NORMAL
+        assert submitted == []
+
+    def test_garbled_wake_sleep_leaves_auto(self) -> None:
+        submitted: list[str] = []
+
+        def fake_submit(text: str, source: str):
+            submitted.append(text)
+            return type("Outcome", (), {"final_answer": "ok", "confirmation": None})()
+
+        loop, _, _, _, _ = _make_loop(submit_task=fake_submit)
+        loop._route("activate auto mode")
+        assert loop._route("Jaro Sleep") == "Okay, sleeping."
+        assert loop.mode == VoiceMode.NORMAL
+        assert submitted == []
+
+    def test_auto_mod_off_leaves_auto(self) -> None:
+        submitted: list[str] = []
+
+        def fake_submit(text: str, source: str):
+            submitted.append(text)
+            return type("Outcome", (), {"final_answer": "ok", "confirmation": None})()
+
+        loop, _, _, _, _ = _make_loop(submit_task=fake_submit)
+        loop._route("activate auto mode")
+        assert loop._route("Auto-mod off") == "Okay, sleeping."
+        assert loop.mode == VoiceMode.NORMAL
+        assert submitted == []
+
+    def test_auto_mode_off_in_normal_says_already_off(self) -> None:
+        submitted: list[str] = []
+
+        def fake_submit(text: str, source: str):
+            submitted.append(text)
+            return type("Outcome", (), {"final_answer": "ok", "confirmation": None})()
+
+        loop, _, _, _, _ = _make_loop(submit_task=fake_submit)
+        assert loop.mode == VoiceMode.NORMAL
+        assert loop._route("auto mode off") == "Auto mode is off."
+        assert loop.mode == VoiceMode.NORMAL
+        assert submitted == []
+
+    def test_bare_sleep_in_normal_is_not_a_mode_command(self) -> None:
+        submitted: list[str] = []
+
+        def fake_submit(text: str, source: str):
+            submitted.append(text)
+            return type("Outcome", (), {"final_answer": "ok", "confirmation": None})()
+
+        loop, _, _, _, _ = _make_loop(submit_task=fake_submit)
+        assert loop.mode == VoiceMode.NORMAL
+        loop._route("Sleep.")
+        assert loop.mode == VoiceMode.NORMAL
+        assert submitted == ["Sleep."]
+
+    def test_stop_auto_mode_wins_over_nothing_but_is_not_a_cancel(self) -> None:
+        """Stop vocabulary is checked before mode phrases, so it still wins."""
+        loop, _, _, _, _ = _make_loop()
+        loop._route("activate auto mode")
+        assert loop._route("stop") == "Stopped."
+        assert loop.mode == VoiceMode.AUTO
