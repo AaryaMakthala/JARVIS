@@ -1250,6 +1250,8 @@ def _handle_confirm_request(client: Any, task_id: str, msg: Any) -> None:
             action_hash=msg.action_hash,
             password=password,
             typed_confirmation=typed,
+            confirmation_id=getattr(msg, "confirmation_id", ""),
+            plan_hash=getattr(msg, "plan_hash", ""),
         )
         console.print("[dim](working...)[/dim]")
     except DaemonError as exc:

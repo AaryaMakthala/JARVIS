@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from platformdirs import PlatformDirs
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
 
 APP_NAME = "jarvis"
@@ -78,6 +78,16 @@ allowed_roots = ["~/Documents/JarvisWorkspace", "~/Desktop", "~/Downloads"]
 delete_preview_threshold = 1
 typed_confirmation_for_folders = true
 
+[paths]
+# Where a bare filename goes (e.g. "create notes.txt"). Empty = the user's real
+# Desktop read from Windows Known Folders (OneDrive-redirected on some PCs).
+default_save_dir = ""
+
+[paths.aliases]
+# Extra named folders usable as a location prefix, e.g.
+#   jarvis = "C:/Users/me/OneDrive/Desktop/Jarvis"
+# Values must be absolute. Alias roots are never added to allowed_roots.
+
 [apps]
 notepad = "notepad.exe"
 calculator = "calc.exe"
@@ -115,6 +125,16 @@ confirm_window_s = 8.0
 # wake word, also cuts JARVIS off while it is SPEAKING.  Gates only that new
 # speaking-state capability; the in-flight watch already accepted a bare cancel.
 bare_stop_while_busy = true
+
+# Stage 3 Tier 2 relaxation.  While this is false (the default) voice may
+# confirm a Tier 1 action only and every Tier 2 confirmation needs the terminal
+# password.  Setting it to true RELAXES the "voice is Tier 1 only" rule: a
+# spoken "proceed" may then approve delete_path / whatsapp_send after a
+# readback.  It never lowers a tier, never unlocks the session, never Tier 3.
+allow_tier2_by_voice = false
+# Speak "I heard: <transcript>" before a Tier >= 1 confirmation prompt.  The
+# transcript is spoken only; the INFO log records a flag, never the text (B9).
+echo_heard = true
 
 [whatsapp]
 app_name = "WhatsApp"
@@ -234,6 +254,42 @@ class PolicySettings(BaseModel):
     typed_confirmation_for_folders: bool = True
 
 
+class PathSettings(BaseModel):
+    """Default save folder and folder aliases (Step D1).
+
+    ``default_save_dir`` is where a bare filename goes; empty means the user's
+    real Desktop (Windows Known Folder).  ``aliases`` maps a name to an
+    absolute folder that a path prefix may use.  Neither is checked against
+    ``allowed_roots`` here -- that stays the policy engine's job, and an alias
+    outside the roots is simply refused later (never auto-added).
+    """
+
+    default_save_dir: str = ""
+    aliases: dict[str, str] = {}
+
+    @field_validator("default_save_dir")
+    @classmethod
+    def _default_save_dir_absolute(cls, value: str) -> str:
+        return _require_absolute(value, "paths.default_save_dir")
+
+    @field_validator("aliases")
+    @classmethod
+    def _alias_values_absolute(cls, value: dict[str, str]) -> dict[str, str]:
+        for name, target in value.items():
+            _require_absolute(target, f"paths.aliases.{name}")
+        return value
+
+
+def _require_absolute(value: str, what: str) -> str:
+    """Return ``value`` unchanged, or raise unless it is blank or absolute."""
+    if not value:
+        return value
+    expanded = os.path.expandvars(os.path.expanduser(str(value)))
+    if not os.path.isabs(expanded):
+        raise ValueError(f"{what} must be an absolute path, got {value!r}")
+    return value
+
+
 class AppSettings(BaseModel):
     """Allowlist of applications the agent may launch (name -> command)."""
 
@@ -325,6 +381,21 @@ class VoiceSettings(BaseModel):
     #: already accepted a bare cancel before this flag existed, so it behaves
     #: identically either way.  ``False`` restores wake-word-only barge-in.
     bare_stop_while_busy: bool = True
+    #: Owner opt-in for the **Stage 3** Tier 2 relaxation.  While this is
+    #: ``False`` (the default) voice may confirm a Tier 1 action only, exactly as
+    #: docs/03 §7.8 requires, and every Tier 2 confirmation needs the terminal
+    #: password.  Setting it to ``True`` RELAXES the "voice is Tier 1 only" rule:
+    #: a spoken ``"proceed"`` may then approve the two named Tier 2 tools
+    #: (``delete_path``, ``whatsapp_send``) after a readback, and only after
+    #: :func:`jarvis.voice.tier2_voice.allowed` re-verifies every condition.
+    #: It never lowers a tier, never unlocks the session, and never reaches
+    #: Tier 3.  See docs/03 §7.9.
+    allow_tier2_by_voice: bool = False
+    #: Speak ``"I heard: <transcript>"`` before a Tier >= 1 confirmation prompt,
+    #: so the user can catch a mis-heard command before answering it.  The
+    #: transcript is spoken only; the INFO log records a flag/count, never the
+    #: text (B9 / docs/03 §7.10).
+    echo_heard: bool = True
     #: Print the ``[VOICE]``/``[LLM]`` lifecycle lines to the console.  The
     #: JSONL log is written either way; turning this off only silences the
     #: terminal, never the diagnostics.
@@ -403,6 +474,7 @@ class Settings(BaseSettings):
     llm: LLMSettings = LLMSettings()
     agent: AgentSettings = AgentSettings()
     policy: PolicySettings = PolicySettings()
+    paths: PathSettings = PathSettings()
     apps: AppSettings = AppSettings()
     daemon: DaemonSettings = DaemonSettings()
     voice: VoiceSettings = VoiceSettings()

@@ -21,6 +21,7 @@ from typing import Any
 
 from jarvis.agent.context import VoiceToolsFacade, make_app_context
 from jarvis.config import LLMSettings, ProviderModels, Settings, VoiceSettings
+from jarvis.daemon.confirmations import plan_hash
 from jarvis.daemon.protocol import (
     AuthMessage,
     ChatMessage,
@@ -367,10 +368,18 @@ class TestVoiceSourceGuard:
         server = self._server()
         slot = TaskSlot(task_id="t1", text="x", source="chat", owner_id="c1", confirm_tier=1)
         server._active = slot
+        pending = server._confirmations.issue("t1", "s1", 1, "h" * 64, plan_hash(["h" * 64]))
         conn = _FakeConn()
         asyncio.run(
             server._handle_confirm(
-                ConfirmResponse(task_id="t1", approved=True, action_hash="h" * 64, source="voice"),
+                ConfirmResponse(
+                    task_id="t1",
+                    approved=True,
+                    action_hash="h" * 64,
+                    source="voice",
+                    confirmation_id=pending.confirmation_id,
+                    plan_hash=pending.plan_hash,
+                ),
                 conn,
             )
         )
@@ -515,6 +524,7 @@ class _VoiceLoopStub:
     def __init__(self, can_approve: bool = True) -> None:
         self.can_approve = can_approve
         self.confirmation_payloads: list[dict[str, Any]] = []
+        self.transcripts: list[Any] = []
 
     def is_active(self) -> bool:
         return True
@@ -522,9 +532,18 @@ class _VoiceLoopStub:
     def can_confirm_by_voice(self, payload: dict[str, Any]) -> bool:
         return self.can_approve
 
-    def confirm_by_voice(self, payload: dict[str, Any], *, on_confirmation: Any = None) -> str:
+    def confirm_by_voice(
+        self,
+        payload: dict[str, Any],
+        *,
+        on_confirmation: Any = None,
+        transcript: Any = None,
+    ) -> str:
+        # ``transcript`` (Stage 3 "I heard") is part of the production signature
+        # now; the stub records it instead of speaking it.
         payload = dict(payload)
         self.confirmation_payloads.append(payload)
+        self.transcripts.append(transcript)
         if on_confirmation is not None:
             on_confirmation(
                 {"approved": self.can_approve, "action_hash": payload.get("action_hash", "")}
@@ -552,11 +571,14 @@ class _VoiceBridgeServer(DaemonServer):
 
     def _worker_run(self, slot: TaskSlot) -> None:  # type: ignore[override]
         self.worker_events.append("started")
+        pending = self._confirmations.issue(slot.task_id, "s1", 1, "h" * 64, plan_hash(["h" * 64]))
         payload = {
             "tier": 1,
             "summary": "create file",
             "action_hash": "h" * 64,
             "typed_confirmation": None,
+            "confirmation_id": pending.confirmation_id,
+            "plan_hash": pending.plan_hash,
         }
         self._run_voice_confirmation(slot, payload)
         slot.event.clear()

@@ -204,7 +204,16 @@ class ConfirmationRequest(BaseModel):
     typed_confirmation: str | None = None
     resolved_paths: list[str] = Field(default_factory=list)
     action_hash: str
+    #: I3 correlation fields.  Defaulted so payloads/checkpoints written before
+    #: these existed still validate; not wired into any flow yet.
+    confirmation_id: str = ""
+    plan_hash: str = ""
+    expires_at: float = 0.0
     untrusted: bool = False
+    #: I3 + batch: the ordered list of (step_id, action_hash) pairs this
+    #: confirmation covers, when it is a plan-level approval.  Defaulted so old
+    #: payloads still load; not on the checkpoint allowlist.
+    eligible: list[tuple[str, str]] | None = None
 
 
 class ClarificationRequest(BaseModel):

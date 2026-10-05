@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from jarvis.daemon.confirmations import plan_hash
 from jarvis.daemon.protocol import (
     AuthMessage,
     StatusRequest,
@@ -347,12 +348,20 @@ class TestRequestAcks:
         server = _server()
         slot = TaskSlot(task_id="t1", text="setup", source="chat", owner_id="oid")
         server._active = slot
+        pending = server._confirmations.issue("t1", "s1", 1, "h", plan_hash(["h"]))
         writer = AsyncMock()
         conn = ClientConnection(writer=writer, reader=AsyncMock())
 
         asyncio.run(
             server._handle_confirm(
-                ConfirmResponse(task_id="t1", approved=True, action_hash="h"), conn
+                ConfirmResponse(
+                    task_id="t1",
+                    approved=True,
+                    action_hash="h",
+                    confirmation_id=pending.confirmation_id,
+                    plan_hash=pending.plan_hash,
+                ),
+                conn,
             )
         )
         assert slot.resume_answer == {"approved": True, "action_hash": "h"}
@@ -454,11 +463,19 @@ class TestAckPrecedesTheWorkerWakeup:
         server = _server()
         slot = TaskSlot(task_id="t1", text="lock", source="chat", owner_id="oid")
         server._active = slot
+        pending = server._confirmations.issue("t1", "s1", 1, "h", plan_hash(["h"]))
         order = self._run_handler(
             server,
             slot,
             lambda conn: server._handle_confirm(
-                ConfirmResponse(task_id="t1", approved=True, action_hash="h"), conn
+                ConfirmResponse(
+                    task_id="t1",
+                    approved=True,
+                    action_hash="h",
+                    confirmation_id=pending.confirmation_id,
+                    plan_hash=pending.plan_hash,
+                ),
+                conn,
             ),
         )
         assert order == ["ack", "worker-woken"]

@@ -26,6 +26,7 @@ class Step(BaseModel):
     rationale: str  # short, user-visible
     expect: str = ""  # human-readable success condition (used by verify + replan)
     depends_on_untrusted: bool = False  # set when args derive from web/file text
+    resolved_from_runtime: bool = False  # args depend on earlier runtime output (fail closed)
 
 
 class Plan(BaseModel):

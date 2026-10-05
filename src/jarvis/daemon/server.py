@@ -32,6 +32,7 @@ import psutil
 
 from jarvis import logging_setup
 from jarvis.config import Settings, daemon_runtime_file, load_settings, log_file
+from jarvis.daemon.confirmations import ConfirmationRegistry, plan_hash
 from jarvis.daemon.protocol import (
     MAX_MESSAGE_SIZE,
     AuthMessage,
@@ -57,6 +58,8 @@ from jarvis.memory import open_memory
 from jarvis.policy.unlock import UnlockManager
 from jarvis.secrets import SecretStore
 from jarvis.tools.base import Cancelled, CancelToken
+from jarvis.voice.tier2_voice import KEY_VOICE_TIER2
+from jarvis.voice.tier2_voice import allowed as tier2_allowed
 
 try:
     from jarvis.voice.service import VoiceService
@@ -198,6 +201,11 @@ class TaskSlot:
     event: threading.Event = field(default_factory=threading.Event)
     confirm_payload: dict[str, Any] | None = None
     confirm_tier: int = 0  # tier of the pending confirmation (for IPC guarding)
+    #: The pending confirmation's own payload, kept after ``confirm_payload`` is
+    #: consumed for dispatch.  Stage 3 needs it to re-verify a voice Tier 2
+    #: approval (``tool``/``allowed``/``readback_args``); the registry check
+    #: still runs first and is what binds the id.
+    confirm_evidence: dict[str, Any] | None = None
     resume_answer: dict[str, Any] | None = None
     result_text: str | None = None
     error: str | None = None
@@ -261,6 +269,8 @@ class DaemonServer:
         self._token = self._store.get("ipc_token") or ""
         self._unlock = UnlockManager(self._store, settings=self._settings)
         self._task_runtime = TaskRuntime()
+        #: I3 confirmation correlation.  In-memory, daemon-transient; never checkpointed.
+        self._confirmations = ConfirmationRegistry()
         self._clients: dict[str, ClientConnection] = {}
         self._queue: list[TaskSlot] = []
         self._active: TaskSlot | None = None
@@ -680,6 +690,7 @@ class DaemonServer:
             max_spoken_chars=self._settings.voice.max_spoken_chars,
             report_status=self._settings.voice.status,
             echo_transcript=self._settings.voice.echo_transcript,
+            voice_settings=self._settings.voice,
             routing_report=self._llm_routing_report,
         )
 
@@ -802,6 +813,8 @@ class DaemonServer:
                     needs_password=payload.get("needs_unlock", False),
                     typed_confirmation=payload.get("typed_confirmation"),
                     action_hash=payload.get("action_hash", ""),
+                    confirmation_id=payload.get("confirmation_id", ""),
+                    plan_hash=payload.get("plan_hash", ""),
                     untrusted=payload.get("untrusted", False),
                 )
             await owner.send(req)
@@ -1216,6 +1229,24 @@ class DaemonServer:
                     return value
         return None
 
+    def _tier2_voice_ok(self, slot: TaskSlot) -> tuple[bool, str]:
+        """Whether this slot's pending confirmation may be approved by voice.
+
+        Delegates every condition to
+        :func:`jarvis.voice.tier2_voice.allowed` (flag, Tier exactly 2, named
+        tool, not blocked, no typed folder name, exact readback) using the
+        payload the graph's own gate produced.  Returns ``(ok, reason)``; the
+        reason is for the log.  Pure delegation - no policy decision is made
+        here, and nothing is unlocked.
+        """
+        payload = slot.confirm_evidence or {}
+        return tier2_allowed(
+            payload.get("tool"),
+            payload,
+            self._settings,
+            args=payload.get("readback_args"),
+        )
+
     def _run_voice_confirmation(self, slot: TaskSlot, payload: dict[str, Any]) -> None:
         """Drive a Tier-1 confirmation by voice from the worker thread.
 
@@ -1240,13 +1271,45 @@ class DaemonServer:
             slot.event.set()
             return
 
+        confirmation_id = str(payload.get("confirmation_id") or "")
+        plan_hash_value = str(payload.get("plan_hash") or "")
+
         def responder(answer: dict[str, Any]) -> Any:
+            # I3: the daemon holds the pending id, so a spoken approval is
+            # checked against the exact confirmation before it can resume.
+            if isinstance(answer, dict) and answer.get("approved"):
+                check = self._confirmations.check(
+                    confirmation_id,
+                    plan_hash_value,
+                    str(answer.get("action_hash") or payload.get("action_hash") or ""),
+                )
+                if check.ok:
+                    self._confirmations.resolve(confirmation_id)
+                    # Stage 3: mark a voice-approved Tier 2 answer for the gate,
+                    # which re-verifies it independently.  The registry check
+                    # above has already run and passed.
+                    if int(payload.get("tier", 0) or 0) >= 2:
+                        ok, reason = tier2_allowed(
+                            payload.get("tool"),
+                            payload,
+                            self._settings,
+                            args=payload.get("readback_args"),
+                        )
+                        if ok:
+                            answer[KEY_VOICE_TIER2] = True
+                        else:
+                            logger.info("voice tier 2 answer not marked: %s", reason)
+                else:
+                    logger.warning("voice confirmation rejected: %s", check.reason)
+                    answer = {"approved": False, "action_hash": answer.get("action_hash")}
             slot.resume_answer = answer
             slot.event.set()
             return None
 
         try:
-            loop.confirm_by_voice(payload, on_confirmation=responder)
+            loop.confirm_by_voice(
+                payload, on_confirmation=responder, transcript=slot.text
+            )
         except Exception:
             logger.exception("voice confirmation failed; refusing")
             slot.resume_answer = {"approved": False, "action_hash": payload.get("action_hash", "")}
@@ -1361,9 +1424,43 @@ class DaemonServer:
                 if outcome.confirmation:
                     payload = dict(outcome.confirmation)
                     kind = outcome.interrupt_kind  # "confirm" | "clarification"
+                    # I3: issue the correlation id before publishing, so the
+                    # client answers against the exact confirmation it saw.
+                    # issue() supersedes this task's older pending ids.
+                    if kind == "confirm":
+                        # Honour a batch plan_hash carried in the payload (Stage 3)
+                        # rather than recomputing a single-step one: the agent may
+                        # publish one interrupt covering several Tier 1 steps.
+                        carry_plan_hash = str(payload.get("plan_hash") or "")
+                        step_ids = payload.get("eligible") or []
+                        if (
+                            kind == "confirm"
+                            and carry_plan_hash
+                            and isinstance(step_ids, list)
+                            and len(step_ids) >= 2
+                        ):
+                            pending = self._confirmations.issue(
+                                slot.task_id,
+                                str(payload.get("step_id") or ""),
+                                int(payload.get("tier", 0) or 0),
+                                str(payload.get("action_hash") or ""),
+                                carry_plan_hash,
+                            )
+                        else:
+                            pending = self._confirmations.issue(
+                                slot.task_id,
+                                str(payload.get("step_id") or ""),
+                                int(payload.get("tier", 0) or 0),
+                                str(payload.get("action_hash") or ""),
+                                plan_hash([str(payload.get("action_hash") or "")]),
+                            )
+                        payload["confirmation_id"] = pending.confirmation_id
+                        payload["plan_hash"] = pending.plan_hash
+                        payload["expires_at"] = pending.expires_at
                     # Signal the loop: "here's an interrupt for the client".
                     slot.confirm_payload = payload
                     slot.confirm_tier = int(payload.get("tier", 0) or 0)
+                    slot.confirm_evidence = payload
                     # Clear the answer event BEFORE waking dispatch so a reply
                     # that lands right after the signal can never be missed.
                     slot.event.clear()
@@ -1439,18 +1536,38 @@ class DaemonServer:
             )
             return
 
-        # Tier 2+ can never be approved by voice (docs/03 §7.8): anything that
-        # claims a voice origin for a Tier 2+ action is refused here, on top of
-        # the refusal inside the worker's own voice-confirmation path.
+        # Stage 3: voice is Tier 1 only *unless* the owner enabled the Tier 2
+        # relaxation.  Anything that claims a voice origin for a Tier 2+ action
+        # is still refused here unless tier2_voice re-verifies every condition
+        # (flag on, Tier exactly 2, a named tool, not blocked, no typed folder
+        # name, exact readback).  Default flag off => identical refusal to before.
         if msg.source == "voice" and slot.confirm_tier >= 2:
+            ok, reason = self._tier2_voice_ok(slot)
+            if not ok:
+                await conn.send(
+                    ErrorMessage(
+                        code="tier_requires_terminal",
+                        message="this action requires terminal confirmation — it cannot be approved by voice",
+                        task_id=msg.task_id,
+                    )
+                )
+                logger.info("voice tier 2 confirm refused: %s", reason)
+                return
+
+        # I3: the answer must correspond to this task's exact pending
+        # confirmation.  Fail closed *before* the password check or any resume:
+        # a missing/unknown/expired/superseded/used/mismatched id approves nothing.
+        check = self._confirmations.check(msg.confirmation_id, msg.plan_hash, msg.action_hash)
+        if not check.ok:
             await conn.send(
                 ErrorMessage(
-                    code="tier_requires_terminal",
-                    message="this action requires terminal confirmation — it cannot be approved by voice",
+                    code="confirmation_stale",
+                    message=f"this confirmation can no longer be used ({check.reason})",
                     task_id=msg.task_id,
                 )
             )
             return
+        self._confirmations.resolve(msg.confirmation_id)
 
         # Password verification for Tier 2 (daemon layer, never the graph)
         if msg.password is not None and not self._unlock.unlock(msg.password):
@@ -1470,6 +1587,12 @@ class DaemonServer:
         }
         if msg.typed_confirmation is not None:
             answer["typed_confirmation"] = msg.typed_confirmation
+        if msg.source == "voice" and slot.confirm_tier >= 2:
+            # Advisory marker for the graph: the gate still re-verifies it from
+            # its own decision.  Set only after the registry check above passed.
+            ok, _ = self._tier2_voice_ok(slot)
+            if ok:
+                answer[KEY_VOICE_TIER2] = True
 
         slot.resume_answer = answer
         # Ack the response **before** waking the worker, not after: the worker
@@ -1607,6 +1730,8 @@ class DaemonServer:
                     and (now - slot.confirm_sent_at) > self._task_runtime.confirm_timeout_s
                 ):
                     logger.warning("confirmation for %s expired", slot.task_id)
+                    # I3: a timed-out confirmation's id must not stay usable.
+                    self._confirmations.supersede(slot.task_id)
                     # Never abandon the task: resume the graph with a timed-out
                     # refusal so the checkpoint finishes cleanly (D1).
                     slot.resume_answer = timeout_answer(slot.confirm_payload)
