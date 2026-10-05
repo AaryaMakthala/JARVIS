@@ -55,10 +55,11 @@ from jarvis.daemon.protocol import (
 from jarvis.daemon.task_runtime import TaskRuntime, TerminalSink, VoiceSink, timeout_answer
 from jarvis.logging_setup import get_logger
 from jarvis.memory import open_memory
+from jarvis.policy.refusal import REASON_MISMATCH, REASON_TIER2_VOICE_DISABLED, refusal_answer
 from jarvis.policy.unlock import UnlockManager
 from jarvis.secrets import SecretStore
 from jarvis.tools.base import Cancelled, CancelToken
-from jarvis.voice.tier2_voice import KEY_VOICE_TIER2
+from jarvis.voice.tier2_voice import KEY_VOICE_TIER2, flag_on
 from jarvis.voice.tier2_voice import allowed as tier2_allowed
 
 try:
@@ -1259,14 +1260,24 @@ class DaemonServer:
         loop = self._ctx_voice_loop()
         if loop is None or not getattr(loop, "is_active", lambda: True)():
             logger.warning("voice confirmation dropped: no active voice loop")
-            slot.resume_answer = {"approved": False, "action_hash": payload.get("action_hash", "")}
+            slot.resume_answer = refusal_answer(payload)
             slot.confirm_payload = None
             slot.event.set()
             return
 
         can_confirm = getattr(loop, "can_confirm_by_voice", lambda p: False)
         if not can_confirm(payload):
-            slot.resume_answer = {"approved": False, "action_hash": payload.get("action_hash", "")}
+            # Name the refusal so the gate does not blame the user for a
+            # window that never opened.  Tier exactly 2 with the flag off is the
+            # only case we can name; anything else keeps the generic wording.
+            try:
+                tier = int(payload.get("tier", 0) or 0)
+            except (TypeError, ValueError):
+                tier = 0
+            reason = (
+                REASON_TIER2_VOICE_DISABLED if tier == 2 and not flag_on(self._settings) else None
+            )
+            slot.resume_answer = refusal_answer(payload, reason)
             slot.confirm_payload = None
             slot.event.set()
             return
@@ -1301,7 +1312,7 @@ class DaemonServer:
                             logger.info("voice tier 2 answer not marked: %s", reason)
                 else:
                     logger.warning("voice confirmation rejected: %s", check.reason)
-                    answer = {"approved": False, "action_hash": answer.get("action_hash")}
+                    answer = refusal_answer(answer, REASON_MISMATCH)
             slot.resume_answer = answer
             slot.event.set()
             return None
@@ -1310,7 +1321,7 @@ class DaemonServer:
             loop.confirm_by_voice(payload, on_confirmation=responder, transcript=slot.text)
         except Exception:
             logger.exception("voice confirmation failed; refusing")
-            slot.resume_answer = {"approved": False, "action_hash": payload.get("action_hash", "")}
+            slot.resume_answer = refusal_answer(payload)
         finally:
             slot.confirm_payload = None
             slot.event.set()

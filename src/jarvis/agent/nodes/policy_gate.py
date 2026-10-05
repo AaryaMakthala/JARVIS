@@ -25,6 +25,7 @@ from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.util import policy_context_for
 from jarvis.agent.schemas import ConfirmationRequest
 from jarvis.agent.state import Decision
+from jarvis.policy.refusal import refusal_text as refusal_sentence
 from jarvis.voice.tier2_voice import allowed as tier2_voice_allowed
 from jarvis.voice.tier2_voice import voice_marker_present
 
@@ -136,7 +137,7 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         return {
             "decisions": decisions,
             "gated_resolved_paths": gated,
-            "halted_reason": "Refused by you (confirmation answered with 'no' or a mismatched action).",
+            "halted_reason": refusal_sentence(answer),
         }
     if not _typed_confirmation_ok(answer, decision):
         return {
