@@ -22,6 +22,7 @@ from typing import Any
 from jarvis.agent.batch_approval import TYPE_PLAN_APPROVAL
 from jarvis.config import VoiceSettings
 from jarvis.daemon.confirmations import plan_hash
+from jarvis.logging_setup import register_redact_value
 from jarvis.voice.announce import (
     CONFIRMATION_PROMPT,
     ECHO_HEARD_PREFIX,
@@ -32,7 +33,6 @@ from jarvis.voice.announce import (
     speakable,
     spoken_before_confirm,
 )
-from jarvis.logging_setup import register_redact_value
 from jarvis.voice.readback import PLAN_APPROVAL_PROMPT
 from jarvis.voice.tier2_voice import flag_on
 
@@ -91,15 +91,12 @@ def test_plan_announcement_deterministic_and_redacted() -> None:
     # reads a VoiceMode, so AUTO cannot change a word.
     from jarvis.voice.modes import VoiceMode
 
-    assert (
-        spoken_before_confirm(
-            payload, settings=VoiceSettings(), transcript="make two files"
-        )
-        == spoken_before_confirm(
-            payload,
-            settings=VoiceSettings(),
-            transcript="make two files",
-        )
+    assert spoken_before_confirm(
+        payload, settings=VoiceSettings(), transcript="make two files"
+    ) == spoken_before_confirm(
+        payload,
+        settings=VoiceSettings(),
+        transcript="make two files",
     )
     assert VoiceMode.AUTO is not None  # the mode simply has no path into this text
 
@@ -173,5 +170,5 @@ def test_tier2_prompt_speaks_the_exact_readback() -> None:
     # Tier 3 never gets its action described out loud.
     assert "delete" not in confirmation_prompt_text(_tier2_payload(tier=3)).lower()
     # An unreadable Tier 2 target is refused, and speakable() masks everything.
-    assert speakable(f"key {SECRET}") .find(SECRET) == -1
+    assert speakable(f"key {SECRET}").find(SECRET) == -1
     assert speakable(None) == ""

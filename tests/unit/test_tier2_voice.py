@@ -27,17 +27,17 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from jarvis.agent.context import make_app_context  # noqa: E402
-from jarvis.agent.graph import open_sqlite_checkpointer  # noqa: E402
-from jarvis.agent.runner import resume_task, run_task  # noqa: E402
-from jarvis.agent.schemas import ActionIntent  # noqa: E402
-from jarvis.config import PolicySettings, Settings, VoiceSettings  # noqa: E402
-from jarvis.daemon.task_runtime import timeout_answer  # noqa: E402
-from jarvis.llm.client import FakeLLM  # noqa: E402
-from jarvis.policy.unlock import UnlockManager  # noqa: E402
-from jarvis.tools.files import make_create_file_spec, make_delete_path_spec  # noqa: E402
-from jarvis.voice.loop import _approval_words  # noqa: E402
-from jarvis.voice.tier2_voice import (  # noqa: E402
+from jarvis.agent.context import make_app_context
+from jarvis.agent.graph import open_sqlite_checkpointer
+from jarvis.agent.runner import resume_task, run_task
+from jarvis.agent.schemas import ActionIntent
+from jarvis.config import PolicySettings, Settings, VoiceSettings
+from jarvis.daemon.task_runtime import timeout_answer
+from jarvis.llm.client import FakeLLM
+from jarvis.policy.unlock import UnlockManager
+from jarvis.tools.files import make_create_file_spec, make_delete_path_spec
+from jarvis.voice.loop import _approval_words
+from jarvis.voice.tier2_voice import (
     KEY_VOICE_TIER2,
     TIER2_PROCEED_WORDS,
     allowed,
@@ -45,7 +45,7 @@ from jarvis.voice.tier2_voice import (  # noqa: E402
     readback_for,
     voice_marker_present,
 )
-from support import FakeDirTrash, approve, brain_steps, registry_with  # noqa: E402
+from support import FakeDirTrash, approve, brain_steps, registry_with
 
 PW = "correct-horse-battery-staple"
 
@@ -117,9 +117,7 @@ def test_flag_on_requires_readback() -> None:
     unreadable = readback_for("delete_path", _decision(resolved_paths=[]))
     assert unreadable.ok is False
     # ... while the same call with the real path succeeds.
-    ok, _ = allowed(
-        "delete_path", _decision(), _on(), args={"paths": [str(Path("C:/tmp/a.txt"))]}
-    )
+    ok, _ = allowed("delete_path", _decision(), _on(), args={"paths": [str(Path("C:/tmp/a.txt"))]})
     assert ok is True
 
 
@@ -399,10 +397,7 @@ def test_batch_never_covers_tier2_with_flag_on(tmp_path: Path) -> None:
     assert batch["type"] == "plan_approval", "two contiguous Tier 1 steps still batch"
     eligible = [step_id for step_id, _ in (batch.get("eligible") or [])]
     assert eligible == ["s1", "s2"], f"the Tier 2 step must not be in the batch: {eligible}"
-    tier2_hashes = [
-        str(h)
-        for step_id, h in (batch.get("eligible") or [])
-    ]
+    tier2_hashes = [str(h) for step_id, h in (batch.get("eligible") or [])]
     assert all(len(h) == 64 for h in tier2_hashes)
     # Answering the batch approves s1/s2 only; s3 then gets its own interrupt
     # and is still gated on the terminal password.

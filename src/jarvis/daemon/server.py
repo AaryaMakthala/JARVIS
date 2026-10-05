@@ -1307,9 +1307,7 @@ class DaemonServer:
             return None
 
         try:
-            loop.confirm_by_voice(
-                payload, on_confirmation=responder, transcript=slot.text
-            )
+            loop.confirm_by_voice(payload, on_confirmation=responder, transcript=slot.text)
         except Exception:
             logger.exception("voice confirmation failed; refusing")
             slot.resume_answer = {"approved": False, "action_hash": payload.get("action_hash", "")}

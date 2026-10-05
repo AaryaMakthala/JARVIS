@@ -76,7 +76,7 @@ def echo_enabled(settings: Any) -> bool:
 
 
 def echo_line(transcript: Any) -> str:
-    """"I heard: <transcript>", redacted.  Logs a length, never the words."""
+    """ "I heard: <transcript>", redacted.  Logs a length, never the words."""
     heard = speakable(transcript)
     if not heard:
         # Nothing usable heard: speak nothing rather than a bare "I heard:".
@@ -122,9 +122,7 @@ def confirmation_prompt_text(payload: Any, *, settings: Any = None) -> str:
     if data.get("type") == "plan_approval":
         return plan_announcement(data)
     if tier == 2:
-        readback = tier2_readback_for(
-            data.get("tool"), data, args=data.get("readback_args")
-        )
+        readback = tier2_readback_for(data.get("tool"), data, args=data.get("readback_args"))
         if not readback.ok:
             return READBACK_UNSAFE_TEXT
         return f"{readback.text}. {PLAN_APPROVAL_PROMPT}"

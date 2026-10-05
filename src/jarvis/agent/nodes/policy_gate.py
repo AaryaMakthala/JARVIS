@@ -148,7 +148,9 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     # hash without the terminal password — but only when the daemon marked the
     # answer AND the gate re-verifies every condition itself.  This never sets
     # ``ctx.unlock`` and never unlocks the session.
-    locked_for_tier2 = decision.needs_unlock and (ctx.unlock is None or not ctx.unlock.is_unlocked())
+    locked_for_tier2 = decision.needs_unlock and (
+        ctx.unlock is None or not ctx.unlock.is_unlocked()
+    )
     if locked_for_tier2 and not _voice_tier2_ok(state, answer, step, decision, ctx):
         return {
             "decisions": decisions,

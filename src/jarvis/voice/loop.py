@@ -1121,9 +1121,7 @@ class VoiceLoop:
             # the optional "I heard: ..." echo, the plan announcement, the exact
             # Tier-2 readback or the Tier-1 prompt - already redacted (B9).
             self._tts.speak(
-                spoken_before_confirm(
-                    payload, settings=self._voice_settings, transcript=transcript
-                )
+                spoken_before_confirm(payload, settings=self._voice_settings, transcript=transcript)
             )
         except Exception:
             logger.exception("voice confirmation prompt failed; refusing")
