@@ -3839,8 +3839,3 @@ bug on its own (a dictation tool defaulting to Notepad is reasonable) but it doe
 ### Not committed
 
 No commit and no push, per instruction. Test 3 not started. Stage 2 not started.
-
-
-
-
-
