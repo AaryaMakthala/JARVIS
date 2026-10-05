@@ -85,6 +85,8 @@ class ConfirmResponse(BaseModel):
     task_id: str
     approved: bool
     action_hash: str
+    confirmation_id: str = ""  # I3 correlation (not wired into any flow yet)
+    plan_hash: str = ""
     password: str | None = None  # only for Tier 2 unlocks; discarded after use
     typed_confirmation: str | None = None  # folder-name confirmation
     source: Literal["terminal", "dialog", "voice"] = "terminal"
@@ -167,6 +169,8 @@ class ConfirmRequest(BaseModel):
     needs_password: bool = False
     typed_confirmation: str | None = None
     action_hash: str = ""
+    confirmation_id: str = ""  # I3 correlation (not wired into any flow yet)
+    plan_hash: str = ""
     untrusted: bool = False
 
 

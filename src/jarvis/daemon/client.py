@@ -177,14 +177,18 @@ class DaemonClient:
         action_hash: str,
         password: str | None = None,
         typed_confirmation: str | None = None,
+        confirmation_id: str = "",
+        plan_hash: str = "",
     ) -> None:
-        """Send a confirmation response."""
+        """Send a confirmation response (echoing the I3 id/plan_hash)."""
         msg = ConfirmResponse(
             task_id=task_id,
             approved=approved,
             action_hash=action_hash,
             password=password,
             typed_confirmation=typed_confirmation,
+            confirmation_id=confirmation_id,
+            plan_hash=plan_hash,
         )
         self._send_recv_ack(msg)
 
