@@ -36,6 +36,7 @@ from send2trash import send2trash
 from jarvis import config
 from jarvis.policy import paths
 from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
+from jarvis.tools.default_dirs import location_label
 
 _MAX_CHARS = 1_048_576  # 1 MiB content/secondary cap
 _CAP = f"content exceeds the {_MAX_CHARS} character limit"
@@ -435,7 +436,7 @@ def _run_create_file(args: CreateFileArgs, ctx: ToolContext) -> ToolResult:
         raise
     return ToolResult(
         ok=True,
-        output=f"wrote {len(data)} bytes to {target}",
+        output=f"Created {target.name} on {location_label(target, ctx.settings)}.",
         data={"path": str(target), "size": len(data)},
     )
 
@@ -703,9 +704,9 @@ def _run_delete_path(args: DeletePathArgs, ctx: ToolContext) -> ToolResult:
         except OSError as exc:
             errors.append(f"deleted {record.original_path} but the undo log failed: {exc}")
             continue
+        label = location_label(Path(record.original_path), ctx.settings)
         deleted.append(
-            f"{record.original_path} -> Recycle Bin ({_human_size(record.size)}, "
-            f"{record.item_count} item(s))"
+            f"Moved {Path(record.original_path).name} to the Recycle Bin (from {label})."
         )
         records.append(record.__dict__)
 
