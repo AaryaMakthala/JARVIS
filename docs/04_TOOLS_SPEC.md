@@ -81,6 +81,20 @@ Legend: **T** = base tier. Verification = what `verify()` checks. All paths are 
 
 ### 2.2 Files (allowed roots only)
 
+**`path` / `paths` argument description (planner-facing).** The schema text sent to the LLM says,
+for `create_file.path` and `delete_path.paths`:
+
+> File name or path. A bare file name means the user's Desktop; a known folder alias (desktop,
+> documents, downloads, pictures or a configured alias) may prefix it; an absolute path is used as
+> given.
+
+This is deliberate: the planner follows the schema it is given, so the schema must state the bare-name
+default rather than implying a path is mandatory. Resolution happens in `agent/nodes/validate.py` via
+`tools/default_dirs.resolve_location`, **before** any policy decision, and it is what makes a bare
+`notes.txt` land on the Desktop. `read_file`, `append_file` and `list_dir` keep the plainer
+"Absolute file path." / "Absolute folder path." wording — they are read-shaped tools the planner
+rarely invents a location for.
+
 | Tool | T | Args | Behaviour | Verification | Notes |
 |------|---|------|-----------|--------------|-------|
 | `list_dir` | 0 | `path` | List names, sizes, modified times (max 200 entries) | — | Untrusted names → `tainted=True` (filenames can contain injection text) |

@@ -55,7 +55,15 @@ class CreateFileArgs(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    path: str = Field(min_length=1, max_length=4096, description="Absolute file path.")
+    path: str = Field(
+        min_length=1,
+        max_length=4096,
+        description=(
+            "File name or path. A bare file name means the user's Desktop; a known folder "
+            "alias (desktop, documents, downloads, pictures or a configured alias) may "
+            "prefix it; an absolute path is used as given."
+        ),
+    )
     content: str = Field(default="", max_length=_MAX_CHARS, description="Text to write.")
     overwrite: bool = Field(default=False, description="Replace the file if it exists.")
 
@@ -96,7 +104,11 @@ class DeletePathArgs(BaseModel):
     paths: list[str] = Field(
         min_length=1,
         max_length=_MAX_PATHS,
-        description=f"Paths to delete (1..{_MAX_PATHS}).",
+        description=(
+            f"File name or path, 1..{_MAX_PATHS} of them. A bare file name means the user's "
+            "Desktop; a known folder alias (desktop, documents, downloads, pictures or a "
+            "configured alias) may prefix it; an absolute path is used as given."
+        ),
     )
 
 
