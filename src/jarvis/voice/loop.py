@@ -63,6 +63,7 @@ from jarvis.agent.answer import spoken_answer
 from jarvis.logging_setup import redact
 from jarvis.voice.announce import CONFIRMATION_PROMPT as _ANNOUNCE_CONFIRMATION_PROMPT
 from jarvis.voice.announce import speakable, spoken_before_confirm
+from jarvis.voice.console_say import say_line
 from jarvis.voice.interfaces import (
     AudioInput,
     AudioSegment,
@@ -1022,6 +1023,7 @@ class VoiceLoop:
         logger.info("voice boundary: voice off heard inside a window; stopping the loop")
         self._reporter.stop_request()
         spoken = self._turn_voice_off()
+        say_line(spoken)
         try:
             self._tts.speak(spoken)
         except Exception:
@@ -1116,13 +1118,12 @@ class VoiceLoop:
             return f"Action requires terminal confirmation: {speakable(summary)}"
 
         window_s = self._confirm_window_s if rearm_timeout_s is None else max(rearm_timeout_s, 0.0)
+        prompt_text = spoken_before_confirm(
+            payload, settings=self._voice_settings, transcript=transcript
+        )
+        say_line(prompt_text)
         try:
-            # Stage 3: one helper builds everything spoken before the window -
-            # the optional "I heard: ..." echo, the plan announcement, the exact
-            # Tier-2 readback or the Tier-1 prompt - already redacted (B9).
-            self._tts.speak(
-                spoken_before_confirm(payload, settings=self._voice_settings, transcript=transcript)
-            )
+            self._tts.speak(prompt_text)
         except Exception:
             logger.exception("voice confirmation prompt failed; refusing")
             callback({"approved": False, "action_hash": action_hash})
@@ -1271,6 +1272,7 @@ class VoiceLoop:
             if on_answer is not None:
                 on_answer(answer)
 
+        say_line(prompt)
         try:
             self._tts.speak(prompt)
         except Exception:
@@ -1320,6 +1322,7 @@ class VoiceLoop:
                     if self._check_auto_idle():
                         logger.info("voice mode=%s reason=%s", VoiceMode.NORMAL.value, "idle")
                         self._set_mode(VoiceMode.NORMAL, reason="idle")
+                        say_line("Going back to sleep.")
                         self._tts.speak("Going back to sleep.")
                         self._quiet_start_drain()
                         self._set_state(
@@ -1560,6 +1563,7 @@ class VoiceLoop:
         # → LISTENING/CAPTURE; the transition to capture happens when speech
         # capture (Phase 3) actually begins.
         logger.info("voice boundary: wake ack speech starting")
+        say_line("Yes?")
         try:
             self._tts.speak("Yes?")
         except Exception:

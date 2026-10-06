@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from jarvis.config import Settings
+from jarvis.daemon.confirmations import plan_hash
 from jarvis.daemon.protocol import AuthMessage, ChatMessage, ConfirmResponse, StatusRequest
 from jarvis.daemon.server import DaemonServer
 
@@ -62,6 +63,12 @@ class _BlockingWorkerServer(DaemonServer):
     def _worker_run(self, slot: Any) -> None:  # type: ignore[override]
         self.worker_started.set()
         expected_hash = "a" * 64
+        # Mirror the real worker (server.py): issue the I3 correlation id
+        # BEFORE publishing, so the client can answer against the exact
+        # confirmation it saw (registry check is fail-closed on unknown id).
+        pending = self._confirmations.issue(
+            slot.task_id, "s1", 1, expected_hash, plan_hash([expected_hash])
+        )
         slot.confirm_payload = {
             "tier": 1,
             "summary": "fake_echo text='hi'",
@@ -69,6 +76,8 @@ class _BlockingWorkerServer(DaemonServer):
             "typed_confirmation": None,
             "action_hash": expected_hash,
             "untrusted": False,
+            "confirmation_id": pending.confirmation_id,
+            "plan_hash": pending.plan_hash,
         }
         slot.event.clear()
         self._wake_dispatch()
@@ -305,7 +314,13 @@ def test_confirm_flow_final_delivered_within_2s(harness: Any) -> None:
         assert req["action_hash"] == "a" * 64
 
         c.send(
-            ConfirmResponse(task_id=req["task_id"], approved=True, action_hash=req["action_hash"])
+            ConfirmResponse(
+                task_id=req["task_id"],
+                approved=True,
+                action_hash=req["action_hash"],
+                confirmation_id=req["confirmation_id"],
+                plan_hash=req["plan_hash"],
+            )
         )
         final = c.recv_next(timeout=2.0)
         elapsed = time.monotonic() - t0
@@ -328,7 +343,13 @@ def test_denied_confirmation_never_executes_and_arrives_promptly(harness: Any) -
         req = c.recv_next(timeout=2)
         assert req and req["type"] == "confirm_request"
         c.send(
-            ConfirmResponse(task_id=req["task_id"], approved=False, action_hash=req["action_hash"])
+            ConfirmResponse(
+                task_id=req["task_id"],
+                approved=False,
+                action_hash=req["action_hash"],
+                confirmation_id=req["confirmation_id"],
+                plan_hash=req["plan_hash"],
+            )
         )
         final = c.recv_next(timeout=2.0)
         assert final is not None and final["type"] == "final"
@@ -338,6 +359,14 @@ def test_denied_confirmation_never_executes_and_arrives_promptly(harness: Any) -
 
 
 def test_tampered_hash_cannot_drive_resume_to_execution(harness: Any) -> None:
+    """A tampered action_hash is rejected by the I3 registry before resume.
+
+    The daemon fails closed with ``confirmation_stale`` (never a graph
+    refusal): the answer stops at the registry check, so no resume answer
+    reaches the worker and the fake tool never runs.  The rejection does NOT
+    consume the id — ``resolve()`` runs only after a passing check
+    (server.py) — but that follow-up is pinned by the registry tests, not here.
+    """
     c = _Client(harness.port)
     try:
         c.send(AuthMessage(token=TEST_TOKEN))
@@ -345,10 +374,26 @@ def test_tampered_hash_cannot_drive_resume_to_execution(harness: Any) -> None:
         c.send(ChatMessage(text="echo hi", id="t3"))
         req = c.recv_next(timeout=2)
         assert req and req["type"] == "confirm_request"
-        c.send(ConfirmResponse(task_id=req["task_id"], approved=True, action_hash="0" * 64))
-        final = c.recv_next(timeout=2.0)
-        assert final is not None and final["type"] == "final"
-        assert "Refused" in final["text"]  # mismatched hash → never executed
+        c.send(
+            ConfirmResponse(
+                task_id=req["task_id"],
+                approved=True,
+                action_hash="0" * 64,
+                confirmation_id=req["confirmation_id"],
+                plan_hash=req["plan_hash"],
+            )
+        )
+        err = c.recv_next(timeout=2.0)
+        assert err is not None and err["type"] == "error"
+        assert err["code"] == "confirmation_stale"
+        assert "action_hash_mismatch" in err["message"]
+
+        # Nothing executed: the tampered answer never reached the worker.
+        slot = harness.server._active
+        assert slot is not None and slot.task_id == "t3"
+        assert slot.resume_answer is None
+        assert slot.result_text is None  # "fake_echo ran hi" would prove a run
+        assert slot.done is False
     finally:
         c.close()
 
@@ -378,7 +423,13 @@ def test_queued_task_result_delivered_after_promotion(harness: Any) -> None:
         # Approve t1 → it completes → t2 is promoted → t2's confirm_request
         # must reach c2 (its owner), then c2 approves and gets its final.
         c1.send(
-            ConfirmResponse(task_id=req1["task_id"], approved=True, action_hash=req1["action_hash"])
+            ConfirmResponse(
+                task_id=req1["task_id"],
+                approved=True,
+                action_hash=req1["action_hash"],
+                confirmation_id=req1["confirmation_id"],
+                plan_hash=req1["plan_hash"],
+            )
         )
         final1 = c1.recv_next(timeout=2.0)
         assert final1 and final1["type"] == "final" and final1["task_id"] == "t1"
@@ -388,7 +439,13 @@ def test_queued_task_result_delivered_after_promotion(harness: Any) -> None:
             "promoted task's confirm_request was not routed to its owner"
         )
         c2.send(
-            ConfirmResponse(task_id=req2["task_id"], approved=True, action_hash=req2["action_hash"])
+            ConfirmResponse(
+                task_id=req2["task_id"],
+                approved=True,
+                action_hash=req2["action_hash"],
+                confirmation_id=req2["confirmation_id"],
+                plan_hash=req2["plan_hash"],
+            )
         )
         final2 = c2.recv_next(timeout=2.0)
         assert final2 and final2["type"] == "final" and final2["task_id"] == "t2"
