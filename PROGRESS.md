@@ -3840,7 +3840,27 @@ bug on its own (a dictation tool defaulting to Notepad is reasonable) but it doe
 
 No commit and no push, per instruction. Test 3 not started. Stage 2 not started.
 
+## STAGE 3 CLOSE-OUT: merged to main, spoken B5/B6 deferred (2026-10-06)
 
+Status: code complete and merged (PR #1, merge commit 148c2fb). Supersedes the status lines of the earlier Stage 3 entry below.
+
+Verified live, text chat (`jarvis chat --no-daemon`): create chattest.txt with no path question (bare name -> real OneDrive Desktop via Known Folders, "Created chattest.txt on your Desktop."); delete -> Tier 2 gate, full path shown, password required, moved to Recycle Bin; undo -> restored. Unknown folder asks which folder and creates nothing; path outside allowed_roots refused.
+
+Verified live, voice: A1 create (no path question); B1 Tier 2 readback of the full OneDrive path printed ("I heard ... Say proceed to approve, or cancel."); mis-heard answers ("rosy", "resume") did not approve.
+
+By code review / unit tests only: A3 (flag off, "proceed" cannot approve a delete: loop.py can_confirm_by_voice, server.py tier_requires_terminal, policy_gate re-verification).
+
+NOT EXERCISED live: spoken B2 ("yes" refused), B5 ("proceed" -> Recycle Bin), B6 (spoken undo), Part C (AUTO + plan announcement). Deferred to the voice-capture step at the end of Stage 4.
+
+Fixes found during live testing: planner-facing path description said "Absolute file path" (448ff63); truthful refusal reasons for flag-off/no-password (bcd2d76); I3 stale tests and console `[VOICE] SAY:` lines (a4d8a58); STT forced to English + vocabulary hint (08b172b).
+
+Known failures, CONFIRMED PRE-EXISTING at 0b64fa8 (Stage 2 close): tests/unit/test_voice_modes.py lines 745 (half duplex, flaky), 872 (closed-vocabulary scan), 917 (wake-prefix strip), 964 (second _run_interaction). Also TestRearmQuietStartGate::test_response_echo_drained_before_detector_reopens. Cleanup item for Stage 10.
+
+Not run since the 3c-4 gate change: test_voice_loop.py, full test_voice_modes.py. Re-run once at Stage 10.
+
+Open items for the voice step: Whisper adds stray punctuation to spoken filenames ("delete. text. dot txt.") -> deterministic transcript clean-up (voice/transcript_clean.py); smaller vocabulary prompt for short confirmation answers; bigger Whisper model if needed; refusal text "Refused by you" can be misleading on non-flag paths; `jarvis password` has no reset command (hash lives in keyring service "jarvis", name "password_hash").
+
+Owner follow-ups: change the shared password with `jarvis password change`; keep voice.allow_tier2_by_voice = false until the voice step.
 
 
 
