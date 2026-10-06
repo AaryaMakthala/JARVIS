@@ -27,6 +27,7 @@ from jarvis.tools.default_dirs import resolve_location
 _LOCATION_ARGS: dict[str, tuple[str, ...]] = {
     "create_file": ("path",),
     "delete_path": ("paths",),
+    "open_in_app": ("path",),
 }
 
 #: Asked (deterministically, never guessed) when a location cannot be resolved.
