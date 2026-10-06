@@ -22,8 +22,14 @@ from pydantic import ValidationError
 
 from jarvis.agent.state import Decision, Step
 from jarvis.config import Settings
+from jarvis.platform_guard import is_windows
 from jarvis.policy import paths, rules, tiers
 from jarvis.tools.registry import ToolRegistry, UnknownTool
+
+#: Reason recorded for a ``windows_only`` tool on a host that is not Windows.
+#: Deliberately distinct from the generic hard-block text so the human is told
+#: the real cause instead of "blocked by policy".
+_WINDOWS_ONLY_REASON = "this tool only works on Windows"
 
 
 class RiskClassifier(Protocol):
@@ -93,6 +99,18 @@ class PolicyEngine:
             args = spec.args_model.model_validate(step.args)
         except ValidationError as exc:
             return _blocked(step, [f"invalid arguments: {exc.error_count()} error(s)"], str(exc))
+
+        # Platform gate: a ``windows_only`` tool is refused on a host that is not
+        # Windows.  Deterministic and pure, and checked before any tier/hash
+        # work because there is nothing to decide for a tool that cannot run
+        # here.  On Windows this is a no-op, so every existing windows_only
+        # tool behaves exactly as it did before.
+        if spec.windows_only and not is_windows():
+            return _blocked(
+                step,
+                [_WINDOWS_ONLY_REASON],
+                f"{spec.describe(args)} (Windows only)",
+            )
 
         tier = spec.base_tier
         reasons: list[str] = []
