@@ -56,6 +56,7 @@ from jarvis.memory import open_memory
 from jarvis.ml.risk import build_classifier
 from jarvis.platform_guard import is_64bit, is_python_supported, is_windows
 from jarvis.policy import tiers
+from jarvis.policy.refusal import REASON_NO_PASSWORD, REASON_USER_DECLINED
 from jarvis.policy.unlock import UnlockManager
 from jarvis.secrets import PROVIDER_SECRETS
 
@@ -986,43 +987,57 @@ def _chat_password_prompt(text: str) -> str:
     return getpass.getpass(text)
 
 
-def _confirmation_answer(agreed: bool, req: dict[str, Any], typed: str | None) -> dict[str, Any]:
+def _confirmation_answer(
+    agreed: bool,
+    req: dict[str, Any],
+    typed: str | None,
+    reason: str | None = None,
+) -> dict[str, Any]:
     """Build the resume payload from a chat answer.
 
     The only keys ever sent are ``approved``, ``action_hash`` and - when a
-    typed folder-name confirmation is required - ``typed_confirmation``.
-    The password is never part of a resume payload (docs/03 invariant 8).
+    typed folder-name confirmation is required - ``typed_confirmation``, plus an
+    optional ``reason`` that only names an existing refusal (it never approves
+    anything).  The password is never part of a resume payload (docs/03
+    invariant 8).
     """
     answer: dict[str, Any] = {"approved": agreed, "action_hash": req.get("action_hash")}
     if typed is not None:
         answer["typed_confirmation"] = typed
+    if reason is not None:
+        answer["reason"] = reason
     return answer
 
 
-def _tier2_unlock_or_refuse(ctx: AppContext, req: dict[str, Any]) -> bool:
-    """Gate a Tier-2 answer behind a live unlocked session (password entry)."""
+def _tier2_unlock_or_refuse(ctx: AppContext, req: dict[str, Any]) -> tuple[bool, str | None]:
+    """Gate a Tier-2 answer behind a live unlocked session (password entry).
+
+    Returns ``(approved, reason)``; ``reason`` is a
+    :mod:`jarvis.policy.refusal` code the gate can speak instead of blaming the
+    user.  An unknown failure keeps ``None`` and today's wording.
+    """
     manager = ctx.unlock
     if manager is None or not hasattr(manager, "has_password"):
         console.print(
             "[red]Tier 2 action needs an unlocked JARVIS session, but no unlock "
             "manager is available in this session - refusing.[/red]"
         )
-        return False
+        return False, REASON_NO_PASSWORD
     if not manager.has_password():
         console.print(
             "[red]No JARVIS password is set. Run `jarvis password set` first - "
             "refusing the Tier 2 action.[/red]"
         )
-        return False
+        return False, REASON_NO_PASSWORD
     if manager.is_unlocked():
-        return True
+        return True, None
     password = _chat_password_prompt("JARVIS password: ")
     if manager.verify(password):
-        return True
+        return True, None
     console.print(
         "[red]Wrong password or the session is locked out - refusing the Tier 2 action.[/red]"
     )
-    return False
+    return False, None
 
 
 def chat_loop(ctx: AppContext, saver: SqliteSaver) -> None:
@@ -1079,17 +1094,20 @@ def resolve_interrupts(outcome: Any, ctx: AppContext, saver: SqliteSaver) -> Any
         answer = _chat_prompt("Approve?")
         agreed = (answer or "").strip().lower() in ("y", "yes")
         typed: str | None = None
+        reason: str | None = None
         if agreed and req.get("typed_confirmation"):
             typed = _chat_prompt(
                 f"Type this exactly to confirm the delete: {req.get('typed_confirmation')}"
             )
         if agreed and req.get("needs_unlock"):
-            agreed = _tier2_unlock_or_refuse(ctx, req)
+            agreed, reason = _tier2_unlock_or_refuse(ctx, req)
+        elif not agreed:
+            reason = REASON_USER_DECLINED
         outcome = resume_task(
             ctx,
             saver,
             outcome.task_id,
-            _confirmation_answer(agreed, req, typed),
+            _confirmation_answer(agreed, req, typed, reason),
         )
 
 
@@ -1250,6 +1268,8 @@ def _handle_confirm_request(client: Any, task_id: str, msg: Any) -> None:
             action_hash=msg.action_hash,
             password=password,
             typed_confirmation=typed,
+            confirmation_id=getattr(msg, "confirmation_id", ""),
+            plan_hash=getattr(msg, "plan_hash", ""),
         )
         console.print("[dim](working...)[/dim]")
     except DaemonError as exc:
@@ -1491,7 +1511,7 @@ def _confirm_undo(ctx: AppContext, decision: Any) -> bool:
         typed = _chat_prompt(f"Type this exactly to confirm: {decision.needs_typed_confirmation}")
         agreed = (typed or "").strip() == decision.needs_typed_confirmation
     if agreed and decision.needs_unlock:
-        agreed = _tier2_unlock_or_refuse(ctx, {"action_hash": decision.action_hash})
+        agreed, _reason = _tier2_unlock_or_refuse(ctx, {"action_hash": decision.action_hash})
     return agreed
 
 

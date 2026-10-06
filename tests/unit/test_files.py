@@ -379,3 +379,39 @@ def test_undo_records_are_list_iterable_from_the_log(ws: Path, tmp_path: Path) -
         str((ws / "a.txt").resolve(strict=False)),
         str((ws / "b.txt").resolve(strict=False)),
     ]
+
+
+# ---------------------------------------------------------------------------
+# D1b: success wording names the location (deterministic, no LLM)
+# ---------------------------------------------------------------------------
+
+
+def test_create_file_output_names_location(
+    ws: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _ctx(ws, tmp_path)
+    monkeypatch.setattr(
+        "jarvis.tools.default_dirs.known_folder", lambda name: ws if name == "desktop" else None
+    )
+
+    spec = make_create_file_spec()
+    result = spec.run(spec.args_model(path=str(ws / "notes.txt"), content="hi"), ctx)
+
+    assert result.ok is True
+    assert result.output == "Created notes.txt on your Desktop."
+
+
+def test_delete_output_names_location(
+    ws: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _ctx(ws, tmp_path)
+    monkeypatch.setattr(
+        "jarvis.tools.default_dirs.known_folder", lambda name: ws if name == "desktop" else None
+    )
+    target = _create(ws, "notes.txt", "hi")
+
+    spec = make_delete_path_spec()
+    result = spec.run(spec.args_model(paths=[str(target)]), ctx)
+
+    assert result.ok is True
+    assert result.output == "Moved notes.txt to the Recycle Bin (from your Desktop)."

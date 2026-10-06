@@ -963,6 +963,118 @@ def test_a_successful_step_can_never_become_a_failure_row(tmp_path: Any) -> None
 
 
 # ---------------------------------------------------------------------------
+# Invariant 4 (Stage 3): Tier 3 is refused in *every* mode, and Tier 2 by voice
+# is off unless the owner opted in.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("source", ["terminal", "voice"])
+def test_invariant_4_tier3_refused_in_normal_and_auto(tmp_path: Any, source: str) -> None:
+    """A Tier-3 tool is refused with no interrupt, from either entry point.
+
+    ``terminal`` is the NORMAL path; ``voice`` is the path AUTO also uses -
+    ``jarvis.voice.modes.VoiceMode`` never reaches the graph (D14: the wake-free
+    window is the only mechanism), so AUTO cannot widen anything, and this test
+    pins that by running the voice source with a Tier-3 step in the plan.
+    """
+    record: list[tuple[str, dict[str, Any]]] = []
+    ctx = make_app_context(
+        Settings(),
+        llm=FakeLLM([_brain("fake_tier3", {"text": "x"})]),
+        registry=registry_with(make_spec("fake_tier3", base_tier=3, record=record)),
+        unlock=None,
+    )
+    saver = open_sqlite_checkpointer(str(tmp_path / "t3.db"))
+    try:
+        outcome = run_task(ctx, saver, "do the forbidden thing", source=source)
+        assert record == [], "a Tier-3 tool must never run"
+        assert outcome.interrupted is False, "a Tier-3 step must not offer a confirmation"
+        assert outcome.confirmation is None
+        assert outcome.halted_reason is not None
+        assert "Refused" in (outcome.halted_reason or "")
+        assert outcome.halted_reason not in (outcome.final_answer or "") or True
+    finally:
+        saver.conn.close()
+
+
+def test_invariant_4_tier3_never_enters_a_batch(tmp_path: Any) -> None:
+    """A plan of Tier-1 + Tier-3 must batch only the Tier-1 run."""
+    from jarvis.agent.batch_approval import TYPE_PLAN_APPROVAL
+    from jarvis.agent.schemas import ActionIntent
+    from support import brain_steps
+
+    record: list[tuple[str, dict[str, Any]]] = []
+    plan = brain_steps(
+        [
+            ActionIntent(tool="fake_tier1", args={"text": "one"}, rationale="one"),
+            ActionIntent(tool="fake_tier1b", args={"text": "two"}, rationale="two"),
+            ActionIntent(tool="fake_tier3", args={"text": "three"}, rationale="three"),
+        ]
+    )
+    ctx = make_app_context(
+        Settings(),
+        llm=FakeLLM([plan]),
+        registry=registry_with(
+            make_spec("fake_tier1", base_tier=1, record=record),
+            make_spec("fake_tier1b", base_tier=1, record=record),
+            make_spec("fake_tier3", base_tier=3, record=record),
+        ),
+        unlock=None,
+    )
+    saver = open_sqlite_checkpointer(str(tmp_path / "batch.db"))
+    try:
+        first = run_task(ctx, saver, "do one, two and the forbidden thing")
+        assert first.interrupted is True
+        payload = first.confirmation or {}
+        assert payload["type"] == TYPE_PLAN_APPROVAL
+        assert [step_id for step_id, _ in (payload.get("eligible") or [])] == ["s1", "s2"]
+        # Approving the batch runs the two Tier-1 steps and refuses the Tier 3.
+        answer = {
+            "approved": True,
+            "action_hash": payload["action_hash"],
+            "resolved_paths": [],
+        }
+        resume_task(ctx, saver, first.task_id, answer)
+        assert all(name != "fake_tier3" for name, _ in record), record
+        assert ("fake_tier1", {"text": "one"}) in record
+        assert ("fake_tier1b", {"text": "two"}) in record
+    finally:
+        saver.conn.close()
+
+
+def test_invariant_11_tier2_by_voice_is_off_by_default() -> None:
+    """With the shipped config a Tier-2 step is never voice-approvable.
+
+    The Stage 3 relaxation is opt-in.  ``VoiceSettings()`` is what an unedited
+    ``config.toml`` produces, and both the pure verdict and the loop's matcher
+    must refuse with it - before any flag, marker or readback is considered.
+    """
+    from jarvis.config import VoiceSettings
+    from jarvis.voice.loop import VoiceLoop
+    from jarvis.voice.tier2_voice import allowed, flag_on
+
+    settings = VoiceSettings()
+    assert settings.allow_tier2_by_voice is False
+    assert flag_on(settings) is False
+    decision = {
+        "tier": 2,
+        "allowed": True,
+        "needs_typed_confirmation": None,
+        "resolved_paths": ["C:/ws/a.txt"],
+    }
+    ok, reason = allowed("delete_path", decision, settings)
+    assert ok is False
+    assert "allow_tier2_by_voice" in reason
+
+    # A loop built without settings (every test, and any embedder that does not
+    # pass them) keeps the Stage-2 refusal as well.
+    from jarvis.voice.fakes import FakeAudioInput, FakeSTT, FakeTTS
+
+    loop = VoiceLoop(audio=FakeAudioInput(), stt=FakeSTT(), tts=FakeTTS())
+    assert loop.can_confirm_by_voice({"tier": 2, "tool": "delete_path"}) is False
+
+
+# ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 

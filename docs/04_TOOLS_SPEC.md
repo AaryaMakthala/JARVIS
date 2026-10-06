@@ -42,6 +42,23 @@ class ToolSpec:  # one per tool
     def describe(self, args) -> str: ...  # canonical summary used in confirmations
 ```
 
+**`describe()` is the single source for the confirmation summary and the spoken readback (Stage 3).**
+One implementation, two consumers: the printed/terminal summary, and the wake-free spoken
+readback. They therefore never disagree — a change to the tool's wording changes both at once.
+
+Rules:
+
+- **Deterministic and total.** No LLM, no clock, no randomness, no network. The same `args` must
+  produce byte-identical text, or the spoken readback and the printed summary could contradict each
+  other. See `tests/unit/test_announce.py::test_plan_announcement_deterministic_and_redacted`.
+- **Bound, never unbounded.** A tool listing many items must summarise rather than enumerate forever
+  (bounds table in §2.8). The `describe()` summary shown in the terminal may be longer than the
+  spoken readback, but truncation is announced in both.
+- **Never contains a secret.** The spoken path additionally passes through `announce.speakable()`,
+  which masks tokens, and the spoken text is never logged at INFO (character count only).
+- **Args only, no side effects.** `describe()` must not touch the filesystem, the network, or the
+  registry; it is called before approval, in the client process, on data the daemon supplied.
+
 **Registry rules**
 - `registry.register(spec)` fails on duplicate names and on names/descriptions matching a forbidden pattern (`shell`, `powershell`, `cmd`, `exec`, `eval`).
 - `registry.catalogue_for_llm()` returns JSON schemas + descriptions + **no tiers** (the LLM should not reason about permissions).
@@ -64,6 +81,20 @@ Legend: **T** = base tier. Verification = what `verify()` checks. All paths are 
 
 ### 2.2 Files (allowed roots only)
 
+**`path` / `paths` argument description (planner-facing).** The schema text sent to the LLM says,
+for `create_file.path` and `delete_path.paths`:
+
+> File name or path. A bare file name means the user's Desktop; a known folder alias (desktop,
+> documents, downloads, pictures or a configured alias) may prefix it; an absolute path is used as
+> given.
+
+This is deliberate: the planner follows the schema it is given, so the schema must state the bare-name
+default rather than implying a path is mandatory. Resolution happens in `agent/nodes/validate.py` via
+`tools/default_dirs.resolve_location`, **before** any policy decision, and it is what makes a bare
+`notes.txt` land on the Desktop. `read_file`, `append_file` and `list_dir` keep the plainer
+"Absolute file path." / "Absolute folder path." wording — they are read-shaped tools the planner
+rarely invents a location for.
+
 | Tool | T | Args | Behaviour | Verification | Notes |
 |------|---|------|-----------|--------------|-------|
 | `list_dir` | 0 | `path` | List names, sizes, modified times (max 200 entries) | — | Untrusted names → `tainted=True` (filenames can contain injection text) |
@@ -74,6 +105,24 @@ Legend: **T** = base tier. Verification = what `verify()` checks. All paths are 
 | `undo_last_delete` | 1 | — | Read undo log; restore latest batch from the Recycle Bin using shell COM/`pywin32` if possible; otherwise instruct the user (path list) | Original path exists again | Best effort; document limitations honestly |
 
 Preview for `delete_path` (in `describe()`): list each resolved path, kind (file/folder), size, and folder item count.
+
+**`delete_path` voice rules (Stage 3).** Base tier 2. Voice may approve it **only** when
+`[voice] allow_tier2_by_voice = true`, and even then:
+
+| Condition | Fail-closed behaviour |
+|-----------|-----------------------|
+| Flag off (default) | voice refuses; terminal/dialog only |
+| Tier re-assigned 3 by the engine | voice refuses, in NORMAL and AUTO alike |
+| Any target outside allowed roots, or protected | voice refuses |
+| Any target not readable at approval time | voice refuses (readback cannot be produced) |
+| Folder requiring a typed name (`needs_typed_confirmation`) | voice refuses |
+| ≥ 6 targets | spoken readback truncates to 5 + `and N more`; printed summary is complete |
+| Target path > 120 chars | that item is truncated in the readback, announced |
+| Session locked | voice **never** unlocks; see `docs/03` §7.4 rule 2 |
+
+The answer must be the single word `proceed`. `"yes"`, `"ok"`, `"go ahead"` are refused. The daemon
+sets a `voice_tier2` marker; `policy_gate` re-verifies flag + tool + tier + readback from the
+checkpointed step and ignores the payload's own claims.
 
 ### 2.3 Keyboard / UI
 
@@ -125,6 +174,21 @@ Flow:
 - Fallback (Phase 6b, optional): Playwright persistent context (`browser_profile/`) on `https://web.whatsapp.com/`; QR login once; same verification-before-send rule.
 - `contacts.json` is edited only through `jarvis contacts …` CLI (no tool lets the LLM add contacts).
 
+**`whatsapp_send` voice rules (Stage 3).** Base tier 2. Voice may approve it **only** when
+`[voice] allow_tier2_by_voice = true`, and even then:
+
+| Condition | Fail-closed behaviour |
+|-----------|-----------------------|
+| Flag off (default) | voice refuses; terminal/dialog only |
+| Tier re-assigned 3 by the engine | voice refuses, in NORMAL and AUTO alike |
+| Contact did not resolve to exactly one recipient | voice refuses (no readback possible) |
+| Verification of the open chat fails later (step 5 above) | send does not happen — draft left for manual send |
+| Message body | **never spoken and never logged at INFO**; the readback names the recipient only |
+| Session locked | voice **never** unlocks (see `docs/03` §7.4 rule 2) |
+
+The answer must be `proceed`. Voice approval authorises the *draft-and-verify* path only; the
+step-5 verification-before-send invariant is unchanged, so an unverifiable chat still blocks the send.
+
 ### 2.7 Audit checks (`audit/checks.py`) — all read-only
 
 | Check | Method | Needs admin? |
@@ -143,6 +207,25 @@ Flow:
 | JARVIS self-review | Query `task_log` and `failures`: repeated failing tools, avg retries, common errors; suggest fixes (text) | No |
 
 Report format (`reports/audit-*.md`): summary table with severity (OK / INFO / WARN / HIGH), per-section findings, "Suggested actions" (text only), footer "read-only audit". LLM (fast model) may write the plain-language summary from the findings JSON (wrapped as untrusted data). The LLM **never** disables protections and no fix tool exists in v1.
+
+### 2.8 Confirmation readback — bounds and voice rules (Stage 3)
+
+Every confirmation reads the action back from the tool's own `describe()`/args before asking for
+approval. The bounds are global so a new tool inherits them for free:
+
+| Bound | Value | On exceed |
+|-------|-------|-----------|
+| Items listed | 5 | `and N more` (printed summary stays complete) |
+| Item length | 120 chars | truncate with `…` |
+| Whole readback | 600 chars | truncate with `… (full list in the terminal summary)` |
+| Secret-shaped tokens | — | replace with `***` |
+| `needs_typed_confirmation` | — | voice can never approve |
+
+Truncation is always **announced**; nothing is silently dropped. The readback is generated from the
+step's **checkpointed** args, never from the daemon payload, so a tampered payload cannot change
+what the user is told they are approving. Voice-approvable tools are exactly `delete_path` and
+`whatsapp_send`; every other Tier 2 tool is terminal/dialog only even with the flag on. Full protocol:
+`docs/03_SECURITY_AND_POLICY.md` §7.4 and §7.4.1.
 
 ## 3. Planner-facing tool catalogue (what the LLM sees)
 

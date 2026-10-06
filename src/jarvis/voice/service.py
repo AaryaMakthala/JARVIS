@@ -124,6 +124,7 @@ class VoiceService:
         echo_transcript: bool = True,
         reporter: VoiceStatusReporter | None = None,
         routing_report: Any | None = None,
+        voice_settings: Any = None,
     ) -> None:
         self._audio = audio
         self._wake_detector = wake_detector
@@ -147,6 +148,9 @@ class VoiceService:
         self._max_spoken_chars = max_spoken_chars
         self._report_status = report_status
         self._echo_transcript = echo_transcript
+        #: ``VoiceSettings`` for the Stage 3 Tier-2-by-voice relaxation
+        #: (``None`` = owner never enabled it, so Tier 2 refuses by voice).
+        self._voice_settings = voice_settings
         self._reporter = reporter
         self._routing_report = routing_report
         self._state: VoiceState = "off"
@@ -231,6 +235,7 @@ class VoiceService:
                 max_spoken_chars=self._max_spoken_chars,
                 report_status=self._report_status,
                 echo_transcript=self._echo_transcript,
+                voice_settings=self._voice_settings,
                 reporter=self._reporter,
                 routing_report=self._routing_report,
                 on_exit=self._on_loop_exit,

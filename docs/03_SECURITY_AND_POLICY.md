@@ -112,7 +112,7 @@ The **summary shown to the user is generated from the validated args**, not from
 5. Daemon resumes the graph with `{"approved": bool, "action_hash": h}` only.
 6. `policy_gate` re-checks `hash == decision.action_hash` and `unlock.is_unlocked()` for Tier 2; `act` re-checks hash ∈ approved.
 7. Confirmations time out (default 60 s) → treated as "no".
-8. Voice may answer yes/no for Tier 1 only, and JARVIS repeats the action aloud first. Tier 2 requires the terminal or dialog.
+8. Voice may answer yes/no for Tier 1 only, and JARVIS repeats the action aloud first. Tier 2 requires the terminal or dialog — **unless the owner explicitly opts in to Tier 2 by voice (§7.4), which is off by default**. Tier 3 is never answerable by voice.
 
 ### 7.1 Voice confirmation window (Tier 1 only)
 
@@ -161,6 +161,73 @@ Confirmation text format (example):
   [!] Derived from untrusted web content   (only when tainted)
 Approve? (yes/no) · JARVIS password required (locked)
 ```
+
+### 7.3 Plan-level approval (Stage 3, decision D1a/D1b)
+
+A single wake-free window (§7.1) may approve **a contiguous run of Tier 1 steps** at plan level instead of interrupting once per step. This is Tier 1 only; it grants no new authority.
+
+- **Eligibility is computed by code, not the planner** (`agent/batch_approval.py`). A step joins the run only if it is Tier 1, its args are fully literal, it needs no unlock, it is not runtime-derived, it is not blocked, and its `action_hash` is not already in the approved set.
+- The run **stops at the first step that fails any of those tests**, and Tier 2 steps are **never** placed in `eligible` — not even when §7.4 is enabled. Tier 2 keeps its own confirmation.
+- The payload is `type="plan_approval"` plus `eligible` (ordered `(step_id, action_hash)` pairs) and a `batch_hash = sha256("|".join(action_hash))` over exactly those steps. The batch hash is a *selection* fingerprint: it binds which steps were offered, not permission to run anything.
+- The announcement (spoken and printed) is the plain ordered list of steps with hashes. `T1 · create_file · 1f3c…`. Deterministic, no LLM, identical in NORMAL and AUTO (D14) — AUTO relaxes nothing.
+- On resume, `policy_gate` re-evaluates every step, skips steps whose hash is already approved, and stops approving at the **first step the engine now assigns a different tier to** (fail closed).
+- `plan_approval` itself carries the normal Tier 1 gate: the engine still computes the decision and the batch hash is a TOCTOU check like any other.
+
+### 7.4 Tier 2 by voice — explicit opt-in relaxation of §7.1 (Stage 3)
+
+**This section deliberately relaxes the rule in §7.1 that "voice = Tier 1 only".** It is a bounded, owner-elected exception, not a new tier. It is **off by default** (`[voice] allow_tier2_by_voice = false`), and with the flag off the behaviour is exactly §7.1.
+
+When the flag is on, and **only** for these two tools:
+
+| Tool | Tier | Extra conditions |
+|------|------|------------------|
+| `delete_path` | 2 | every resolved target is inside allowed roots, is not protected, and is readable at approval time; count shown to the user matches |
+| `whatsapp_send` | 2 | exactly one recipient resolved from `contacts.json`; recipient shown to the user |
+
+Everything below holds even with the flag on:
+
+1. **Tier 3 is always refused**, in NORMAL and in AUTO, and the refusal is identical in both.
+2. **The session is never unlocked.** Voice approval does not call `UnlockManager.unlock`, does not create a session, and does not satisfy `needs_unlock` — `policy_gate` checks this itself, so even a forged resume cannot convert voice into an unlocked session. Tier 2 by voice is *not* a relaxation of the password rule.
+3. **The readback is spoken first and is bounded** (§7.4.1). The user must be able to hear what they are approving.
+4. **The accepted answer is `proceed` only.** `"yes"`, `"ok"`, `"go ahead"` etc. are **refused** for a Tier 2 window. Anything that is not `proceed` is "no". Silence and timeout are "no".
+5. **No typed confirmation.** A step that needs the folder name typed can never be approved by voice.
+6. **A flag alone approves nothing.** The daemon sets a `voice_tier2=True` marker *and* re-verifies every condition below in `policy_gate`. The marker is necessary, never sufficient.
+7. **Nothing reaches the planner.** Tier, tool name, and readback text never enter an LLM prompt.
+
+`policy_gate` grants the exemption only when **all** of these are true, re-derived from the checkpointed step — not from the payload:
+
+- `answer["approved"]` is true, and the step's `action_hash` matches the answer (ordinary §7.6 check);
+- `state["source"] == "voice"` (AUTO and NORMAL identical) and the daemon-set marker is present;
+- the owner flag is on;
+- the engine's fresh `Decision` is `allowed=True` and `tier == 2` (a re-tier to 3 fails closed);
+- the step's tool ∈ {`delete_path`, `whatsapp_send`};
+- `needs_typed_confirmation` is false;
+- the readback recomputed from the step's own args is `ok` and bounded.
+
+**Fail closed.** If the readback cannot be produced, or the target cannot be read, the voice path refuses and the owner must use the terminal.
+
+#### 7.4.1 Readback bounds
+
+The spoken readback is generated from the step's own arguments (`voice/readback.py`, `voice/announce.py`) and is bounded so a long list can never become an unbounded TTS utterance:
+
+| Bound | Value | Effect when exceeded |
+|-------|-------|----------------------|
+| Items | 5 | remainder summarised as `and N more`; the user still sees the full list in the printed summary |
+| Item length | 120 chars | truncated with `…` |
+| Whole readback | 600 chars | truncated with `… (full list in the terminal summary)` |
+| Secrets, tokens, message bodies | never spoken | masked as `***` |
+
+`delete_path` names the count and total size; `whatsapp_send` names **one** recipient. Truncation is announced, never silent. Every spoken confirmation, announcement, and readback passes through the single redaction choke point (`announce.speakable`), and INFO logs record only a character count, never the words.
+
+### 7.5 Correlation and expiry (Stage 3)
+
+A confirmation is bound to **one specific action at one specific moment** by three values, all checked in code:
+
+- **`confirmation_id`** — a fresh opaque id per request. An answer that names an id the daemon does not hold is rejected as unknown, and the id is consumed on use, so a replayed answer is rejected too.
+- **`plan_hash`** — SHA-256 over the step ids, tool names, and `action_hash`es of the whole plan. It is refreshed on every replan. A stale answer from an earlier plan cannot approve a step in a different plan.
+- **`expiry`** — the request carries an absolute deadline; past it the answer is "no". A late answer is refused even if the hash still matches.
+
+Plus the ordinary `action_hash` / approved-hash check: approval is bound to the exact tool plus normalised args. A stale or hijacked window therefore cannot approve a different action, in Tier 1, in a §7.3 batch, or in §7.4.
 
 ## 8. Untrusted content handling
 

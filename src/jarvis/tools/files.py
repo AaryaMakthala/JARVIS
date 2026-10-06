@@ -36,6 +36,7 @@ from send2trash import send2trash
 from jarvis import config
 from jarvis.policy import paths
 from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
+from jarvis.tools.default_dirs import location_label
 
 _MAX_CHARS = 1_048_576  # 1 MiB content/secondary cap
 _CAP = f"content exceeds the {_MAX_CHARS} character limit"
@@ -54,7 +55,15 @@ class CreateFileArgs(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    path: str = Field(min_length=1, max_length=4096, description="Absolute file path.")
+    path: str = Field(
+        min_length=1,
+        max_length=4096,
+        description=(
+            "File name or path. A bare file name means the user's Desktop; a known folder "
+            "alias (desktop, documents, downloads, pictures or a configured alias) may "
+            "prefix it; an absolute path is used as given."
+        ),
+    )
     content: str = Field(default="", max_length=_MAX_CHARS, description="Text to write.")
     overwrite: bool = Field(default=False, description="Replace the file if it exists.")
 
@@ -95,7 +104,11 @@ class DeletePathArgs(BaseModel):
     paths: list[str] = Field(
         min_length=1,
         max_length=_MAX_PATHS,
-        description=f"Paths to delete (1..{_MAX_PATHS}).",
+        description=(
+            f"File name or path, 1..{_MAX_PATHS} of them. A bare file name means the user's "
+            "Desktop; a known folder alias (desktop, documents, downloads, pictures or a "
+            "configured alias) may prefix it; an absolute path is used as given."
+        ),
     )
 
 
@@ -435,7 +448,7 @@ def _run_create_file(args: CreateFileArgs, ctx: ToolContext) -> ToolResult:
         raise
     return ToolResult(
         ok=True,
-        output=f"wrote {len(data)} bytes to {target}",
+        output=f"Created {target.name} on {location_label(target, ctx.settings)}.",
         data={"path": str(target), "size": len(data)},
     )
 
@@ -703,9 +716,9 @@ def _run_delete_path(args: DeletePathArgs, ctx: ToolContext) -> ToolResult:
         except OSError as exc:
             errors.append(f"deleted {record.original_path} but the undo log failed: {exc}")
             continue
+        label = location_label(Path(record.original_path), ctx.settings)
         deleted.append(
-            f"{record.original_path} -> Recycle Bin ({_human_size(record.size)}, "
-            f"{record.item_count} item(s))"
+            f"Moved {Path(record.original_path).name} to the Recycle Bin (from {label})."
         )
         records.append(record.__dict__)
 

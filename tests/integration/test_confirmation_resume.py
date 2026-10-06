@@ -44,6 +44,8 @@ def test_approve_runs_verifies_and_reports(tmp_path: Any) -> None:
             "resolved_paths": [],
             "action_hash": first.confirmation["action_hash"],
             "untrusted": False,
+            "tool": "fake_echo",
+            "allowed": True,
         }
 
         result = resume_task(ctx, saver, first.task_id, approve(first.confirmation))

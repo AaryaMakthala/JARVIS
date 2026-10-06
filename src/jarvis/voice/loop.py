@@ -61,6 +61,9 @@ from typing import Any
 
 from jarvis.agent.answer import spoken_answer
 from jarvis.logging_setup import redact
+from jarvis.voice.announce import CONFIRMATION_PROMPT as _ANNOUNCE_CONFIRMATION_PROMPT
+from jarvis.voice.announce import speakable, spoken_before_confirm
+from jarvis.voice.console_say import say_line
 from jarvis.voice.interfaces import (
     AudioInput,
     AudioSegment,
@@ -81,6 +84,8 @@ from jarvis.voice.status import (
     VoiceStatusReporter,
 )
 from jarvis.voice.stopwatch import BARE_CANCEL_MAX_S, OnsetTrigger
+from jarvis.voice.tier2_voice import TIER2_PROCEED_WORDS
+from jarvis.voice.tier2_voice import allowed as tier2_voice_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -302,7 +307,10 @@ VOICE_OFF_ACKNOWLEDGEMENT = "Goodbye."
 #: wake-free window (see :meth:`VoiceLoop._capture_spoken_answer`), so asking
 #: for the wake word here would be asking for something the window does not
 #: listen for.  A constant, like the cancellation acknowledgement.
-CONFIRMATION_PROMPT = "Say yes to continue, or no to cancel."
+#: Stage 3 moved the wording to :mod:`jarvis.voice.announce` (which also owns
+#: the plan/Tier-2 prompts); it is re-exported here so existing importers keep
+#: working and there is exactly one definition of the words.
+CONFIRMATION_PROMPT = _ANNOUNCE_CONFIRMATION_PROMPT
 
 #: Spoken when the wake-free window produced no usable answer.  Fixed wording,
 #: and always a refusal (fail closed, docs/03 §7.8).
@@ -334,17 +342,30 @@ def _approval_words(payload: dict[str, Any]) -> frozenset[str]:
     """The words that count as "yes" for ``payload``'s confirmation.
 
     A payload is treated as destructive/high-risk when it demands a typed
-    folder-name confirmation or carries a Tier 2+ step.  Anything that reaches
-    the voice matcher is normally Tier 1 + untagged, so the loose set applies;
+    folder-name confirmation, carries a Tier 2+ step, or is a plan-level
+    ``plan_approval`` covering several steps at once.  A single Tier 1 step that
+    reaches the voice matcher is untagged, so the loose set still applies to it;
     the strict set is the defensive fallback that can never loosen a refusal.
+
+    Stage 3: a **single Tier 2** step (the only tier the voice path may reach
+    when ``voice.allow_tier2_by_voice`` is on) is stricter still - only
+    "proceed".  "yes", "confirm", "ok" and "go" are refused, because a spoken
+    readback ending in "...or cancel." is exactly the moment an "ok" slips out.
+    A ``plan_approval`` payload is always Tier 1 batch, so it keeps the strict
+    set; a Tier 3 payload never reaches the matcher at all.
     """
+    if payload.get("type") == "plan_approval":
+        return _STRICT_YES_WORDS
     if payload.get("typed_confirmation") is not None:
         return _STRICT_YES_WORDS
     try:
-        if int(payload.get("tier", 0)) >= 2:
-            return _STRICT_YES_WORDS
+        tier = int(payload.get("tier", 0))
     except (TypeError, ValueError):
-        pass
+        return _LOOSE_YES_WORDS
+    if tier >= 3:
+        return _STRICT_YES_WORDS
+    if tier == 2:
+        return TIER2_PROCEED_WORDS
     return _LOOSE_YES_WORDS
 
 
@@ -754,6 +775,7 @@ class VoiceLoop:
         echo_transcript: bool = True,
         max_spoken_chars: int = DEFAULT_MAX_SPOKEN_CHARS,
         routing_report: Callable[[], ProviderReport | None] | None = None,
+        voice_settings: Any = None,
     ) -> None:
         self._audio = audio
         self._wake_detector = wake_detector
@@ -787,6 +809,10 @@ class VoiceLoop:
         #: Optional provider/model probe, called after the agent answered, so
         #: the console can show which provider actually served the request.
         self._routing_report = routing_report
+        #: ``VoiceSettings`` (or ``None``) for the Stage 3 Tier-2-by-voice
+        #: relaxation.  ``None`` means the owner never enabled it, so a directly
+        #: constructed loop keeps refusing every Tier 2 action by voice.
+        self._voice_settings = voice_settings
         self._reporter = reporter or VoiceStatusReporter(
             stream="auto",
             enabled=report_status,
@@ -997,6 +1023,7 @@ class VoiceLoop:
         logger.info("voice boundary: voice off heard inside a window; stopping the loop")
         self._reporter.stop_request()
         spoken = self._turn_voice_off()
+        say_line(spoken)
         try:
             self._tts.speak(spoken)
         except Exception:
@@ -1027,18 +1054,33 @@ class VoiceLoop:
         logger.info("dictation stopped")
 
     def can_confirm_by_voice(self, payload: dict[str, Any]) -> bool:
-        """Whether ``payload`` may be approved by voice (Tier 1 only).
+        """Whether ``payload`` may be approved by voice.
 
-        Fails closed: Tier 2+ and typed folder-name confirmations always need
-        the terminal.  Unknown / missing fields are treated as a refusal.
+        Tier 1 as before.  Stage 3 adds the *opt-in* Tier 2 relaxation: a
+        single Tier 2 step is voice-approvable only when
+        ``voice.allow_tier2_by_voice`` is on **and**
+        :func:`jarvis.voice.tier2_voice.allowed` re-verifies every condition
+        (Tier exactly 2, a named tool, not blocked, no typed folder name, and a
+        readback that states the action in full).  Tier 3, typed folder-name
+        confirmations and unknown/missing fields are still refusals, and with
+        the flag off every Tier 2 payload refuses exactly as before Stage 3.
         """
+        payload = dict(payload or {})
         tier = payload.get("tier", 0)
         try:
             tier = int(tier)
         except (TypeError, ValueError):
             return False
         if tier >= 2:
-            return False
+            ok, reason = tier2_voice_allowed(
+                payload.get("tool"),
+                payload,
+                self._voice_settings,
+                args=payload.get("readback_args"),
+            )
+            if not ok:
+                logger.info("voice confirmation refused for tier %s: %s", tier, reason)
+            return ok
         return payload.get("typed_confirmation") is None
 
     def confirm_by_voice(
@@ -1047,6 +1089,7 @@ class VoiceLoop:
         *,
         on_confirmation: Callable[[dict[str, Any]], Any],
         rearm_timeout_s: float | None = None,
+        transcript: Any = "",
     ) -> str:
         """Ask the user to approve/reject a confirmation by voice.
 
@@ -1070,13 +1113,17 @@ class VoiceLoop:
         callback = on_confirmation
 
         if not self.can_confirm_by_voice(payload):
-            logger.info("voice confirmation refused: action is not Tier 1")
+            logger.info("voice confirmation refused: this action is not voice-approvable")
             callback({"approved": False, "action_hash": action_hash})
-            return f"Action requires terminal confirmation: {summary}"
+            return f"Action requires terminal confirmation: {speakable(summary)}"
 
         window_s = self._confirm_window_s if rearm_timeout_s is None else max(rearm_timeout_s, 0.0)
+        prompt_text = spoken_before_confirm(
+            payload, settings=self._voice_settings, transcript=transcript
+        )
+        say_line(prompt_text)
         try:
-            self._tts.speak(f"{summary}. {CONFIRMATION_PROMPT}" if summary else CONFIRMATION_PROMPT)
+            self._tts.speak(prompt_text)
         except Exception:
             logger.exception("voice confirmation prompt failed; refusing")
             callback({"approved": False, "action_hash": action_hash})
@@ -1225,6 +1272,7 @@ class VoiceLoop:
             if on_answer is not None:
                 on_answer(answer)
 
+        say_line(prompt)
         try:
             self._tts.speak(prompt)
         except Exception:
@@ -1274,6 +1322,7 @@ class VoiceLoop:
                     if self._check_auto_idle():
                         logger.info("voice mode=%s reason=%s", VoiceMode.NORMAL.value, "idle")
                         self._set_mode(VoiceMode.NORMAL, reason="idle")
+                        say_line("Going back to sleep.")
                         self._tts.speak("Going back to sleep.")
                         self._quiet_start_drain()
                         self._set_state(
@@ -1514,6 +1563,7 @@ class VoiceLoop:
         # → LISTENING/CAPTURE; the transition to capture happens when speech
         # capture (Phase 3) actually begins.
         logger.info("voice boundary: wake ack speech starting")
+        say_line("Yes?")
         try:
             self._tts.speak("Yes?")
         except Exception:
