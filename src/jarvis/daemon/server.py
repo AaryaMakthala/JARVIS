@@ -651,7 +651,11 @@ class DaemonServer:
         try:
             from jarvis.voice.stt import create as create_stt
 
-            stt = create_stt(model_size=self._settings.voice.stt_model)
+            stt = create_stt(
+                model_size=self._settings.voice.stt_model,
+                language=self._settings.voice.stt_language,
+                initial_prompt=self._settings.voice.stt_initial_prompt,
+            )
         except Exception:
             logger.debug("STT unavailable", exc_info=True)
 

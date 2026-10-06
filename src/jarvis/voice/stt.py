@@ -32,10 +32,14 @@ class FasterWhisperSTT:
         *,
         model_size: str = _DEFAULT_MODEL_SIZE,
         language: str | None = _DEFAULT_LANGUAGE,
+        initial_prompt: str | None = None,
     ) -> None:
         self._model = model
         self._model_size = model_size
-        self._language = language
+        # "" (config's "auto-detect" spelling) means None = faster-whisper
+        # auto-detect; "" initial_prompt means "no vocabulary hint".
+        self._language = language or None
+        self._initial_prompt = initial_prompt or None
 
     def transcribe(self, segment: AudioSegment) -> STTResult:
         """Transcribe an audio segment to text."""
@@ -46,6 +50,10 @@ class FasterWhisperSTT:
         segments, info = self._model.transcribe(
             audio_np,
             language=self._language,
+            initial_prompt=self._initial_prompt,
+            # Do not carry a previous (possibly garbage) transcript forward as
+            # conditioning: one bad detection must not poison the next one.
+            condition_on_previous_text=False,
             beam_size=1,
             vad_filter=False,  # we do our own VAD
         )
@@ -63,6 +71,7 @@ def create(
     model_size: str = _DEFAULT_MODEL_SIZE,
     compute_type: str = _DEFAULT_COMPUTE_TYPE,
     language: str | None = _DEFAULT_LANGUAGE,
+    initial_prompt: str | None = None,
 ) -> FasterWhisperSTT | None:
     """Create an STT engine; returns ``None`` if faster-whisper is missing."""
     try:
@@ -89,4 +98,9 @@ def create(
         )
         return None
 
-    return FasterWhisperSTT(model, model_size=model_size, language=language)
+    return FasterWhisperSTT(
+        model,
+        model_size=model_size,
+        language=language,
+        initial_prompt=initial_prompt,
+    )

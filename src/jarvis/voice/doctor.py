@@ -56,7 +56,7 @@ def run_voice_doctor(
         checks.extend(_probe_audio(settings))
     checks.extend(_probe_wake(vs.wake_word, vs.wake_threshold))
     if stt:
-        checks.append(_probe_stt(vs.stt_model))
+        checks.append(_probe_stt(vs))
     if tts:
         checks.append(_probe_tts(vs.tts_backend))
     return checks
@@ -173,13 +173,17 @@ def _probe_wake(wake_word: str, threshold: float) -> list[Check]:
     ]
 
 
-def _probe_stt(model_size: str) -> Check:
+def _probe_stt(vs: config.VoiceSettings) -> Check:
     """Load the STT model and transcribe one second of silence."""
-    if not model_size:
+    if not vs.stt_model:
         return _check("stt_model", "FAIL", "no stt_model set in config.toml")
     from jarvis.voice.stt import create as create_stt
 
-    stt = create_stt(model_size=model_size)
+    stt = create_stt(
+        model_size=vs.stt_model,
+        language=vs.stt_language,
+        initial_prompt=vs.stt_initial_prompt,
+    )
     if stt is None:
         return _check("stt_model", "FAIL", VOICE_HINTS["stt-model-missing"])
     try:
@@ -190,7 +194,7 @@ def _probe_stt(model_size: str) -> Check:
     return _check(
         "stt_model",
         "PASS",
-        f"'{model_size}' loaded and silent probe transcribed (first use downloads the model)",
+        f"'{vs.stt_model}' loaded and silent probe transcribed (first use downloads the model)",
     )
 
 
