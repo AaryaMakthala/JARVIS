@@ -45,6 +45,7 @@ jarvis/
 │  ├─ secrets.py             # keyring wrapper: get/set/delete; never logs values
 │  ├─ logging_setup.py       # JSONL file logging + redaction filter
 │  ├─ platform_guard.py      # is_windows(), require_windows(), lazy imports
+│  ├─ apps_scan.py           # [apps] discovery + scan/add/list CLI (never a tool)
 │  ├─ llm/
 │  │   ├─ client.py          # LLMClient protocol, GroqClient, GeminiClient, FakeLLM (tests)
 │  │   └─ prompts.py         # brain/replan prompts (templates)

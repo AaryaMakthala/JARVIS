@@ -44,6 +44,7 @@ It answers in text (terminal) and by voice (if enabled) and shows a visible indi
 | `jarvis password set` / `change` | Set/change the JARVIS password (Argon2id hash in keyring). |
 | `jarvis lock` / `unlock` | Manually lock/unlock the Tier-2 session. |
 | `jarvis contacts add|list|remove` | Manage WhatsApp contacts (`name → +countrycode number`). |
+| `jarvis apps scan|add|list` | Discover installed apps (read-only) and seed `[apps]` entries; only `--approve`d proposals are written. |
 | `jarvis autostart enable|disable|status` | Task Scheduler "At log on" task. |
 | `jarvis audit [--fix-suggestions]` | Read-only security/performance/updates/self report to Markdown. |
 | `jarvis skills list|show|delete` | Inspect skill memory. |

@@ -18,6 +18,7 @@ from __future__ import annotations
 import getpass
 import logging
 import traceback
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -38,6 +39,7 @@ from jarvis.agent import (
     resume_task,
     run_task,
 )
+from jarvis.apps_scan import append_apps_entries, list_entries, scan_command, validate_add
 from jarvis.checks import Check, _check
 from jarvis.llm import models as llm_models
 from jarvis.llm.client import (
@@ -1818,6 +1820,69 @@ def contacts_list() -> None:
         return
     for row in rows:
         console.print(row)
+
+
+# ── apps: scan / add / list ([apps] seeding) ─────────────────────────────────
+
+
+def _apps_settings() -> config.Settings:
+    """Load settings (seam so tests can stub the config file)."""
+    return config.load_settings()
+
+
+def _apps_config_path() -> Path:
+    """Path to config.toml (seam for the apps commands)."""
+    return config.config_file()
+
+
+def _apps_show(action: Callable[[], list[str]]) -> None:
+    """Run an apps action and render its lines; a refusal exits red."""
+    try:
+        lines = action()
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    for line in lines:
+        console.print(line)
+
+
+apps_app = typer.Typer(
+    help="Discover installed apps and seed [apps] entries (owner-approved).",
+    no_args_is_help=True,
+)
+app.add_typer(apps_app, name="apps")
+
+
+@apps_app.command("scan")
+def apps_scan(
+    approve: Annotated[str, typer.Option(help="Entry number(s) to write, e.g. 1 or 1,3.")] = "",
+    dry_run: Annotated[bool, typer.Option(help="Report without touching config.toml.")] = False,
+) -> None:
+    """Propose [apps] entries from the Start Menu and App Paths (read-only)."""
+    _apps_show(
+        lambda: scan_command(
+            _apps_settings(), _apps_config_path(), approve=approve, dry_run=dry_run
+        )
+    )
+
+
+@apps_app.command("add")
+def apps_add(
+    name: Annotated[str, typer.Argument(help="Key for [apps], e.g. vscode (letters/digits/_-).")],
+    path: Annotated[str, typer.Argument(help="Absolute path to the .exe.")],
+) -> None:
+    """Add one owner-supplied [apps] entry (same rules as scan)."""
+    _apps_show(
+        lambda: append_apps_entries(
+            _apps_config_path(), {name: validate_add(_apps_settings(), name, path)}
+        )
+    )
+
+
+@apps_app.command("list")
+def apps_list() -> None:
+    """Show the configured [apps] entries."""
+    _apps_show(lambda: list_entries(_apps_settings()))
 
 
 # ── learned skills / memory (Phase 8) ──────────────────────────────────────
