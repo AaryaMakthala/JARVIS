@@ -166,6 +166,9 @@ similarity_threshold = 0.75
 max_skills = 500
 max_failures = 200
 max_preferences = 50
+
+[tools]
+max_code_chars = 4000
 """
 
 
@@ -479,6 +482,12 @@ class MemorySettings(BaseModel):
     max_task_log: int = 500
 
 
+class ToolsSettings(BaseModel):
+    """Limits enforced by the file-writing tools at run time (fail-closed)."""
+
+    max_code_chars: int = 4000
+
+
 class Settings(BaseSettings):
     """Top-level application settings.
 
@@ -504,6 +513,7 @@ class Settings(BaseSettings):
     whatsapp: WhatsAppSettings = WhatsAppSettings()
     memory: MemorySettings = MemorySettings()
     risk: RiskSettings = RiskSettings()
+    tools: ToolsSettings = ToolsSettings()
     config_version: int = 1
 
     @classmethod

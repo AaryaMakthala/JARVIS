@@ -44,6 +44,15 @@ _MAX_PATHS = 20
 _COUNT_CAP = 50_000  # previews/stat cap for folder scanning
 _HASH_BYTES = 64 * 1024 * 1024  # sha256 cap for very large files
 
+#: Fixed line cap for code-like files (not config-driven; stage 4.6).
+MAX_CODE_LINES = 120
+
+#: Suffixes treated as code for the small-code limit (case-insensitive).
+CODE_SUFFIXES = frozenset(
+    ".py .pyw .js .jsx .ts .tsx .html .htm .css .java .c .h .cpp .hpp .cs .go .rs "  # noqa: SIM905
+    ".sh .rb .php .sql .lua .kt .swift".split()
+)
+
 
 # ---------------------------------------------------------------------------
 # Args models
@@ -419,6 +428,34 @@ def _resolve(args: CreateFileArgs) -> Path:
     return paths.resolve_safe(args.path)
 
 
+def _code_refusal(
+    target: Path, content: str, ctx: ToolContext, existing: Path | None = None
+) -> str | None:
+    """Small-code refusal message for code-like targets, else None (fail-closed)."""
+    if target.suffix.lower() not in CODE_SUFFIXES:
+        return None
+    max_chars = ctx.settings.tools.max_code_chars
+    refuse = (
+        "This version supports small code tasks only."
+        f" (max {max_chars} characters / {MAX_CODE_LINES} lines)"
+    )
+    size = 0
+    lines = 0
+    if existing is not None:
+        try:
+            size = existing.stat().st_size
+            text = (
+                existing.read_text(encoding="utf-8", errors="replace") if size <= max_chars else ""
+            )
+        except OSError:
+            return refuse
+        lines = text.count("\n") + (1 if text else 0)
+    lines += content.count("\n") + (1 if content else 0)
+    if size + len(content) > max_chars or lines > MAX_CODE_LINES:
+        return refuse
+    return None
+
+
 def _run_create_file(args: CreateFileArgs, ctx: ToolContext) -> ToolResult:
     try:
         target = _resolve(args)
@@ -429,6 +466,10 @@ def _run_create_file(args: CreateFileArgs, ctx: ToolContext) -> ToolResult:
 
     if target.exists() and not args.overwrite:
         return ToolResult(ok=False, error=f"file exists; pass overwrite=true to replace: {target}")
+
+    refusal = _code_refusal(target, args.content, ctx)
+    if refusal is not None:
+        return ToolResult(ok=False, error=refusal)
 
     if ctx.dry_run:
         return ToolResult(ok=True, output=f"[dry-run] would create {target}")
@@ -513,6 +554,10 @@ def _run_append_file(args: AppendFileArgs, ctx: ToolContext) -> ToolResult:
 
     if not target.is_file():
         return ToolResult(ok=False, error=f"file does not exist (use create_file): {target}")
+
+    refusal = _code_refusal(target, args.content, ctx, existing=target)
+    if refusal is not None:
+        return ToolResult(ok=False, error=refusal)
 
     if ctx.dry_run:
         return ToolResult(

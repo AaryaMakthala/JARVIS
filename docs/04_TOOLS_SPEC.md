@@ -101,6 +101,8 @@ rarely invents a location for.
 | `read_file` | 0 | `path`, `max_bytes=20000` | Read text file (utf-8, fallback errors=replace). Refuse binary. | — | Output `tainted=True` |
 | `create_file` | 1 | `path`, `content`, `overwrite=False` | Create parents; fail if exists and not overwrite. If `overwrite=True` and exists → engine sets Tier 1 with "OVERWRITE" warning + shows size/hash of the old file. Atomic write (temp + `os.replace`). | Exists; size matches; SHA-256 of content matches | Encoding utf-8; max 1 MB |
 | `append_file` | 1 | `path`, `content` | Append text | Size increased by expected bytes | |
+
+Code-like suffixes (`.py .js .ts .html .css .c .go .sh …`, case-insensitive, on the resolved target) are capped at `tools.max_code_chars` (default 4000) and 120 lines by `create_file` and `append_file` (appends include the existing size); over the limit the run refuses with "This version supports small code tasks only." and writes nothing — other suffixes are unaffected.
 | `delete_path` | 2 | `paths: list[str]` (max 20) | Resolve all; each must be inside allowed roots and not protected; move to Recycle Bin with `send2trash`; write undo-log entry (JSONL: time, original path, size, hash if file). Folders: engine requires typed folder name; show item count and total size. | Path no longer exists | Never `os.remove`/`shutil.rmtree`. Files in use → error per path |
 | `undo_last_delete` | 1 | — | Read undo log; restore latest batch from the Recycle Bin using shell COM/`pywin32` if possible; otherwise instruct the user (path list) | Original path exists again | Best effort; document limitations honestly |
 
