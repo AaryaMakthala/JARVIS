@@ -27,10 +27,14 @@ How a label is produced
    and the audit trail.  It cannot push a step above the tier its text already
    justifies; a tainted Tier 0 read is left alone, as the spec intends.
 4. **Label + confidence** - the label is the arg-max of the weighted votes
-   (ties break toward the *more severe* label).  The confidence is a monotone
-   function of how far ahead the winner is, so it means the same thing as the
-   ONNX model's max softmax probability: the caller escalates one label when it
-   is below the configured threshold (fail toward caution).
+   (ties break toward the prior, see :func:`_winner`).  The confidence is a
+   monotone function of how far ahead the winner is, so it means the same thing
+   as the ONNX model's max softmax probability: the caller escalates one label
+   when it is below the configured threshold (fail toward caution).  The
+   escalation needs a SENSITIVE or DANGEROUS signal to act on: when the only
+   counter-evidence is SAFE wording tying with the prior (``open`` on a Tier 1
+   open tool), that is negative evidence, not uncertainty, and the label stays
+   where the prior put it.
 """
 
 from __future__ import annotations
@@ -379,6 +383,19 @@ def _confidence(margin: float, evidence: float) -> float:
     return round(1.0 / (1.0 + math.exp(-_SLOPE * (margin - _MID))), 4)
 
 
+def _risk_evidence(votes: dict[str, float], prior_label: Label | None, evidence: float) -> float:
+    """SENSITIVE/DANGEROUS pattern votes; SAFE wording is never risk evidence.
+
+    ``evidence`` already excludes the prior vote, so subtracting the SAFE
+    pattern votes leaves exactly what a caution escalation may act on.  When
+    that remainder is zero, the only thing dragging the confidence down is SAFE
+    wording tying with the prior - "open notes.txt in notepad" on a Tier 1 open
+    tool - and raising the label would ask for a password to open a text file.
+    """
+    safe_pattern_votes = votes[SAFE] - (PRIOR_WEIGHT if prior_label == SAFE else 0.0)
+    return evidence - safe_pattern_votes
+
+
 def assess(
     text: str,
     *,
@@ -390,7 +407,8 @@ def assess(
 
     ``prior_label`` is the label the rules already decided (from the tool's
     ``base_tier``); pass ``None`` when the tool is unknown.  A verdict whose
-    confidence is below ``threshold`` is escalated one label (docs/08 section 2),
+    confidence is below ``threshold`` is escalated one label (docs/08 section 2)
+    *when a SENSITIVE or DANGEROUS signal voted* (see :func:`_risk_evidence`),
     clamped so a low-confidence prediction can never reach Tier 3.  The returned
     tier is never below the prior, because this layer may only add a tier.
     """
@@ -415,7 +433,7 @@ def assess(
     evidence = sum(votes.values()) - (PRIOR_WEIGHT if has_prior else 0.0)
     label, _best, margin = _winner(votes, prior_label)
     confidence = _confidence(margin, evidence)
-    escalated = confidence < threshold
+    escalated = confidence < threshold and _risk_evidence(votes, prior_label, evidence) > 0.0
     if escalated:
         label = more_severe(label)
     return Assessment(

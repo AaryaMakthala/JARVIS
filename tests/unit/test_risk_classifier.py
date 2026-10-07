@@ -254,6 +254,32 @@ def test_a_tie_resolves_to_the_prior_then_escalates_one_label() -> None:
     assert result.min_tier == 1
 
 
+def test_safe_tie_on_a_tier1_open_is_not_escalated_to_a_password_prompt() -> None:
+    """The live 4.11 case: "open notes.txt in notepad" on the Tier 1 open tool.
+
+    The only counter-evidence is the SAFE "open" pattern tying with the
+    SENSITIVE prior, which drove confidence to 0.119 and used to escalate to
+    Tier 2 (unlock + password).  SAFE wording is negative evidence, so the
+    prior label stands; real risk wording on the same tool still escalates.
+    """
+    text = serialize.serialize_action(
+        "open_in_app", {"path": "notes.txt", "app": "notepad"}, "open notes.txt in notepad"
+    )
+    result = signals.assess(text, prior_label=signals.SENSITIVE)
+    assert result.escalated is False
+    assert result.label == signals.SENSITIVE
+    assert result.min_tier == 1
+
+    risky = signals.assess(
+        serialize.serialize_action(
+            "open_in_app", {"path": "notes.txt", "app": "notepad"}, "open notes.txt and wipe it"
+        ),
+        prior_label=signals.SENSITIVE,
+    )
+    assert risky.escalated is True
+    assert risky.min_tier == 2
+
+
 def test_a_tie_never_lands_below_the_prior() -> None:
     for prior in signals.LABELS:
         text = serialize.serialize_action("delete_path", {"paths": ["a"]}, "delete a")
