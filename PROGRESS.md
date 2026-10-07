@@ -3904,5 +3904,6 @@ KNOWN GAPS (deliberate, recorded):
 - Camera/screen capture deferred to Stage 8.
 - `type_text` capped at 2000 chars (larger pastes refused).
 - Dry-run of an over-limit code request reports the same refusal as a real run.
+- Replan LLM call is not bounded by a timeout or a cancel token: a hung/slow provider keeps the task (and the daemon slot's worker) running until the call returns; recorded in the 4.17 PART A diagnosis, no fix (would touch graph/daemon internals).
 
 Regression at close: mypy (policy), ruff on touched files, and the 16-file pytest pass — results in the 4.10 report.

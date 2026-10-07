@@ -18,6 +18,10 @@ from jarvis.agent.context import AppContext
 from jarvis.agent.state import Plan
 from jarvis.tools.base import ToolResult
 
+# 4.17c: focus failures never improve on an identical second attempt (same
+# target, same window): skip retry_now and go straight to replan/fail-closed.
+_NON_RETRYABLE = ("failed to focus", "focus verification failed")
+
 
 def verify(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     """Verify the last result and advance the step bookkeeping."""
@@ -68,7 +72,10 @@ def verify(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     max_retries = ctx.settings.agent.max_retries_per_step
     retry_count = int(state.get("retry_count") or 0)
     if not last.ok or verified is False:
-        if retry_count < max_retries:
+        non_retryable = (not last.ok) and any(
+            (last.error or "").lower().startswith(prefix) for prefix in _NON_RETRYABLE
+        )
+        if retry_count < max_retries and not non_retryable:
             return {"results": results, "retry_count": retry_count + 1, "retry_now": True}
         # Retries exhausted: try a fresh plan while the replan budget allows it,
         # otherwise fail closed (never move to the next step on a failure).
