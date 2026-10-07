@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from jarvis.agent import fastpath
 from jarvis.agent.context import AppContext
 from jarvis.agent.prompts import brain_system_prompt, brain_user_prompt
 from jarvis.agent.schemas import BrainDecision
@@ -51,6 +52,9 @@ LLM_NO_ANSWER = "I couldn't produce an answer."
 def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     """Classify the request and propose actions via one structured LLM call."""
     task_id = state.get("task_id")
+    fp_update = fastpath.brain_update(state, ctx)
+    if fp_update is not None:
+        return fp_update
     if ctx.llm is None:
         # Fail immediately: there is nothing to wait for, so no retry, no
         # timeout, no provider probing may happen on this path.
