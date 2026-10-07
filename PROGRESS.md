@@ -3864,3 +3864,45 @@ Owner follow-ups: change the shared password with `jarvis password change`; keep
 
 
 
+## STAGE 4 CLOSE-OUT: time/apps scan/list windows/open_in_app/Notepad/code limit/local fast path (2026-10-07)
+
+Delivered (sub-steps 4.1-4.8 + 4.10; 4.9 SKIPPED by owner decision below):
+
+- 4.1 `get_time` (Tier 0, any OS, `tools/clock.py`) + `list_windows` (Tier 0, `windows_only`, output `tainted=True`, `tools/windows_list.py`); both wired into the registry and prompt catalogue.
+- 4.2 `jarvis apps scan` / `apps add` / `apps list` (`apps_scan.py`, `cli.py`): owner-only seeding of `[apps]`; suggestions never auto-applied; `NAME_RE` key pattern.
+- 4.3 `[apps]` config surface in `config.py` + docs; `open_app` resolves configured commands (PATH, Windows `App Paths`).
+- 4.4 `list_windows` verification hook (`_verify_list_windows`, `verified=None`) and taint plumbing through `act`.
+- 4.5a `open_in_app` (Tier 1): allowlisted launcher only, `.exe`/`.com` direct, path resolved + root-checked, protected/ADS/relative refused, `verified=None` + note.
+- 4.5b defence in depth: `DENIED_FILE_SUFFIXES` (pinned, never config) refuses everything Windows executes; `INTERPRETER_STEMS` refuses script-host/interpreter launchers ("is an interpreter"); launcher suffix re-checked in `act`.
+- 4.6 `tools.max_code_chars` (default 4000) + `MAX_CODE_LINES = 120` on `create_file`/`append_file`; refusal "This version supports small code tasks only." before dry-run; `tests/unit/test_code_limit.py` (10 tests).
+- 4.7 Notepad open+type integration tests (`tests/unit/test_notepad_flow.py`, 5 tests): allowlist, foreground fail-closed, Tier 1 batch approval covering both steps with `step_index` mirroring production.
+- 4.8 local fast path (`agent/fastpath.py`, `brain.py` hook): closed whole-utterance vocabulary (time/windows phrases, `open|launch|start <[apps] key>`), skips ONLY the LLM call; validate → policy_gate → act → verify unchanged; fail-closed guard (60 chars, reject-char set, ONE trailing `. ? !` stripped first); 13 tests incl. graph-level end-to-end with an exploding LLM.
+- 4.10 documentation pass: `docs/03` (fast-path contract + owner-approved `[apps]`), `docs/04` (`get_time`/`list_windows`/`open_in_app` catalogue rows, `windows_only` engine refusal note), this entry, ROADMAP section 9 tick.
+
+Owner live checks (manual, not run here):
+
+a. "what time is it?" → instant reply, log line `event=fastpath`.
+b. "open notepad" and "Open Notepad." → Notepad opens.
+c. "open notepad and write buy milk" → ONE readback → say yes → text appears.
+d. "what windows are open" → short spoken summary, no confirmation prompt.
+e. "create hello.py with a hello world" succeeds; a ~500-line code request is refused with the small-code message.
+f. `jarvis apps scan`, `jarvis apps --approve <name>`, `jarvis apps add evil C:\Windows\System32\cmd.exe` → last one refused.
+g. "open notes.txt in code" → readback names BOTH file and app → opens in VS Code.
+h. Attempt to open a `.bat` file via `open_in_app` → refused by the deny-list.
+
+KNOWN GAPS (deliberate, recorded):
+
+- 4.9 SKIPPED by owner: no default-folder resolver for `append_file`/`read_file`/`list_dir` (bare names still reach `resolve_safe` CWD-relative for those tools; latent behaviour pinned by `test_paths.py:91`).
+- Taint detection is whole-value containment only (no overlap/span analysis).
+- `engine.py:165` escalation path is a no-op tier escalation (harmless; needs a real raiser later).
+- Symlink-slip test unverified on this PC (no admin token to create a symlink); test marked accordingly.
+- `list_windows` process-name lookups for invisible windows: performance unmeasured.
+- `open_app` is Tier 0, so "open notepad and type X" is ONE confirmation (`type_text`, Tier 1), not a batch approval — safe but less granular.
+- Fast path works with no provider configured BY DESIGN (it skips only the LLM).
+- Hand-editing an interpreter path into `[apps]` is blocked at run time by `open_in_app`, not at config time.
+- `[tools]` settings class newly added; only `max_code_chars` exists so far.
+- Camera/screen capture deferred to Stage 8.
+- `type_text` capped at 2000 chars (larger pastes refused).
+- Dry-run of an over-limit code request reports the same refusal as a real run.
+
+Regression at close: mypy (policy), ruff on touched files, and the 16-file pytest pass — results in the 4.10 report.

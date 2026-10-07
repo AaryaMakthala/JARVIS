@@ -93,8 +93,24 @@ def test_negatives_never_fast_path() -> None:
         "a" * 61,
         "",
         "open",
-        "Open Notepad.",  # decision 4: raw "." -> LLM (fail-closed)
     ):
+        assert fastpath.match(text, Settings()) is None, text
+
+
+def test_trailing_sentence_punctuation_still_hits() -> None:
+    cases = {
+        "Open Notepad.": ("open_app", {"name": "notepad"}),
+        "What time is it?": ("get_time", {}),
+        "list windows!": ("list_windows", {}),
+    }
+    for text, expected in cases.items():
+        hit = fastpath.match(text, Settings())
+        assert hit is not None, text
+        assert (hit[0], hit[1]) == expected
+
+
+def test_dotted_names_and_paths_still_never_fast_path() -> None:
+    for text in ("open notepad.exe", "open ../../x", "open notepad.."):
         assert fastpath.match(text, Settings()) is None, text
 
 

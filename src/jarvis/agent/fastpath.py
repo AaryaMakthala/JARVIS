@@ -12,9 +12,10 @@ Safety contract (stage 4.8; docs/03):
   pipeline ``validate -> policy_gate -> act -> verify``. The deterministic
   policy engine is the only authority that assigns tiers or approves anything;
   this module never reads or writes a tier.
-* **Fail-closed guard first:** a raw utterance over 60 characters, or
-  containing any of ``/ \\ . : & ; | % $ "`` or a newline, is never fast-pathed
-  — it falls through to the LLM. Everything that does not hit a phrase falls
+* **Fail-closed guard first:** after stripping ONE trailing ``. ? !`` from the
+  raw utterance, a raw utterance over 60 characters, or containing
+  ``/ \\ . : & ; | % $ "`` or a newline, is never fast-pathed — it falls through
+  to the LLM. Everything that does not hit a phrase falls
   through byte-for-byte unchanged, including the provider-not-configured halt.
 """
 
@@ -80,9 +81,12 @@ def match(raw: str, settings: Settings) -> tuple[str, dict[str, Any], str] | Non
     The phrase table is checked first and wins over app keys; ``<name>`` must
     equal a normalised ``[apps]`` key exactly (multi-word keys allowed).
     """
-    if not raw or _rejected(raw):
+    if not raw:
         return None
-    text = normalise(raw)
+    guarded = raw[:-1] if raw[-1] in ".?!" else raw
+    if _rejected(guarded):
+        return None
+    text = normalise(guarded)
     if not text:
         return None
     if text in _TIME_PHRASES:

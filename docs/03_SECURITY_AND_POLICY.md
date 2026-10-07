@@ -10,6 +10,13 @@ This document is **non-negotiable**. If a feature conflicts with it, the feature
 A web page, a file, a search result, or a window title can contain text that tries to instruct the LLM.
 Because the LLM can never approve or lower a tier, such text cannot cause a sensitive action without user consent.
 
+**Local fast path (Stage 4, `agent/fastpath.py`).** A closed vocabulary of whole-utterance phrases
+("what time is it", "what windows are open", `open|launch|start <allowlisted [apps] key>`) is
+answered without calling the LLM. This skips **only** the LLM call: the Plan built in code runs the
+unchanged `validate → policy_gate → act → verify`, tiers are still assigned solely by the
+PolicyEngine, there is no fuzzy or substring matching, and it works with no provider configured.
+Everything else falls through to the LLM byte-for-byte.
+
 ## 2. Threat model
 
 | ID | Threat | Example | Mitigation |
@@ -36,6 +43,8 @@ Because the LLM can never approve or lower a tier, such text cannot cause a sens
 
 **Escalation only:** rules may raise a tier (e.g., overwrite of an existing file: Tier 1; delete of a folder: Tier 2 + typed confirmation), never lower one below the tool's `base_tier`.
 Final tier = `max(tool.base_tier, rule_tier, classifier_min_tier, taint_escalation)`.
+
+**`[apps]` is owner-approved only (Stage 4).** Entries enter the allowlist solely through the owner running `jarvis apps scan` (one-time seeding; suggestions never auto-applied) or `jarvis apps add <name> <path>`. The planner cannot add, edit, or suggest-install entries; every launch reads the configured `[apps]` section, and hand-edited interpreter/script paths are still refused at run time by `open_in_app`.
 
 ## 4. Decision algorithm (`policy/engine.py`)
 

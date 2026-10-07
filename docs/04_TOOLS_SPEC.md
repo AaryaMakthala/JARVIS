@@ -42,6 +42,10 @@ class ToolSpec:  # one per tool
     def describe(self, args) -> str: ...  # canonical summary used in confirmations
 ```
 
+**`windows_only` enforcement (Stage 4).** `PolicyEngine.decide` refuses any `windows_only`
+tool on a non-Windows host *before* any tier/hash work, blocked Tier-3-style with the exact
+reason `this tool only works on Windows` (`policy/engine.py`; `test_windows_only_enforcement.py`).
+
 **`describe()` is the single source for the confirmation summary and the spoken readback (Stage 3).**
 One implementation, two consumers: the printed/terminal summary, and the wake-free spoken
 readback. They therefore never disagree — a change to the tool's wording changes both at once.
@@ -101,6 +105,7 @@ rarely invents a location for.
 | `read_file` | 0 | `path`, `max_bytes=20000` | Read text file (utf-8, fallback errors=replace). Refuse binary. | — | Output `tainted=True` |
 | `create_file` | 1 | `path`, `content`, `overwrite=False` | Create parents; fail if exists and not overwrite. If `overwrite=True` and exists → engine sets Tier 1 with "OVERWRITE" warning + shows size/hash of the old file. Atomic write (temp + `os.replace`). | Exists; size matches; SHA-256 of content matches | Encoding utf-8; max 1 MB |
 | `append_file` | 1 | `path`, `content` | Append text | Size increased by expected bytes | |
+| `open_in_app` | 1 | `path`, `app` | Resolve the path (absolute, inside allowed roots, not protected) and open it with the `app`'s allowlisted `[apps]` launcher (`.exe`/`.com` only — no `.cmd` shims). **Deny-list** (pinned constant `DENIED_FILE_SUFFIXES`, never config): everything Windows executes — `.exe .com .bat .cmd .ps1 .vbs .js .hta .msi .reg .lnk .url` and friends (full list in `tools/open_in_app.py`). **Interpreter/script-host launchers refused** at run time: `python py node powershell cmd …` (`INTERPRETER_STEMS`). | App launched with the file; opening not observable → `verified=None` + note | Launcher and roots re-checked in `act` (TOCTOU) |
 
 Code-like suffixes (`.py .js .ts .html .css .c .go .sh …`, case-insensitive, on the resolved target) are capped at `tools.max_code_chars` (default 4000) and 120 lines by `create_file` and `append_file` (appends include the existing size); over the limit the run refuses with "This version supports small code tasks only." and writes nothing — other suffixes are unaffected.
 | `delete_path` | 2 | `paths: list[str]` (max 20) | Resolve all; each must be inside allowed roots and not protected; move to Recycle Bin with `send2trash`; write undo-log entry (JSONL: time, original path, size, hash if file). Folders: engine requires typed folder name; show item count and total size. | Path no longer exists | Never `os.remove`/`shutil.rmtree`. Files in use → error per path |
@@ -147,6 +152,8 @@ No generic "press keys", "click at x,y", or "run command" tools in v1.
 | `defender_quick_scan` | 1 | — | Fixed command `Start-MpScan -ScanType QuickScan` in background; returns immediately | Process started |
 | `audit_run` | 0 | `sections: list[Literal["security","performance","updates","self"]]` | Runs `audit/checks.py` (read-only) and writes a Markdown report | Report file exists |
 | `lock_jarvis` | 0 | — | `UnlockManager.lock()` | `is_unlocked()==False` |
+| `get_time` | 0 | — | Current PC local time as a spoken string; any OS (not `windows_only`) | — (`verified=None`: no observable post-condition) |
+| `list_windows` | 0 | — | Enumerate visible top-level windows (title + process); `windows_only=True`. Window titles are untrusted → output marked **`tainted=True`** and only ever summarised | — (`verified=None`) |
 
 PowerShell usage rule: commands are **module-level constants**, executed with
 `subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", CONST], capture_output=True, text=True, timeout=…)`.
