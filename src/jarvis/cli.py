@@ -1170,7 +1170,7 @@ def _daemon_one_shot(client: Any, line: str) -> str:
 
     _show_submission_ack(client)
     try:
-        return _daemon_event_loop(client, task_id)
+        return _daemon_event_loop(client)
     except (KeyboardInterrupt, EOFError):
         _abandon_task(client, task_id)
         console.print("[dim]cancelled[/dim]")
@@ -1201,8 +1201,8 @@ def _abandon_task(client: Any, task_id: str) -> None:
         logging.getLogger("jarvis.cli").debug("cancelling the abandoned task failed", exc_info=True)
 
 
-def _daemon_event_loop(client: Any, task_id: str) -> str:
-    """Print daemon events for ``task_id`` until it produces a final answer."""
+def _daemon_event_loop(client: Any) -> str:
+    """Print this chat's events until a final answer; replies bind to ``msg.task_id`` (4.15)."""
     from jarvis.daemon.client import DaemonError
     from jarvis.daemon.protocol import (
         ClarificationRequest,
@@ -1221,12 +1221,12 @@ def _daemon_event_loop(client: Any, task_id: str) -> str:
             console.print(f"[green]{msg.text}[/green]")
             return msg.text
         if isinstance(msg, ConfirmRequest):
-            _handle_confirm_request(client, task_id, msg)
+            _handle_confirm_request(client, msg)
         elif isinstance(msg, ClarificationRequest):
             console.print(f"[yellow]clarification needed: {msg.question}[/yellow]")
             answer = _chat_prompt("Your answer:")
             try:
-                client.send_clarification(task_id, answer=answer or "")
+                client.send_clarification(msg.task_id, answer=answer or "")
                 console.print("[dim](working...)[/dim]")
             except DaemonError as exc:
                 console.print(f"[red]{exc.message}[/red]")
@@ -1240,12 +1240,13 @@ def _daemon_event_loop(client: Any, task_id: str) -> str:
                 console.print(f"[dim]{data['message']}[/dim]")
 
 
-def _handle_confirm_request(client: Any, task_id: str, msg: Any) -> None:
+def _handle_confirm_request(client: Any, msg: Any) -> None:
     """Show a Tier confirmation, collect the answer, and send it back.
 
-    The ``action_hash`` is echoed verbatim, so the daemon can re-check that the
-    approval belongs to the exact action it interrupted on (invariant 7).  The
-    password, if asked for, goes to the daemon and never into the graph.
+    The ``action_hash`` is echoed verbatim, so the daemon re-checks that the
+    approval belongs to the action it interrupted on (invariant 7); the reply
+    carries ``msg.task_id`` - the task that asked (4.15 / P4b).  Passwords
+    never enter the graph.
     """
     from jarvis.daemon.client import DaemonError
     from jarvis.policy import tiers as _tiers
@@ -1265,7 +1266,7 @@ def _handle_confirm_request(client: Any, task_id: str, msg: Any) -> None:
 
     try:
         client.send_confirm(
-            task_id,
+            msg.task_id,
             approved=agreed,
             action_hash=msg.action_hash,
             password=password,

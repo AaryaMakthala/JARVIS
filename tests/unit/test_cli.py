@@ -589,3 +589,24 @@ class TestDaemonChatSurvivesInterruption:
         assert payload["action_hash"] == "h1"
         assert payload["approved"] is True
         assert payload["password"] is None
+
+    def test_replies_bind_to_the_task_that_asked_not_the_outer_chat_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """4.15 / P4b: the outer chat id ("t1" from send_chat) may differ from
+        the task that raised the prompt; the reply must target the asker or
+        the daemon rejects it with "no active task awaiting confirmation"."""
+        from jarvis.daemon.protocol import ClarificationRequest, ConfirmRequest, FinalMessage
+
+        client = _FakeDaemonClient(
+            [
+                ClarificationRequest(task_id="t-asking", question="Which file?"),
+                ConfirmRequest(task_id="t-asking", tier=1, summary="Open it", action_hash="h1"),
+                FinalMessage(task_id="t1", text="opened"),
+            ]
+        )
+        monkeypatch.setattr(cli, "_chat_prompt", lambda text: "y")
+        assert cli._daemon_one_shot(client, "open notes.txt") == "opened"
+        assert ("clarification", {"task_id": "t-asking", "answer": "y"}) in client.sent
+        confirms = [payload for kind, payload in client.sent if kind == "confirm"]
+        assert [payload["task_id"] for payload in confirms] == ["t-asking"]

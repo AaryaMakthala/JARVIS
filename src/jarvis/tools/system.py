@@ -216,7 +216,7 @@ def _run_lock_computer(args: LockComputerArgs, ctx: ToolContext) -> ToolResult:
 #: the lock state is not readable from a user-mode process, so there is no
 #: deterministic post-condition to check.  ``verified`` therefore stays ``None``
 #: (docs/04 §2.4: "Best effort"), and this note keeps the final answer
-#: accurate instead of the generic "could not be independently verified".
+#: accurate; the old generic "could not be independently verified" wording is gone (4.14).
 _LOCK_VERIFY_NOTE = (
     "best-effort action: the Windows lock screen cannot be observed from this process"
 )
