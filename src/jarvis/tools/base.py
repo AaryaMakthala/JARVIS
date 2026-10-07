@@ -59,9 +59,9 @@ class ToolResult(BaseModel):
     #: Human-facing explanation of the ``verified`` status, set by ``verify()``
     #: when ``verified is None`` for a step whose completion cannot be observed
     #: (a *best-effort* action, e.g. ``lock_computer``: the Windows lock screen
-    #: is not visible to a user-mode process).  It replaces the generic
-    #: "could not be independently verified" caveat in the final answer with an
-    #: accurate one, and is never a claim of verification.
+    #: is not visible to a user-mode process).  It is the only caveat shown for
+    #: such a step in the final answer (the generic wording was removed in
+    #: 4.14), and is never a claim of verification.
     verify_note: str = ""
 
 

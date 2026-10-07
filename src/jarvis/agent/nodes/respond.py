@@ -94,28 +94,25 @@ def _answer_for(state: dict[str, Any]) -> dict[str, str]:
         )
 
     unverified = [r for r in results if r.verified is None and r.ok]
-    if unverified:
-        return _answer(_success_text(results) + _unverified_hint(unverified))
-
-    return _answer(_success_text(results))
+    return _answer(_success_text(results) + _unverified_hint(unverified))
 
 
 def _unverified_hint(unverified: list[StepResult]) -> str:
     """The parenthetical for step(s) that succeeded without a post-condition.
 
-    A tool may declare *why* it is unverifiable (``StepResult.verify_note``,
-    e.g. ``lock_computer``: the Windows lock screen is not observable).  When
-    every unverifiable step carries such a note the answer says exactly that,
-    so a documented best-effort action does not read like a shortfall.  A step
-    with no note keeps the generic, deliberately cautious wording.
+    Only the tools' own ``StepResult.verify_note`` text is ever shown: a tool
+    may declare *why* it is unverifiable (e.g. ``lock_computer``: the Windows
+    lock screen is not observable).  A step with no note contributes nothing -
+    ``verified is None`` means there is no post-condition to check, which is
+    not a shortfall, so the generic "(N step(s) succeeded ...)" caveat was
+    removed (owner decision 4.14).  ``verified is False`` never reaches this
+    function: it is a hard failure handled in :func:`_answer_for`.
     """
     notes = [(r.verify_note or "").strip() for r in unverified]
-    if notes and all(notes):
-        return " (" + "; ".join(notes) + ")"
-    return (
-        f" ({len(unverified)} step(s) succeeded, but completion could "
-        "not be independently verified)"
-    )
+    kept = [note for note in notes if note]
+    if kept:
+        return " (" + "; ".join(kept) + ")"
+    return ""
 
 
 def _success_text(results: list[StepResult]) -> str:

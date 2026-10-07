@@ -172,9 +172,7 @@ def test_cancelled_run_stops_before_the_next_step() -> None:
     ctx = make_app_context(
         Settings(),
         llm=decisions,
-        registry=registry_with(
-            first, make_spec("fake_second", base_tier=0, record=second_record)
-        ),
+        registry=registry_with(first, make_spec("fake_second", base_tier=0, record=second_record)),
     )
 
     with pytest.raises(Cancelled):
@@ -199,9 +197,7 @@ def test_cancelled_run_stops_before_the_next_step() -> None:
                 )
             ]
         ),
-        registry=registry_with(
-            first, make_spec("fake_second", base_tier=0, record=second_record)
-        ),
+        registry=registry_with(first, make_spec("fake_second", base_tier=0, record=second_record)),
     )
     run_task(control, None, "do both")
     assert [name for name, _ in second_record] == ["fake_second"]
@@ -333,11 +329,12 @@ def test_respond_never_claims_success_when_verification_failed() -> None:
 
 def test_respond_marks_unverified_success_honestly() -> None:
     """ok + verified=None is a success reported truthfully — never a failure
-    (regression: a successful lock_computer used to read as if it failed)."""
+    (regression: a successful lock_computer used to read as if it failed),
+    and it no longer carries the generic caveat either (owner decision 4.14)."""
     results = [StepResult(step_id="s1", ok=True, output="I did it", verified=None)]
     out = respond({"results": results}, None)
     assert out["final_answer"].startswith("I did it")
-    assert "could not be independently verified" in out["final_answer"]
+    assert "could not be independently verified" not in out["final_answer"]
     assert "Could not complete" not in out["final_answer"]
     assert "failed" not in out["final_answer"].lower()
 
@@ -360,3 +357,22 @@ def test_respond_uses_a_best_effort_verify_note_when_present() -> None:
     assert "cannot be observed" in out["final_answer"]
     assert "could not be independently verified" not in out["final_answer"]
     assert "Could not complete" not in out["final_answer"]
+
+
+def test_respond_drops_the_generic_caveat_even_for_a_mixed_result_set() -> None:
+    """No verify_note means no parenthetical, whatever the step mix (4.14).
+
+    The old wording counted every verified=None step ("N step(s) succeeded ...")
+    even when other steps were fully verified; the caveat is note-driven now:
+    shown only when a tool supplies its own verify_note.
+    """
+    results = [
+        StepResult(step_id="s1", ok=True, output="17:42", verified=None),
+        StepResult(step_id="s2", ok=True, output="notepad - Notepad", verified=True),
+    ]
+    out = respond({"results": results}, None)
+    assert out["final_answer"].startswith("Done.")
+    assert "independently verified" not in out["final_answer"]
+    assert "step(s) succeeded" not in out["final_answer"]
+    assert "Could not complete" not in out["final_answer"]
+    assert "failed" not in out["final_answer"].lower()
