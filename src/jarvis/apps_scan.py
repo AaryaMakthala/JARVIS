@@ -23,21 +23,29 @@ from jarvis import config
 
 logger = logging.getLogger(__name__)
 
-#: Case-insensitive substrings that deny an executable stem (installers etc.).
-DENY_FRAGMENTS = frozenset({"unins", "setup", "instal", "update", "patch"})
+#: Case-insensitive substrings that deny an executable stem (installers, and
+#: versioned wrappers such as ``claude-ssh-<version>`` whose stem changes on
+#: every release, so an exact stem can never match).
+DENY_FRAGMENTS = frozenset({"unins", "setup", "instal", "update", "patch", "claude-ssh"})
 
-#: Exact lower-cased executable stems that deny shells, script hosts, LOLBins
-#: and interpreters.  Module constants, never config-driven (owner decision 5).
+#: Exact lower-cased executable stems that deny shells, script hosts, LOLBins,
+#: interpreters, remote/pairing clients, package managers and admin utilities
+#: (owner decision, 4.13).  Module constants, never config-driven (owner decision 5).
 DENY_STEMS = frozenset(
     "cmd powershell powershell_ise pwsh wscript cscript mshta rundll32 regedit "  # noqa: SIM905
     "regedt32 regsvr32 msiexec certutil bitsadmin psexec conhost sysedit "
-    "python pythonw py node npm npx deno ruby perl php java javaw dotnet".split()
+    "python pythonw py node npm npx deno ruby perl php java javaw dotnet "
+    "wsl wt windowsterminal bash sh zsh fish git-bash mintty ssh scp sftp ftp "
+    "telnet curl wget winget windowspackagemanagerserver choco chocolatey scoop "
+    "pip pip3 reg schtasks sc net netsh taskkill wmic mmc mstsc diskpart bcdedit "
+    "vssadmin takeown icacls cipher msconfig nvm git-gui dism sfc wevtutil".split()
 )
 
-#: Launcher stems ``open_in_app`` refuses: an interpreter EXECUTES the file (4.5b).
+#: Launcher stems ``open_in_app`` refuses: an interpreter EXECUTES the file
+#: (4.5b); the shells too - ``bash notes.txt`` runs it as a script (4.13).
 INTERPRETER_STEMS = frozenset(
     "python pythonw py node deno ruby perl php java javaw dotnet powershell "  # noqa: SIM905
-    "pwsh cmd wscript cscript mshta".split()
+    "pwsh cmd wscript cscript mshta bash sh zsh fish git-bash wsl wt".split()
 )
 
 #: Owner-approved key pattern for ``[apps]`` entries.
@@ -168,12 +176,17 @@ def filter_candidates(
     candidates: Iterable[Candidate],
     existing_names: Iterable[str],
 ) -> list[Proposal]:
-    """Apply the owner's filter chain; dedupes and returns a stable order."""
+    """Apply the owner's filter chain; one entry per name, stable order."""
     configured = {str(name).lower() for name in existing_names}
-    seen: set[str] = set()
     out: list[Proposal] = []
     for target, arguments, source in candidates:
         path = Path(target.strip().strip('"'))
+        if "\\windowsapps\\" in str(path).lower().replace("/", "\\"):
+            # Store package paths are version-pinned (they change on every
+            # app update, so the entry would go stale immediately), sit behind
+            # package ACLs, and are often CLI helpers rather than the GUI app.
+            logger.debug("skipping %s: version-pinned path", path)
+            continue
         if not path.is_absolute() or not path.is_file() or path.suffix.lower() != ".exe":
             continue
         if arguments.strip() or denied_reason(path.stem) is not None:
@@ -181,13 +194,15 @@ def filter_candidates(
         name = path.stem.lower()
         if name in configured or NAME_RE.match(name) is None:
             continue
-        key = str(path.resolve(strict=False)).lower()
-        if key in seen:
-            continue
-        seen.add(key)
         out.append(Proposal(name=name, target=str(path), source=source))
     out.sort(key=lambda proposal: (proposal.name, proposal.target.lower()))
-    return out
+    # One entry per name; the sort makes the first path win (System32 before
+    # SysWOW64), so a duplicate name cannot be printed twice and then silently
+    # collapsed by scan_command's name-keyed dict (4.13, the odbcad32 bug).
+    by_name: dict[str, Proposal] = {}
+    for proposal in out:
+        by_name.setdefault(proposal.name, proposal)
+    return list(by_name.values())
 
 
 def _parse_indices(spec: str, total: int) -> list[int]:

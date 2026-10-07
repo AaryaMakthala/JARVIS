@@ -6,6 +6,7 @@ real Start Menu, registry and owner's config.toml are never touched.
 
 from __future__ import annotations
 
+import logging
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from typing import Any
 import pytest
 
 from jarvis.apps_scan import (
+    INTERPRETER_STEMS,
     ShortcutReader,
     append_apps_entries,
     denied_reason,
@@ -73,14 +75,75 @@ def _scan(settings: Settings, config: Path, **options: Any) -> list[str]:
 
 class TestDenyList:
     @pytest.mark.parametrize(
-        "stem", ["cmd", "powershell", "wscript", "python", "py", "unins000", "setup"]
+        "stem",
+        [
+            "cmd",
+            "powershell",
+            "wscript",
+            "python",
+            "py",
+            "unins000",
+            "setup",
+            # 4.13: terminals/shells, remote clients, package managers,
+            # admin utilities - exact stems, never prefixes.
+            "wsl",
+            "wt",
+            "windowsterminal",
+            "bash",
+            "sh",
+            "zsh",
+            "fish",
+            "git-gui",
+            "mintty",
+            "ssh",
+            "scp",
+            "sftp",
+            "ftp",
+            "telnet",
+            "curl",
+            "wget",
+            "winget",
+            "windowspackagemanagerserver",
+            "choco",
+            "scoop",
+            "pip",
+            "reg",
+            "schtasks",
+            "sc",
+            "net",
+            "netsh",
+            "taskkill",
+            "wmic",
+            "mmc",
+            "mstsc",
+            "diskpart",
+            "bcdedit",
+            "vssadmin",
+            "takeown",
+            "icacls",
+            "cipher",
+            "msconfig",
+            "nvm",
+            "dism",
+            "sfc",
+            "wevtutil",
+        ],
     )
     def test_denylisted_stems_are_refused(self, stem: str) -> None:
         assert denied_reason(stem) is not None
 
-    @pytest.mark.parametrize("stem", ["pycharm", "code", "spotify", "notepad"])
+    @pytest.mark.parametrize("stem", ["claude-ssh-0.9.3", "claude-ssh-latest"])
+    def test_versioned_wrapper_fragments_are_refused(self, stem: str) -> None:
+        # The stem changes every release, so an exact deny stem can never match.
+        assert denied_reason(stem) is not None
+
+    @pytest.mark.parametrize("stem", ["pycharm", "code", "spotify", "notepad", "netflix"])
     def test_similar_names_still_pass(self, stem: str) -> None:
         assert denied_reason(stem) is None
+
+    def test_exec_shells_are_launcher_refusals_too(self) -> None:
+        # open_in_app refuses these at run time; the scan denies them too.
+        assert {"bash", "sh", "zsh", "fish", "git-bash", "wsl", "wt"} <= INTERPRETER_STEMS
 
 
 class TestFilter:
@@ -117,6 +180,40 @@ class TestFilter:
         found = filter_candidates(candidates, [])
         assert [p.name for p in found] == ["code", "spotify"]
         assert found[0].source == "app paths"
+
+    def test_duplicate_names_collapse_to_the_first_sorted_path(self, tmp_path: Path) -> None:
+        # The live odbcad32 bug: System32 and SysWOW64 both propose the same
+        # name.  One entry per name, first sorted path wins (System32 sorts
+        # before SysWOW64), regardless of candidate order.
+        system32 = tmp_path / "System32"
+        syswow64 = tmp_path / "SysWOW64"
+        system32.mkdir()
+        syswow64.mkdir()
+        wanted = _exe(system32, "odbcad32.exe")
+        other_arch = _exe(syswow64, "odbcad32.exe")
+
+        found = filter_candidates(
+            [(str(other_arch), "", "start menu"), (str(wanted), "", "start menu")], []
+        )
+
+        assert [p.name for p in found] == ["odbcad32"]
+        assert found[0].target == str(wanted)
+
+    def test_windowsapps_paths_are_skipped_as_version_pinned(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        store = tmp_path / "Program Files" / "WindowsApps"
+        store.mkdir(parents=True)
+        store_exe = _exe(store, "spotify_cli.exe")
+        normal = _exe(tmp_path, "spotify.exe")
+
+        with caplog.at_level(logging.DEBUG, logger="jarvis.apps_scan"):
+            found = filter_candidates(
+                [(str(store_exe), "", "start menu"), (str(normal), "", "start menu")], []
+            )
+
+        assert [p.name for p in found] == ["spotify"]
+        assert "version-pinned path" in caplog.text
 
 
 class TestDiscovery:
@@ -234,6 +331,30 @@ class TestScanCommand:
         assert lines[0].startswith("  1. code")
         assert "approve e.g. --approve 1" in lines[-1]
         assert config.read_text(encoding="utf-8") == ORIGINAL
+
+    def test_duplicate_names_are_printed_once(self, tmp_path: Path) -> None:
+        # The live symptom: the numbered list printed odbcad32 twice (System32
+        # and SysWOW64) while scan_command's name-keyed dict silently kept one.
+        config = _write_config(tmp_path)
+        system32 = tmp_path / "System32"
+        syswow64 = tmp_path / "SysWOW64"
+        system32.mkdir()
+        syswow64.mkdir()
+        wanted = _exe(system32, "odbcad32.exe")
+        other_arch = _exe(syswow64, "odbcad32.exe")
+
+        lines = _scan(
+            _settings(),
+            config,
+            app_paths_source=lambda: [
+                ("syswow64.exe", str(other_arch)),
+                ("system32.exe", str(wanted)),
+            ],
+        )
+
+        proposal_lines = [line for line in lines if "odbcad32" in line]
+        assert len(proposal_lines) == 1
+        assert str(wanted) in proposal_lines[0]
 
     def test_approve_writes_only_the_chosen_entry(self, tmp_path: Path) -> None:
         config = _write_config(tmp_path)
