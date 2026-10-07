@@ -54,6 +54,9 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     pctx = policy_context_for(state, ctx.policy_ctx)
 
     decision = ctx.engine.decide(step, pctx)
+    logger.info(
+        "policy gate step=%s allowed=%s reasons=%s", step.id, decision.allowed, decision.reasons
+    )
     decisions = dict(state.get("decisions") or {})
     decisions[step.id] = decision
 

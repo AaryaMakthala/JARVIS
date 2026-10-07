@@ -125,7 +125,10 @@ class ToolSpec:
         except Exception as exc:  # noqa: BLE001 - tools never raise to the graph
             result = ToolResult(ok=False, error=f"{type(exc).__name__}: {exc}")
         result.data.setdefault("duration_ms", _elapsed_ms(started))
-        logger.info("tool end name=%s ok=%s verified=%s", self.name, result.ok, result.verified)
+        err = (result.error or "")[:200]
+        logger.info(
+            "tool end %s ok=%s verified=%s error=%s", self.name, result.ok, result.verified, err
+        )
         return result
 
     def _dry_run_result(self, args: BaseModel) -> ToolResult:
