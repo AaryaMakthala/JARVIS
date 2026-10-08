@@ -309,13 +309,15 @@ class LLMCallFailure:
     """One provider/role failure, reduced to safe, loggable fields.
 
     Carries no credential, no prompt, and no raw provider body: only the
-    provider label, the model label, the role, an HTTP status, a category, a
-    latency, and the client's own already-sanitised message.
+    provider label, the model label, the role, the credential key slot, an
+    HTTP status, a category, a latency, and the client's own already-
+    sanitised message.
     """
 
     provider: str
     model: str
     role: str
+    slot: int = 1  # credential key slot (1 = primary); never a secret name
     category: FailureCategory = FailureCategory.UNEXPECTED
     http_status: int | None = None
     latency_ms: int = 0
@@ -337,9 +339,13 @@ class LLMCallFailure:
         return f"{self.provider}/{self.model}" if self.model else self.provider
 
     def safe_summary(self) -> str:
-        """A one-line, secret-free description for logs and terminal output."""
+        """A one-line, secret-free description for logs and terminal output.
+
+        Uses the slot label ``<provider>/s<N>`` (an integer - never a key
+        name) plus role, HTTP status and category.
+        """
         status = f" HTTP {self.http_status}" if self.http_status else ""
-        return f"{self.label()} [{self.role}]{status} {self.category.value}"
+        return f"{self.provider}/s{self.slot} [{self.role}]{status} {self.category.value}"
 
 
 def failure_from_exception(
@@ -348,6 +354,7 @@ def failure_from_exception(
     provider: str,
     model: str,
     role: str,
+    slot: int = 1,
     latency_ms: int = 0,
 ) -> LLMCallFailure:
     """Build a :class:`LLMCallFailure` from a raised transport/client error."""
@@ -360,6 +367,7 @@ def failure_from_exception(
         provider=provider,
         model=model,
         role=role,
+        slot=slot,
         category=classify(exc),
         http_status=http_status,
         latency_ms=latency_ms,

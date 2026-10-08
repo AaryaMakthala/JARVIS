@@ -22,12 +22,12 @@ from jarvis.llm.failures import (
 )
 from jarvis.llm.health import ProviderHealth
 
-#: The configured preference order that must be preserved.
-ORDER: list[tuple[str, str]] = [
-    ("Groq", "fast"),
-    ("OpenRouter", "fast"),
-    ("NVIDIA", "fast"),
-    ("Gemini", "fast"),
+#: The configured preference order that must be preserved: (provider, slot, role).
+ORDER: list[tuple[str, int, str]] = [
+    ("Groq", 1, "fast"),
+    ("OpenRouter", 1, "fast"),
+    ("NVIDIA", 1, "fast"),
+    ("Gemini", 1, "fast"),
 ]
 
 
@@ -48,8 +48,11 @@ def _failure(
     category: FailureCategory,
     provider: str = "NVIDIA",
     role: str = "fast",
+    slot: int = 1,
 ) -> LLMCallFailure:
-    return LLMCallFailure(provider=provider, model="test/model", role=role, category=category)
+    return LLMCallFailure(
+        provider=provider, model="test/model", role=role, slot=slot, category=category
+    )
 
 
 class TestCooldownIsFiniteAndDynamic:
@@ -115,6 +118,73 @@ class TestGranularity:
         assert health.is_cooling("Groq", "fast") is False
 
 
+class TestSlotGranularity:
+    def test_slots_of_one_provider_are_independent_entries(self) -> None:
+        """A 429 on the primary key must not cool the provider's backup key."""
+        clock = _Clock()
+        health = ProviderHealth(clock)
+        health.record_failure(_failure(FailureCategory.RATE_LIMIT, provider="Groq", slot=2))
+        assert health.is_cooling("Groq", "fast", slot=2) is True
+        assert health.is_cooling("Groq", "fast", slot=1) is False
+        assert health.failure_count("Groq", "fast", slot=2) == 1
+        assert health.failure_count("Groq", "fast", slot=1) == 0
+        # A success on slot 1 must not clear slot 2's independent streak.
+        health.record_success("Groq", "fast", slot=1)
+        assert health.failure_count("Groq", "fast", slot=2) == 1
+        assert health.is_cooling("Groq", "fast", slot=2) is True
+
+    def test_cooling_slot_sinks_while_sibling_slot_keeps_its_position(self) -> None:
+        """Per-slot ordering: the healthy primary stays ahead of the cooled backup."""
+        clock = _Clock()
+        health = ProviderHealth(clock)
+        items = [("Groq", 1, "fast"), ("Groq", 2, "fast"), ("NVIDIA", 1, "fast")]
+        health.record_failure(_failure(FailureCategory.RATE_LIMIT, provider="Groq", slot=2))
+        ordered = health.order(items, key=lambda item: item)
+        assert ordered == [("Groq", 1, "fast"), ("NVIDIA", 1, "fast"), ("Groq", 2, "fast")]
+
+    def test_snapshot_lists_per_slot_entries_with_counts_only(self) -> None:
+        clock = _Clock()
+        health = ProviderHealth(clock)
+        health.record_failure(_failure(FailureCategory.TIMEOUT, provider="Groq", slot=1))
+        health.record_failure(_failure(FailureCategory.RATE_LIMIT, provider="Groq", slot=2))
+        snap = health.snapshot()
+        assert len(snap) == 2
+        by_slot = {row["slot"]: row for row in snap}
+        assert by_slot[1]["provider"] == "Groq"
+        assert by_slot[1]["total_failures"] == 1
+        assert by_slot[1]["last_category"] == FailureCategory.TIMEOUT.value
+        assert by_slot[2]["consecutive_failures"] == 1
+        assert by_slot[2]["last_category"] == FailureCategory.RATE_LIMIT.value
+        allowed = {
+            "provider",
+            "slot",
+            "role",
+            "consecutive_failures",
+            "cooling",
+            "cooldown_remaining_s",
+            "last_category",
+            "total_failures",
+            "total_successes",
+        }
+        for row in snap:
+            assert set(row) <= allowed
+
+    def test_safe_summary_label_carries_slot_but_never_key_material(self) -> None:
+        failure = LLMCallFailure(
+            provider="groq",
+            model="test/model",
+            role="planner",
+            slot=2,
+            category=FailureCategory.RATE_LIMIT,
+            http_status=429,
+            message="429 gsk_super_secret_key",
+        )
+        summary = failure.safe_summary()
+        assert summary == "groq/s2 [planner] HTTP 429 rate_limit"
+        for needle in ("_api_key", "gsk", "secret", "test/model"):
+            assert needle not in summary
+
+
 class TestOrdering:
     def test_healthy_order_is_untouched(self) -> None:
         health = ProviderHealth(_Clock())
@@ -128,7 +198,7 @@ class TestOrdering:
         ordered = health.order(ORDER, key=lambda item: item)
         assert len(ordered) == len(ORDER)
         assert set(ordered) == set(ORDER)
-        assert ordered[-1] == ("Groq", "fast")
+        assert ordered[-1] == ("Groq", 1, "fast")
 
     def test_sinks_back_to_front_after_recovery(self) -> None:
         clock = _Clock()
@@ -143,12 +213,12 @@ class TestOrdering:
         for provider, role in (("Groq", "fast"), ("OpenRouter", "fast")):
             health.record_failure(_failure(FailureCategory.RATE_LIMIT, provider, role))
         ordered = health.order(ORDER, key=lambda item: item)
-        assert ordered[:2] == [("NVIDIA", "fast"), ("Gemini", "fast")]
+        assert ordered[:2] == [("NVIDIA", 1, "fast"), ("Gemini", 1, "fast")]
 
     def test_all_cooling_is_reported_but_callers_still_try(self) -> None:
         clock = _Clock()
         health = ProviderHealth(clock)
-        for provider, role in ORDER:
+        for provider, _slot, role in ORDER:
             health.record_failure(_failure(FailureCategory.SERVER_ERROR, provider, role))
         assert health.all_cooling(ORDER) is True
         # Deprioritised, never removed.

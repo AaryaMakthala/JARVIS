@@ -9,9 +9,10 @@ by hand.
 This module holds that state.  It is deliberately small and clock-injected so
 the behaviour is fully deterministic in tests.
 
-Granularity is ``(provider, role)``: NVIDIA's ``fast`` model timing out must
-not knock out NVIDIA's ``planner`` model, because they are different endpoints
-with different load.
+Granularity is ``(provider, slot, role)``: NVIDIA's ``fast`` model timing out
+must not knock out NVIDIA's ``planner`` model (different endpoints, different
+load), and a 429 on a provider's primary key must not cool its backup key —
+the health store tracks one entry per credential key slot.
 
 **Nothing here is a blacklist.**  Every entry has a finite cooldown, a decaying
 consecutive-failure count, and a reset on the next success.  A rotating an API
@@ -33,10 +34,11 @@ T = TypeVar("T")
 
 @dataclass
 class ProviderHealthEntry:
-    """Health of one ``(provider, role)`` pair.  Safe to log; no secrets."""
+    """Health of one ``(provider, slot, role)`` triple.  Safe to log; no secrets."""
 
     provider: str
     role: str
+    slot: int = 1  # credential key slot (1 = primary); never a secret name
     consecutive_failures: int = 0
     cooldown_until: float = 0.0
     last_category: FailureCategory = FailureCategory.NONE
@@ -65,6 +67,7 @@ class ProviderHealthEntry:
         moment = time.monotonic() if now is None else now
         return {
             "provider": self.provider,
+            "slot": self.slot,
             "role": self.role,
             "consecutive_failures": self.consecutive_failures,
             "cooling": self.cooldown_until > moment,
@@ -84,13 +87,13 @@ class ProviderHealth:
 
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
-        self._entries: dict[tuple[str, str], ProviderHealthEntry] = {}
+        self._entries: dict[tuple[str, int, str], ProviderHealthEntry] = {}
 
     # ── recording ────────────────────────────────────────────────────────
 
-    def record_success(self, provider: str, role: str) -> None:
-        """Clear the failure state for ``(provider, role)`` (recovery)."""
-        entry = self._entry(provider, role)
+    def record_success(self, provider: str, role: str, slot: int = 1) -> None:
+        """Clear the failure state for ``(provider, slot, role)`` (recovery)."""
+        entry = self._entry(provider, slot, role)
         entry.consecutive_failures = 0
         entry.cooldown_until = 0.0
         entry.last_category = FailureCategory.NONE
@@ -106,7 +109,7 @@ class ProviderHealth:
         finite, and any success resets the count to zero.
         """
         now = self._clock()
-        entry = self._entry(failure.provider, failure.role)
+        entry = self._entry(failure.provider, failure.slot, failure.role)
         entry.consecutive_failures += 1
         entry.total_failures += 1
         entry.last_category = failure.category
@@ -122,33 +125,33 @@ class ProviderHealth:
 
     # ── queries ──────────────────────────────────────────────────────────
 
-    def entry(self, provider: str, role: str) -> ProviderHealthEntry:
-        """The health entry for ``(provider, role)`` (created on demand)."""
-        return self._entry(provider, role)
+    def entry(self, provider: str, role: str, slot: int = 1) -> ProviderHealthEntry:
+        """The health entry for ``(provider, slot, role)`` (created on demand)."""
+        return self._entry(provider, slot, role)
 
-    def is_cooling(self, provider: str, role: str) -> bool:
-        """Whether ``(provider, role)`` must be skipped for this call."""
-        return self._entry(provider, role).is_cooling(self._clock())
+    def is_cooling(self, provider: str, role: str, slot: int = 1) -> bool:
+        """Whether ``(provider, slot, role)`` must be skipped for this call."""
+        return self._entry(provider, slot, role).is_cooling(self._clock())
 
-    def remaining(self, provider: str, role: str) -> float:
-        """Seconds until ``(provider, role)`` is retried."""
-        return self._entry(provider, role).remaining(self._clock())
+    def remaining(self, provider: str, role: str, slot: int = 1) -> float:
+        """Seconds until ``(provider, slot, role)`` is retried."""
+        return self._entry(provider, slot, role).remaining(self._clock())
 
-    def failure_count(self, provider: str, role: str) -> int:
-        """Consecutive failures recorded for ``(provider, role)``."""
-        return self._entry(provider, role).consecutive_failures
+    def failure_count(self, provider: str, role: str, slot: int = 1) -> int:
+        """Consecutive failures recorded for ``(provider, slot, role)``."""
+        return self._entry(provider, slot, role).consecutive_failures
 
-    def all_cooling(self, providers: Iterable[tuple[str, str]]) -> bool:
-        """Whether every listed pair is cooling.
+    def all_cooling(self, providers: Iterable[tuple[str, int, str]]) -> bool:
+        """Whether every listed ``(provider, slot, role)`` is cooling.
 
         The caller must still try them in that case — a cooling provider is
         deprioritised, never removed, because refusing to call anything would
         fail the interaction outright.
         """
-        pairs = list(providers)
-        return bool(pairs) and all(self.is_cooling(p, r) for p, r in pairs)
+        triples = list(providers)
+        return bool(triples) and all(self.is_cooling(p, r, s) for p, s, r in triples)
 
-    def order(self, items: Sequence[T], key: Callable[[T], tuple[str, str]]) -> list[T]:
+    def order(self, items: Sequence[T], key: Callable[[T], tuple[str, int, str]]) -> list[T]:
         """Return ``items`` reordered by current health, stably.
 
         Healthy pairs keep their configured order.  Cooling pairs sink, and
@@ -167,8 +170,8 @@ class ProviderHealth:
         now = self._clock()
         decorated: list[tuple[int, int, int, T]] = []
         for index, item in enumerate(items):
-            provider, role = key(item)
-            entry = self._entry(provider, role)
+            provider, slot, role = key(item)
+            entry = self._entry(provider, slot, role)
             cooling = entry.is_cooling(now)
             decorated.append(
                 (1 if cooling else 0, entry.consecutive_failures if cooling else 0, index, item)
@@ -177,7 +180,7 @@ class ProviderHealth:
         return [row[3] for row in decorated]
 
     def snapshot(self) -> list[dict[str, Any]]:
-        """Safe diagnostic view of every tracked pair (on the injected clock)."""
+        """Safe diagnostic view of every tracked triple (on the injected clock)."""
         now = self._clock()
         return [entry.snapshot(now) for entry in self._entries.values()]
 
@@ -187,10 +190,10 @@ class ProviderHealth:
 
     # ── internals ────────────────────────────────────────────────────────
 
-    def _entry(self, provider: str, role: str) -> ProviderHealthEntry:
-        pair = (provider, role)
-        entry = self._entries.get(pair)
+    def _entry(self, provider: str, slot: int, role: str) -> ProviderHealthEntry:
+        key = (provider, slot, role)
+        entry = self._entries.get(key)
         if entry is None:
-            entry = ProviderHealthEntry(provider=provider, role=role)
-            self._entries[pair] = entry
+            entry = ProviderHealthEntry(provider=provider, slot=slot, role=role)
+            self._entries[key] = entry
         return entry

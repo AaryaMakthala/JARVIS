@@ -11,8 +11,8 @@ walks the list and:
   that just 503'd is deprioritised for the next interaction without being
   removed from the configuration;
 * on any failure records a :class:`~jarvis.llm.failures.LLMCallFailure`, applies
-  a finite cooldown for that ``(provider, role)``, and moves on.  Bounded retries
-  already happened inside the individual client;
+  a finite cooldown for that ``(provider, slot, role)``, and moves on.  Bounded
+  retries already happened inside the individual client;
 * when every provider has failed, raises :class:`LLMError` with a joined set of
   safe reasons (provider/model/category only, never credentials).
 
@@ -145,7 +145,7 @@ class MultiProviderClient:
         return ", ".join(parts) or "none"
 
     def health_snapshot(self) -> list[dict[str, Any]]:
-        """Safe diagnostic view of every tracked ``(provider, role)`` pair."""
+        """Safe diagnostic view of every tracked ``(provider, slot, role)`` triple."""
         return self._health.snapshot()
 
     # ── operations ───────────────────────────────────────────────────────
@@ -227,11 +227,11 @@ class MultiProviderClient:
         """Candidates for ``role`` in current health order (stable)."""
         return self._health.order(
             self._candidates,
-            key=lambda item: (item[0].name, role),
+            key=lambda item: (item[0].name, item[0].slot, role),
         )
 
     def _label(self, info: ProviderInfo, role: str) -> str:
-        cooling = self._health.is_cooling(info.name, role)
+        cooling = self._health.is_cooling(info.name, role, info.slot)
         return f"{info.name} ({'cooldown' if cooling else 'ready'})"
 
     def _note_failure(
@@ -252,6 +252,7 @@ class MultiProviderClient:
             provider=info.name,
             model=model or (meta.model if isinstance(meta, CallMeta) else ""),
             role=role,
+            slot=info.slot,
             latency_ms=meta.latency_ms if isinstance(meta, CallMeta) else 0,
         )
         applied = self._health.record_failure(failure)
@@ -284,7 +285,7 @@ class MultiProviderClient:
 
     def _note_success(self, info: ProviderInfo, role: str, client: Any) -> None:
         """Clear the cooldown and publish who answered, for the voice reporter."""
-        self._health.record_success(info.name, role)
+        self._health.record_success(info.name, role, info.slot)
         meta = getattr(client, "last_call", None)
         if isinstance(meta, CallMeta):
             self._last_call = CallMeta(
