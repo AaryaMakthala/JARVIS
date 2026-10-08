@@ -3,7 +3,9 @@
 Selects clients from ``settings.llm.provider_order``.  For each provider, in
 order, the factory:
 
-1. ignores providers with no credential (keyring, then environment variable);
+1. ignores providers with no credential (keyring, then environment variable) -
+   one client is built per configured key slot (``llm.key_slots``) that has a
+   credential, slot 1 first;
 2. ignores models that the pricing policy refuses - under ``free_only=true``
    paid and unknown-priced models are blocked; under ``strict_zero_cost=true``
    only ``zero_cost_endpoint`` models pass and free-tier models are blocked
@@ -43,7 +45,7 @@ from typing import Any, Protocol
 
 from jarvis.config import Settings
 from jarvis.llm import models as llm_models
-from jarvis.secrets import SECRET_ENV_VARS, SecretStoreError
+from jarvis.secrets import SECRET_ENV_VARS, SecretStoreError, slot_secret_name
 
 __all__ = [
     "LLMConfigError",
@@ -80,6 +82,7 @@ class ProviderInfo:
 
     name: str
     model: str  # the planner model label as configured
+    slot: int = 1  # credential key slot (1 = primary; Stage 5a failover)
 
 
 @dataclass
@@ -155,9 +158,16 @@ def _guard_free(settings: Settings, name: str, planner: str, fast: str) -> None:
     ``free_only``/``strict_zero_cost`` from settings are passed straight to
     :func:`jarvis.llm.models.qualify`; a refused model raises before any
     client is constructed, so a paid or free-tier-under-strict model can
-    never reach the graph.
+    never reach the graph.  When the provider has a vision model configured
+    (per-provider ``vision`` or the legacy ``vision_model`` field) it is
+    guarded the same way, so an ineligible vision model fails the build
+    closed instead of waiting until image understanding is first used.
     """
-    for label, model in (("planner", planner), ("fast", fast)):
+    roles = [("planner", planner), ("fast", fast)]
+    vision = settings.llm.model_for(name, "vision")
+    if vision:
+        roles.append(("vision", vision))
+    for label, model in roles:
         allowed, _spec, reason = llm_models.qualify(
             name,
             model,
@@ -166,6 +176,47 @@ def _guard_free(settings: Settings, name: str, planner: str, fast: str) -> None:
         )
         if not allowed:
             raise LLMConfigError(f"{name} {label} model: {reason}")
+
+
+def _slot_secret_names(settings: Settings, name: str) -> list[str]:
+    """Ordered keyring names to try for ``name``.
+
+    Uses ``settings.llm.key_slots[name]`` when configured (Stage 5a key
+    failover, owner-edited or hinted by ``jarvis keys set --slot``), else the
+    single primary name for slot 1.
+    """
+    configured = settings.llm.key_slots.get(name)
+    if configured:
+        return configured
+    return [slot_secret_name(name, 1)]
+
+
+def _slot_number(name: str, secret: str, index: int) -> int:
+    """Physical slot for a configured secret name.
+
+    Parsed from the ``<provider>_<N>_api_key`` convention so health/log labels
+    stay stable even if the owner reorders ``key_slots``; any other name falls
+    back to its 1-based position in the list.
+    """
+    if secret == f"{name}_api_key":
+        return 1
+    tail = secret.removesuffix("_api_key").removeprefix(f"{name}_")
+    return int(tail) if tail.isdigit() else index
+
+
+def _credential_for(store: ProviderKeyStore, name: str, secret: str) -> str:
+    """Read ``secret`` (keyring, then env) or raise a safe config error.
+
+    The raised message never contains credential material - only the key's
+    name and how to set it.
+    """
+    try:
+        api_key = _store_from(store).get(secret)
+    except Exception as exc:
+        raise LLMConfigError(f"could not read the {name} API key: {exc}") from exc
+    if not api_key:
+        raise LLMConfigError(f"{name} API key not found - run `jarvis keys set {name}`")
+    return api_key
 
 
 def _build_groq(settings: Settings, planner: str, fast: str, api_key: str) -> Any:
@@ -252,14 +303,7 @@ def build_provider_client(settings: Settings, store: ProviderKeyStore, name: str
     """
     if name not in _FACTORIES:
         raise LLMConfigError(f"{name}: unknown provider in provider_order")
-    secret = f"{name}_api_key"
-    key_store = _store_from(store)
-    try:
-        api_key = key_store.get(secret)
-    except Exception as exc:
-        raise LLMConfigError(f"could not read the {name} API key: {exc}") from exc
-    if not api_key:
-        raise LLMConfigError(f"{name} API key not found - run `jarvis keys set {name}`")
+    api_key = _credential_for(store, name, slot_secret_name(name, 1))
     planner, fast = _resolve_models(settings, name)
     _guard_free(settings, name, planner, fast)
     try:
@@ -268,6 +312,41 @@ def build_provider_client(settings: Settings, store: ProviderKeyStore, name: str
         raise
     except Exception as exc:
         raise LLMConfigError(f"{name} provider unavailable: {exc}") from exc
+
+
+def _build_provider_slots(
+    settings: Settings, store: ProviderKeyStore, name: str
+) -> tuple[list[tuple[int, Any]], str]:
+    """Build one client per configured key slot that actually has a key.
+
+    Returns ``(slot, client)`` pairs plus the planner model.  A missing
+    backup key is skipped as long as at least one slot works; when no slot
+    has a credential, or the provider fails model resolution/free-only
+    guarding, a safe :class:`LLMConfigError` is raised (credentials are
+    probed before models so a missing key stays the reported reason).
+    """
+    keys: list[tuple[int, str]] = []
+    problem = ""
+    for index, secret in enumerate(_slot_secret_names(settings, name), start=1):
+        try:
+            keys.append((_slot_number(name, secret, index), _credential_for(store, name, secret)))
+        except LLMConfigError as exc:
+            problem = str(exc)
+    if not keys:
+        raise LLMConfigError(problem)
+    planner, fast = _resolve_models(settings, name)
+    _guard_free(settings, name, planner, fast)
+    built: list[tuple[int, Any]] = []
+    for slot, api_key in keys:
+        try:
+            built.append((slot, _FACTORIES[name](settings, planner, fast, api_key)))
+        except LLMConfigError as exc:
+            problem = str(exc)
+        except Exception as exc:  # noqa: BLE001 - a client constructor may fail any way
+            problem = f"{name} provider unavailable: {exc}"
+    if not built:
+        raise LLMConfigError(problem)
+    return built, planner
 
 
 def build_llm_client(
@@ -280,8 +359,9 @@ def build_llm_client(
 
     Returns ``ProviderSelection(client=None, reasons=[...])`` when no free
     provider is available; each reason describes one skip and is safe to
-    show.  When several providers qualify, the returned client is a
-    :class:`MultiProviderClient` that falls through providers per operation.
+    show.  When several providers qualify - or one provider has several key
+    slots - the returned client is a :class:`MultiProviderClient` that falls
+    through candidates per operation.
     """
     reasons: list[str] = []
     candidates: list[tuple[ProviderInfo, llm_models.ModelSpec, Any]] = []
@@ -291,18 +371,18 @@ def build_llm_client(
             reasons.append(f"{name}: unknown provider in provider_order")
             continue
         try:
-            client = build_provider_client(settings, store, name)
+            built, planner = _build_provider_slots(settings, store, name)
         except LLMConfigError as exc:
             reasons.append(f"{name}: {exc}")
             continue
-        planner, _fast = _resolve_models(settings, name)
-        info = ProviderInfo(name=name, model=planner)
         spec = llm_models.model_spec(name, planner)
-        candidates.append((info, spec, client))
+        for slot, client in built:
+            candidates.append((ProviderInfo(name=name, model=planner, slot=slot), spec, client))
         if logger is not None:
             logger.info(
-                "llm provider available name=%s model=%s mode=%s",
+                "llm provider available name=%s slots=%s model=%s mode=%s",
                 name,
+                ",".join(str(slot) for slot, _client in built),
                 planner,
                 spec.pricing_mode,
             )

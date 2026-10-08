@@ -354,3 +354,87 @@ def test_legacy_per_provider_models_resolve() -> None:
     # legacy fallback still works
     legacy = Settings(llm=LLMSettings(planner_model="openai/gpt-oss-120b"))
     assert legacy.llm.model_for("groq", "planner") == "openai/gpt-oss-120b"
+
+
+# ── Stage 5a: key slots ────────────────────────────────────────────────────
+
+
+def _slot_settings(names: list[str]) -> Settings:
+    return Settings(
+        llm=LLMSettings(
+            provider_order=["groq"],
+            strict_zero_cost=False,
+            planner_model=PLANNER,
+            fast_model=FAST,
+            key_slots={"groq": names},
+        )
+    )
+
+
+def test_default_selection_reports_slot_one() -> None:
+    sel = build_llm_client(_settings(["groq"]), MemoryKeyStore({"groq_api_key": "sk-test"}))
+    assert sel.info is not None
+    assert sel.info.slot == 1
+
+
+def test_key_slots_build_one_candidate_per_present_key() -> None:
+    store = MemoryKeyStore({"groq_api_key": "k-one", "groq_2_api_key": "k-two"})
+    sel = build_llm_client(_slot_settings(["groq_api_key", "groq_2_api_key"]), store)
+    assert sel.client is not None
+    assert sel.client.providers == ["groq", "groq"]
+    assert sel.info is not None and sel.info.slot == 1
+    assert sel.reasons == []
+    assert "k-one" not in repr(sel) and "k-two" not in repr(sel)
+
+
+def test_missing_backup_slot_does_not_block_primary() -> None:
+    store = MemoryKeyStore({"groq_api_key": "k-one"})
+    sel = build_llm_client(_slot_settings(["groq_api_key", "groq_2_api_key"]), store)
+    assert sel.client is not None
+    assert sel.info is not None and sel.info.name == "groq" and sel.info.slot == 1
+    assert sel.reasons == []
+
+
+def test_all_configured_slots_missing_is_one_safe_reason() -> None:
+    sel = build_llm_client(_slot_settings(["groq_api_key", "groq_2_api_key"]), MemoryKeyStore())
+    assert sel.client is None
+    assert len(sel.reasons) == 1
+    assert "groq" in sel.reasons[0]
+    assert "key not found" in sel.reasons[0]
+
+
+def test_slot_number_follows_secret_name_not_position() -> None:
+    store = MemoryKeyStore({"groq_2_api_key": "k-two"})
+    sel = build_llm_client(_slot_settings(["groq_2_api_key"]), store)
+    assert sel.client is not None
+    assert sel.info is not None and sel.info.slot == 2
+
+
+# ── Stage 5a: vision model is guarded like planner/fast ────────────────────
+
+
+def test_unregistered_vision_model_blocks_build() -> None:
+    settings = Settings(
+        llm=LLMSettings(
+            provider_order=["groq"],
+            strict_zero_cost=False,
+            models={"groq": ProviderModels(planner=PLANNER, fast=FAST, vision="not-a-model")},
+        )
+    )
+    sel = build_llm_client(settings, MemoryKeyStore({"groq_api_key": "k"}))
+    assert sel.client is None
+    assert "vision model" in sel.reasons[0]
+    assert "not registered" in sel.reasons[0]
+
+
+def test_registered_vision_model_allows_build() -> None:
+    settings = Settings(
+        llm=LLMSettings(
+            provider_order=["groq"],
+            strict_zero_cost=False,
+            models={"groq": ProviderModels(planner=PLANNER, fast=FAST, vision=PLANNER)},
+        )
+    )
+    sel = build_llm_client(settings, MemoryKeyStore({"groq_api_key": "k"}))
+    assert sel.client is not None
+    assert sel.reasons == []
