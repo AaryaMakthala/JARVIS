@@ -3947,7 +3947,8 @@ pytest per sub-step, no full-suite runs, no push, free-only gate untouched.
 | 5 | `e5891d9` | doctor: key-slot presence rows, daemon-queried `llm_health` rows, dynamic vision row, `StatusResponse.llm_health` |
 | 6 | `4fbc592` | Gemini vision method `describe_image`, `supports_vision=True` registry for gemini-3.8/3.7-flash, non-vision clients raise `LLMCapabilityError`, Multi vision walk, `_build_gemini` wires `vision_model` |
 | 7 | `21c0375` | speech-aware brain prompt (D2): `VOICE_SOURCE_LINE` appended to the user prompt only when `state["source"] == "voice"` |
-| 8 | this commit | completeness check (D2): four-outcome prompt rules, transient `BrainDecision.assumption`/`missing`, `clarification_count` in the user prompt, 2-round cap with a stop that names missing items, assumption carried on `Plan.assumption` and spoken by `respond` |
+| 8 | `8ac71a9` | completeness check (D2): four-outcome prompt rules, transient `BrainDecision.assumption`/`missing`, `clarification_count` in the user prompt, 2-round cap with a stop that names missing items, assumption carried on `Plan.assumption` and spoken by `respond` |
+| 9 | `0494837` | voice retry budget: optional per-call `max_retries`/`timeout_s` on `structured`/`text` (protocol, Groq, OpenAI-compat, Gemini, Multi, FakeLLM), brain + replan pass `max_retries=0` and `timeout_s=min(configured, 10.0)` only on `source == "voice"`, terminal/benchmark None (`0494837`) |
 
 Decisions logged:
 - `keys status` line format is per-slot: `groq slot 1: configured` … `tavily slot 3: not configured`
@@ -4001,6 +4002,16 @@ Decisions logged:
   `missing` *and* states no `assumption` is rejected fail-closed (silent invention). Perception
   provenance is enforced by the existing taint pipe (`Step.depends_on_untrusted` ->
   `Decision.warn_untrusted`), never by the prompt alone.
+- **Voice retry budget (sub-step 9):** `structured`/`text` on every client gained optional
+  keyword-only `max_retries: int | None = None` and `timeout_s: float | None = None`; `None` keeps
+  the configured default (settings `llm.max_retries`/`llm.timeout_seconds` for Groq, ctor defaults
+  for Gemini/OpenAI-compat), so terminal/benchmark behaviour is byte-identical. `brain` and `replan`
+  pass `max_retries=0` and `timeout_s=min(ctx.settings.llm.timeout_seconds, 10.0)` **only** when
+  `state["source"] == "voice"`; a transient failure then raises immediately and the B8 multi-walk
+  falls straight through to the next provider/slot (no key rotation to dodge 429s, `rotate_on_rate_limit`
+  untouched). MultiProviderClient forwards the two kwargs to the wrapped client. FakeLLM and the
+  one explicit-signature test fake (`_RecorderLLM` in `test_brain_prompt.py`) accept them; all other
+  fakes already take `**kwargs`. No new serde type; `describe_image` is out of scope for the budget.
 
 ### Stage 10 known-red list - addition this session
 
@@ -4018,6 +4029,17 @@ Decisions logged:
     DTZ005, `runner.py:33` UP035 + `runner.py:564` S110, `tasks.py:228` RUF100 (unused `noqa: BLE001`)
   - `tests/unit/test_benchmark_checkers.py`: I001 (1) + 27x RUF012 mutable class-attribute defaults
   - `tests/unit/test_invariants.py:995` SIM222 (`... or True`)
+- Three more voice tests surfaced by `pytest --lf` after the interrupted full run and **confirmed
+  failing at HEAD today** with sub-step 9 stashed (none touch the LLM layer; not caused by this
+  session's code). Fix before Stage 10 sign-off:
+  - `tests/unit/test_voice_cli.py::TestVoiceStateMachine::test_clean_idle_exit_moves_state_to_off`
+    - asserts `svc.state == "off"` after an idle timeout but the service stays `on` (RECOVERING loop).
+  - `tests/unit/test_voice_modes.py::TestHalfDuplex::test_the_buffer_is_flushed_before_every_capture`
+    - flaky race: `len(stt.transcribe_calls) == audio.flush_calls` (7 vs 8); already flagged at
+    line 3857 as `lines 745 (half duplex, flaky)`.
+  - `tests/unit/test_voice_modes.py::TestStateVocabularyIsClosed::test_no_capturing_or_processing_anywhere_in_the_tree`
+    - closed-vocabulary scan finds `capturing`/`processing` in the tree (e.g.
+    `src/jarvis/voice/loop.py`); already flagged at line 3857 as `line 872 (closed-vocabulary scan)`.
 
 ### Deferred (confirmed this session, per ROADMAP V2.1)
 
@@ -4025,3 +4047,9 @@ Decisions logged:
   in Stage 5a; existing `voice/announce.speakable` choke point is unchanged.
 - **D19 graph test** (thread-aware "it/that" session-context resolution) -> **Stage 8**. No graph
   test written in Stage 5a.
+- **Stage 9 gap (recorded during sub-step 9):** `Plan.assumption` is **not** shown in the Tier 1+
+  pre-approval readback used by a voice task - the policy_gate confirmation `Decision.summary` /
+  daemon `batch_approval` / voice `plan_announcement` carry only the tool + normalised args, so a
+  voice user approves an action without hearing the stated assumption; `respond` is the only reader
+  today. If we want the assumption in the readback, Stage 9 must add it to the announcement payload
+  (a new allowlisted field is not required - the assumption already rides on `Plan`).
