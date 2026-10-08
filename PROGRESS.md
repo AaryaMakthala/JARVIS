@@ -3945,7 +3945,8 @@ pytest per sub-step, no full-suite runs, no push, free-only gate untouched.
 | 3b | `003706b` | B8 rotation rule (`ROTATION_CATEGORIES`/`MODEL_SCOPED_CATEGORIES`), grouped walk, provider-wide slot-0 pseudo-entry |
 | 4 | `e0672b1` | `jarvis keys set/paste/clear <provider> --slot N` + per-slot `jarvis keys status` |
 | 5 | `e5891d9` | doctor: key-slot presence rows, daemon-queried `llm_health` rows, dynamic vision row, `StatusResponse.llm_health` |
-| 6 | this commit | Gemini vision method `describe_image`, `supports_vision=True` registry for gemini-3.8/3.7-flash, non-vision clients raise `LLMCapabilityError`, Multi vision walk, `_build_gemini` wires `vision_model` |
+| 6 | `4fbc592` | Gemini vision method `describe_image`, `supports_vision=True` registry for gemini-3.8/3.7-flash, non-vision clients raise `LLMCapabilityError`, Multi vision walk, `_build_gemini` wires `vision_model` |
+| 7 | this commit | speech-aware brain prompt (D2): `VOICE_SOURCE_LINE` appended to the user prompt only when `state["source"] == "voice"` |
 
 Decisions logged:
 - `keys status` line format is per-slot: `groq slot 1: configured` … `tavily slot 3: not configured`
@@ -3979,6 +3980,12 @@ Decisions logged:
   gate - a spec gate skip short-circuits before the method lookup, so it is the primary signal.
 - Gemini with no vision model configured raises `LLMCapabilityError` (model-scoped, cools slot 0
   provider-wide) so the Multi walk falls through, never to a paid or non-vision provider.
+- The voice transcript line is a prompt-content change only (D2): `brain_user_prompt` gained a
+  keyword-only `source="terminal"`, and `brain` passes `state["source"]`; `VOICE_SOURCE_LINE` is a
+  public constant so tests pin wording without a live model. Temperature stays 0.0, no schema/serde
+  change, `BrainDecision` stays transient, and the fast path still short-circuits before the prompt
+  is even built ("open notepad" via voice asks the LLM nothing). Terminal/benchmark input gets no
+  line because typed input is not a transcript.
 
 ### Stage 10 known-red list - addition this session
 
@@ -3988,6 +3995,14 @@ Decisions logged:
   session's changes stashed (`git stash push -u`). Fix before Stage 10 sign-off. (The other red
   voice test, `TestRearmQuietStartGate::test_response_echo_drained_before_detector_reopens`, is
   already on this list.)
+- [ ] `ruff check .` reports **38 errors** in untouched files (confirmed pre-existing at HEAD with
+  this session's changes stashed; `ruff check` on all touched files passes). Fix before Stage 10
+  sign-off, grouped by file:
+  - `benchmarks/analyze.py:21` RUF100, `benchmarks/runner.py:21` RUF100 (unused `noqa: E402`)
+  - `src/jarvis/benchmark/analyze.py:29` UP035, `checkers.py:26` UP035, `cli.py:18` UP035 + `cli.py:111`
+    DTZ005, `runner.py:33` UP035 + `runner.py:564` S110, `tasks.py:228` RUF100 (unused `noqa: BLE001`)
+  - `tests/unit/test_benchmark_checkers.py`: I001 (1) + 27x RUF012 mutable class-attribute defaults
+  - `tests/unit/test_invariants.py:995` SIM222 (`... or True`)
 
 ### Deferred (confirmed this session, per ROADMAP V2.1)
 
