@@ -57,6 +57,14 @@ free_only = true
 strict_zero_cost = true
 timeout_seconds = 30.0
 max_retries = 1
+# Ordered keyring names per provider for key failover (Stage 5a).  Every name
+# must already exist in the credential store: `jarvis keys set groq --slot 2`
+# stores groq_2_api_key and prints the exact line to add here.  Omit the key
+# (or leave it empty) to run with one key per provider.
+# key_slots = { groq = ["groq_api_key", "groq_2_api_key"] }
+# Availability-only failover: allow a rate-limited (429) key to hand over to
+# the next key of the same provider.  Never switches model or provider.
+rotate_on_rate_limit = false
 
 [llm.models.groq]
 planner = "openai/gpt-oss-120b"
@@ -176,13 +184,15 @@ class ProviderModels(BaseModel):
     """Per-provider model roles.
 
     ``planner`` is used for understanding/planning/replanning (structured
-    output + tool planning); ``fast`` is used for spoken/chat answers.  A
-    provider with only one model configured falls back to that model for both
-    roles at selection time.
+    output + tool planning); ``fast`` is used for spoken/chat answers; ``vision``
+    is used by ``describe_image`` (Stage 5a/6) and stays "" unless the owner
+    opts in to cloud vision.  A provider with only one model configured falls
+    back to that model for both roles at selection time.
     """
 
     planner: str = ""
     fast: str = ""
+    vision: str = ""
 
 
 class LLMSettings(BaseModel):
@@ -205,6 +215,13 @@ class LLMSettings(BaseModel):
     (Groq OSS, Gemini flash) are refused because the account billing state
     cannot be verified.  Set ``strict_zero_cost = false`` in config.toml to
     allow free-tier providers again under ``free_only = true``.
+
+    ``key_slots`` (Stage 5a) maps a provider to its ordered keyring names for
+    key failover: slot 1 first, then ``<provider>_2_api_key`` and so on (the
+    secret names come from :func:`jarvis.secrets.slot_secret_name`).  An empty
+    dict means one key per provider.  ``rotate_on_rate_limit`` (default false)
+    additionally allows a 429 on one key to hand over to the next key of the
+    same provider; otherwise failover stays availability-only.
     """
 
     planner_model: str = ""
@@ -217,6 +234,8 @@ class LLMSettings(BaseModel):
     timeout_seconds: float = 30.0
     max_retries: int = 1
     models: dict[str, ProviderModels] = {}
+    key_slots: dict[str, list[str]] = {}
+    rotate_on_rate_limit: bool = False
 
     def model_for(self, provider: str, role: str) -> str:
         """Resolve the effective model name for a provider/role.

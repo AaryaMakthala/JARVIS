@@ -56,6 +56,43 @@ def test_default_config_toml_parses() -> None:
     assert data["policy"]["unlock_ttl_seconds"] == 300
 
 
+def test_llm_key_slot_and_vision_defaults() -> None:
+    """Stage 5a config primitives: key slots, rotation flag, vision role."""
+    llm = config.LLMSettings()
+    assert llm.key_slots == {}
+    assert llm.rotate_on_rate_limit is False
+    assert config.ProviderModels().vision == ""
+    parsed = tomllib.loads(config.DEFAULT_CONFIG_TOML)
+    assert parsed["llm"]["rotate_on_rate_limit"] is False
+    # key_slots ships as a documented comment: `keys set --slot 2` prints the
+    # exact line the owner adds to config.toml (decision: no auto-edit).
+    assert "key_slots" not in parsed["llm"]
+
+
+def test_key_slots_and_rotation_load_from_toml(tmp_path: Path) -> None:
+    toml = tmp_path / "config.toml"
+    toml.write_text(
+        '[llm]\nkey_slots = { groq = ["groq_api_key", "groq_2_api_key"] }\n'
+        "rotate_on_rate_limit = true\n",
+        encoding="utf-8",
+    )
+    settings = config.load_settings(toml)
+    assert settings.llm.key_slots == {"groq": ["groq_api_key", "groq_2_api_key"]}
+    assert settings.llm.rotate_on_rate_limit is True
+
+
+def test_vision_model_resolution() -> None:
+    """Per-provider ``vision`` role wins, then the legacy ``vision_model``."""
+    llm = config.LLMSettings(models={"gemini": config.ProviderModels(vision="gemini-3.8-flash")})
+    assert llm.model_for("gemini", "vision") == "gemini-3.8-flash"
+    assert llm.model_for("groq", "vision") == ""
+    legacy = config.LLMSettings(
+        vision_model="legacy-vision",
+        models={"gemini": config.ProviderModels(planner="p")},
+    )
+    assert legacy.model_for("gemini", "vision") == "legacy-vision"
+
+
 def test_strict_zero_cost_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     toml = tmp_path / "config.toml"
     toml.write_text(config.DEFAULT_CONFIG_TOML, encoding="utf-8")

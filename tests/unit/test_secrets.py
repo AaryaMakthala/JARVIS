@@ -9,12 +9,16 @@ import pytest
 from keyring.backend import KeyringBackend
 
 from jarvis.secrets import (
+    MAX_KEY_SLOTS,
+    PROVIDER_SECRETS,
     REDACTABLE_NAMES,
+    SECRET_ENV_VARS,
     SECRET_NAMES,
     SECRET_SERVICE_NAME,
     SecretStore,
     SecretStoreError,
     check_store_access,
+    slot_secret_name,
 )
 
 
@@ -104,10 +108,46 @@ def test_secret_names_and_redactables_align() -> None:
         "gemini_api_key",
         "nvidia_api_key",
         "tavily_api_key",
+        "groq_2_api_key",
+        "groq_3_api_key",
+        "openrouter_2_api_key",
+        "openrouter_3_api_key",
+        "gemini_2_api_key",
+        "gemini_3_api_key",
+        "nvidia_2_api_key",
+        "nvidia_3_api_key",
+        "tavily_2_api_key",
+        "tavily_3_api_key",
         "ipc_token",
         "password_hash",
         "virustotal_api_key",
     }
+
+
+def test_slot_secret_name_naming() -> None:
+    assert slot_secret_name("groq", 1) == "groq_api_key"
+    assert slot_secret_name("groq", 2) == "groq_2_api_key"
+    assert slot_secret_name("gemini", MAX_KEY_SLOTS) == "gemini_3_api_key"
+    assert slot_secret_name("tavily", 1) == "tavily_api_key"
+
+
+def test_slot_secret_name_rejects_bad_input() -> None:
+    with pytest.raises(ValueError):
+        slot_secret_name("groq", 0)
+    with pytest.raises(ValueError):
+        slot_secret_name("groq", MAX_KEY_SLOTS + 1)
+    with pytest.raises(ValueError):
+        slot_secret_name("unknown_provider", 2)
+
+
+def test_every_slot_name_is_registered_keyring_only() -> None:
+    """Every composable slot name is a registered secret with no env fallback."""
+    for provider in PROVIDER_SECRETS:
+        for slot in range(1, MAX_KEY_SLOTS + 1):
+            name = slot_secret_name(provider, slot)
+            assert name in SECRET_NAMES
+            if slot > 1:
+                assert name not in SECRET_ENV_VARS
 
 
 def test_provider_secret_map_matches_secret_names() -> None:
