@@ -3943,7 +3943,8 @@ pytest per sub-step, no full-suite runs, no push, free-only gate untouched.
 | 2 | `6518e9f` | one client per present key slot (`provider.py`), vision-model guard |
 | 3a | `034d37e` | `LLMCallFailure.slot`, health key `(provider, slot, role)`, `safe_summary()` |
 | 3b | `003706b` | B8 rotation rule (`ROTATION_CATEGORIES`/`MODEL_SCOPED_CATEGORIES`), grouped walk, provider-wide slot-0 pseudo-entry |
-| 4 | this commit | `jarvis keys set/paste/clear <provider> --slot N` + per-slot `jarvis keys status` |
+| 4 | `e0672b1` | `jarvis keys set/paste/clear <provider> --slot N` + per-slot `jarvis keys status` |
+| 5 | this commit | doctor: key-slot presence rows, daemon-queried `llm_health` rows, dynamic vision row, `StatusResponse.llm_health` |
 
 Decisions logged:
 - `keys status` line format is per-slot: `groq slot 1: configured` … `tavily slot 3: not configured`
@@ -3953,6 +3954,20 @@ Decisions logged:
 - MALFORMED_REQUEST in the B8 walk: cool the real slot, break to the next provider (owner choice).
 - Slot validation/naming stays in `secrets.slot_secret_name`; `provider_has_credential` gained a
   keyword-only `slot`; `cli.py` only wires the option and formats rows.
+- Doctor key-slot rows are driven by `llm.key_slots` (exactly the ladder the failover walk will
+  try), skip slot 1 (the primary row already covers it), and follow the `<provider>_<N>_api_key`
+  convention for presence checks. A missing configured backup is WARN, never FAIL.
+- `StatusResponse.llm_health` defaults to `[]` (old clients ignore the extra key; existing status
+  tests validate unchanged). The server fills it in `_handle_status` only, from
+  `ctx.llm.health_snapshot()` when that exists - counts/cooldown/last category, never prompts,
+  latencies or key material.
+- Doctor health: daemon unreachable -> one WARN row `health: unknown (daemon not running)`, never
+  FAIL; reachable -> one PASS/WARN row per `(provider, slot, role)` (WARN while cooling), with the
+  provider-wide slot 0 shown as `health.<provider>/provider/<role>`.
+- Vision row is now dynamic: PASS only when a `provider_order` provider has a configured vision
+  model the registry marks `supports_vision` AND a credential; else WARN. No registry entry has
+  vision capability yet, so every install WARNs until Stage 6 registers one (fail-closed). Both
+  rows note that graph wiring lands in Stage 6.
 
 ### Stage 10 known-red list - addition this session
 

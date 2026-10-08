@@ -134,6 +134,43 @@ class TestDefaults:
         parsed = StatusResponse.model_validate(json.loads(msg.model_dump_json()))
         assert parsed.voice_reason == "mic-open-failed"
 
+    def test_status_response_llm_health_defaults_empty(self) -> None:
+        """Old clients and status tests keep validating without the field."""
+        assert StatusResponse().llm_health == []
+        msg = StatusResponse(daemon="running", voice="off", unlocked=False, queue=0)
+        assert msg.llm_health == []
+
+    def test_status_response_llm_health_round_trip(self) -> None:
+        rows: list[dict[str, Any]] = [
+            {
+                "provider": "groq",
+                "slot": 2,
+                "role": "fast",
+                "consecutive_failures": 1,
+                "cooling": True,
+                "cooldown_remaining_s": 42.0,
+                "last_category": "rate_limited",
+                "total_failures": 1,
+                "total_successes": 3,
+            },
+            {
+                "provider": "gemini",
+                "slot": "provider",
+                "role": "planner",
+                "consecutive_failures": 0,
+                "cooling": False,
+                "cooldown_remaining_s": 0.0,
+                "last_category": "none",
+                "total_failures": 0,
+                "total_successes": 5,
+            },
+        ]
+        msg = StatusResponse(daemon="running", llm_health=rows)
+        parsed = StatusResponse.model_validate(json.loads(msg.model_dump_json()))
+        assert parsed.llm_health == rows
+        # rows are counts-only dicts, never secret material
+        assert all(isinstance(row, dict) for row in parsed.llm_health)
+
 
 # ── Validation ───────────────────────────────────────────────────────────
 

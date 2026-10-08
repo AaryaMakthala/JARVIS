@@ -471,6 +471,91 @@ def _provider_model_diagnostic(
     return _check(f"{name}_model", "FAIL", f"{refused[0]} model: {refused[4]}"), False
 
 
+def _daemon_llm_health() -> list[dict[str, Any]] | None:
+    """Best-effort LLM health snapshot from a running daemon.
+
+    Returns ``None`` when the daemon is unreachable (including "not
+    installed"), which :func:`run_doctor` reports as a WARN - doctor never
+    fails just because the optional daemon is not running.  The port file is
+    read before any credential access, so an absent daemon fails fast without
+    touching the keyring or the network.
+    """
+    from jarvis.daemon.client import DaemonClient
+
+    client = DaemonClient()
+    try:
+        client.connect()
+        try:
+            return client.get_status().llm_health
+        finally:
+            client.close()
+    except Exception as exc:  # noqa: BLE001 - doctor must survive any probe failure
+        logger.debug("daemon LLM health unavailable: %s", exc)
+        return None
+
+
+def _health_checks(rows: list[dict[str, Any]] | None) -> list[Check]:
+    """Render the daemon's per-(provider, slot, role) health as doctor rows.
+
+    Counts, cooldown state and the last failure category only - never
+    prompts, latencies or key material.  The provider-wide pseudo-slot 0
+    reads as ``provider``.  An unreachable daemon is one WARN row; health
+    never produces a FAIL (a cooling provider recovers by itself).
+    """
+    if rows is None:
+        return [_check("health", "WARN", "unknown (daemon not running)")]
+    checks: list[Check] = []
+    for row in rows:
+        provider = str(row.get("provider", "?"))
+        slot = row.get("slot", 1)
+        slot_label = "provider" if slot in (0, "provider") else f"slot{slot}"
+        role = str(row.get("role", "?"))
+        cooling = bool(row.get("cooling"))
+        if cooling:
+            cool_text = f"yes ({row.get('cooldown_remaining_s', 0.0)}s)"
+        else:
+            cool_text = "no"
+        detail = (
+            f"ok={row.get('total_successes', 0)} "
+            f"fail={row.get('total_failures', 0)} "
+            f"streak={row.get('consecutive_failures', 0)} "
+            f"cooling={cool_text} last={row.get('last_category', 'none')}"
+        )
+        checks.append(
+            _check(
+                f"health.{provider}/{slot_label}/{role}",
+                "WARN" if cooling else "PASS",
+                detail,
+            )
+        )
+    return checks
+
+
+def _vision_check(
+    settings: config.Settings,
+    store: secret_module.SecretStore,
+    providers: list[str],
+) -> Check:
+    """Doctor row for vision readiness (graph wiring lands in Stage 6).
+
+    PASS only when a provider in ``provider_order`` has a configured vision
+    model that the pricing registry marks vision-capable *and* a stored
+    credential; otherwise WARN with what is missing.  Fail-closed: a model
+    unknown to the registry reports ``supports_vision=False``.
+    """
+    note = "vision model selection/graph wiring lands in Stage 6"
+    for name in providers:
+        model = settings.llm.model_for(name, "vision")
+        if not model:
+            continue
+        if not llm_models.model_spec(name, model).capabilities.supports_vision:
+            continue
+        if not provider_has_credential(store, name):
+            continue
+        return _check("vision", "PASS", f"ready ({name}/{model}) - {note}")
+    return _check("vision", "WARN", f"no vision model configured - {note}")
+
+
 def run_doctor(
     *,
     settings: config.Settings | None = None,
@@ -537,6 +622,23 @@ def run_doctor(
                     f"{name}_api_key missing - provide it with `jarvis keys set {name}`",
                 )
             )
+        # Backup key slots the config declares in [llm.key_slots]: presence
+        # only (the value never leaves the store).  Slot 1's row above already
+        # covers the primary key; an unconventional secret name is not a
+        # numbered slot, so it gets no slot row here.
+        if name in PROVIDER_SECRETS:
+            configured_slots = set(settings.llm.key_slots.get(name, []))
+            for slot in range(2, MAX_KEY_SLOTS + 1):
+                if slot_secret_name(name, slot) not in configured_slots:
+                    continue
+                slot_ok = provider_has_credential(store, name, slot=slot)
+                checks.append(
+                    _check(
+                        f"{name}_api_key[slot{slot}]",
+                        "PASS" if slot_ok else "WARN",
+                        "present" if slot_ok else "missing",
+                    )
+                )
 
     tavily_present = provider_has_credential(store, "tavily")
     checks.append(
@@ -590,13 +692,8 @@ def run_doctor(
     else:
         checks.append(_check("llm_provider", "FAIL", "No free LLM provider configured"))
 
-    checks.append(
-        _check(
-            "vision",
-            "WARN",
-            "vision is not wired into the graph yet; no vision capability is required",
-        )
-    )
+    checks.append(_vision_check(settings, store, providers))
+    checks.extend(_health_checks(_daemon_llm_health()))
 
     if live:
         live_ran = False

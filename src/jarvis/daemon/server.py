@@ -1714,6 +1714,16 @@ class DaemonServer:
                             voice_mode = str(mode)
             except Exception:  # noqa: BLE001, S110 - best effort
                 pass
+        llm_health: list[dict[str, Any]] = []
+        snapshot = getattr(getattr(self._ctx, "llm", None), "health_snapshot", None)
+        if callable(snapshot):
+            try:
+                rows = snapshot()
+            except Exception:
+                logger.debug("llm health snapshot unavailable", exc_info=True)
+            else:
+                if isinstance(rows, list):
+                    llm_health = [row for row in rows if isinstance(row, dict)]
         await conn.send(
             StatusResponse(
                 daemon="running",
@@ -1723,6 +1733,7 @@ class DaemonServer:
                 unlocked=self._unlock.is_unlocked(),
                 queue=queue_len,
                 active_task=active_id,
+                llm_health=llm_health,
             )
         )
 

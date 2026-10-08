@@ -494,3 +494,63 @@ class TestAckPrecedesTheWorkerWakeup:
             ),
         )
         assert order == ["ack", "worker-woken"]
+
+
+# ── Status: llm_health fill ──────────────────────────────────────────────
+
+
+class TestHandleStatusLlmHealth:
+    @staticmethod
+    def _status_payload(server: DaemonServer) -> dict:
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+        asyncio.run(server._handle_status(conn))
+        written = writer.write.call_args[0][0].decode("utf-8")
+        data = json.loads(written)
+        assert data["type"] == "status_response"
+        return data
+
+    def test_status_without_llm_context_reports_empty_health(self) -> None:
+        data = self._status_payload(_server())
+        assert data["llm_health"] == []
+
+    def test_status_fills_llm_health_from_context(self) -> None:
+        rows: list[dict] = [
+            {
+                "provider": "groq",
+                "slot": 2,
+                "role": "fast",
+                "consecutive_failures": 1,
+                "cooling": False,
+                "cooldown_remaining_s": 0.0,
+                "last_category": "rate_limited",
+                "total_failures": 1,
+                "total_successes": 3,
+            }
+        ]
+
+        class _LLM:
+            def health_snapshot(self) -> list[dict]:
+                return rows
+
+        class _Ctx:
+            llm = _LLM()
+
+        server = _server()
+        server._ctx = _Ctx()  # type: ignore[assignment]
+        data = self._status_payload(server)
+        assert data["llm_health"] == rows
+
+    def test_status_survives_a_raising_health_snapshot(self) -> None:
+        class _LLM:
+            def health_snapshot(self) -> list[dict]:
+                raise RuntimeError("boom")
+
+        class _Ctx:
+            llm = _LLM()
+
+        server = _server()
+        server._ctx = _Ctx()  # type: ignore[assignment]
+        data = self._status_payload(server)
+        assert data["llm_health"] == []
+        assert data["daemon"] == "running"

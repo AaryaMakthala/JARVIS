@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import tomllib
 from pathlib import Path
 
@@ -271,6 +272,174 @@ def test_doctor_paid_or_unregistered_model_fails_closed(
     checks = {c.name: c for c in cli.run_doctor(settings=settings, store=store)}
     assert checks["groq_model"].status == "FAIL"
     assert checks["llm_provider"].status == "FAIL"
+
+
+# ── doctor: key-slot rows, daemon LLM health, vision readiness ────────────
+
+
+def test_doctor_slot_rows_presence_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    settings = cli.config.load_settings()
+    settings.llm.key_slots = {"groq": ["groq_api_key", "groq_2_api_key", "groq_3_api_key"]}
+    store = FakeStore(groq_api_key="gsk-primary", groq_2_api_key="gsk-backup")
+    checks = {c.name: c for c in cli.run_doctor(settings=settings, store=store)}
+    assert checks["groq_api_key[slot2]"].status == "PASS"
+    assert checks["groq_api_key[slot2]"].detail == "present"
+    assert checks["groq_api_key[slot3]"].status == "WARN"
+    assert checks["groq_api_key[slot3]"].detail == "missing"
+    # presence only - the value never appears in the row
+    assert "gsk-primary" not in str(checks)
+    assert "gsk-backup" not in str(checks)
+
+
+def test_doctor_slot_rows_absent_when_not_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    settings = cli.config.load_settings()
+    assert settings.llm.key_slots == {}
+    store = FakeStore(groq_api_key="gsk-primary", groq_2_api_key="gsk-backup")
+    checks = [c.name for c in cli.run_doctor(settings=settings, store=store)]
+    assert not any("[slot" in name for name in checks)
+
+
+def test_doctor_health_rows_from_fake_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    rows = [
+        {
+            "provider": "groq",
+            "slot": 2,
+            "role": "fast",
+            "total_successes": 3,
+            "total_failures": 1,
+            "consecutive_failures": 1,
+            "cooling": False,
+            "cooldown_remaining_s": 0.0,
+            "last_category": "rate_limited",
+        },
+        {
+            "provider": "gemini",
+            "slot": "provider",
+            "role": "planner",
+            "total_successes": 0,
+            "total_failures": 2,
+            "consecutive_failures": 2,
+            "cooling": True,
+            "cooldown_remaining_s": 40.0,
+            "last_category": "timeout",
+        },
+    ]
+    monkeypatch.setattr(cli, "_daemon_llm_health", lambda: rows)
+    checks = {
+        c.name: c for c in cli.run_doctor(settings=cli.config.load_settings(), store=FakeStore())
+    }
+    slot_row = checks["health.groq/slot2/fast"]
+    assert slot_row.status == "PASS"
+    assert "ok=3" in slot_row.detail
+    assert "fail=1" in slot_row.detail
+    assert "cooling=no" in slot_row.detail
+    assert "last=rate_limited" in slot_row.detail
+    provider_row = checks["health.gemini/provider/planner"]
+    assert provider_row.status == "WARN"  # cooling degrades, never fails
+    assert "cooling=yes" in provider_row.detail
+    assert "40.0s" in provider_row.detail
+    assert "health" not in checks  # daemon-down row not mixed in when reachable
+
+
+def test_doctor_health_warn_when_daemon_unreachable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(cli, "_daemon_llm_health", lambda: None)
+    checks = {
+        c.name: c for c in cli.run_doctor(settings=cli.config.load_settings(), store=FakeStore())
+    }
+    assert checks["health"].status == "WARN"
+    assert checks["health"].detail == "unknown (daemon not running)"
+
+
+def test_doctor_health_probe_fails_fast_without_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No daemon.json -> no keyring, no network, no event loop; just None."""
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    assert cli._daemon_llm_health() is None
+
+
+def test_doctor_vision_ready_when_registry_and_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from dataclasses import replace
+
+    from jarvis.llm.models import Capabilities
+
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    settings = cli.config.load_settings()
+    settings.llm.provider_order = ["groq"]
+    settings.llm.models = {
+        "groq": ProviderModels(
+            planner="openai/gpt-oss-120b",
+            fast="openai/gpt-oss-20b",
+            vision="vision-test-model",
+        )
+    }
+    store = FakeStore(groq_api_key="gsk-test")
+    real_spec = cli.llm_models.model_spec
+
+    def _vision_spec(provider: str, model: str) -> object:
+        spec = real_spec(provider, model)
+        if model == "vision-test-model":
+            return replace(
+                spec,
+                capabilities=Capabilities(
+                    supports_tools=True, supports_structured_output=True, supports_vision=True
+                ),
+            )
+        return spec
+
+    monkeypatch.setattr(cli.llm_models, "model_spec", _vision_spec)
+    checks = {c.name: c for c in cli.run_doctor(settings=settings, store=store)}
+    assert checks["vision"].status == "PASS"
+    assert "ready (groq/vision-test-model)" in checks["vision"].detail
+    assert "Stage 6" in checks["vision"].detail
+
+
+def test_doctor_vision_warn_when_not_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    settings = cli.config.load_settings()
+    settings.llm.provider_order = ["groq"]
+    settings.llm.models = {"groq": ProviderModels(planner="openai/gpt-oss-120b")}
+    store = FakeStore(groq_api_key="gsk-test")
+    checks = {c.name: c for c in cli.run_doctor(settings=settings, store=store)}
+    assert checks["vision"].status == "WARN"
+    assert "no vision model configured" in checks["vision"].detail
+    assert "Stage 6" in checks["vision"].detail
+
+
+def test_doctor_never_prints_key_material(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    canary = "gsk-canary-do-not-print-12345"
+    settings = cli.config.Settings()
+    settings.llm.key_slots = {"groq": ["groq_api_key", "groq_2_api_key"]}
+    store = FakeStore(groq_api_key=canary, groq_2_api_key=canary)
+    monkeypatch.setattr(cli.config, "load_settings", lambda: settings)
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+    monkeypatch.setattr(cli, "_daemon_llm_health", lambda: None)
+    with caplog.at_level(logging.DEBUG):
+        result = runner.invoke(cli.app, ["doctor"])
+        checks = cli.run_doctor(settings=settings, store=store)
+    rendered = " ".join(f"{c.name} {c.status} {c.detail}" for c in checks)
+    assert canary not in rendered
+    assert canary not in caplog.text
+    assert canary not in result.output
+    # the health fallback row did render, so the command really ran
+    assert "daemon not running" in result.output
 
 
 def test_doctor_live_requires_a_configured_provider(

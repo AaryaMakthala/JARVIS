@@ -214,6 +214,11 @@ class StatusResponse(BaseModel):
     ``voice == "error"``, so ``jarvis status`` can surface the same reason
     that ``jarvis on`` reported.
     ``mode`` is the current voice mode: ``NORMAL`` or ``AUTO``.
+    ``llm_health`` is the daemon's secret-free LLM health snapshot: one row
+    per tracked ``(provider, slot, role)`` with counts, cooldown state and
+    the last failure category only - never prompts, latencies or key
+    material.  It defaults to empty so older clients and status tests keep
+    validating unchanged; the daemon fills it in when an LLM context exists.
     """
 
     type: Literal["status_response"] = "status_response"
@@ -225,6 +230,7 @@ class StatusResponse(BaseModel):
     queue: int = 0
     active_task: str | None = None
     version: str = PROTOCOL_VERSION
+    llm_health: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ── Union type for parsing ───────────────────────────────────────────────
