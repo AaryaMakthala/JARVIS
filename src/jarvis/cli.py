@@ -60,7 +60,7 @@ from jarvis.platform_guard import is_64bit, is_python_supported, is_windows
 from jarvis.policy import tiers
 from jarvis.policy.refusal import REASON_NO_PASSWORD, REASON_USER_DECLINED
 from jarvis.policy.unlock import UnlockManager
-from jarvis.secrets import PROVIDER_SECRETS
+from jarvis.secrets import MAX_KEY_SLOTS, PROVIDER_SECRETS, slot_secret_name
 
 app = typer.Typer(
     name="jarvis",
@@ -256,6 +256,24 @@ def _apply_backspace(line: str) -> str:
     return "".join(edited)
 
 
+def _slot_config_hint(short: str, slot: int) -> str:
+    """One-line config.toml hint printed by ``keys set --slot N`` (N > 1).
+
+    ``keys set --slot`` deliberately never edits ``config.toml`` (decision:
+    no auto-edit), so the receipt names the secret it stored and the exact
+    ``llm.key_slots`` line the owner adds to make the failover walk use it.
+    The example lists every slot up to ``slot``; names for slots that are not
+    stored yet are skipped by the builder, so the line is always safe to paste
+    verbatim.  Only secret *names* appear here - never values.
+    """
+    names = ", ".join(f'"{slot_secret_name(short, n)}"' for n in range(1, slot + 1))
+    return (
+        "Hint: config.toml was not edited - add "
+        f"{slot_secret_name(short, slot)} to llm.key_slots, e.g. "
+        f"key_slots = {{ {short} = [{names}] }}"
+    )
+
+
 def keys_set_command(
     store: secret_module.SecretStore,
     short: str,
@@ -264,6 +282,7 @@ def keys_set_command(
     interactive: bool = True,
     prompt_fn: Any = None,
     visible: bool = False,
+    slot: int = 1,
 ) -> str:
     """Securely store a provider API key; hidden input unless ``visible=True``.
 
@@ -280,8 +299,14 @@ def keys_set_command(
     never logged and never raised in an exception: the receipt is built only
     *after* the credential store accepted the value, so a storage failure or
     empty input returns no fragment of the key at all.
+
+    ``slot`` (CLI: ``--slot N``) selects the credential key slot 1..3 and is
+    validated by :func:`jarvis.secrets.slot_secret_name` before any prompt.
+    Slots 2+ store under ``<provider>_<N>_api_key`` and append the
+    :func:`_slot_config_hint` line; the default (slot 1) receipt is unchanged.
     """
     _validate_provider(short)
+    secret_name = slot_secret_name(short, slot)  # rejects slot 0 and 4+
     if interactive:
         reader = (prompt_fn or visible_input) if visible else (prompt_fn or getpass.getpass)
         raw = reader(f"{_provider_label(short)} API key: ")
@@ -289,9 +314,12 @@ def keys_set_command(
     value = (value or "").strip()
     if not value:
         raise ValueError(_KEYS_SET_EMPTY_MESSAGE)
-    store.set(PROVIDER_SECRETS[short], value)
+    store.set(secret_name, value)
     shown = value if visible else masked_key_preview(value)
-    return f"{_KEYS_SET_SAVED_MESSAGE}\n{_KEYS_SET_PREVIEW_PREFIX}{shown}"
+    receipt = f"{_KEYS_SET_SAVED_MESSAGE}\n{_KEYS_SET_PREVIEW_PREFIX}{shown}"
+    if slot > 1:
+        receipt += "\n" + _slot_config_hint(short, slot)
+    return receipt
 
 
 def keys_paste_command(
@@ -300,42 +328,50 @@ def keys_paste_command(
     *,
     clipboard_fn: Any = None,
     clear_clipboard_fn: Any = None,
+    slot: int = 1,
 ) -> str:
-    """Import an API key from the clipboard. Returns "saved".
+    """Import an API key from the clipboard into ``slot``. Returns "saved".
 
     Strips whitespace, rejects empty values, stores in the keyring and then
     best-effort clears the clipboard (documented in :func:`_clipboard_clear`).
-    The key itself is never printed.
+    The key itself is never printed.  ``slot`` uses the same validation as
+    :func:`keys_set_command` (slot 0 and 4+ are rejected before reading the
+    clipboard); slots 2+ store under ``<provider>_<N>_api_key``.
     """
     _validate_provider(short)
+    secret_name = slot_secret_name(short, slot)  # rejects slot 0 and 4+
     clipboard_fn = clipboard_fn or _clipboard_paste
     value = (clipboard_fn() or "").strip()
     if not value:
         raise ValueError(f"clipboard was empty - nothing stored for {short}")
-    store.set(PROVIDER_SECRETS[short], value)
+    store.set(secret_name, value)
     if clear_clipboard_fn is not None:
         clear_clipboard_fn()
     return "saved"
 
 
-def keys_clear_command(store: secret_module.SecretStore, short: str) -> str:
-    """Remove a stored provider API key. Returns "cleared"."""
+def keys_clear_command(store: secret_module.SecretStore, short: str, *, slot: int = 1) -> str:
+    """Remove a stored provider API key from ``slot``. Returns "cleared"."""
 
     _validate_provider(short)
-    store.delete(PROVIDER_SECRETS[short])
+    store.delete(slot_secret_name(short, slot))  # rejects slot 0 and 4+
     return "cleared"
 
 
 def keys_status_lines(store: secret_module.SecretStore) -> list[str]:
-    """Render one line per provider: ``groq: configured`` / ``not configured``.
+    """Render one line per provider key slot: ``groq slot 1: configured``.
 
     Presence is effective (keyring, then environment variable); no prefix,
-    suffix, length, hash or masked value is ever shown.
+    suffix, length, hash or masked value is ever shown.  Slot 1 is the
+    primary key and honours its environment-variable fallback; slots 2+ are
+    keyring-only, so they report credential-store presence alone.
     """
     lines: list[str] = []
     for short in CREDENTIAL_PROVIDERS:
-        present = provider_has_credential(store, short)
-        lines.append(f"{short}: {'configured' if present else 'not configured'}")
+        for slot in range(1, MAX_KEY_SLOTS + 1):
+            present = provider_has_credential(store, short, slot=slot)
+            state = "configured" if present else "not configured"
+            lines.append(f"{short} slot {slot}: {state}")
     return lines
 
 
@@ -676,12 +712,18 @@ def keys_set(
             help="Echo the key while typing and print it in full (INSECURE, opt-in only).",
         ),
     ] = False,
+    slot: Annotated[
+        int,
+        typer.Option("--slot", help="Credential key slot 1-3 (1 = primary; 2+ are backup keys)."),
+    ] = 1,
 ) -> None:
     """Store a provider API key (hidden input; opt in with --visible)."""
     if visible:
         console.print(f"[yellow]{_KEYS_SET_VISIBLE_WARNING}[/yellow]")
     try:
-        message = keys_set_command(secret_module.SecretStore(), provider, visible=visible)
+        message = keys_set_command(
+            secret_module.SecretStore(), provider, visible=visible, slot=slot
+        )
     except secret_module.SecretStoreError:
         console.print("[red]✗ API key received, but secure storage failed.[/red]")
         raise typer.Exit(code=1)
@@ -696,10 +738,15 @@ def keys_set(
 @keys_app.command("paste")
 def keys_paste(
     provider: Annotated[str, typer.Argument(help="groq|openrouter|gemini|nvidia|tavily")],
+    slot: Annotated[
+        int,
+        typer.Option("--slot", help="Credential key slot 1-3 (1 = primary; 2+ are backup keys)."),
+    ] = 1,
 ) -> None:
     """Import an API key from the Windows clipboard (safe for pasting)."""
     try:
         _validate_provider(provider)
+        slot_secret_name(provider, slot)  # reject --slot 0/4 before prompting
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
@@ -712,6 +759,7 @@ def keys_paste(
             secret_module.SecretStore(),
             provider,
             clear_clipboard_fn=_clipboard_clear,
+            slot=slot,
         )
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -722,10 +770,14 @@ def keys_paste(
 @keys_app.command("clear")
 def keys_clear(
     provider: Annotated[str, typer.Argument(help="groq|openrouter|gemini|nvidia|tavily")],
+    slot: Annotated[
+        int,
+        typer.Option("--slot", help="Credential key slot 1-3 (1 = primary; 2+ are backup keys)."),
+    ] = 1,
 ) -> None:
     """Remove a stored provider API key from the credential store."""
     try:
-        message = keys_clear_command(secret_module.SecretStore(), provider)
+        message = keys_clear_command(secret_module.SecretStore(), provider, slot=slot)
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)

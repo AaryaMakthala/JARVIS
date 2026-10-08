@@ -4,12 +4,19 @@ Asserts the contract: hidden input is the default, whitespace stripped,
 explicit safe receipt feedback followed by a masked preview (first/last 4
 characters only), empty values rejected without storage, clipboard import
 never echoes the value, ``status`` shows only
-``<provider>: configured|not configured``, and unknown providers are rejected.
-The complete secret must never appear in any output or log.
+``<provider> slot <N>: configured|not configured`` per key slot, and unknown
+providers are rejected.  The complete secret must never appear in any output
+or log.
 
 Visible entry exists only behind the explicit ``--visible`` opt-in flag; these
 tests pin that opt-in down (warning shown, full key in the receipt) *and* that
 neither mode ever writes the full key to logs.
+
+``--slot N`` (Stage 5a) composes with every sub-command: slots are validated
+1..3 by ``secrets.slot_secret_name`` (slot 0/4 rejected), slot 2+ store under
+``<provider>_<N>_api_key``, ``keys set --slot N`` never edits config.toml but
+prints the ``llm.key_slots`` hint, and the default (no ``--slot``) receipt is
+byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -261,6 +268,16 @@ def test_paste_does_not_echo_the_key() -> None:
 # ── status (env fallback) ─────────────────────────────────────────────────
 
 
+def _expected_status_lines(configured: set[tuple[str, int]]) -> list[str]:
+    """The exact status output: one line per provider key slot."""
+    lines: list[str] = []
+    for short in CREDENTIAL_PROVIDERS:
+        for slot in (1, 2, 3):
+            state = "configured" if (short, slot) in configured else "not configured"
+            lines.append(f"{short} slot {slot}: {state}")
+    return lines
+
+
 def test_keys_status_cli_reports_only_configured_state(monkeypatch: pytest.MonkeyPatch) -> None:
     secret = "test-status-secret"
     store = FakeStore(groq_api_key=secret)
@@ -277,17 +294,13 @@ def test_keys_status_cli_reports_only_configured_state(monkeypatch: pytest.Monke
 
     result = runner.invoke(cli.app, ["keys", "status"])
 
-    expected = [
-        f"{short}: {'configured' if short == 'groq' else 'not configured'}"
-        for short in CREDENTIAL_PROVIDERS
-    ]
     assert result.exit_code == 0
-    assert result.output.strip().splitlines() == expected
+    assert result.output.strip().splitlines() == _expected_status_lines({("groq", 1)})
     assert secret not in result.output
     assert "length=" not in result.output
 
 
-def test_status_lists_every_provider_once(monkeypatch: typing.Any) -> None:
+def test_status_lists_every_provider_slot_once(monkeypatch: typing.Any) -> None:
     store = FakeStore(groq_api_key="x")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -296,22 +309,38 @@ def test_status_lists_every_provider_once(monkeypatch: typing.Any) -> None:
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
 
     lines = cli.keys_status_lines(store)
-    assert [l.split(":")[0] for l in lines] == list(CREDENTIAL_PROVIDERS)
-    assert "groq: configured" in lines
+    assert lines == _expected_status_lines({("groq", 1)})
+    assert [l.split(":")[0] for l in lines] == [
+        f"{short} slot {slot}" for short in CREDENTIAL_PROVIDERS for slot in (1, 2, 3)
+    ]
+    assert "groq slot 2: not configured" in lines
+    assert "groq slot 3: not configured" in lines
     for short in ("openrouter", "gemini", "nvidia", "tavily"):
-        assert f"{short}: not configured" in lines
+        assert f"{short} slot 1: not configured" in lines
 
 
 def test_status_reflects_environment(monkeypatch: typing.Any) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "AIza-from-env")
     lines = cli.keys_status_lines(FakeStore())
-    assert "gemini: configured" in lines
+    assert "gemini slot 1: configured" in lines
 
 
 def test_status_reflects_google_env_fallback(monkeypatch: typing.Any) -> None:
     monkeypatch.setenv("GOOGLE_API_KEY", "AIza-google-env")
     lines = cli.keys_status_lines(FakeStore())
-    assert "gemini: configured" in lines
+    assert "gemini slot 1: configured" in lines
+
+
+def test_status_slot_one_env_fallback_does_not_leak_to_backup_slots(
+    monkeypatch: typing.Any,
+) -> None:
+    """A slot-1 env var satisfies only slot 1: slots 2+ are keyring-only."""
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-from-environment-only")
+    lines = cli.keys_status_lines(FakeStore())
+    assert "groq slot 1: configured" in lines
+    assert "groq slot 2: not configured" in lines
+    assert "groq slot 3: not configured" in lines
+    assert "gsk-from-environment-only" not in " ".join(lines)
 
 
 def test_status_never_leaks_value_shape(monkeypatch: typing.Any) -> None:
@@ -319,6 +348,17 @@ def test_status_never_leaks_value_shape(monkeypatch: typing.Any) -> None:
     lines = cli.keys_status_lines(FakeStore(groq_api_key="gsk-mega-secret-value-123"))
     assert "gsk-mega-secret-value-123" not in " ".join(lines)
     assert "mega" not in " ".join(lines)
+
+
+def test_status_slot_two_presence_never_leaks_value(monkeypatch: typing.Any) -> None:
+    backup = "gsk-slot2-super-secret-xyz"
+    lines = cli.keys_status_lines(FakeStore(groq_2_api_key=backup))
+    assert "groq slot 2: configured" in lines
+    assert "groq slot 1: not configured" in lines
+    joined = " ".join(lines)
+    assert backup not in joined
+    assert "secret" not in joined
+    assert "slot2" not in joined
 
 
 # ── clear ─────────────────────────────────────────────────────────────────
@@ -521,3 +561,196 @@ def test_visible_mode_shows_key_only_in_receipt_never_in_logs(
     assert result.exit_code == 0
     assert f"Key: {secret}" in result.output  # explicit --visible session only
     assert secret not in caplog.text
+
+
+# ── key slots (--slot N; Stage 5a) ───────────────────────────────────────
+
+_SLOT2_HINT_LINE = 'key_slots = { groq = ["groq_api_key", "groq_2_api_key"] }'
+
+
+def test_set_slot_two_stores_backup_name_and_prints_hint() -> None:
+    store = FakeStore()
+    out = cli.keys_set_command(
+        store, "groq", value="  backup-key-value  ", interactive=False, slot=2
+    )
+    receipt, preview_line, hint = out.splitlines()
+    assert receipt == "✓ API key received and saved securely."
+    assert preview_line == f"Key: {cli.masked_key_preview('backup-key-value')}"
+    assert store.get("groq_2_api_key") == "backup-key-value"
+    assert store.get("groq_api_key") is None  # slot 1 untouched
+    assert "llm.key_slots" in hint
+    assert "groq_2_api_key" in hint
+    assert _SLOT2_HINT_LINE in hint  # the exact config.toml line to add
+    assert "backup-key-value" not in out  # value never printed
+
+
+def test_set_slot_three_stores_third_name_and_lists_full_ladder() -> None:
+    store = FakeStore()
+    out = cli.keys_set_command(
+        store, "nvidia", value="nvapi-third-key-123", interactive=False, slot=3
+    )
+    assert store.get("nvidia_3_api_key") == "nvapi-third-key-123"
+    assert 'key_slots = { nvidia = ["nvidia_api_key", "nvidia_2_api_key",' in out
+    assert '"nvidia_3_api_key"] }' in out
+    assert "nvapi-third-key-123" not in out
+
+
+def test_set_explicit_slot_one_receipt_is_unchanged() -> None:
+    """--slot 1 (the default) behaves exactly like no --slot: 2 lines, no hint."""
+    store = FakeStore()
+    out = cli.keys_set_command(store, "groq", value=_PREVIEW_SECRET, interactive=False, slot=1)
+    receipt, preview_line = out.splitlines()
+    assert receipt == "✓ API key received and saved securely."
+    assert preview_line == f"Key: {cli.masked_key_preview(_PREVIEW_SECRET)}"
+    assert "Hint" not in out
+    assert "llm.key_slots" not in out
+    assert store.get("groq_api_key") == _PREVIEW_SECRET
+
+
+def test_set_slot_composes_with_visible_mode() -> None:
+    store = FakeStore()
+    out = cli.keys_set_command(
+        store,
+        "nvidia",
+        interactive=True,
+        visible=True,
+        slot=2,
+        prompt_fn=lambda _prompt: f"  {_VISIBLE_SECRET}\r\n",
+    )
+    receipt, key_line, hint = out.splitlines()
+    assert receipt == "✓ API key received and saved securely."
+    assert key_line == f"Key: {_VISIBLE_SECRET}"  # explicit opt-in still shows it
+    assert "llm.key_slots" in hint
+    assert store.get("nvidia_2_api_key") == _VISIBLE_SECRET
+
+
+def test_set_rejects_slot_zero() -> None:
+    store = FakeStore()
+    with pytest.raises(ValueError, match=r"slot must be 1\.\.3, got 0"):
+        cli.keys_set_command(store, "groq", value="x", interactive=False, slot=0)
+    assert store.get("groq_api_key") is None  # rejected before any storage
+
+
+def test_set_rejects_slot_four() -> None:
+    store = FakeStore()
+    with pytest.raises(ValueError, match=r"slot must be 1\.\.3, got 4"):
+        cli.keys_set_command(store, "groq", value="x", interactive=False, slot=4)
+    assert store.get("groq_api_key") is None
+
+
+def test_paste_slot_two_stores_backup_name() -> None:
+    store = FakeStore()
+    out = cli.keys_paste_command(
+        store,
+        "groq",
+        clipboard_fn=lambda: "  gsk-from-clipboard  ",
+        clear_clipboard_fn=lambda: None,
+        slot=2,
+    )
+    assert out == "saved"
+    assert store.get("groq_2_api_key") == "gsk-from-clipboard"
+    assert store.get("groq_api_key") is None
+
+
+def test_paste_rejects_slot_out_of_range() -> None:
+    for bad_slot in (0, 4):
+        with pytest.raises(ValueError, match=r"slot must be 1\.\.3"):
+            cli.keys_paste_command(
+                FakeStore(),
+                "groq",
+                clipboard_fn=lambda: "x",
+                slot=bad_slot,
+            )
+
+
+def test_clear_slot_two_keeps_the_primary_key() -> None:
+    store = FakeStore(groq_api_key="primary", groq_2_api_key="backup")
+    out = cli.keys_clear_command(store, "groq", slot=2)
+    assert out == "cleared"
+    assert store.get("groq_2_api_key") is None
+    assert store.get("groq_api_key") == "primary"  # other slots untouched
+
+
+def test_clear_rejects_slot_out_of_range() -> None:
+    for bad_slot in (0, 4):
+        with pytest.raises(ValueError, match=r"slot must be 1\.\.3"):
+            cli.keys_clear_command(FakeStore(), "groq", slot=bad_slot)
+
+
+def test_unknown_provider_rejected_even_with_a_slot() -> None:
+    with pytest.raises(ValueError, match="unknown provider"):
+        cli.keys_set_command(FakeStore(), "mystery", value="x", interactive=False, slot=2)
+
+
+def test_keys_set_cli_slot_two_prints_hint_and_stores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+    secret = "test-slot-two-cli-secret"
+    prompts: list[str] = []
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda p: (prompts.append(p), f"  {secret}\r\n")[1])
+
+    result = runner.invoke(cli.app, ["keys", "set", "groq", "--slot", "2"])
+
+    assert result.exit_code == 0
+    assert prompts == ["Groq API key: "]  # hidden input unchanged by --slot
+    assert store.get("groq_2_api_key") == secret
+    assert "llm.key_slots" in result.output
+    assert "groq_2_api_key" in result.output
+    assert _SLOT2_HINT_LINE in result.output
+    assert secret not in result.output
+
+
+def test_keys_set_cli_slot_zero_rejected_before_prompting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+    prompts: list[str] = []
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda p: (prompts.append(p), "x")[1])
+
+    result = runner.invoke(cli.app, ["keys", "set", "groq", "--slot", "0"])
+
+    assert result.exit_code == 1
+    assert "slot must be 1..3" in result.output
+    assert prompts == []  # rejected before any input was consumed
+    assert store.get("groq_api_key") is None
+    assert store.get("groq_2_api_key") is None
+
+
+def test_keys_set_cli_slot_four_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = FakeStore()
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+
+    result = runner.invoke(cli.app, ["keys", "set", "groq", "--slot", "4"])
+
+    assert result.exit_code == 1
+    assert "slot must be 1..3" in result.output
+    assert store.get("groq_api_key") is None
+
+
+def test_keys_set_cli_unknown_provider_with_slot_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+
+    result = runner.invoke(cli.app, ["keys", "set", "mystery", "--slot", "2"])
+
+    assert result.exit_code == 1
+    assert "unknown provider" in result.output
+
+
+def test_keys_clear_cli_slot_two_only_clears_that_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore(groq_api_key="primary", groq_2_api_key="backup")
+    monkeypatch.setattr(cli.secret_module, "SecretStore", lambda: store)
+
+    result = runner.invoke(cli.app, ["keys", "clear", "groq", "--slot", "2"])
+
+    assert result.exit_code == 0
+    assert "cleared" in result.output
+    assert store.get("groq_2_api_key") is None
+    assert store.get("groq_api_key") == "primary"

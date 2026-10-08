@@ -3930,3 +3930,42 @@ Live results (owner PC):
 - [ ] 7. Confirm `get_time` and `open_app` return `verified=None`, `windows_only` is enforced in code and not only documented, and new tool names pass `matches_blocked`.
 - [ ] 8. Apps commands grew `cli.py` → decide whether to move them to `apps_scan.py`.
 - [ ] 9. Re-run the known-red voice tests and the full suite at Stage 10.
+
+## STAGE 5a SESSION (2026-10-08): key slots, per-slot health, B8 rotation, keys CLI
+
+Owner-approved plan: one sub-step per commit, path-only staging (no `git add -A`), ruff + focused
+pytest per sub-step, no full-suite runs, no push, free-only gate untouched.
+
+| Sub-step | Commit | What |
+|---|---|---|
+| 1 | `6834238` | `secrets.slot_secret_name`/`MAX_KEY_SLOTS`, `llm.key_slots` + `llm.rotate_on_rate_limit` config primitives |
+| docs | `76c4fb8` | ROADMAP V2.2 amendments + Stage 4 acceptance |
+| 2 | `6518e9f` | one client per present key slot (`provider.py`), vision-model guard |
+| 3a | `034d37e` | `LLMCallFailure.slot`, health key `(provider, slot, role)`, `safe_summary()` |
+| 3b | `003706b` | B8 rotation rule (`ROTATION_CATEGORIES`/`MODEL_SCOPED_CATEGORIES`), grouped walk, provider-wide slot-0 pseudo-entry |
+| 4 | this commit | `jarvis keys set/paste/clear <provider> --slot N` + per-slot `jarvis keys status` |
+
+Decisions logged:
+- `keys status` line format is per-slot: `groq slot 1: configured` … `tavily slot 3: not configured`
+  (15 lines, presence-only; slot 1 keeps its env-var fallback, slots 2+ are keyring-only).
+- `keys set --slot N` never edits `config.toml`; the receipt appends the exact
+  `llm.key_slots` line to add (matches the promise in the `DEFAULT_CONFIG_TOML` comment).
+- MALFORMED_REQUEST in the B8 walk: cool the real slot, break to the next provider (owner choice).
+- Slot validation/naming stays in `secrets.slot_secret_name`; `provider_has_credential` gained a
+  keyword-only `slot`; `cli.py` only wires the option and formats rows.
+
+### Stage 10 known-red list - addition this session
+
+- [ ] `tests/unit/test_voice_loop.py::TestApprovalWordsD2::test_tier2_demands_the_strict_set` -
+  asserts tier-2 approval words `{"proceed"}` but `_approval_words({"tier": 2})` returns that set
+  instead of `{"confirm", "proceed", "yes"}`. **Confirmed pre-existing**: fails at HEAD with this
+  session's changes stashed (`git stash push -u`). Fix before Stage 10 sign-off. (The other red
+  voice test, `TestRearmQuietStartGate::test_response_echo_drained_before_detector_reopens`, is
+  already on this list.)
+
+### Deferred (confirmed this session, per ROADMAP V2.1)
+
+- **B9** (redact secret-like patterns before TTS; hidden UI never read) -> **Stage 6**. Not built
+  in Stage 5a; existing `voice/announce.speakable` choke point is unchanged.
+- **D19 graph test** (thread-aware "it/that" session-context resolution) -> **Stage 8**. No graph
+  test written in Stage 5a.

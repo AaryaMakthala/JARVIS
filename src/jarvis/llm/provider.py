@@ -282,15 +282,17 @@ def _provider_label(name: str) -> str:
     return llm_models.PROVIDER_LABELS.get(name, name)
 
 
-def provider_has_credential(store: ProviderKeyStore, name: str) -> bool:
-    """Whether ``name`` has a credential reachable (keyring, then env).
+def provider_has_credential(store: ProviderKeyStore, name: str, *, slot: int = 1) -> bool:
+    """Whether ``name``'s credential for ``slot`` is reachable (keyring, then env).
 
     Safe for ``doctor``/``keys status``: returns a boolean, never a value or
-    a credential-store exception.
+    a credential-store exception.  Slots 2+ have no environment fallback (they
+    are keyring-only), so they report keyring presence alone; an unknown
+    provider or an out-of-range slot reports ``False`` rather than raising.
     """
     try:
-        return _store_from(store).has(f"{name}_api_key")
-    except SecretStoreError:
+        return _store_from(store).has(slot_secret_name(name, slot))
+    except (SecretStoreError, ValueError):
         return False
 
 
