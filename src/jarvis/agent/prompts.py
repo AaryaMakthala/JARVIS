@@ -15,10 +15,23 @@ from __future__ import annotations
 
 import json
 
-__all__ = ["brain_system_prompt", "brain_user_prompt"]
+__all__ = ["VOICE_SOURCE_LINE", "brain_system_prompt", "brain_user_prompt"]
 
 _MIN_STEPS = 1
 _MAX_STEPS = 12
+
+#: Appended to the user prompt (one line) only when ``source == "voice"``.
+#: Speech recognition is lossy, so a transcript may be missing details or be
+#: subtly wrong; the brain may ask ONE clarification - but only when a detail is
+#: *genuinely* missing or the transcript is too unclear to act on safely, and a
+#: fully specified request must never be converted into a question.  Never
+#: mention policy machinery here: it is enforced in code, never via prompt.
+VOICE_SOURCE_LINE = (
+    "The user input is a speech transcript and may contain recognition errors; "
+    "when a required detail is genuinely missing or the transcript is too "
+    "unclear to act on safely, prefer ONE clarification question over guessing, "
+    "and never over-ask a fully specified request."
+)
 
 
 def brain_system_prompt(catalogue: list[dict[str, object]]) -> str:
@@ -71,12 +84,16 @@ def brain_user_prompt(
     clarification_question: str | None = None,
     clarification_answer: str | None = None,
     repair_error: str | None = None,
+    source: str = "terminal",
 ) -> str:
     """Build the user prompt for one brain call.
 
     The optional ``clarification_question``/``clarification_answer`` pair is
     passed when the brain re-runs after the ``clarify`` node; ``repair_error``
     is the deterministic validate rejection text for plan-repair retries.
+    ``source`` is the input channel (``"terminal"``/``"voice"``/``"benchmark"``);
+    only ``"voice"`` appends :data:`VOICE_SOURCE_LINE`, because a transcript is
+    lossy whereas typed input is not.
     """
     parts = [f"The user said:\n{user_input!r}"]
     if clarification_question and clarification_answer is not None:
@@ -97,5 +114,7 @@ def brain_user_prompt(
         parts.append(
             "Relevant past examples:\n" + json.dumps(memory_context[:5], default=str, indent=2)
         )
+    if source == "voice":
+        parts.append(VOICE_SOURCE_LINE)
     parts.append("Return the BrainDecision JSON only.")
     return "\n\n".join(parts)

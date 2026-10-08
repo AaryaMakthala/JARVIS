@@ -83,6 +83,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         clarification_question=state.get("clarification_question"),
         clarification_answer=state.get("clarification_answer"),
         repair_error=previous_error,
+        source=state.get("source") or "terminal",
     )
 
     try:

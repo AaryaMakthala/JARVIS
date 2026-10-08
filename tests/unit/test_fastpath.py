@@ -155,6 +155,19 @@ def test_brain_hit_skips_even_an_exploding_llm() -> None:
     assert update["tokens"] == 0
 
 
+def test_brain_voice_hit_skips_even_an_exploding_llm() -> None:
+    """A voice fast-path hit (e.g. "open notepad") still asks the LLM nothing."""
+    ctx = make_app_context(Settings(), llm=_ExplodingLLM())
+
+    update = brain({"user_input": "open notepad", "source": "voice", "task_id": "t1"}, ctx)
+
+    assert update["plan"].steps[0].tool == "open_app"
+    assert update["plan"].steps[0].args == {"name": "notepad"}
+    assert update["request_kind"] == "tool"
+    assert update["api_calls"] == 0
+    assert update["tokens"] == 0
+
+
 def test_brain_hit_works_with_no_provider_configured() -> None:
     ctx = make_app_context(Settings(), llm=None)
 
@@ -188,3 +201,19 @@ def test_graph_fastpath_end_to_end_with_exploding_llm() -> None:
     assert values["api_calls"] == 0
     assert values["tokens"] == 0
     assert values["plan"].goal == "fastpath: what time is it"
+
+
+def test_graph_fastpath_voice_end_to_end_still_zero_api_calls() -> None:
+    """ "open chrome"-style voice requests short-circuit before the LLM prompt."""
+    ctx = make_app_context(Settings(), llm=_ExplodingLLM())
+    graph = build_graph(ctx, None, None)
+
+    values = graph.invoke(
+        {"user_input": "open notepad", "source": "voice", "task_id": "fpv1"},
+        {"configurable": {"thread_id": "fpv1"}},
+    )
+
+    assert values["final_answer"]
+    assert values["api_calls"] == 0
+    assert values["tokens"] == 0
+    assert values["plan"].goal == "fastpath: open notepad"
