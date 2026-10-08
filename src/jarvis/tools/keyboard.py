@@ -23,6 +23,13 @@ logger = logging.getLogger(__name__)
 _FOCUS_ATTEMPTS = 12
 _FOCUS_POLL_S = 0.25
 
+# Bounded foreground re-read (4.19): set_focus() can return before Windows
+# has finished activating the window, so the first read can transiently see
+# an empty title.  8 attempts x 0.25 s <= 1.75 s of sleeping, well inside
+# type_text's 10 s tool timeout.
+_VERIFY_ATTEMPTS = 8
+_VERIFY_POLL_S = 0.25
+
 
 def _pause(seconds: float) -> None:
     """Sleep between focus attempts; a module function so tests never wait."""
@@ -59,22 +66,34 @@ def _read_foreground_title() -> str:
 def _verify_focus(target: str) -> ToolResult | None:
     """Return an error :class:`ToolResult` unless the foreground window is ``target``.
 
-    Fails closed: an unreadable foreground window is a verification failure,
-    never an excuse to paste into an unknown window.
+    Re-reads the foreground title up to ``_VERIFY_ATTEMPTS`` times (4.19):
+    ``set_focus()`` can return before Windows has finished activating the
+    window, so a single read can transiently see ``foreground=''``.  The
+    acceptance condition is unchanged (the same substring check as before,
+    evaluated per read), and the error returned when the budget is exhausted
+    is byte-identical to the single-read error, so 4.17c's non-retryable
+    classification keeps matching.  Fails closed: a read that raises stops
+    immediately and is never polled again, and an unreadable or still-
+    mismatched foreground window is a verification failure, never an excuse
+    to paste into an unknown window.
     """
-    try:
-        title = _read_foreground_title()
-    except Exception as exc:  # noqa: BLE001 - fail closed when focus cannot be read
-        return ToolResult(
-            ok=False,
-            error=f"focus verification failed: could not read foreground window: {exc}",
-        )
-    if target.lower() not in title.lower():
-        return ToolResult(
-            ok=False,
-            error=f"focus verification failed: foreground is {title!r}, expected {target!r}",
-        )
-    return None
+    title = ""
+    for attempt in range(_VERIFY_ATTEMPTS):
+        try:
+            title = _read_foreground_title()
+        except Exception as exc:  # noqa: BLE001 - fail closed when focus cannot be read
+            return ToolResult(
+                ok=False,
+                error=f"focus verification failed: could not read foreground window: {exc}",
+            )
+        if target.lower() in title.lower():
+            return None
+        if attempt < _VERIFY_ATTEMPTS - 1:
+            _pause(_VERIFY_POLL_S)
+    return ToolResult(
+        ok=False,
+        error=f"focus verification failed: foreground is {title!r}, expected {target!r}",
+    )
 
 
 def _focus_fallback(target: str) -> bool:

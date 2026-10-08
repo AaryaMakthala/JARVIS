@@ -160,6 +160,7 @@ class TestTypeTextFocusVerification:
 
     def test_foreground_mismatch_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._install_gui_fakes(monkeypatch, foreground_title="Calculator")
+        monkeypatch.setattr("jarvis.tools.keyboard._pause", lambda _seconds: None)
         spec = make_type_text_spec()
         ctx = ToolContext(settings=Settings(), dry_run=False)
         result = spec.run(TypeTextArgs(text="hi", target_app="notepad"), ctx)
@@ -185,6 +186,7 @@ class TestTypeTextFocusVerification:
     def test_config_added_app_accepted_by_allowlist(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """F11: apps added via config extra entries must pass the allowlist."""
         self._install_gui_fakes(monkeypatch, foreground_title="MyCustomApp - Window")
+        monkeypatch.setattr("jarvis.tools.keyboard._pause", lambda _seconds: None)
         from jarvis.config import AppSettings
 
         settings = Settings(apps=AppSettings(notepad="notepad.exe", myApp="custom.exe"))
