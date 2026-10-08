@@ -72,9 +72,17 @@ def _answer_for(state: dict[str, Any]) -> dict[str, str]:
         # Set by the brain node for conversational (no-tool) requests.
         return _answer(str(state["final_answer"]))
 
+    #: The completeness check (ROADMAP V2.2 Stage 5a) may proceed on an
+    #: optional default the user never stated; the brain carries it here as
+    #: ``Plan.assumption`` (a plain string on the allowlisted model) so the
+    #: final answer states it - never silently guessed.
+    assumption = ""
+    if plan is not None and plan.kind == "tool":
+        assumption = (getattr(plan, "assumption", "") or "").strip()
+
     results: list[StepResult] = list(state.get("results") or [])
     if not results:
-        return _answer("No task performed.")
+        return _answer(_assumption_prefix(assumption) + "No task performed.")
 
     # Verified-False is a hard failure: never claim success on an action whose
     # post-condition check reported failure (docs/02_ARCHITECTURE.md section 11).
@@ -88,13 +96,23 @@ def _answer_for(state: dict[str, Any]) -> dict[str, str]:
         last = failures[-1]
         if last.ok and last.verified is False:
             detail = f"step {last.step_id} could not be verified"
-            return _answer(f"Could not complete the task: {detail}.")
+            return _answer(
+                _assumption_prefix(assumption) + f"Could not complete the task: {detail}."
+            )
         return _answer(
-            f"Could not complete the task: {last.error or f'step {last.step_id} failed'}."
+            _assumption_prefix(assumption)
+            + f"Could not complete the task: {last.error or f'step {last.step_id} failed'}."
         )
 
     unverified = [r for r in results if r.verified is None and r.ok]
-    return _answer(_success_text(results) + _unverified_hint(unverified))
+    return _answer(
+        _assumption_prefix(assumption) + _success_text(results) + _unverified_hint(unverified)
+    )
+
+
+def _assumption_prefix(assumption: str) -> str:
+    """The deterministic ``Assumption: ...`` lead for an action's final answer."""
+    return f"Assumption: {assumption}. " if assumption else ""
 
 
 def _unverified_hint(unverified: list[StepResult]) -> str:

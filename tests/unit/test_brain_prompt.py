@@ -15,7 +15,7 @@ from typing import Any
 
 from jarvis.agent.context import make_app_context
 from jarvis.agent.nodes.brain import brain
-from jarvis.agent.prompts import VOICE_SOURCE_LINE, brain_user_prompt
+from jarvis.agent.prompts import VOICE_SOURCE_LINE, brain_system_prompt, brain_user_prompt
 from jarvis.agent.schemas import BrainDecision
 from jarvis.config import Settings
 from jarvis.llm.client import Usage
@@ -76,6 +76,49 @@ def test_voice_line_requires_real_ambiguity_before_asking() -> None:
     assert "if in doubt" not in prompt
 
 
+# ── completeness rules (ROADMAP V2.2 Stage 5a): prompt content ──────────────
+
+
+def test_system_prompt_has_the_four_completeness_outcomes() -> None:
+    prompt = brain_system_prompt([{"name": "open_app", "description": "x", "args_schema": {}}])
+    # values come only from the user's words, never from perception (I1)
+    assert "Completeness" in prompt
+    assert "Never invent a value" in prompt
+    assert "screen, page, OCR" in prompt and "UIA text" in prompt
+    # session references ("delete it") count as provided (D19)
+    assert '"delete it"' in prompt and "count as provided" in prompt
+    # outcome 1: required missing -> clarification
+    assert "required detail is missing" in prompt and '"clarification"' in prompt
+    # outcome 2: optional missing -> proceed + state the assumption
+    assert "optional detail is missing" in prompt
+    assert '"assumption"' in prompt and "stated to the user" in prompt
+    # outcome 3: not executable -> plain spoken explanation, no loop
+    assert '"unsupported"' in prompt and "no clarification loop" in prompt
+    # outcome 4: policy-disallowed is never decided by the brain
+    assert "policy" in prompt.lower() and "never decided here" in prompt
+    # the schema template exposes the two new transient fields
+    assert '"assumption": str' in prompt
+    assert '"missing": [str]' in prompt
+
+
+def test_fully_specified_user_prompt_never_invites_clarification() -> None:
+    for source in ("terminal", "voice"):
+        prompt = brain_user_prompt("open notepad", source=source)
+        assert "always ask" not in prompt
+        assert "if in doubt" not in prompt
+        assert "you should ask" not in prompt
+
+
+def test_clarification_count_round_line_appears_only_after_a_round() -> None:
+    assert "Clarification round" not in brain_user_prompt("empty the folder")
+    p1 = brain_user_prompt("empty the folder", clarification_count=1)
+    assert "Clarification round 1 of up to 2." in p1
+    p2 = brain_user_prompt("empty the folder", clarification_count=2)
+    assert "This is clarification round 2 (the last one)." in p2
+    assert "instead of asking again" in p2
+    assert "'missing'" in p2  # the stop path points at the missing list
+
+
 # ── wiring: state source reaches the LLM call, temperature unchanged ────────
 
 
@@ -129,3 +172,19 @@ def test_brain_wires_terminal_source_without_the_line() -> None:
     brain({"user_input": "say hello", "source": "terminal", "task_id": "t2"}, _ctx(recorder))
     assert recorder.user is not None
     assert VOICE_SOURCE_LINE not in recorder.user
+
+
+def test_brain_wires_clarification_count_into_the_llm_call() -> None:
+    recorder = _RecorderLLM(brain_conversation("hi back"))
+    update = brain(
+        {
+            "user_input": "empty the folder",
+            "source": "terminal",
+            "clarification_count": 2,
+            "task_id": "t3",
+        },
+        _ctx(recorder),
+    )
+    assert recorder.user is not None
+    assert "This is clarification round 2 (the last one)." in recorder.user
+    assert update["request_kind"] == "conversation"

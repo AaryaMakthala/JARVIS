@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 
+from jarvis.agent.nodes.clarify import MAX_CLARIFICATIONS
+
 __all__ = ["VOICE_SOURCE_LINE", "brain_system_prompt", "brain_user_prompt"]
 
 _MIN_STEPS = 1
@@ -70,11 +72,26 @@ Decision rules:
 7. Always set "goal" to a short summary of what the user wants.
 8. Return valid JSON exactly matching the BrainDecision schema:
    {{"request_type": "conversation"|"action"|"clarification"|"unsupported",
-     "goal": str,
-     "actions": [{{"tool", "args", "rationale", "expect",
-                  "depends_on_untrusted"}}],
-     "response_text": str, "clarification_question": str|null,
-     "response_hint": str, "conversation_context": str}}
+      "goal": str,
+      "actions": [{{"tool", "args", "rationale", "expect",
+                   "depends_on_untrusted"}}],
+      "response_text": str, "clarification_question": str|null,
+      "assumption": str, "missing": [str],
+      "response_hint": str, "conversation_context": str}}
+9. Completeness. Decide only from the user's words (or their answers to your
+   questions). Never invent a value, and never take one from screen, page, OCR
+   or UIA text. Conversation references such as "delete it" count as provided -
+   resolve them from context, never re-ask about them.
+   - A required detail is missing -> request_type="clarification", ONE short
+     question.
+   - Only an optional detail is missing -> proceed ("action") and set
+     "assumption" to the default you used, so it can be stated to the user.
+   - Not executable -> request_type="unsupported" with a plain spoken
+     explanation in "response_text" - no clarification loop.
+   - What is allowed or needs confirmation (policy) is never decided here.
+10. "assumption" is empty unless you proceeded on an optional default the user
+   did not state; "missing" lists only real gaps in the user's words. Both are
+   stated plainly - they are never nested JSON, never templates.
 """
 
 
@@ -85,6 +102,7 @@ def brain_user_prompt(
     clarification_answer: str | None = None,
     repair_error: str | None = None,
     source: str = "terminal",
+    clarification_count: int | None = None,
 ) -> str:
     """Build the user prompt for one brain call.
 
@@ -93,7 +111,9 @@ def brain_user_prompt(
     is the deterministic validate rejection text for plan-repair retries.
     ``source`` is the input channel (``"terminal"``/``"voice"``/``"benchmark"``);
     only ``"voice"`` appends :data:`VOICE_SOURCE_LINE`, because a transcript is
-    lossy whereas typed input is not.
+    lossy whereas typed input is not.  ``clarification_count`` is the round the
+    graph is on (0 on a fresh request); the last round tells the brain to
+    stop asking and state what is missing.
     """
     parts = [f"The user said:\n{user_input!r}"]
     if clarification_question and clarification_answer is not None:
@@ -116,5 +136,16 @@ def brain_user_prompt(
         )
     if source == "voice":
         parts.append(VOICE_SOURCE_LINE)
+    if clarification_count:
+        if clarification_count >= MAX_CLARIFICATIONS:
+            parts.append(
+                f"This is clarification round {clarification_count} (the last one). "
+                "If a required detail is still missing, return 'unsupported' with a "
+                "short spoken explanation listing it in 'missing' instead of asking again."
+            )
+        else:
+            parts.append(
+                f"Clarification round {clarification_count} of up to {MAX_CLARIFICATIONS}."
+            )
     parts.append("Return the BrainDecision JSON only.")
     return "\n\n".join(parts)

@@ -24,6 +24,7 @@ from typing import Any
 
 from jarvis.agent import fastpath
 from jarvis.agent.context import AppContext
+from jarvis.agent.nodes.clarify import MAX_CLARIFICATIONS
 from jarvis.agent.prompts import brain_system_prompt, brain_user_prompt
 from jarvis.agent.schemas import BrainDecision
 from jarvis.agent.state import Plan, Step
@@ -84,6 +85,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         clarification_answer=state.get("clarification_answer"),
         repair_error=previous_error,
         source=state.get("source") or "terminal",
+        clarification_count=int(state.get("clarification_count") or 0),
     )
 
     try:
@@ -135,6 +137,21 @@ def _project(decision: BrainDecision, state: dict[str, Any], usage: Any) -> dict
         }
 
     if decision.request_type == "clarification":
+        asked = int(state.get("clarification_count") or 0)
+        if asked >= MAX_CLARIFICATIONS:
+            # Round budget exhausted: the clarify-node limit check is the
+            # backstop, but this converts *before* another interrupt so the
+            # task fails closed deterministically with an honest stop message.
+            listed = ", ".join(decision.missing[:5]) if decision.missing else "some details"
+            return {
+                **update,
+                "plan": None,  # drop the leftover round's clarification plan so respond shows the halt
+                "request_kind": "unsupported",
+                "halted_reason": (
+                    f"Still missing: {listed}. I have already asked {asked} "
+                    "question(s); please start over with more detail."
+                ),
+            }
         return {
             **update,
             "plan": Plan(
@@ -157,9 +174,24 @@ def _project(decision: BrainDecision, state: dict[str, Any], usage: Any) -> dict
             "halted_reason": reason or "I can't do that.",
         }
 
+    if decision.missing and not (decision.assumption or "").strip():
+        # Completeness contract (ROADMAP V2.2 Stage 5a): proceeding on a gap is
+        # only lawful when the default used is disclosed.  Missing details with
+        # no stated assumption means values were silently invented - fail closed.
+        return {
+            **update,
+            "plan": None,
+            "request_kind": "unsupported",
+            "halted_reason": (
+                "I cannot proceed safely: some details are still missing and no "
+                "assumption was stated. Please repeat the request with the specifics."
+            ),
+        }
+
     plan = Plan(
         kind="tool",
         goal=decision.goal or "",
+        assumption=(decision.assumption or "").strip(),
         steps=[
             Step(
                 id=f"s{i + 1}",

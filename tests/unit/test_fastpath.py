@@ -168,6 +168,18 @@ def test_brain_voice_hit_skips_even_an_exploding_llm() -> None:
     assert update["tokens"] == 0
 
 
+def test_open_chrome_asks_nothing() -> None:
+    """A completeness-check anchor: "open chrome" short-circuits, zero LLM calls."""
+    ctx = make_app_context(Settings(), llm=_ExplodingLLM())
+
+    update = brain({"user_input": "open chrome", "source": "voice", "task_id": "t1"}, ctx)
+
+    assert update["plan"].steps[0].tool == "open_app"
+    assert update["plan"].steps[0].args == {"name": "chrome"}
+    assert update["api_calls"] == 0
+    assert update["tokens"] == 0
+
+
 def test_brain_hit_works_with_no_provider_configured() -> None:
     ctx = make_app_context(Settings(), llm=None)
 

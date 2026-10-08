@@ -45,6 +45,13 @@ class Plan(BaseModel):
     needs_clarification: bool = False
     clarification_question: str | None = None
     dialog_answer: str | None = None
+    #: Plain-string carrier for the brain's stated optional default (ROADMAP V2.2
+    #: Stage 5a completeness check): "the file is in the Downloads folder".
+    #: Projected from the transient ``BrainDecision.assumption``; it is a field on
+    #: this already-allowlisted model (no new serde type) and is surfaced by the
+    #: ``respond`` node as the ``Assumption: ...`` prefix.  Empty on requests that
+    #: needed no default.
+    assumption: str = ""
 
 
 class Decision(BaseModel):

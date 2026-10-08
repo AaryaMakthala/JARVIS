@@ -120,6 +120,14 @@ class BrainDecision(BaseModel):
       ``clarify`` node before doing anything else;
     * ``unsupported`` - anything out of scope or that needs a human.
 
+    ``assumption`` is set only when the brain proceeds on an *optional* default
+    the user did not state (the completeness check, ROADMAP V2.2 Stage 5a); it
+    is empty for fully specified requests.  ``missing`` lists only real gaps in
+    the user's words or answers - never values taken from screen/page/OCR/UIA
+    text (I1) and never invented.  ``missing`` feeds the clarification stop
+    message once the round budget is exhausted; neither field is ever
+    checkpointed in its own right.
+
     Like :class:`ActionIntent`, this object is request-scoped and **never
     checkpointed**: not on the serializer allowlist, never stored in AgentState.
     """
@@ -131,6 +139,8 @@ class BrainDecision(BaseModel):
     actions: list[ActionIntent] = Field(default_factory=list)
     response_text: str = ""
     clarification_question: str | None = None
+    assumption: str = ""
+    missing: list[str] = Field(default_factory=list)
     response_hint: str = ""
     conversation_context: str = ""
 
