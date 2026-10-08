@@ -16,6 +16,8 @@ Invariant this module must never violate:
 * it never approves a step whose recomputed decision no longer matches;
 * it only ever batches a **contiguous** run of steps that starts at the step the
   gate is standing on, and never one whose hash is already approved;
+* it never lets a non-approving answer (timeout or rejection) fall through to
+  act: the resume halts with honest wording instead of a silent empty result;
 * it never touches the serde allowlist.
 """
 
@@ -25,6 +27,7 @@ from typing import Any
 
 from jarvis.agent.plan_summary import summarise
 from jarvis.daemon.confirmations import plan_hash
+from jarvis.policy.refusal import refusal_text
 
 #: Interrupt payload ``type`` for a plan-level approval.
 TYPE_PLAN_APPROVAL = "plan_approval"
@@ -229,7 +232,8 @@ def recompute_and_resolve_batch(
 
     Returns ``(updates, approved_hashes)`` where:
     * ``updates`` is the dict policy_gate should return (may include a fresh
-      ``halted_reason`` when the batch cannot be approved as a whole);
+      ``halted_reason`` when the batch cannot be approved as a whole — a
+      confirmation timeout, an explicit rejection, or a failed check);
     * ``approved_hashes`` is the list of action hashes to append to
       ``approved_hashes`` (only the steps that still pass every check).
 
@@ -244,7 +248,16 @@ def recompute_and_resolve_batch(
     the batch beyond what the user actually saw.
     """
     if not isinstance(answer, dict) or answer.get("approved") is not True:
-        return {"decisions": decisions}, []
+        # Neither a timeout nor an explicit rejection may fall through to act,
+        # where the missing hash would surface as a misleading "the plan was
+        # likely altered after confirmation" refusal.  Halt here with the same
+        # honest wording the single-step confirmation path uses (policy_gate).
+        if isinstance(answer, dict) and answer.get("timed_out") is True:
+            return {
+                "decisions": decisions,
+                "halted_reason": "Confirmation timed out. I did not perform the action.",
+            }, []
+        return {"decisions": decisions, "halted_reason": refusal_text(answer)}, []
 
     provided_hash = answer.get("action_hash")
     if not isinstance(provided_hash, str) or not provided_hash:
