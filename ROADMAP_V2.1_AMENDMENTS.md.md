@@ -125,6 +125,6 @@ All ten accepted as recommended.
 ## H. Progress tracker additions
 
 - [x] Stage 0 includes `jarvis benchmark run` import check
-- [ ] Stage 4 includes local fast path
+- [x] Stage 4 includes local fast path
 - [ ] Stage 5a done
 - [ ] Stage 10 includes 5b decision (do it or drop it)

@@ -3907,3 +3907,26 @@ KNOWN GAPS (deliberate, recorded):
 - Replan LLM call is not bounded by a timeout or a cancel token: a hung/slow provider keeps the task (and the daemon slot's worker) running until the call returns; recorded in the 4.17 PART A diagnosis, no fix (would touch graph/daemon internals).
 
 Regression at close: mypy (policy), ruff on touched files, and the 16-file pytest pass — results in the 4.10 report.
+
+## STAGE 4 ACCEPTED WITH DEFERRED CHECKS (2026-10-08)
+
+Owner accepted Stage 4. Post-close remediation 4.17-4.20 is committed (`d11250a`, `481929b`, `d922bc7`, `5562c6c`); focused tests and ruff green, working tree clean.
+
+Live results (owner PC):
+- "what time is it" — PASS (fast path, deterministic).
+- "what applications are open" — PASS.
+- "open notepad and type buy milk" — PASS (one readback, wake-free yes).
+- "open spotify" / "open vs code" — refused because they are not in `[apps]`; allowlist working as designed, not a defect.
+- `.py` creation on the Desktop — reported working by the owner.
+
+### DEFERRED CHECKS TO REVIEW BEFORE STAGE 10 SIGN-OFF
+
+- [ ] 1. Owner approves `vscode` and `spotify` via `jarvis apps scan`, then live-test "open notes.txt in code" and "open spotify".
+- [ ] 2. Voice-capture step: spoken "yes" refused on Tier 2, spoken "proceed" to Recycle Bin, spoken undo, AUTO plan announcement.
+- [ ] 3. Whisper stray punctuation typed into Notepad ("buy milk." = 9 chars) and in readbacks → deterministic transcript clean-up.
+- [ ] 4. Command capture cut off after one word ("open.", "create.") → check endpointing and `silence_timeout_s`.
+- [ ] 5. TTS reads markdown and code fences aloud (Stage 9).
+- [ ] 6. 4.9 default-folder resolver for `append_file`, `read_file`, `list_dir`.
+- [ ] 7. Confirm `get_time` and `open_app` return `verified=None`, `windows_only` is enforced in code and not only documented, and new tool names pass `matches_blocked`.
+- [ ] 8. Apps commands grew `cli.py` → decide whether to move them to `apps_scan.py`.
+- [ ] 9. Re-run the known-red voice tests and the full suite at Stage 10.
