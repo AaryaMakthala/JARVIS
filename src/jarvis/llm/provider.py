@@ -251,6 +251,7 @@ def _build_gemini(settings: Settings, planner: str, fast: str, api_key: str) -> 
         api_key,
         planner_model=planner,
         fast_model=fast,
+        vision_model=settings.llm.model_for("gemini", "vision"),
         timeout=settings.llm.timeout_seconds,
         max_retries=settings.llm.max_retries,
     )

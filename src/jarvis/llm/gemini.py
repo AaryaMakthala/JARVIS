@@ -9,10 +9,15 @@ the provider/model/status.
 A model that rejects structured output raises :class:`LLMCapabilityError` so
 the composite client skips Gemini for that operation instead of degrading to
 unsafe free-form parsing.
+
+Image understanding (Stage 5a/6) sends the image inline as base64 in a
+``describe_image`` call.  The image bytes are never logged, embedded in
+exceptions, or checkpointed: only the returned text moves on.
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 import time
 from typing import Any
@@ -29,7 +34,7 @@ from jarvis.llm.client import (
     Usage,
 )
 
-_MODEL_ROLES = ("planner", "fast")
+_MODEL_ROLES = ("planner", "fast", "vision")
 _GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 _CAPABILITY_TOKENS = (
@@ -54,6 +59,7 @@ class GeminiClient:
         *,
         planner_model: str,
         fast_model: str,
+        vision_model: str = "",
         base_url: str = _GEMINI_BASE_URL,
         timeout: float = 30.0,
         max_retries: int = 1,
@@ -63,6 +69,7 @@ class GeminiClient:
         self._api_key = api_key
         self._planner_model = planner_model
         self._fast_model = fast_model
+        self._vision_model = vision_model
         self._timeout = timeout
         self._max_retries = max_retries
         self._logger = logger or logging.getLogger("llm.client")
@@ -78,9 +85,15 @@ class GeminiClient:
     def _model_for(self, role: str) -> str:
         if role not in _MODEL_ROLES:
             raise LLMError(f"unknown model role {role!r}; expected one of {_MODEL_ROLES}")
-        name = self._planner_model if role == "planner" else self._fast_model
+        if role == "vision":
+            name = self._vision_model
+        elif role == "planner":
+            name = self._planner_model
+        else:
+            name = self._fast_model
         if not name:
-            raise LLMError(f"no {role} model configured for gemini")
+            error_type = LLMCapabilityError if role == "vision" else LLMError
+            raise error_type(f"no {role} model configured for gemini")
         return name
 
     def _status_for(self, model: str, status: int, body_text: str) -> Exception:
@@ -236,6 +249,44 @@ class GeminiClient:
         body = self._body(system, user, temperature, None)
         if max_tokens is not None:
             body["generationConfig"]["maxOutputTokens"] = max_tokens
+        content, _, _ = self._generate(model, body)
+        return content, self._snapshot_usage()
+
+    def describe_image(
+        self,
+        *,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        mime: str,
+        model_role: str = "vision",
+        temperature: float = 0.0,
+    ) -> tuple[str, Usage]:
+        """Ask the vision model to interpret the image and return its answer.
+
+        The image travels inline as base64 in a single ``generateContent``
+        call.  ``image_bytes`` is never logged, embedded in exceptions, or
+        checkpointed; only the returned text moves on to the graph.
+        """
+        model = self._model_for(model_role)
+        body = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "inlineData": {
+                                "mimeType": mime,
+                                "data": base64.b64encode(image_bytes).decode("ascii"),
+                            }
+                        },
+                        {"text": user},
+                    ],
+                }
+            ],
+            "systemInstruction": {"parts": [{"text": system}]},
+            "generationConfig": {"temperature": temperature},
+        }
         content, _, _ = self._generate(model, body)
         return content, self._snapshot_usage()
 

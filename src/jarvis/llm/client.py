@@ -507,6 +507,25 @@ class GroqClient(_MetaMixin):
             raise _as_llm_error(category, f"Groq completion failed: {category.value}", exc) from exc
         return content, self._snapshot_usage()
 
+    def describe_image(
+        self,
+        *,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        mime: str,
+        model_role: str = "vision",
+        temperature: float = 0.0,
+    ) -> tuple[str, Usage]:
+        """Image understanding is not available on Groq.
+
+        ``MultiProviderClient`` skips Groq for ``describe_image`` via the
+        pricing registry (``supports_vision=False``), so this only fires on a
+        direct call; it raises a model-scoped capability error rather than
+        degrading or pretending to read images.
+        """
+        raise LLMCapabilityError("vision not supported")
+
     def _snapshot_usage(self) -> Usage:
         return Usage(
             calls=self.usage.calls,

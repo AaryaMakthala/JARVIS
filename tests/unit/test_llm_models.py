@@ -246,3 +246,14 @@ def _inject(
 def test_capabilities_shape() -> None:
     spec = model_spec("openrouter", "openrouter/free")
     assert spec.capabilities.supports_vision is False
+
+
+def test_gemini_flash_models_support_vision() -> None:
+    assert model_spec("gemini", "gemini-3.8-flash").capabilities.supports_vision is True
+    assert model_spec("gemini", "gemini-3.7-flash").capabilities.supports_vision is True
+    for provider, model in (
+        ("groq", _GROQ_PLANNER),
+        ("openrouter", "openrouter/free"),
+        ("nvidia", "nvidia/nemotron-3-super-120b-a12b"),
+    ):
+        assert model_spec(provider, model).capabilities.supports_vision is False

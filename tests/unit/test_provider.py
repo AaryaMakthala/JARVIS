@@ -438,3 +438,35 @@ def test_registered_vision_model_allows_build() -> None:
     sel = build_llm_client(settings, MemoryKeyStore({"groq_api_key": "k"}))
     assert sel.client is not None
     assert sel.reasons == []
+
+
+def test_gemini_factory_wires_vision_model() -> None:
+    settings = Settings(
+        llm=LLMSettings(
+            provider_order=["gemini"],
+            strict_zero_cost=False,
+            models={
+                "gemini": ProviderModels(
+                    planner="gemini-3.8-flash",
+                    fast="gemini-3.7-flash",
+                    vision="gemini-3.8-flash",
+                )
+            },
+        )
+    )
+    client = build_provider_client(settings, MemoryKeyStore({"gemini_api_key": "k"}), "gemini")
+    assert client._vision_model == "gemini-3.8-flash"
+    client.close()
+
+
+def test_gemini_factory_leaves_vision_empty_when_unset() -> None:
+    settings = Settings(
+        llm=LLMSettings(
+            provider_order=["gemini"],
+            strict_zero_cost=False,
+            models={"gemini": ProviderModels(planner="gemini-3.8-flash", fast="gemini-3.7-flash")},
+        )
+    )
+    client = build_provider_client(settings, MemoryKeyStore({"gemini_api_key": "k"}), "gemini")
+    assert client._vision_model == ""
+    client.close()

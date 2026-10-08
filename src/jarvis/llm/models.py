@@ -101,6 +101,7 @@ def _cap(tools: bool, structured: bool, vision: bool = False) -> Capabilities:
 #:   * `available=False` means the provider no longer serves the model for
 #:     free -> selected callers must fail instead of switching to paid.
 #:   * `supports_tools`/`supports_structured_output` gate planning operations.
+#:   * `supports_vision` gates image understanding (`describe_image`).
 #: NVIDIA entries verified 2026-09 against build.nvidia.com ("Free Endpoint:
 #: Available") - see the per-entry notes.  Source: docs/09 and live provider
 #: pages; re-verify with `jarvis doctor --live`.
@@ -142,18 +143,18 @@ _FREE_ONLY_MODELS: dict[tuple[str, str], ModelSpec] = {
         "gemini-3.8-flash",
         "free_tier",
         True,
-        _cap(tools=True, structured=True),
+        _cap(tools=True, structured=True, vision=True),
         note="Gemini Free Tier flash model; account billing state cannot be "
-        "verified -> refused under strict_zero_cost",
+        "verified -> refused under strict_zero_cost.  Accepts image input.",
     ),
     ("gemini", "gemini-3.7-flash"): ModelSpec(
         "gemini",
         "gemini-3.7-flash",
         "free_tier",
         True,
-        _cap(tools=True, structured=True),
+        _cap(tools=True, structured=True, vision=True),
         note="Gemini Free Tier flash model; account billing state cannot be "
-        "verified -> refused under strict_zero_cost",
+        "verified -> refused under strict_zero_cost.  Accepts image input.",
     ),
     # Groq - free tier rate limits exist but Groq also publishes paid token
     # pricing for these models.  Classified free_tier, never zero-cost.

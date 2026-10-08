@@ -3944,7 +3944,8 @@ pytest per sub-step, no full-suite runs, no push, free-only gate untouched.
 | 3a | `034d37e` | `LLMCallFailure.slot`, health key `(provider, slot, role)`, `safe_summary()` |
 | 3b | `003706b` | B8 rotation rule (`ROTATION_CATEGORIES`/`MODEL_SCOPED_CATEGORIES`), grouped walk, provider-wide slot-0 pseudo-entry |
 | 4 | `e0672b1` | `jarvis keys set/paste/clear <provider> --slot N` + per-slot `jarvis keys status` |
-| 5 | this commit | doctor: key-slot presence rows, daemon-queried `llm_health` rows, dynamic vision row, `StatusResponse.llm_health` |
+| 5 | `e5891d9` | doctor: key-slot presence rows, daemon-queried `llm_health` rows, dynamic vision row, `StatusResponse.llm_health` |
+| 6 | this commit | Gemini vision method `describe_image`, `supports_vision=True` registry for gemini-3.8/3.7-flash, non-vision clients raise `LLMCapabilityError`, Multi vision walk, `_build_gemini` wires `vision_model` |
 
 Decisions logged:
 - `keys status` line format is per-slot: `groq slot 1: configured` … `tavily slot 3: not configured`
@@ -3968,6 +3969,16 @@ Decisions logged:
   model the registry marks `supports_vision` AND a credential; else WARN. No registry entry has
   vision capability yet, so every install WARNs until Stage 6 registers one (fail-closed). Both
   rows note that graph wiring lands in Stage 6.
+- `describe_image` on gemini sends the image as `inlineData.mimeType`/`data` inside the existing
+  `generateContent` body (Gemini REST camelCase), reusing `_generate`; image bytes are never
+  logged, embedded in exceptions, or checkpointed. Registry change is `_cap(..., vision=True)` on
+  the two gemini flash entries only - qualify/pricing/strict/free_only untouched.
+- `LLMClient` runtime-checkable protocol is unchanged; Groq and OpenAI-compatible clients get a
+  `describe_image` that raises `LLMCapabilityError("vision not supported")` on a direct call.
+  `MultiProviderClient.describe_image` duck-types (getattr) plus the registry `supports_vision`
+  gate - a spec gate skip short-circuits before the method lookup, so it is the primary signal.
+- Gemini with no vision model configured raises `LLMCapabilityError` (model-scoped, cools slot 0
+  provider-wide) so the Multi walk falls through, never to a paid or non-vision provider.
 
 ### Stage 10 known-red list - addition this session
 

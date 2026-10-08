@@ -249,6 +249,54 @@ class MultiProviderClient:
                 return result
         raise LLMError("all free LLM providers failed: " + "; ".join(failures))
 
+    def describe_image(
+        self,
+        *,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        mime: str,
+        model_role: str = "vision",
+        temperature: float = 0.0,
+    ) -> tuple[str, Usage]:
+        """First client that can read images for ``model_role`` wins.
+
+        Candidates without vision support (registry ``supports_vision=False``)
+        or without a ``describe_image`` method are skipped; the walk and
+        health recording behave exactly like :meth:`text`.  Image bytes are
+        only ever forwarded to a vision-capable client.
+        """
+        failures: list[str] = []
+        for group in self._groups(model_role):
+            for info, _spec, client in group:
+                spec = _spec_for_role(info.name, _spec, client, model_role)
+                if not spec.capabilities.supports_vision:
+                    failures.append(f"{info.name}: skipped ({spec.model} lacks vision support)")
+                    continue
+                describe = getattr(client, "describe_image", None)
+                if not callable(describe):
+                    failures.append(f"{info.name}: skipped (client has no vision method)")
+                    continue
+                try:
+                    result = describe(
+                        system=system,
+                        user=user,
+                        image_bytes=image_bytes,
+                        mime=mime,
+                        model_role=model_role,
+                        temperature=temperature,
+                    )
+                except LLMError as exc:
+                    failure = self._note_failure(
+                        info, model_role, client, exc, failures, structured=False, kind="vision"
+                    )
+                    if self._advance_after_failure(failure):
+                        continue
+                    break
+                self._note_success(info, model_role, client)
+                return result
+        raise LLMError("all free LLM providers failed for vision: " + "; ".join(failures))
+
     def close(self) -> None:
         """Close every wrapped client that owns a transport."""
         for _info, _spec, client in self._candidates:
@@ -318,6 +366,7 @@ class MultiProviderClient:
         failures: list[str],
         *,
         structured: bool,
+        kind: str | None = None,
     ) -> LLMCallFailure:
         """Record the failure, apply its cooldown, and queue a safe reason.
 
@@ -348,12 +397,12 @@ class MultiProviderClient:
             ok=False,
         )
         failures.append(f"{info.name}: {failure.category.value} ({exc})")
-        kind = "structured output" if structured else "text"
+        kind_label = kind if kind is not None else ("structured output" if structured else "text")
         if failure.retryable:
             self._logger.warning(
                 "provider %s %s transient failure: %s; cooling that role for %.0fs",
                 info.name,
-                kind,
+                kind_label,
                 failure.category.value,
                 applied,
             )
@@ -361,7 +410,7 @@ class MultiProviderClient:
             self._logger.warning(
                 "provider %s %s failed: %s; cooling that role for %.0fs",
                 info.name,
-                kind,
+                kind_label,
                 failure.category.value,
                 applied,
             )
