@@ -3946,7 +3946,8 @@ pytest per sub-step, no full-suite runs, no push, free-only gate untouched.
 | 4 | `e0672b1` | `jarvis keys set/paste/clear <provider> --slot N` + per-slot `jarvis keys status` |
 | 5 | `e5891d9` | doctor: key-slot presence rows, daemon-queried `llm_health` rows, dynamic vision row, `StatusResponse.llm_health` |
 | 6 | `4fbc592` | Gemini vision method `describe_image`, `supports_vision=True` registry for gemini-3.8/3.7-flash, non-vision clients raise `LLMCapabilityError`, Multi vision walk, `_build_gemini` wires `vision_model` |
-| 7 | this commit | speech-aware brain prompt (D2): `VOICE_SOURCE_LINE` appended to the user prompt only when `state["source"] == "voice"` |
+| 7 | `21c0375` | speech-aware brain prompt (D2): `VOICE_SOURCE_LINE` appended to the user prompt only when `state["source"] == "voice"` |
+| 8 | this commit | completeness check (D2): four-outcome prompt rules, transient `BrainDecision.assumption`/`missing`, `clarification_count` in the user prompt, 2-round cap with a stop that names missing items, assumption carried on `Plan.assumption` and spoken by `respond` |
 
 Decisions logged:
 - `keys status` line format is per-slot: `groq slot 1: configured` … `tavily slot 3: not configured`
@@ -3986,6 +3987,20 @@ Decisions logged:
   change, `BrainDecision` stays transient, and the fast path still short-circuits before the prompt
   is even built ("open notepad" via voice asks the LLM nothing). Terminal/benchmark input gets no
   line because typed input is not a transcript.
+- **Deliberate choice (Stage 5a completeness): location for "search for internships" is OPTIONAL.**
+  The brain proceeds on the user's actual place (from the profile/remembered answers when present,
+  else a stated default) and must set `assumption` to what it used; it never invents one silently.
+- Assumption carriage: `BrainDecision.assumption` is transient; it is projected onto the existing
+  allowlisted `Plan` model as a defaulted plain string (`Plan.assumption`, no new serde type, old
+  checkpoints load, allowlist set unchanged) and `respond` speaks it as an `Assumption: ...` lead
+  on the action's final answer. `BrainDecision.missing` is never checkpointed; its labels appear
+  only as user text in the round-cap stop message.
+- Two deterministic guards in `brain._project` (code, not prompt): (1) a clarification when
+  `clarification_count >= MAX_CLARIFICATIONS` becomes a halt stating the `missing` items - the
+  `clarify`-node limit check stays as the backstop; (2) an action that proceeds while listing
+  `missing` *and* states no `assumption` is rejected fail-closed (silent invention). Perception
+  provenance is enforced by the existing taint pipe (`Step.depends_on_untrusted` ->
+  `Decision.warn_untrusted`), never by the prompt alone.
 
 ### Stage 10 known-red list - addition this session
 
