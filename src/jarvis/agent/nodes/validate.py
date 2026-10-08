@@ -1,7 +1,8 @@
 """validate node: deterministic plan checks before anything executes.
 
-Rejects unknown tools, invalid arguments, and plans over the step cap.  A
-rejected *initial* plan goes back to ``plan`` once (one repair retry); a
+Rejects unknown tools, invalid arguments, unsafe step IDs (blank, duplicate,
+or colliding with a preserved completed result), and plans over the step cap.
+A rejected *initial* plan goes back to ``plan`` once (one repair retry); a
 rejected *replacement* plan goes back to ``replan`` once.  A second rejection
 of either halts with an honest explanation.
 
@@ -70,6 +71,7 @@ def validate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         }
 
     errors: list[str] = []
+    errors.extend(_check_step_ids(plan, state))
     for step in plan.steps:
         spec = ctx.registry.get_optional(step.tool)
         if spec is None:
@@ -126,6 +128,39 @@ def validate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         "halted_reason": None,
         "pending_replan": False,
     }
+
+
+def _check_step_ids(plan: Any, state: dict[str, Any]) -> list[str]:
+    """Fail-closed step-ID checks feeding the existing repair/replan machinery.
+
+    ``Step.id`` keys the decision map, the TOCTOU path snapshot, batch
+    approval's eligible list, and act's exactly-once guard, so a blank or
+    duplicated ID silently collapses those maps.  A replacement plan must also
+    avoid the IDs of the *preserved* completed results, or act would treat the
+    new step as already executed and skip it.  Returns one human-readable
+    problem per bad ID for :func:`validate` to reject with; never raises and
+    never rewrites an ID (validation is the boundary, not normalization).
+    """
+    errors: list[str] = []
+    preserved: set[str] = set()
+    if state.get("pending_replan"):
+        preserved = {str(getattr(r, "step_id", "") or "") for r in state.get("results") or []}
+    seen: set[str] = set()
+    for i, step in enumerate(getattr(plan, "steps", None) or []):
+        sid = str(getattr(step, "id", "") or "")
+        if not sid.strip():
+            errors.append(f"step {i + 1} has a blank id; step ids must be non-blank and unique")
+            continue
+        if sid in seen:
+            errors.append(f"duplicate step id {sid!r}; step ids must be unique")
+        else:
+            seen.add(sid)
+        if sid in preserved:
+            errors.append(
+                f"step {i + 1} reuses completed step id {sid!r}; a replacement plan must "
+                "use ids that do not collide with completed steps"
+            )
+    return errors
 
 
 def _resolve_locations(plan: Any, settings: Any) -> bool:
