@@ -19,7 +19,7 @@ from jarvis.agent.nodes.verify import verify
 from jarvis.agent.schemas import ReplanDecision
 from jarvis.agent.state import Plan, Step, StepResult
 from jarvis.config import AgentSettings, Settings
-from jarvis.llm.client import FakeLLM
+from jarvis.llm.client import FakeLLM, Usage
 from support import (
     brain_action,
     brain_clarify,
@@ -125,6 +125,35 @@ def test_replan_continue_without_plan_is_rejected() -> None:
 
     with pytest.raises(ValidationError):
         ReplanDecision(action="continue", plan=None)
+
+
+class _RecorderReplanner:
+    """Records the retry-budget kwargs on the replan LLM call."""
+
+    def __init__(self) -> None:
+        self.max_retries: int | None = None
+        self.timeout_s: float | None = None
+
+    def structured(self, **kwargs: Any) -> tuple[Any, Usage]:
+        self.max_retries = kwargs.get("max_retries")
+        self.timeout_s = kwargs.get("timeout_s")
+        return replan_continue(echo_plan()), Usage(calls=1, prompt_tokens=1, completion_tokens=1)
+
+
+def test_replan_voice_forwards_zero_retries_and_capped_timeout() -> None:
+    recorder = _RecorderReplanner()
+    ctx = make_app_context(Settings(), llm=recorder)
+    replan({**_failing_state(), "source": "voice"}, ctx)
+    assert recorder.max_retries == 0
+    assert recorder.timeout_s == 10.0
+
+
+def test_replan_terminal_forwards_no_retry_budget() -> None:
+    recorder = _RecorderReplanner()
+    ctx = make_app_context(Settings(), llm=recorder)
+    replan(_failing_state(), ctx)
+    assert recorder.max_retries is None
+    assert recorder.timeout_s is None
 
 
 def test_verify_sets_replan_now_when_retries_exhausted() -> None:

@@ -188,6 +188,7 @@ def test_non_schema_groq_error_wraps_in_llm_error() -> None:
     also 400s the failure is raised, not swallowed.  ``text()`` sends no response
     format, so it raises on the first 400.
     """
+
     def _raising(_kwargs: Any) -> Any:
         raise bad_request("some other 400")
 
@@ -210,6 +211,7 @@ def test_bare_400_schema_probe_is_paid_only_once() -> None:
     single structured call for the whole session, because the capability cache
     was only written when the error text literally mentioned ``json_schema``.
     """
+
     def _reject_schema(kwargs: Any) -> Any:
         if (kwargs.get("response_format") or {}).get("type") == "json_schema":
             raise bad_request("Bad Request")
@@ -261,6 +263,34 @@ def test_rate_limit_exhaustion_raises() -> None:
     client = GroqClient("gsk-key", settings(max_retries=0), completer=completer)
     with pytest.raises(LLMError):
         client.structured(system="s", user="u", schema=Plan)
+
+
+def test_per_call_max_retries_zero_never_retries() -> None:
+    """``max_retries=0`` disables retries even when the settings allow them."""
+    completer = FakeCompleter().add(lambda k: (_ for _ in ()).throw(rate_limit()))
+    client = GroqClient("gsk-key", settings(), completer=completer)  # settings max_retries=1
+    with pytest.raises(LLMError):
+        client.structured(system="s", user="u", schema=Plan, max_retries=0)
+    assert len(completer.calls) == 1  # one attempt, no retry, no sleep
+
+
+def test_per_call_max_retries_overrides_a_zero_settings_budget() -> None:
+    completer = (
+        FakeCompleter().add(lambda k: (_ for _ in ()).throw(rate_limit())).add(lambda k: ok_json(k))
+    )
+    client = GroqClient("gsk-key", settings(max_retries=0), completer=completer)
+    plan, _ = client.structured(system="s", user="u", schema=Plan, max_retries=1)
+    assert plan.action == "open_app"
+    assert len(completer.calls) == 2
+
+
+def test_per_call_timeout_forwarded_to_the_completer() -> None:
+    completer = FakeCompleter()
+    client = GroqClient("gsk-key", settings(), completer=completer)
+    client.text(system="s", user="u", timeout_s=7.5)
+    assert completer.calls[0]["timeout"] == 7.5
+    client.text(system="s", user="u")  # None keeps the configured default
+    assert completer.calls[1]["timeout"] == 30.0
 
 
 def test_server_error_retries() -> None:
@@ -322,6 +352,14 @@ class TestFakeLLM:
         assert u1.calls == 1
         assert u2.calls == 2
         assert u2.prompt_tokens == 4
+
+    def test_accepts_retry_budget_kwargs(self) -> None:
+        fake = FakeLLM([Plan(action="a", args={})])
+        plan, _ = fake.structured(system="s", user="u", schema=Plan, max_retries=0, timeout_s=5.0)
+        text, _ = fake.text(system="s", user="u", max_retries=0, timeout_s=5.0)
+        assert plan.action == "a"
+        assert text == "ok"
+        assert fake.calls == [("structured", "planner", "Plan"), ("text", "fast", "str")]
 
 
 def _dummy_logger() -> Any:

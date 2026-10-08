@@ -114,12 +114,19 @@ class GeminiClient:
         self,
         model: str,
         body: dict[str, Any],
+        *,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[str, int, int]:
         """One generateContent call with bounded transient retries.
 
         Returns ``(content, prompt_tokens, completion_tokens)``; token counts
         are best-effort (Gemini reports usage metadata when available).
+        ``max_retries`` / ``timeout_s`` override the configured budget and
+        timeout for this call only; ``None`` keeps the configured default.
         """
+        retry_budget = self._max_retries if max_retries is None else max_retries
+        request_timeout = self._timeout if timeout_s is None else timeout_s
         backoff = 1.0
         attempts = 0
         while True:
@@ -128,10 +135,11 @@ class GeminiClient:
                     f"models/{model}:generateContent",
                     params={"key": self._api_key},
                     json=body,
+                    timeout=request_timeout,
                 )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 attempts += 1
-                if attempts > self._max_retries:
+                if attempts > retry_budget:
                     raise LLMTransientError(
                         f"Gemini request failed after {attempts} attempts"
                     ) from exc
@@ -141,7 +149,7 @@ class GeminiClient:
                 continue
             if resp.status_code == 429 or resp.status_code >= 500:
                 attempts += 1
-                if attempts > self._max_retries:
+                if attempts > retry_budget:
                     raise LLMTransientError(
                         f"Gemini transient failure (HTTP {resp.status_code}) "
                         f"persisted after {attempts} attempts"
@@ -202,10 +210,12 @@ class GeminiClient:
         schema: type[BaseModel],
         model_role: str = "planner",
         temperature: float = 0.0,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[BaseModel, Usage]:
         model = self._model_for(model_role)
         body = self._body(system, user, temperature, schema.model_json_schema())
-        raw, _, _ = self._generate(model, body)
+        raw, _, _ = self._generate(model, body, max_retries=max_retries, timeout_s=timeout_s)
         try:
             parsed = schema.model_validate_json(self._strip_json_fence(raw))
         except ValidationError as first_error:
@@ -227,7 +237,9 @@ class GeminiClient:
                     ],
                 },
             ]
-            raw2, _, _ = self._generate(model, repair_body)
+            raw2, _, _ = self._generate(
+                model, repair_body, max_retries=max_retries, timeout_s=timeout_s
+            )
             try:
                 parsed = schema.model_validate_json(self._strip_json_fence(raw2))
             except ValidationError as second_error:
@@ -244,12 +256,14 @@ class GeminiClient:
         model_role: str = "fast",
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[str, Usage]:
         model = self._model_for(model_role)
         body = self._body(system, user, temperature, None)
         if max_tokens is not None:
             body["generationConfig"]["maxOutputTokens"] = max_tokens
-        content, _, _ = self._generate(model, body)
+        content, _, _ = self._generate(model, body, max_retries=max_retries, timeout_s=timeout_s)
         return content, self._snapshot_usage()
 
     def describe_image(

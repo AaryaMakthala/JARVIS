@@ -183,6 +183,8 @@ class MultiProviderClient:
         schema: type[BaseModel],
         model_role: str = "planner",
         temperature: float = 0.0,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[BaseModel, Usage]:
         """First provider that can produce ``schema`` for ``model_role`` wins."""
         failures: list[str] = []
@@ -203,6 +205,8 @@ class MultiProviderClient:
                         schema=schema,
                         model_role=model_role,
                         temperature=temperature,
+                        max_retries=max_retries,
+                        timeout_s=timeout_s,
                     )
                 except LLMError as exc:
                     failure = self._note_failure(
@@ -225,6 +229,8 @@ class MultiProviderClient:
         model_role: str = "fast",
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[str, Usage]:
         """First healthy provider that can answer plain text for ``model_role``."""
         failures: list[str] = []
@@ -237,6 +243,8 @@ class MultiProviderClient:
                         model_role=model_role,
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        max_retries=max_retries,
+                        timeout_s=timeout_s,
                     )
                 except LLMError as exc:
                     failure = self._note_failure(

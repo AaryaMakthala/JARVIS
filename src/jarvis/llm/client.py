@@ -121,6 +121,8 @@ class LLMClient(Protocol):
         schema: type[BaseModel],
         model_role: str = "planner",
         temperature: float = 0.0,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[BaseModel, Usage]: ...
 
     def text(
@@ -131,6 +133,8 @@ class LLMClient(Protocol):
         model_role: str = "fast",
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[str, Usage]: ...
 
 
@@ -295,6 +299,8 @@ class GroqClient(_MetaMixin):
         response_format: dict[str, Any] | None,
         temperature: float,
         role: str = "planner",
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[str, int, int]:
         """Run one completion; bounded retry for genuinely transient failures.
 
@@ -306,7 +312,13 @@ class GroqClient(_MetaMixin):
         exhausted the error carries its explicit
         :class:`~jarvis.llm.failures.FailureCategory` so the composite client
         knows what to log and how long to cool this provider down.
+
+        ``max_retries`` / ``timeout_s`` override the configured retry budget
+        and timeout for this call only; ``None`` keeps the configured default,
+        so existing callers behave identically.
         """
+        retry_budget = self._settings.llm.max_retries if max_retries is None else max_retries
+        request_timeout = self._settings.llm.timeout_seconds if timeout_s is None else timeout_s
         backoff = 1.0
         attempts = 0
         started = time.perf_counter()
@@ -317,7 +329,7 @@ class GroqClient(_MetaMixin):
                     messages=messages,
                     response_format=response_format,
                     temperature=temperature,
-                    timeout=self._settings.llm.timeout_seconds,
+                    timeout=request_timeout,
                 )
             except Exception as exc:
                 category = classify(exc)
@@ -326,10 +338,7 @@ class GroqClient(_MetaMixin):
                     raise LLMContextLengthError(
                         f"Groq model {model!r} context window exceeded ({category.value})"
                     ) from exc
-                if (
-                    should_retry_same_provider(category)
-                    and attempts <= self._settings.llm.max_retries
-                ):
+                if should_retry_same_provider(category) and attempts <= retry_budget:
                     self._logger.warning("groq %s; retrying in %.1fs", category.value, backoff)
                     time.sleep(backoff)
                     backoff *= 2
@@ -370,6 +379,8 @@ class GroqClient(_MetaMixin):
         schema: type[BaseModel],
         model_role: str = "planner",
         temperature: float = 0.0,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[BaseModel, Usage]:
         model = self._model_for(model_role)
         messages = [
@@ -380,7 +391,14 @@ class GroqClient(_MetaMixin):
         if self._schema_modes.get(model) is False:
             self._logger.info("structured output mode: json (cached, model %s)", model)
             return self._parse(
-                model, schema, messages, {"type": "json_object"}, temperature, model_role
+                model,
+                schema,
+                messages,
+                {"type": "json_object"},
+                temperature,
+                model_role,
+                max_retries=max_retries,
+                timeout_s=timeout_s,
             )
 
         try:
@@ -398,6 +416,8 @@ class GroqClient(_MetaMixin):
                 },
                 temperature,
                 model_role,
+                max_retries=max_retries,
+                timeout_s=timeout_s,
             )
         except Exception as exc:
             if not _is_schema_rejection(exc):
@@ -414,7 +434,14 @@ class GroqClient(_MetaMixin):
             )
             self._schema_modes[model] = False
             return self._parse(
-                model, schema, messages, {"type": "json_object"}, temperature, model_role
+                model,
+                schema,
+                messages,
+                {"type": "json_object"},
+                temperature,
+                model_role,
+                max_retries=max_retries,
+                timeout_s=timeout_s,
             )
 
         self._schema_modes[model] = True
@@ -429,6 +456,8 @@ class GroqClient(_MetaMixin):
         response_format: dict[str, Any],
         temperature: float,
         role: str = "planner",
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[BaseModel, Usage]:
         """Ask the model for JSON, validate it, and repair it once if invalid.
 
@@ -445,6 +474,8 @@ class GroqClient(_MetaMixin):
             response_format=response_format,
             temperature=temperature,
             role=role,
+            max_retries=max_retries,
+            timeout_s=timeout_s,
         )
         try:
             parsed = schema.model_validate_json(self._strip_json_fence(raw))
@@ -468,6 +499,8 @@ class GroqClient(_MetaMixin):
                 response_format=response_format,
                 temperature=temperature,
                 role=role,
+                max_retries=max_retries,
+                timeout_s=timeout_s,
             )
             try:
                 parsed = schema.model_validate_json(self._strip_json_fence(raw2))
@@ -486,6 +519,8 @@ class GroqClient(_MetaMixin):
         model_role: str = "fast",
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[str, Usage]:
         model = self._model_for(model_role)
         messages = [
@@ -499,6 +534,8 @@ class GroqClient(_MetaMixin):
                 response_format=None,
                 temperature=temperature,
                 role=model_role,
+                max_retries=max_retries,
+                timeout_s=timeout_s,
             )
         except LLMError:
             raise
@@ -568,6 +605,8 @@ class FakeLLM:
         schema: type[BaseModel],
         model_role: str = "planner",
         temperature: float = 0.0,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[BaseModel, Usage]:
         if self._responses:
             item = self._responses.pop(0)
@@ -590,6 +629,8 @@ class FakeLLM:
         model_role: str = "fast",
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[str, Usage]:
         if self._responses:
             item = self._responses.pop(0)

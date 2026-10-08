@@ -40,6 +40,12 @@ def replan(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     repair_error = state.get("error") if state.get("pending_replan") else None
     catalogue = ctx.registry.catalogue_for_llm()
+    llm_budget: dict[str, Any] = {}
+    if (state.get("source") or "terminal") == "voice":
+        llm_budget = {
+            "max_retries": 0,
+            "timeout_s": min(float(ctx.settings.llm.timeout_seconds), 10.0),
+        }
     try:
         model, usage = ctx.llm.structured(
             system=replan_system_prompt(catalogue),
@@ -55,6 +61,7 @@ def replan(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             schema=ReplanDecision,
             model_role="planner",
             temperature=0.0,
+            **llm_budget,
         )
     except Exception as exc:  # noqa: BLE001 - LLM failures stop this task only
         ctx.logger.warning("replanning failed: %s", exc)

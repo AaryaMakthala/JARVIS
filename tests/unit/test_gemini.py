@@ -19,7 +19,7 @@ import pytest
 from pydantic import BaseModel
 
 from jarvis.config import LLMSettings, Settings
-from jarvis.llm.client import GroqClient, LLMCapabilityError, LLMError
+from jarvis.llm.client import GroqClient, LLMCapabilityError, LLMError, LLMTransientError
 from jarvis.llm.gemini import GeminiClient
 from jarvis.llm.models import model_spec
 from jarvis.llm.multi import MultiProviderClient
@@ -233,3 +233,40 @@ def test_text_still_works() -> None:
     text, usage = client.text(system="s", user="u")
     assert text == "hello from gemini"
     assert usage.calls == 1
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    import jarvis.llm.gemini as gemini_module
+
+    monkeypatch.setattr(gemini_module.time, "sleep", lambda _s: None)
+
+
+def test_default_retries_a_transient_500_once() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(500, json={}, request=request)
+        return _ok_generate('{"label": "recovered"}')
+
+    client = _gemini(handler)  # ctor max_retries=1
+    parsed, _ = client.structured(system="s", user="u", schema=_Note)
+    assert parsed.label == "recovered"
+    assert attempts == 2
+
+
+def test_per_call_max_retries_zero_fails_immediately_without_retrying() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(500, json={}, request=request)
+
+    client = _gemini(handler)  # ctor max_retries=1, so retries would be allowed
+    with pytest.raises(LLMTransientError):
+        client.structured(system="s", user="u", schema=_Note, max_retries=0)
+    assert attempts == 1  # one attempt: no retry, no sleep

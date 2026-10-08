@@ -54,15 +54,19 @@ class FakeClient:
         self.response = response
         self.text_calls = 0
         self.structured_calls = 0
+        self.last_text_kwargs: typing.Any = None
+        self.last_structured_kwargs: typing.Any = None
 
     def text(self, **kwargs: typing.Any) -> tuple[str, Usage]:
         self.text_calls += 1
+        self.last_text_kwargs = kwargs
         if self.error is not None:
             raise self.error
         return self.response, Usage()
 
     def structured(self, **kwargs: typing.Any) -> tuple[object, Usage]:
         self.structured_calls += 1
+        self.last_structured_kwargs = kwargs
         if self.error is not None:
             raise self.error
         return self.response, Usage()
@@ -124,6 +128,27 @@ def test_auth_failure_advances_to_the_next_slot() -> None:
     assert nvidia.text_calls == 0
     assert multi.health.is_cooling("groq", "fast", slot=1) is True
     assert multi.health.is_cooling("groq", "fast", slot=2) is False
+
+
+def test_budget_kwargs_are_forwarded_to_the_first_healthy_client() -> None:
+    """``max_retries``/``timeout_s`` pass through the walk to the wrapped client."""
+    s1 = FakeClient(response="a")
+    multi = MultiProviderClient([_cand("groq", 1, s1)])
+    multi.text(system="s", user="u", max_retries=0, timeout_s=5.0)
+    assert s1.last_text_kwargs["max_retries"] == 0
+    assert s1.last_text_kwargs["timeout_s"] == 5.0
+    multi.structured(system="s", user="u", schema=dict, max_retries=0, timeout_s=5.0)
+    assert s1.last_structured_kwargs["max_retries"] == 0
+    assert s1.last_structured_kwargs["timeout_s"] == 5.0
+
+
+def test_budget_kwargs_stay_none_by_default() -> None:
+    """With no explicit budget the wrapped client sees ``None`` (its own default)."""
+    s1 = FakeClient(response="a")
+    multi = MultiProviderClient([_cand("groq", 1, s1)])
+    multi.text(system="s", user="u")
+    assert s1.last_text_kwargs["max_retries"] is None
+    assert s1.last_text_kwargs["timeout_s"] is None
 
 
 def test_capability_failure_cools_every_slot_with_one_probe() -> None:

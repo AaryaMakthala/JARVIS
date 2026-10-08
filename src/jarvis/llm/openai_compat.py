@@ -114,13 +114,20 @@ class OpenAICompatClient:
         response_format: dict[str, Any] | None,
         temperature: float,
         max_tokens: int | None = None,
+        *,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[str, int, int]:
         """One completion with bounded transient retries.
 
         Retries: at most ``max_retries`` for 429/5xx/transport errors, with
         exponential backoff.  Auth and model-availability failures are never
-        retried.  Returns ``(content, prompt_tokens, completion_tokens)``.
+        retried.  ``max_retries`` / ``timeout_s`` override the configured
+        budget and timeout for this call only; ``None`` keeps the configured
+        default.  Returns ``(content, prompt_tokens, completion_tokens)``.
         """
+        retry_budget = self._max_retries if max_retries is None else max_retries
+        request_timeout = self._timeout if timeout_s is None else timeout_s
         backoff = 1.0
         attempts = 0
         payload: dict[str, Any] = {
@@ -134,10 +141,10 @@ class OpenAICompatClient:
             payload["max_tokens"] = max_tokens
         while True:
             try:
-                resp = self._http.post("chat/completions", json=payload)
+                resp = self._http.post("chat/completions", json=payload, timeout=request_timeout)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 attempts += 1
-                if attempts > self._max_retries:
+                if attempts > retry_budget:
                     raise LLMTransientError(
                         f"{self._provider} request failed after {attempts} attempts"
                     ) from exc
@@ -149,7 +156,7 @@ class OpenAICompatClient:
                 continue
             if resp.status_code == 429 or resp.status_code >= 500:
                 attempts += 1
-                if attempts > self._max_retries:
+                if attempts > retry_budget:
                     raise LLMTransientError(
                         f"{self._provider} transient failure (HTTP {resp.status_code}) "
                         f"persisted after {attempts} attempts"
@@ -194,6 +201,8 @@ class OpenAICompatClient:
         schema: type[BaseModel],
         model_role: str = "planner",
         temperature: float = 0.0,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[BaseModel, Usage]:
         model = self._model_for(model_role)
         messages = [
@@ -213,6 +222,8 @@ class OpenAICompatClient:
             messages=messages,
             response_format=response_format,
             temperature=temperature,
+            max_retries=max_retries,
+            timeout_s=timeout_s,
         )
         try:
             parsed = schema.model_validate_json(self._strip_json_fence(raw))
@@ -235,6 +246,8 @@ class OpenAICompatClient:
                 messages=repair_messages,
                 response_format=response_format,
                 temperature=temperature,
+                max_retries=max_retries,
+                timeout_s=timeout_s,
             )
             try:
                 parsed = schema.model_validate_json(self._strip_json_fence(raw2))
@@ -252,6 +265,8 @@ class OpenAICompatClient:
         model_role: str = "fast",
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[str, Usage]:
         model = self._model_for(model_role)
         messages = [
@@ -264,6 +279,8 @@ class OpenAICompatClient:
             response_format=None,
             temperature=temperature,
             max_tokens=max_tokens,
+            max_retries=max_retries,
+            timeout_s=timeout_s,
         )
         return content, self._snapshot_usage()
 

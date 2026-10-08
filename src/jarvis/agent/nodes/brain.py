@@ -74,6 +74,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     ctx.logger.info("agent event=llm_start task_id=%s", task_id)
 
     previous_error = state.get("error") if int(state.get("validate_attempts") or 0) > 0 else None
+    source = state.get("source") or "terminal"
     catalogue = ctx.registry.catalogue_for_llm()
     system = brain_system_prompt(catalogue)
     user = brain_user_prompt(
@@ -84,13 +85,25 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         clarification_question=state.get("clarification_question"),
         clarification_answer=state.get("clarification_answer"),
         repair_error=previous_error,
-        source=state.get("source") or "terminal",
+        source=source,
         clarification_count=int(state.get("clarification_count") or 0),
     )
 
+    llm_budget: dict[str, Any] = {}
+    if source == "voice":
+        llm_budget = {
+            "max_retries": 0,
+            "timeout_s": min(float(ctx.settings.llm.timeout_seconds), 10.0),
+        }
+
     try:
         model, usage = ctx.llm.structured(
-            system=system, user=user, schema=BrainDecision, model_role="planner", temperature=0.0
+            system=system,
+            user=user,
+            schema=BrainDecision,
+            model_role="planner",
+            temperature=0.0,
+            **llm_budget,
         )
     except Exception as exc:  # noqa: BLE001 - a brain failure stops this task only
         ctx.logger.warning("brain call failed: %s", exc)

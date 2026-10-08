@@ -129,6 +129,8 @@ class _RecorderLLM:
         self._decision = decision
         self.user: str | None = None
         self.temperature: float | None = None
+        self.max_retries: int | None = None
+        self.timeout_s: float | None = None
 
     def structured(
         self,
@@ -138,11 +140,15 @@ class _RecorderLLM:
         schema: type[Any],
         model_role: str = "planner",
         temperature: float = 0.0,
+        max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[BrainDecision, Usage]:
         assert issubclass(schema, BrainDecision)
         assert system
         self.user = user
         self.temperature = temperature
+        self.max_retries = max_retries
+        self.timeout_s = timeout_s
         return self._decision, Usage(calls=1, prompt_tokens=2, completion_tokens=2)
 
 
@@ -188,3 +194,20 @@ def test_brain_wires_clarification_count_into_the_llm_call() -> None:
     assert recorder.user is not None
     assert "This is clarification round 2 (the last one)." in recorder.user
     assert update["request_kind"] == "conversation"
+
+
+def test_brain_voice_forwards_zero_retries_and_a_capped_timeout() -> None:
+    """Speech gets no retry budget and at most 10s per attempt (Stage 5a sub-step 9)."""
+    recorder = _RecorderLLM(brain_conversation("hi back"))
+    brain({"user_input": "say hello", "source": "voice", "task_id": "t4"}, _ctx(recorder))
+    assert recorder.max_retries == 0
+    assert recorder.timeout_s == min(Settings().llm.timeout_seconds, 10.0)
+    assert recorder.timeout_s == 10.0  # the default 30s is already capped
+
+
+def test_brain_terminal_forwards_no_retry_budget() -> None:
+    """Typed input keeps the configured retry budget and timeout (None)."""
+    recorder = _RecorderLLM(brain_conversation("hi back"))
+    brain({"user_input": "say hello", "source": "terminal", "task_id": "t5"}, _ctx(recorder))
+    assert recorder.max_retries is None
+    assert recorder.timeout_s is None
