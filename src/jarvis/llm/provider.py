@@ -396,7 +396,11 @@ def build_llm_client(
     else:
         from jarvis.llm.multi import MultiProviderClient
 
-        client = MultiProviderClient(candidates, logger=logger)
+        client = MultiProviderClient(
+            candidates,
+            logger=logger,
+            rotate_on_rate_limit=settings.llm.rotate_on_rate_limit,
+        )
     return ProviderSelection(client=client, info=info, reasons=reasons)
 
 

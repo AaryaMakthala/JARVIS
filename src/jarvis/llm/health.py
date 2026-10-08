@@ -14,6 +14,13 @@ must not knock out NVIDIA's ``planner`` model (different endpoints, different
 load), and a 429 on a provider's primary key must not cool its backup key —
 the health store tracks one entry per credential key slot.
 
+Slot 0 is the **provider-wide pseudo-slot**: model-scoped failures (the model
+cannot do structured output, the prompt overflows, ...) are recorded there
+once, and every real slot of that provider reports cooling while slot 0 is
+cooling.  Slot 0 is never a callable candidate; it only exists so one probe
+can cool a provider for a role instead of burning every key against a known-
+bad model/request.
+
 **Nothing here is a blacklist.**  Every entry has a finite cooldown, a decaying
 consecutive-failure count, and a reset on the next success.  A rotating an API
 key or a provider re-publishing a model therefore recovers by itself: the next
@@ -63,11 +70,14 @@ class ProviderHealthEntry:
         against the *injected* clock.  Reading the real clock here would make
         ``cooling`` disagree with :meth:`is_cooling` in every test and in any
         caller that drives the health store from a fake timeline.
+
+        The provider-wide slot-0 entry is rendered as ``"slot": "provider"``
+        so it reads as provider-level health, never as a credential key.
         """
         moment = time.monotonic() if now is None else now
         return {
             "provider": self.provider,
-            "slot": self.slot,
+            "slot": "provider" if self.slot == 0 else self.slot,
             "role": self.role,
             "consecutive_failures": self.consecutive_failures,
             "cooling": self.cooldown_until > moment,
@@ -130,12 +140,19 @@ class ProviderHealth:
         return self._entry(provider, slot, role)
 
     def is_cooling(self, provider: str, role: str, slot: int = 1) -> bool:
-        """Whether ``(provider, slot, role)`` must be skipped for this call."""
-        return self._entry(provider, slot, role).is_cooling(self._clock())
+        """Whether ``(provider, slot, role)`` must be skipped for this call.
+
+        A real slot also reports cooling while the provider-wide slot-0
+        entry is cooling (Stage 5a model-scoped failures).
+        """
+        return self._cooldown_until(provider, slot, role) > self._clock()
 
     def remaining(self, provider: str, role: str, slot: int = 1) -> float:
-        """Seconds until ``(provider, slot, role)`` is retried."""
-        return self._entry(provider, slot, role).remaining(self._clock())
+        """Seconds until ``(provider, slot, role)`` is retried.
+
+        Includes a cooling provider-wide slot-0 entry, like :meth:`is_cooling`.
+        """
+        return max(0.0, self._cooldown_until(provider, slot, role) - self._clock())
 
     def failure_count(self, provider: str, role: str, slot: int = 1) -> int:
         """Consecutive failures recorded for ``(provider, slot, role)``."""
@@ -172,7 +189,7 @@ class ProviderHealth:
         for index, item in enumerate(items):
             provider, slot, role = key(item)
             entry = self._entry(provider, slot, role)
-            cooling = entry.is_cooling(now)
+            cooling = self._cooldown_until(provider, slot, role) > now
             decorated.append(
                 (1 if cooling else 0, entry.consecutive_failures if cooling else 0, index, item)
             )
@@ -197,3 +214,19 @@ class ProviderHealth:
             entry = ProviderHealthEntry(provider=provider, slot=slot, role=role)
             self._entries[key] = entry
         return entry
+
+    def _cooldown_until(self, provider: str, slot: int, role: str) -> float:
+        """Effective cooldown deadline for ``(provider, slot, role)``.
+
+        A real slot also inherits the provider-wide pseudo-slot 0 entry, so
+        one model-scoped probe cools every slot of the provider for the role.
+        Slot 0 inherits nothing, and this lookup never *creates* the slot-0
+        entry - a plain read must not pollute ``snapshot()`` with empty
+        provider-level rows.
+        """
+        until = self._entry(provider, slot, role).cooldown_until
+        if slot >= 1:
+            zero = self._entries.get((provider, 0, role))
+            if zero is not None:
+                until = max(until, zero.cooldown_until)
+        return until

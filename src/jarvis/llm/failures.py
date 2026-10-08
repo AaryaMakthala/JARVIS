@@ -82,6 +82,37 @@ RETRYABLE: frozenset[FailureCategory] = frozenset(
     }
 )
 
+#: Categories scoped to the *model/request*, not to a credential key:
+#: retrying with a different key of the same provider cannot help.  The
+#: composite walk records them once on the provider-wide pseudo-slot
+#: ``(provider, 0, role)`` (Stage 5a), so a single probe cools every real
+#: slot of that provider for the role, and moves to the next provider.
+MODEL_SCOPED_CATEGORIES: frozenset[FailureCategory] = frozenset(
+    {
+        FailureCategory.UNSUPPORTED_CAPABILITY,
+        FailureCategory.UNSUPPORTED_MODEL,
+        FailureCategory.CONTEXT_LENGTH,
+        FailureCategory.INVALID_STRUCTURED_OUTPUT,
+    }
+)
+
+#: B8 key rotation is for **availability only**: these are the failures
+#: where advancing to the provider's *next key slot* may help (a rejected
+#: credential, an outage, a transport fault).  A 429 deliberately does not
+#: rotate by default - ``llm.rotate_on_rate_limit`` is false, because some
+#: provider terms forbid evading rate limits by rotating accounts.
+ROTATION_CATEGORIES: frozenset[FailureCategory] = frozenset(
+    {
+        FailureCategory.AUTH,
+        FailureCategory.SERVER_ERROR,
+        FailureCategory.CONNECTION,
+        FailureCategory.DNS,
+        FailureCategory.TLS,
+        FailureCategory.TIMEOUT,
+        FailureCategory.UNEXPECTED,
+    }
+)
+
 #: Default cooldown before a provider is skipped for the failed role.  Finite
 #: on purpose: every provider is retried on a later interaction, so a rotated
 #: credential or a re-published model recovers without restarting the daemon.

@@ -9,12 +9,28 @@ walks the list and:
   role**, not always the planner;
 * orders candidates by :class:`~jarvis.llm.health.ProviderHealth`, so a provider
   that just 503'd is deprioritised for the next interaction without being
-  removed from the configuration;
+  removed from the configuration.  Candidates are walked **provider-major**:
+  providers in health order, each with its key slots in slot order;
 * on any failure records a :class:`~jarvis.llm.failures.LLMCallFailure`, applies
-  a finite cooldown for that ``(provider, slot, role)``, and moves on.  Bounded
-  retries already happened inside the individual client;
+  a finite cooldown, then follows the B8 rotation rule (see below) - either
+  advancing to the provider's next key slot or moving to the next provider;
 * when every provider has failed, raises :class:`LLMError` with a joined set of
   safe reasons (provider/model/category only, never credentials).
+
+B8 KEY ROTATION (availability only)
+-----------------------------------
+* Availability failures - ``AUTH``, ``SERVER_ERROR``, ``CONNECTION``, ``DNS``,
+  ``TLS``, ``TIMEOUT``, ``UNEXPECTED`` - advance to the provider's *next key
+  slot*; a rotated credential may succeed where the current one cannot.
+* ``RATE_LIMIT`` cools only the failing ``(provider, slot, role)`` and does
+  **not** rotate keys by default: it falls through to the next provider, and
+  logs it plainly.  Set ``llm.rotate_on_rate_limit = true`` to rotate (some
+  provider terms forbid evading 429s by account rotation).
+* Model-scoped failures (no structured output, unknown model, context length,
+  unrepairable output) are recorded once on the provider-wide pseudo-slot 0
+  and go to the next provider: a different key cannot fix a model/request
+  problem, and one probe cools every slot of that provider for the role.
+* Slot 0 is never a callable candidate; it exists only in health.
 
 **No permanent blacklisting.**  A cooldown expiring makes the provider eligible
 again, and the next success resets its failure count, so a rotated key or a
@@ -32,13 +48,20 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from pydantic import BaseModel
 
 from jarvis.llm import models as llm_models
 from jarvis.llm.client import CallMeta, LLMError, Usage
-from jarvis.llm.failures import failure_from_exception
+from jarvis.llm.failures import (
+    MODEL_SCOPED_CATEGORIES,
+    ROTATION_CATEGORIES,
+    FailureCategory,
+    LLMCallFailure,
+    failure_from_exception,
+)
 from jarvis.llm.health import ProviderHealth
 from jarvis.llm.models import ModelSpec
 from jarvis.llm.provider import ProviderInfo
@@ -99,12 +122,14 @@ class MultiProviderClient:
         *,
         health: ProviderHealth | None = None,
         clock: Callable[[], float] = time.monotonic,
+        rotate_on_rate_limit: bool = False,
     ) -> None:
         if not candidates:
             raise ValueError("MultiProviderClient needs at least one candidate")
         self._candidates = list(candidates)
         self._logger = logger or logging.getLogger("llm.multi")
         self._health = health if health is not None else ProviderHealth(clock=clock)
+        self._rotate_on_rate_limit = rotate_on_rate_limit
         self._last_call = CallMeta(provider="", model="", role="")
 
     # ── observability ────────────────────────────────────────────────────
@@ -161,28 +186,33 @@ class MultiProviderClient:
     ) -> tuple[BaseModel, Usage]:
         """First provider that can produce ``schema`` for ``model_role`` wins."""
         failures: list[str] = []
-        for info, _spec, client in self._ordered(model_role):
-            spec = _spec_for_role(info.name, _spec, client, model_role)
-            caps = spec.capabilities
-            if not (caps.supports_structured_output and caps.supports_tools):
-                failures.append(
-                    f"{info.name}: skipped ({spec.model} lacks "
-                    "structured-output/tool-planning support)"
-                )
-                continue
-            try:
-                result = client.structured(
-                    system=system,
-                    user=user,
-                    schema=schema,
-                    model_role=model_role,
-                    temperature=temperature,
-                )
-            except LLMError as exc:
-                self._note_failure(info, model_role, client, exc, failures, structured=True)
-                continue
-            self._note_success(info, model_role, client)
-            return result
+        for group in self._groups(model_role):
+            for info, _spec, client in group:
+                spec = _spec_for_role(info.name, _spec, client, model_role)
+                caps = spec.capabilities
+                if not (caps.supports_structured_output and caps.supports_tools):
+                    failures.append(
+                        f"{info.name}: skipped ({spec.model} lacks "
+                        "structured-output/tool-planning support)"
+                    )
+                    continue
+                try:
+                    result = client.structured(
+                        system=system,
+                        user=user,
+                        schema=schema,
+                        model_role=model_role,
+                        temperature=temperature,
+                    )
+                except LLMError as exc:
+                    failure = self._note_failure(
+                        info, model_role, client, exc, failures, structured=True
+                    )
+                    if self._advance_after_failure(failure):
+                        continue
+                    break
+                self._note_success(info, model_role, client)
+                return result
         raise LLMError(
             "all free LLM providers failed for structured output: " + "; ".join(failures)
         )
@@ -198,20 +228,25 @@ class MultiProviderClient:
     ) -> tuple[str, Usage]:
         """First healthy provider that can answer plain text for ``model_role``."""
         failures: list[str] = []
-        for info, _spec, client in self._ordered(model_role):
-            try:
-                result = client.text(
-                    system=system,
-                    user=user,
-                    model_role=model_role,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-            except LLMError as exc:
-                self._note_failure(info, model_role, client, exc, failures, structured=False)
-                continue
-            self._note_success(info, model_role, client)
-            return result
+        for group in self._groups(model_role):
+            for info, _spec, client in group:
+                try:
+                    result = client.text(
+                        system=system,
+                        user=user,
+                        model_role=model_role,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                except LLMError as exc:
+                    failure = self._note_failure(
+                        info, model_role, client, exc, failures, structured=False
+                    )
+                    if self._advance_after_failure(failure):
+                        continue
+                    break
+                self._note_success(info, model_role, client)
+                return result
         raise LLMError("all free LLM providers failed: " + "; ".join(failures))
 
     def close(self) -> None:
@@ -230,6 +265,46 @@ class MultiProviderClient:
             key=lambda item: (item[0].name, item[0].slot, role),
         )
 
+    def _groups(self, role: str) -> list[list[Candidate]]:
+        """Candidates grouped per provider, slots in slot order (B8 walk).
+
+        Provider order comes from the flat health order (first appearance of
+        any of the provider's slots); within a group slots ascend, so the
+        walk visits key slot 1, 2, ... in order.  The provider-wide slot-0
+        entry never appears here: it is health state, not a callable
+        candidate.  Every candidate appears exactly once, so the walk stays
+        bounded by the candidate count.
+        """
+        groups: dict[str, list[Candidate]] = {}
+        for candidate in self._ordered(role):
+            groups.setdefault(candidate[0].name, []).append(candidate)
+        for members in groups.values():
+            members.sort(key=lambda item: item[0].slot)
+        return list(groups.values())
+
+    def _advance_after_failure(self, failure: LLMCallFailure) -> bool:
+        """B8: whether the walk may try this provider's *next key slot*.
+
+        ``True`` = advance within the provider group; ``False`` = leave the
+        group and move on to the next provider.  Model-scoped failures were
+        already recorded provider-wide on slot 0 by :meth:`_note_failure`.
+        """
+        if failure.category in MODEL_SCOPED_CATEGORIES:
+            return False  # a different key cannot fix a model/request problem
+        if failure.category is FailureCategory.MALFORMED_REQUEST:
+            return False  # a different key cannot fix a rejected payload
+        if failure.category is FailureCategory.RATE_LIMIT:
+            if self._rotate_on_rate_limit:
+                self._logger.warning(
+                    "%s rate limited; rotating to the next key slot", failure.provider
+                )
+                return True
+            self._logger.warning(
+                "%s rate limited; not rotating key, trying next provider", failure.provider
+            )
+            return False
+        return failure.category in ROTATION_CATEGORIES
+
     def _label(self, info: ProviderInfo, role: str) -> str:
         cooling = self._health.is_cooling(info.name, role, info.slot)
         return f"{info.name} ({'cooldown' if cooling else 'ready'})"
@@ -243,8 +318,14 @@ class MultiProviderClient:
         failures: list[str],
         *,
         structured: bool,
-    ) -> None:
-        """Record the failure, apply its cooldown, and queue a safe reason."""
+    ) -> LLMCallFailure:
+        """Record the failure, apply its cooldown, and queue a safe reason.
+
+        Model-scoped categories are re-attributed to the provider-wide
+        pseudo-slot 0 before recording, so one probe cools every key slot of
+        that provider for this role instead of burning each key in turn.
+        Returns the recorded failure so the walk can apply the B8 rule.
+        """
         meta = getattr(client, "last_call", None)
         model = _role_model(client, role)
         failure = failure_from_exception(
@@ -255,6 +336,8 @@ class MultiProviderClient:
             slot=info.slot,
             latency_ms=meta.latency_ms if isinstance(meta, CallMeta) else 0,
         )
+        if failure.category in MODEL_SCOPED_CATEGORIES:
+            failure = replace(failure, slot=0)
         applied = self._health.record_failure(failure)
         self._last_call = CallMeta(
             provider=info.name,
@@ -282,6 +365,7 @@ class MultiProviderClient:
                 failure.category.value,
                 applied,
             )
+        return failure
 
     def _note_success(self, info: ProviderInfo, role: str, client: Any) -> None:
         """Clear the cooldown and publish who answered, for the voice reporter."""

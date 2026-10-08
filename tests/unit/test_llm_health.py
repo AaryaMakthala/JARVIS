@@ -184,6 +184,55 @@ class TestSlotGranularity:
         for needle in ("_api_key", "gsk", "secret", "test/model"):
             assert needle not in summary
 
+    def test_expired_cooldown_is_a_fresh_probe_for_slot_and_slot_zero(self) -> None:
+        """Both a per-slot and a provider-wide cooldown must lift by time alone."""
+        clock = _Clock()
+        health = ProviderHealth(clock)
+        health.record_failure(_failure(FailureCategory.RATE_LIMIT, provider="Groq", slot=1))
+        health.record_failure(
+            LLMCallFailure(
+                provider="Groq",
+                model="test/model",
+                role="fast",
+                slot=0,
+                category=FailureCategory.UNSUPPORTED_MODEL,
+            )
+        )
+        items = [("Groq", 1, "fast"), ("Groq", 2, "fast"), ("NVIDIA", 1, "fast")]
+        # Slot 0 cools every real slot of that provider for the role...
+        assert health.is_cooling("Groq", "fast", slot=1) is True
+        assert health.is_cooling("Groq", "fast", slot=2) is True
+        # ...and cooling entries sink without ever being dropped.
+        assert health.order(items, key=lambda item: item) == [
+            ("NVIDIA", 1, "fast"),
+            ("Groq", 2, "fast"),
+            ("Groq", 1, "fast"),
+        ]
+        # After the longer (slot 0) cooldown both slots are fresh probes.
+        clock.advance(cooldown_seconds(FailureCategory.UNSUPPORTED_MODEL) + 1.0)
+        assert health.is_cooling("Groq", "fast", slot=1) is False
+        assert health.is_cooling("Groq", "fast", slot=2) is False
+        assert health.order(items, key=lambda item: item) == items
+
+    def test_slot_zero_snapshot_is_provider_level_not_a_key(self) -> None:
+        clock = _Clock()
+        health = ProviderHealth(clock)
+        health.record_failure(
+            LLMCallFailure(
+                provider="groq",
+                model="test/model",
+                role="planner",
+                slot=0,
+                category=FailureCategory.UNSUPPORTED_CAPABILITY,
+            )
+        )
+        rows = health.snapshot()
+        assert len(rows) == 1
+        assert rows[0]["slot"] == "provider"
+        assert rows[0]["provider"] == "groq"
+        assert rows[0]["role"] == "planner"
+        assert rows[0]["last_category"] == FailureCategory.UNSUPPORTED_CAPABILITY.value
+
 
 class TestOrdering:
     def test_healthy_order_is_untouched(self) -> None:
