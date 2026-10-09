@@ -3949,6 +3949,7 @@ pytest per sub-step, no full-suite runs, no push, free-only gate untouched.
 | 7 | `21c0375` | speech-aware brain prompt (D2): `VOICE_SOURCE_LINE` appended to the user prompt only when `state["source"] == "voice"` |
 | 8 | `8ac71a9` | completeness check (D2): four-outcome prompt rules, transient `BrainDecision.assumption`/`missing`, `clarification_count` in the user prompt, 2-round cap with a stop that names missing items, assumption carried on `Plan.assumption` and spoken by `respond` |
 | 9 | `0494837` | voice retry budget: optional per-call `max_retries`/`timeout_s` on `structured`/`text` (protocol, Groq, OpenAI-compat, Gemini, Multi, FakeLLM), brain + replan pass `max_retries=0` and `timeout_s=min(configured, 10.0)` only on `source == "voice"`, terminal/benchmark None (`0494837`) |
+| 10 | `1e2beef` | one-shot slow-response notice: `voice/slow_notice.maybe_speak` (exact phrase "This is taking a moment", default 4 s threshold, once per task), suppressed while a confirmation/clarification owns the mic (`slot.confirm_payload`, `"type"` discriminator), slot done, or voice stopping; single call-in at the `_voice_submit` wait loop; public `VoiceService.tts` accessor |
 
 Decisions logged:
 - `keys status` line format is per-slot: `groq slot 1: configured` … `tavily slot 3: not configured`
@@ -4012,6 +4013,20 @@ Decisions logged:
   untouched). MultiProviderClient forwards the two kwargs to the wrapped client. FakeLLM and the
   one explicit-signature test fake (`_RecorderLLM` in `test_brain_prompt.py`) accept them; all other
   fakes already take `**kwargs`. No new serde type; `describe_image` is out of scope for the budget.
+- **Voice slow-response notice (sub-step 10):** new pure module `voice/slow_notice.py` -
+  `maybe_speak(tts, started, threshold=SLOW_THRESHOLD_S, *, confirmation_owns_mic,
+  clarification_owns_mic, done, stopping, already_spoken, clock) -> bool`, exact phrase
+  "This is taking a moment", default threshold 4.0 s, one-shot per task via the caller feeding the
+  return value back as `already_spoken`. Suppression mirrors the existing mic-ownership signal
+  `slot.confirm_payload` (a clarification is distinguished by `payload["type"] == "clarification"`
+  exactly as the dispatch already does at `server.py` ~:808; plan_approval/confirm interrupts
+  otherwise count as a confirmation owning the mic), plus `slot.done` and `self._voice_stopping`.
+  The daemon adds a **single** call-in in the `_voice_submit` wait loop (after the stopping
+  early-return, before the stop-watch) and reaches the engine through a new public
+  `VoiceService.tts` property; `server.py` only forwards slot state, all decisions live in the
+  module. No changes to `voice/loop.py`, to the sub-step 9 retry budget, or to the free-only gate.
+  Deterministic: injectable `clock`, tests use a fake TTS + fake clock only (`tests/unit/test_slow_notice.py`,
+  11 tests: threshold, exact phrase, custom threshold, one-shot, all four suppressions, None-tts, accessor).
 
 ### Stage 10 known-red list - addition this session
 
