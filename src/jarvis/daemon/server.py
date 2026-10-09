@@ -59,6 +59,7 @@ from jarvis.policy.refusal import REASON_MISMATCH, REASON_TIER2_VOICE_DISABLED, 
 from jarvis.policy.unlock import UnlockManager
 from jarvis.secrets import SecretStore
 from jarvis.tools.base import Cancelled, CancelToken
+from jarvis.voice.slow_notice import maybe_speak
 from jarvis.voice.tier2_voice import KEY_VOICE_TIER2, flag_on
 from jarvis.voice.tier2_voice import allowed as tier2_allowed
 
@@ -1102,6 +1103,8 @@ class DaemonServer:
         started = time.monotonic()
         deadline = started + VOICE_SUBMIT_TIMEOUT_S
         waited = 0.0
+        voice_tts = self._voice_service.tts if self._voice_service is not None else None
+        notice_spoken = False
         while not slot.done:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1123,6 +1126,21 @@ class DaemonServer:
                 )
                 self._cancel_voice_task(slot)
                 return _VoiceOutcome(cancelled=True)
+            confirm_payload = slot.confirm_payload
+            clarifying = bool(confirm_payload and confirm_payload.get("type") == "clarification")
+            # One-shot slow-response notice: speak "This is taking a moment"
+            # once the task has run past the threshold, unless a confirmation
+            # or clarification owns the microphone, the slot is done, or the
+            # pipeline is stopping (all decided inside the module).
+            notice_spoken = maybe_speak(
+                voice_tts,
+                started,
+                confirmation_owns_mic=bool(confirm_payload and not clarifying),
+                clarification_owns_mic=clarifying,
+                done=slot.done,
+                stopping=self._voice_stopping.is_set(),
+                already_spoken=notice_spoken,
+            )
             watched, stop_requested = self._watch_for_stop(
                 slot, min(_VOICE_POLL_INTERVAL_S, remaining)
             )

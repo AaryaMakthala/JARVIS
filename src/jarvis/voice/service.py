@@ -283,6 +283,16 @@ class VoiceService:
         with self._lock:
             return self._loop
 
+    @property
+    def tts(self) -> TextToSpeech | None:
+        """The TTS engine backing the pipeline (None before a start).
+
+        Used by the daemon to speak progress notices while a voice task is
+        running (see :func:`jarvis.voice.slow_notice.maybe_speak`).
+        """
+        with self._lock:
+            return self._tts
+
     # ── internals ──────────────────────────────────────────────────────
 
     def _missing_component_code(self) -> str | None:
