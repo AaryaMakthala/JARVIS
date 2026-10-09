@@ -127,4 +127,5 @@ All ten accepted as recommended.
 - [x] Stage 0 includes `jarvis benchmark run` import check
 - [x] Stage 4 includes local fast path
 - [ ] Stage 5a done
+- [ ] Stage 7 includes re-observe and re-plan scope rules
 - [ ] Stage 10 includes 5b decision (do it or drop it)

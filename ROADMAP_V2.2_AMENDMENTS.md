@@ -55,7 +55,7 @@ Popup that says "click Allow"; stale confirmation after a re-plan; clarification
 
 ## Tracker additions (v2.1 section H)
 
-- [ ] Stage 5a includes completeness check
+- [x] Stage 5a includes completeness check
 - [ ] Stage 7 includes re-observe and re-plan scope rules
 
 ## Not doing (and why)

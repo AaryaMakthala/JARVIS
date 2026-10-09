@@ -4068,3 +4068,57 @@ Decisions logged:
   voice user approves an action without hearing the stated assumption; `respond` is the only reader
   today. If we want the assumption in the readback, Stage 9 must add it to the announcement payload
   (a new allowlisted field is not required - the assumption already rides on `Plan`).
+
+### Sub-step 11 — wrap-up (2026-10-09): Stage 5a status and remaining live checks
+
+**Scope:** documentation + tracker reconciliation + status only; no code changed (last code commit
+`1e2beef`).
+
+- **Stage 5a spans** the ROADMAP_V2 "Stage 5" LLM-layer work except the 5b orchestrator (B3; the
+  Stage 10 tracker item "5b decision" is untouched) and except "speak 'This is taking a moment'"
+  which **is** delivered (sub-step 10, `1e2beef`). Commits: code `6834238` `6518e9f` `034d37e`
+  `003706b` `e0672b1` `e5891d9` `4fbc592` `21c0375` `22360aa` `0494837` `1e2beef`; docs `76c4fb8`
+  `4a34174` `8ac71a9` `aa7b347` `782512a`. Working tree clean.
+- **Checks this session:** `mypy src/jarvis/policy` -> **Success: no issues found in 7 source
+  files**; `ruff check` on the sub-step 10 Python files (`slow_notice.py`, `server.py`,
+  `service.py`, `test_slow_notice.py`) -> **All checks passed!**; `pytest tests/unit/test_slow_notice.py`
+  -> **11 passed**. Focused sets already green per sub-step (e.g. `test_completeness.py`
+  `test_brain_prompt.py` `test_replan.py` sub-steps 8-9; 11 passed sub-step 10).
+- **Tracker changes:** ROADMAP_V2.2 §H `Stage 5a includes completeness check` ticked (implemented
+  `8ac71a9`, focused-verified `test_completeness.py`); ROADMAP_V2.1 §H gained `Stage 7 includes
+  re-observe and re-plan scope rules` (**unchecked** - Stage 7 not started). `Stage 5a done`
+  (v2.1 §H) is **deliberately unticked**: code-complete is not live-validated.
+
+**Status: implemented + focused-test verified; NOT live-validated. Do not equate the two.**
+
+| Work (sub-step) | Implemented + focused tests | Live evidence |
+|---|---|---|
+| Key slots, per-slot clients, per-key health/rotation (1-3b) | yes | failover unproven |
+| `jarvis keys set/paste/clear/status --slot N` (4) | yes (`test_keys_cli.py`) | not run on a live keyring |
+| doctor rows: key-slot presence / `llm_health` / dynamic vision (5) | yes | daemon off/on output not produced |
+| Gemini `describe_image` + vision registry (6) | yes | never called live (no vision entry registered; doctor row WARNs by design until Stage 6) |
+| Speech-aware brain prompt (7) | yes | - |
+| Completeness check (8): four outcomes, `assumption`/`missing`, 2-round cap | yes (`test_completeness.py`, `test_brain_prompt.py`) | chat/voice smoke pending |
+| Voice retry budget for `source=="voice"` (9) | yes (`test_replan.py`, `test_llm_*`) | 429 live behavior unproven |
+| One-shot slow notice (10) | yes (`test_slow_notice.py`, 11) | >4 s smoke pending |
+
+**Remaining live checks for the owner (not run by the agent; any evidence captured in `jarvis.jsonl`):**
+
+1. **Doctor off/on.** `jarvis doctor` with the daemon stopped -> exit 0, key-slot presence rows
+   (WARN for unconfigured backups); then `jarvis daemon --foreground` + `jarvis doctor --live` ->
+   reachable health rows per `(provider, slot, role)`; vision row WARN (expected until Stage 6).
+2. **Backup-key failover** (ROADMAP_V2 Stage 5 live test): remove/disable one slot's key -> the
+   next provider/slot answers; ask a two-part question and check `jarvis.jsonl` shows both parts on
+   different models (provider/model markers).
+3. **429 non-rotation behavior:** trigger/observe a 429 on a voice task -> short voice budget
+   (`max_retries=0`, `timeout_s` capped at 10 s) falls straight through the B8 walk to the next
+   provider/slot with **no key rotation** (`rotate_on_rate_limit` default false). Check the daemon log.
+4. **Completeness smoke, chat then voice:** a fully-specified request is never over-asked; an
+   ambiguous one gets at most 2 clarification rounds then the stop that names the missing items;
+   "search for internships" with no location proceeds and states the assumption; the final answer
+   leads with `Assumption: ...`.
+5. **Voice latency intent (8/9):** a normal quick voice task finishes on the short budget and does
+   not fire the slow notice.
+6. **Sub-step 10 notice smoke:** give voice a task that takes **> 4 s** -> hear
+   "This is taking a moment" **exactly once**; never while a confirmation/clarification owns the
+   mic; never while stopping.
