@@ -2,7 +2,7 @@
 
  > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
-## STAGE 6: Screen reading and description — IMPLEMENTED, focused tests green (2026-10-11)
+## STAGE 6: Screen reading and description — IMPLEMENTED, focused tests green, live acceptance passed (2026-10-11)
 
 **Scope (this session):** implement Stage 6 only. UIA-first local read of the foreground
 window; OCR is an optional local fallback; cloud vision is a disabled-by-default opt-in. No
@@ -44,24 +44,33 @@ policy weakening, no Stage 7 work, no live capture/cloud calls run in tests.
 
 ### Live verification (2026-10-11)
 
-- Live smoke test PASSED: the command above ran against the real desktop; it identified the
-  foreground application (Notepad, then Calculator) and returned its visible UIA text. The
-  daemon was stopped cleanly afterwards (`jarvis stop`).
+- Live foreground screen-reading PASSED on Notepad, Calculator, and the Windows desktop: the
+  command above identified each foreground application and returned its visible UIA text.
+- The Hindu live test: JARVIS identified the publication and extracted the visible article
+  headline. Full article-body summarization was NOT validated and is not claimed.
+- Sensitive-title denylist PASSED live: a separate Windows PowerShell window titled
+  `MyBank-reminder window` was in focus; after the Tier 1 action was approved, JARVIS refused
+  to read the window and returned no window contents. (Process-name denylist remains covered
+  by unit tests; it cannot be faked live without renaming an EXE.)
+- Daemon shutdown verified (`jarvis stop`; daemon no longer running).
+- Cloud vision remains disabled by default (`screen.allow_cloud_vision = false`); existing
+  tests/invariants cover disabled-by-default behavior, no live cloud screenshot was sent or
+  required.
 - **OCR fallback accuracy is NOT validated**: the optional `[vision]` dependency is NOT
   installed (`rapidocr_onnxruntime` / `rapidocr` absent, `mss` absent, `Pillow` present).
-  The live read therefore ran UIA-only; when no text is found the tools report "Local OCR is
+  The live reads therefore ran UIA-only; when no text is found the tools report "Local OCR is
   not installed".
-- Cloud vision was NOT tested live and must remain disabled by default
-  (`screen.allow_cloud_vision = false`).
-- Remaining live acceptance checks are still pending: denylist refusal of a sensitive window,
-  and confirming cloud vision stays unused (no screenshot sent) while disabled.
+- Known issues (separate from the passes above): a CLI attempt reported
+  `tool 'summarize_output' is not available` (planner referenced an unregistered tool; the
+  policy engine rightly rejected it - "unknown tool = rejected" - investigate if it recurs),
+  and one confirmation attempt timed out. Neither attempt was a successful screen summary.
 - Browser-domain privacy enforcement deferred to Stage 7 (per decision).
 
 ### Next
 
-- Owner: remaining live checks — open a sensitive/denylisted app and confirm `read_screen`
-  refuses before capture; confirm `describe_screen` sends nothing to the cloud while disabled.
-  Optionally `pip install -e ".[vision]"` to enable local OCR and validate OCR accuracy.
+- Optionally `pip install -e ".[vision]"` to enable local OCR and validate OCR accuracy
+  (not required for Stage 6 acceptance).
+- Watch for recurrence of the `summarize_output` planner slip and the confirmation timeout.
 
 ## STAGE 3: Tier 2 by voice, plan-level Tier 1, redaction, announcements (2026-10-05)
 
