@@ -177,6 +177,26 @@ max_preferences = 50
 
 [tools]
 max_code_chars = 4000
+
+[screen]
+# Stage 6 read-only screen understanding.  Default target is the FOREGROUND
+# window only (D16); `list_windows` already covers "what is open".
+#
+# Cloud vision is OFF.  A screenshot is sent to a vision model only when the
+# owner sets allow_cloud_vision = true AND every other privacy layer passes
+# (D15/I11): a spoken notice alone is never consent, no screenshot is ever
+# written to disk or logged, and local UIA/OCR text is always tried first.
+allow_cloud_vision = false
+# Refuse to capture when the foreground window's process name matches any of
+# these case-insensitive fragments (password managers, banking helpers).  This
+# is layer 1 of the privacy model (B5); extend it for your own sensitive apps.
+deny_processes = ["keepass", "1password", "bitwarden", "lastpass", "dashlane", "keeper", "nordpass", "enpass", "protonpass"]
+# Refuse to capture when the window TITLE contains any of these fragments.
+deny_title_fragments = ["password", "bank", "authenticator", "1password", "bitwarden", "lastpass", "keepass"]
+# Cap on redacted text kept from a single capture (characters).
+max_text_chars = 6000
+# Cap on UI Automation elements walked per capture (bounds cost on huge windows).
+max_ui_elements = 400
 """
 
 
@@ -507,6 +527,51 @@ class ToolsSettings(BaseModel):
     max_code_chars: int = 4000
 
 
+class ScreenSettings(BaseModel):
+    """Screen-perception settings (``[screen]`` in config.toml, Stage 6).
+
+    Implements the layered privacy model of **B5** and the opt-in cloud rule of
+    **D15/I11**:
+
+    * ``deny_processes`` / ``deny_title_fragments`` are the first layer - a
+      match refuses the capture outright (fail closed), before any pixels are
+      read.  They are case-insensitive substring tests and deliberately broad.
+    * UIA secure/password controls are never read (layer 2, in
+      :mod:`jarvis.perception.ui_text`); extracted text is passed through
+      :func:`jarvis.logging_setup.redact` (layer 3).
+    * ``allow_cloud_vision`` is the last layer and defaults to ``False``: a
+      screenshot is sent to a vision model only when this is true *and* the
+      other layers pass.  A spoken notice is never treated as consent.
+
+    ``max_text_chars`` / ``max_ui_elements`` bound the cost and the size of a
+    capture so a huge window cannot stall JARVIS or flood the answer.
+    """
+
+    allow_cloud_vision: bool = False
+    deny_processes: list[str] = [
+        "keepass",
+        "1password",
+        "bitwarden",
+        "lastpass",
+        "dashlane",
+        "keeper",
+        "nordpass",
+        "enpass",
+        "protonpass",
+    ]
+    deny_title_fragments: list[str] = [
+        "password",
+        "bank",
+        "authenticator",
+        "1password",
+        "bitwarden",
+        "lastpass",
+        "keepass",
+    ]
+    max_text_chars: int = 6000
+    max_ui_elements: int = 400
+
+
 class Settings(BaseSettings):
     """Top-level application settings.
 
@@ -533,6 +598,7 @@ class Settings(BaseSettings):
     memory: MemorySettings = MemorySettings()
     risk: RiskSettings = RiskSettings()
     tools: ToolsSettings = ToolsSettings()
+    screen: ScreenSettings = ScreenSettings()
     config_version: int = 1
 
     @classmethod

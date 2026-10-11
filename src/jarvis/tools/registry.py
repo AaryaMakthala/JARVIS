@@ -135,6 +135,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     )
     from jarvis.tools.keyboard import make_type_text_spec
     from jarvis.tools.open_in_app import make_open_in_app_spec
+    from jarvis.tools.screen import make_describe_screen_spec, make_read_screen_spec
     from jarvis.tools.system import (
         make_lock_computer_spec,
         make_lock_jarvis_spec,
@@ -153,6 +154,8 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_system_info_spec(),
         make_get_time_spec(),
         make_list_windows_spec(),
+        make_read_screen_spec(),
+        make_describe_screen_spec(),
         make_lock_jarvis_spec(),
         make_lock_computer_spec(),
         make_audit_run_spec(),

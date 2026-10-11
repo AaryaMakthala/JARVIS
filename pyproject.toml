@@ -43,6 +43,7 @@ gemini = ["langchain-google-genai"]
 voice = ["sounddevice", "openwakeword", "faster-whisper", "piper-tts", "pyttsx3"]
 browser = ["playwright"]
 ml = ["onnxruntime", "tokenizers", "optimum"]
+vision = ["mss", "Pillow", "rapidocr-onnxruntime"]
 dev = ["pytest", "pytest-asyncio", "pytest-cov", "hypothesis", "ruff", "mypy", "types-PyYAML"]
 
 [project.scripts]

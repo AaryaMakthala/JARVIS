@@ -86,7 +86,14 @@ PACKAGES: list[tuple[str, str, int, bool]] = [
     ("openwakeword", "openwakeword", 5, False),
     ("piper-tts", "piper", 5, False),
     ("pyttsx3", "pyttsx3", 5, False),
-    ("playwright", "playwright", 6, False),
+    # Stage 6 screen perception (optional [vision] extra): in-memory capture and
+    # local OCR.  Missing is WARN - the tools then keep UIA text and report that
+    # local OCR is unavailable (never a cloud OCR fallback).
+    ("mss", "mss", 6, False),
+    ("Pillow", "PIL", 6, False),
+    ("rapidocr-onnxruntime", "rapidocr_onnxruntime", 6, False),
+    # Stage 7 owns the browser (Playwright); it is not needed for Stage 6.
+    ("playwright", "playwright", 7, False),
     ("fastembed", "fastembed", 8, False),
     ("tokenizers", "tokenizers", 8, False),
     ("pytest", "pytest", 0, False),
@@ -95,7 +102,17 @@ PACKAGES: list[tuple[str, str, int, bool]] = [
     ("mypy", "mypy", 0, False),
 ]
 # Optional packages: missing is WARN, not FAIL (they have documented fallbacks)
-OPTIONAL = {"piper-tts", "pyttsx3", "playwright", "pyautogui", "tokenizers", "fastembed"}
+OPTIONAL = {
+    "piper-tts",
+    "pyttsx3",
+    "playwright",
+    "pyautogui",
+    "tokenizers",
+    "fastembed",
+    "mss",
+    "Pillow",
+    "rapidocr-onnxruntime",
+}
 
 
 def check_python() -> None:

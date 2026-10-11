@@ -2,6 +2,67 @@
 
  > Maintained by the coding agent. Update at the END of every session. Keep it short and factual.
 
+## STAGE 6: Screen reading and description — IMPLEMENTED, focused tests green (2026-10-11)
+
+**Scope (this session):** implement Stage 6 only. UIA-first local read of the foreground
+window; OCR is an optional local fallback; cloud vision is a disabled-by-default opt-in. No
+policy weakening, no Stage 7 work, no live capture/cloud calls run in tests.
+
+### Built
+
+- `src/jarvis/perception/` (new): `screen.py` (`ForegroundWindow`, `foreground_window()`,
+  `capture_foreground()` in-memory mss+Pillow, never persisted), `ui_text.py`
+  (`foreground_uia_text()` — visible + non-secure controls only, bounded by 400 elements /
+  6000 chars, deduped, never raises), `ocr.py` (lazy RapidOCR singleton, `ocr_available()`).
+- `src/jarvis/tools/screen.py` (new): `read_screen` (Tier 0, `TIER_SAFE`) and
+  `describe_screen` (Tier 1, `TIER_CONFIRM`). Both `windows_only`, `tainted=True`, override
+  args (`extra="forbid"`). Order: UIA → optional OCR → optional cloud vision (only when
+  `screen.allow_cloud_vision=true`), then `redact()` then truncate. Capture failure degrades
+  to UIA-only; denied process/title → refusal.
+- `src/jarvis/config.py`: `ScreenSettings` (`allow_cloud_vision=False`, `deny_processes`,
+  `deny_title_fragments`, `max_text_chars=6000`, `max_ui_elements=400`) + `[screen]` block.
+  Free-only LLM gate untouched.
+- `src/jarvis/tools/registry.py`: registers both specs.
+- `pyproject.toml`: `[vision]` optional extra (`mss`, `Pillow`, `rapidocr-onnxruntime`).
+- `scripts/verify_env.py`: adds the three optional packages to phase 6; `playwright` moved to
+  phase 7.
+- `tests/unit/test_tools_screen.py` (new): UIA/OCR/cloud/denylist/redaction/truncation/dry-run,
+  spec, platform gate, registration.
+- `tests/unit/test_invariants.py`: new I1 (screen text = data, never instruction) and I11
+  (screenshots/cloud never leave the PC by default).
+
+### Verified
+
+| Command | Result |
+|---|---|
+| ruff check (changed files) | PASS |
+| ruff format --check (changed files) | PASS (10 files) |
+| mypy src/jarvis/policy | PASS |
+| pytest test_tools_screen.py test_invariants.py | PASS |
+| pytest config/risk_classifier/windows_only_enforcement/audit/type_text/list_windows | PASS |
+| live manual smoke: `jarvis run "Read the current screen and summarize the visible text."` — foreground app identified + visible text returned (Notepad, then Calculator) | PASS |
+
+### Live verification (2026-10-11)
+
+- Live smoke test PASSED: the command above ran against the real desktop; it identified the
+  foreground application (Notepad, then Calculator) and returned its visible UIA text. The
+  daemon was stopped cleanly afterwards (`jarvis stop`).
+- **OCR fallback accuracy is NOT validated**: the optional `[vision]` dependency is NOT
+  installed (`rapidocr_onnxruntime` / `rapidocr` absent, `mss` absent, `Pillow` present).
+  The live read therefore ran UIA-only; when no text is found the tools report "Local OCR is
+  not installed".
+- Cloud vision was NOT tested live and must remain disabled by default
+  (`screen.allow_cloud_vision = false`).
+- Remaining live acceptance checks are still pending: denylist refusal of a sensitive window,
+  and confirming cloud vision stays unused (no screenshot sent) while disabled.
+- Browser-domain privacy enforcement deferred to Stage 7 (per decision).
+
+### Next
+
+- Owner: remaining live checks — open a sensitive/denylisted app and confirm `read_screen`
+  refuses before capture; confirm `describe_screen` sends nothing to the cloud while disabled.
+  Optionally `pip install -e ".[vision]"` to enable local OCR and validate OCR accuracy.
+
 ## STAGE 3: Tier 2 by voice, plan-level Tier 1, redaction, announcements (2026-10-05)
 
 **Scope (this session):** do not build features. Delivered Stage 3 wrap-up artifacts (doc edits), confirmed targeted unit tests for voice Tier 2. test_voice_loop.py was not run by design. Live voice behaviour not exercised.

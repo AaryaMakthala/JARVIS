@@ -349,7 +349,7 @@ Live test: the common commands feel instant; errors are spoken clearly.
 - [x] Stage 3: Plan announce, "proceed", plan-level approval, Tier 2 by voice (opt-in) (merged 148c2fb; spoken B5/B6 deferred to the voice step)
 - [x] Stage 4: Time, apps scan, list windows, open_in_app, Notepad, small VS Code code (4.9 deferred; accepted 2026-10-08, deferred checks listed in PROGRESS.md)
 - [ ] Stage 5: Key pools, orchestrator, speech-aware brain, vision capability (5a done 2026-10-11 — see ROADMAP_V2.1 §H / PROGRESS.md; 5b orchestrator optional, not started)
-- [ ] Stage 6: Screen reading and description
+- [ ] Stage 6: Screen reading and description (2026-10-11 — UIA-first read_screen/describe_screen, cloud vision OFF by default, OCR dep NOT installed; focused tests green, live smoke test PASSED on Notepad/Calculator, remaining acceptance checks + OCR accuracy pending — see PROGRESS.md)
 - [ ] Stage 7: Browser DOM + UIA clicking, Spotify
 - [ ] Stage 8: Camera, viewer, delete, WhatsApp photo
 - [ ] Stage 9: UX polish and local fast path
