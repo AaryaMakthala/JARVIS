@@ -24,6 +24,7 @@ import signal
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from typing import Any
 import psutil
 
 from jarvis import logging_setup
+from jarvis.browser.context import BrowserError, PlaywrightBrowser
 from jarvis.config import Settings, daemon_runtime_file, load_settings, log_file
 from jarvis.daemon.confirmations import ConfirmationRegistry, plan_hash
 from jarvis.daemon.protocol import (
@@ -233,6 +235,54 @@ class _VoiceOutcome:
     cancelled: bool = False
 
 
+# ── Managed-browser lifecycle ────────────────────────────────────────────
+
+
+class _LazyBrowserSession:
+    """Delegates the :class:`BrowserSession` contract to a lazily-started browser.
+
+    The daemon hands this adapter to the shared ``AppContext`` via ``browser=``
+    (``_build_default_context``), keeping the *start* on the call that first
+    needs a page.  Merely importing the daemon, building the context,
+    health-checking or running non-browser tasks never launches Chrome.  This
+    is a lifecycle adapter over the one browser implementation
+    (:class:`PlaywrightBrowser`), never a second browser engine: delegation is
+    one hop, and every call goes through the same started session the daemon
+    owns.  A browser that cannot start fails every interaction closed (a
+    :class:`BrowserError` the browser tools wrap into a refused ``ToolResult``)
+    and leaves every other daemon operation untouched.
+    """
+
+    def __init__(self, acquire: Callable[[], Any | None]) -> None:
+        self._acquire = acquire
+
+    def _session(self) -> Any:
+        session = self._acquire()
+        if session is None:
+            raise BrowserError("the managed browser is not available in this context")
+        return session
+
+    def goto(self, url: str) -> dict[str, Any]:
+        return self._session().goto(url)
+
+    def read(self, max_elements: int = 80) -> Any:
+        return self._session().read(max_elements)
+
+    def resolve(self, ref: str) -> Any | None:
+        return self._session().resolve(ref)
+
+    def click(self, ref: str) -> dict[str, Any]:
+        return self._session().click(ref)
+
+    def type_text(self, ref: str, text: str) -> dict[str, Any]:
+        return self._session().type_text(ref, text)
+
+    def close(self) -> None:
+        session = self._acquire()
+        if session is not None:
+            session.close()
+
+
 # ── Server ───────────────────────────────────────────────────────────────
 
 
@@ -292,6 +342,12 @@ class DaemonServer:
         self._voice_service: Any = None  # VoiceService | None
         self._memory: Any = None  # SqliteMemory | None (Phase 8, opened lazily)
         self._app_registry: Any = None  # ToolRegistry | None (built with the context)
+        #: The managed browser session (Stage 7, Slice 10).  Started lazily on
+        #: the first call that needs a page, shared by every task, closed once
+        #: at shutdown.  ``None`` until started; ``_browser_lock`` guards the
+        #: start path.  The session object never enters agent/graph state.
+        self._browser: Any | None = None
+        self._browser_lock = threading.Lock()
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -323,6 +379,7 @@ class DaemonServer:
             raise
         finally:
             self._close_memory()
+            self._close_browser()
             self._cleanup_pid_file()
         logger.info("daemon: stopped cleanly")
 
@@ -556,6 +613,7 @@ class DaemonServer:
             unlock=self._unlock,
             classifier=build_classifier(self._settings, self._registry(), logger=logger),
             voice=VoiceToolsFacade(service=self._voice_service),
+            browser=_LazyBrowserSession(self._browser_start),
         )
 
     def _registry(self) -> Any:
@@ -599,6 +657,44 @@ class DaemonServer:
                 close()
         except Exception:
             logger.debug("closing the memory store failed", exc_info=True)
+
+    def _browser_start(self) -> Any | None:
+        """Return the started managed-browser session, starting one on first use.
+
+        Lazy and idempotent: the daemon holds at most one ``PlaywrightBrowser``
+        for its whole lifetime, and Chrome is launched only when a browser tool
+        (or its target resolver) first needs a page.  A failed start returns
+        ``None`` (fail closed: every browser tool refuses cleanly) and never
+        raises, so a machine without Playwright/Chrome cannot take down
+        non-browser tasks or the daemon itself.  ``_browser_lock`` keeps the
+        start path single-threaded even though only one worker runs at a time.
+        """
+        with self._browser_lock:
+            if self._browser is None:
+                self._browser = PlaywrightBrowser(settings=self._settings, profile="general")
+            if not getattr(self._browser, "started", False):
+                try:
+                    self._browser.start()
+                except Exception:
+                    logger.warning("managed browser could not start", exc_info=True)
+                    self._browser = None
+                    return None
+            return self._browser
+
+    def _close_browser(self) -> None:
+        """Close the managed browser if one was started (idempotent).
+
+        Called once from :meth:`run`'s ``finally`` on shutdown, after every
+        task is done.  ``self._browser`` is cleared first so a concurrent
+        ``_browser_start`` can never resurrect a closing session.
+        """
+        browser, self._browser = self._browser, None
+        if browser is None:
+            return
+        try:
+            browser.close()
+        except Exception:
+            logger.debug("closing the managed browser failed", exc_info=True)
 
     def _build_voice_service(self) -> Any:
         """Build a VoiceService with lazy-imported backends.
@@ -1541,6 +1637,38 @@ class DaemonServer:
             if slot.owner_id == VOICE_OWNER:
                 slot.event.set()
             logger.error("worker for %s failed: %s", task_id, slot.error)
+        finally:
+            # The task is finished - success, error or cancellation - so its
+            # in-memory transient runtime state (scope grant and target
+            # bindings) must not outlive it: a later task, even one re-asking
+            # the same goal, has to earn a fresh authorization (docs/03 §7).
+            self._end_task_runtime(task_id)
+
+    def _end_task_runtime(self, task_id: str) -> None:
+        """Drop a finished task's scope grant and target bindings.
+
+        Grants live on the shared daemon context's :class:`ScopeRegistry` and
+        one-shot :class:`TargetBindingStore`, both in-memory and keyed by
+        ``task_id``.  Revoking on worker exit means nothing is inherited across
+        tasks and nothing survives a daemon restart (the maps are never
+        checkpointed).  Never raises: cleanup bookkeeping must not surface as a
+        worker failure.
+        """
+        ctx = self._ctx
+        if ctx is None or not task_id:
+            return
+        registry = getattr(ctx, "scope_registry", None)
+        bindings = getattr(ctx, "target_bindings", None)
+        if registry is not None:
+            try:
+                registry.revoke(task_id)
+            except Exception:
+                logger.debug("scope cleanup for %s failed", task_id, exc_info=True)
+        if bindings is not None:
+            try:
+                bindings.clear_task(task_id)
+            except Exception:
+                logger.debug("binding cleanup for %s failed", task_id, exc_info=True)
 
     def _finish_cancelled(self, slot: TaskSlot) -> None:
         """Book-keep a task that stopped at a cancellation boundary.

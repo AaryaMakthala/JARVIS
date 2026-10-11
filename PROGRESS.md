@@ -4475,3 +4475,184 @@ No source code changed in Phases A-C beyond the already-approved slow-notice lat
   natural "proceed + stated assumption" trigger (could not be elicited via search).
 
 No subsequent stage (5b, 6, 7, …) has been started.
+
+*(Superseded — see Stage 7 entries below; Stage 6 and Stage 7 Slices 1–8 are in progress on the
+working tree. This line is retained for history only.)*
+
+## STAGE 7 — SLICE 8: interaction-target resolution + task-scoped domain confirmation (2026-10-11)
+
+**Status: code + tests complete, ruff/pytest green, NOT committed.** Slice 8 wires gate-time target
+resolution, task-scoped browser domain scope confirmation, and risky-target re-confirmation into the
+real `policy_gate` node. The deterministic `PolicyEngine` remains the sole authorization authority;
+no tool/engine invariant was weakened.
+
+Files changed (working tree, uncommitted):
+- `src/jarvis/agent/context.py` — `AppContext.scope_registry` (+ `make_app_context` param).
+- `src/jarvis/agent/nodes/util.py` — `StepTarget`, `resolve_step_target`, `plan_hash_for`,
+  `validated_step_args`.
+- `src/jarvis/agent/nodes/policy_gate.py` — rewritten gate flow (resolve → scope prompt → decide →
+  binding / Option A).
+- `tests/unit/test_scope_gate.py` — new (14 graph-level + resolver tests).
+
+**Gate flow (new):** resolve target (fail-closed refusal if a target-sensitive tool cannot observe
+one) → `engine.decide` → if blocked, structured scope check (hypothetical re-decide with the origin
+host approved) → domain scope interrupt → mint task-scoped `ScopeGrant` → risky controls
+(`CONTROL_FRESH_CONFIRM`), `needs_unlock`, or typed-confirmation still get their own fresh action
+interrupt → record `TargetBinding` + approved hash.
+
+**Key implementation note (LangGraph):** the scope grant is issued only *after* the final interrupt.
+Because LangGraph re-runs the node from the top on every resume, issuing the grant earlier changed
+the node's interrupt sequence and mis-mapped stacked resume values. Issuing last keeps the sequence
+deterministic (scope prompt, then optional risky-action prompt).
+
+**Deviations from the approved design to report:**
+- `_blocked_or_scope` prefers the trial decision's specific reason (payment/password/ambiguous) over
+  the generic scope reason; outcome is still a hard Tier-3 refusal.
+- Voice may approve a Tier-1 domain scope confirmation.
+
+**Focused verification (all green):** `pytest` on `test_scope_gate`, `test_policy_gate_batch`,
+`test_batch_graph`, `test_agent`, `test_scope`, `test_policy_target_context`, `test_browser_tools`;
+`ruff check` + `ruff format --check` clean; `git diff --check` clean. Slice 5–7 files preserved.
+
+**Known boundary (Slice 9):** a batch of static/grant-covered browser steps bypasses per-step target
+checks exactly as pre-Slice 8; target re-observation for batched steps and the atomic action budget
+remain Slice 9 work (`act.py` untouched).
+
+## STAGE 7 -- SLICE 9: act re-validation and atomic action budget (2026-10-11)
+
+**Scope (this session):** connect Slice 8 authorization to the real execution path. act() now
+re-observes the interaction target, proves the gate's one-shot TargetBinding byte-identical
+immediately before dispatch, re-decides with the same enriched PolicyContext (policy/execution
+parity), and reserves the step's cost against the atomic per-task action budget. Managed-browser
+typing bypass closed (type_text vs browser_type). No Slice 10 work.
+
+### Built
+
+- src/jarvis/policy/scope.py: ScopeRegistry.reserve(task_id, *, cost=1, cap=None) -- grant-independent
+  atomic reservation sharing the per-task counter/_task_cap/_lock with consume(); reasons no_task /
+  bad_cost / budget_exhausted; never refunded; module docstring budget-semantics updated.
+- src/jarvis/tools/base.py: ToolSpec.budget_cost: int = 0.
+- src/jarvis/browser/tools.py / src/jarvis/uia/tools.py: budget_cost=1 on browser_goto/click/type and
+  ui_click; observations (browser_read, ui_list_controls) stay 0.
+- src/jarvis/browser/context.py: MANAGED_BROWSER_CHANNEL = "chrome" (wired in launch_persistent_context).
+- src/jarvis/policy/engine.py: PolicyContext.managed_browser_app + hard block of type_text into the
+  managed app (normalized app token equality; reason "typing into the managed browser must use
+  browser_type") -- engine-level, never prompt.
+- src/jarvis/agent/context.py: make_app_context sets managed_browser_app when a browser is wired and
+  defaults ScopeRegistry to settings.browser.task_scope_max_actions.
+- src/jarvis/agent/nodes/util.py: shared active_scope_cid(scope_registry, task_id) used by gate and act.
+- src/jarvis/agent/nodes/policy_gate.py: _active_scope_cid delegates; batch path records one-shot
+  target bindings for every newly-approved target-bearing step (_record_batch_bindings); unresolvable
+  batch targets get no binding and are refused at act (fail closed).
+- src/jarvis/agent/nodes/act.py: full revalidation flow -- exactly-once guard -> spec lookup ->
+  policy_context_for -> plan_hash_for -> resolve_step_target (refuse if unobservable) ->
+  engine.decide(resolved context) -> tier/approval check -> TOCTOU paths -> args validate ->
+  binding consume (target-bearing, non-dry) -> budget reserve (budget_cost>0, non-dry) -> execute.
+
+### Budget semantics (final)
+
+8 configurable (task_scope_max_actions) state-changing actions per task, sub-cap of agent.max_steps.
+Charged atomically immediately before dispatch; never refunded even if dispatch later fails (execution
+may already have begun). Replan preserves the count; new task = fresh budget; daemon restart loses it
+(in-memory, never checkpointed). consume() is never used by act (config-allowed browser steps have no
+grant). A pre-dispatch refusal (missing/mismatched binding, exhaustion) never reaches the charge.
+
+### Decisions to report
+
+- Batch bypass stays as-is; batch bindings are recorded at approval time for target-bearing steps.
+- type_text bypass is an engine hard block driven by PolicyContext.managed_browser_app (set only when
+  a browser session is actually wired).
+- One-shot binding consequences: a consumed binding can never authorize twice; a retry after consumption
+  is refused (fail closed). Verified for browser tools (verify() returns None, so no retry path exists).
+- Scope-grant/binding tests in test_scope_gate.py updated: the one-shot binding is now consumed by act,
+  so post-completion assertions check it is gone.
+
+### Focused verification (all green)
+
+pytest on test_act_target_parity (14 new), test_scope (11 new reserve tests), test_browser_tools,
+test_uia_tools, test_scope_gate (updated), test_act_node, test_batch_graph, test_policy_gate_batch,
+test_policy_target_context, test_agent, test_invariants, test_serializer, test_tool_resolver,
+test_target_binding, test_browser_context. ruff check + ruff format --check clean on Slice-9 files;
+git diff --check shows only CRLF warnings.
+
+### Not committed
+
+Slice 9 production hunks are interleaved with the still-uncommitted Slice 4-8 changes in the same
+tracked files (scope.py, tools/base.py, engine.py, context.py, act.py, policy_gate.py, util.py) and
+depend on untracked browser/ and uia/ modules, so a Slice-9-only commit cannot be constructed. Stopped
+at the commit step per the pre-agreed rule; local-only, nothing pushed. Suggested subject once slices
+are committed together: feat(stage7): revalidate targets and enforce atomic browser budget.
+
+### STAGE 7 -- SLICE 10 (DAEMON INTEGRATION): implemented, deterministic tests green
+
+**Scope resolution (recorded):** no canonical slice list exists anywhere in the repo; the slice
+plan was operational. The canonical roadmap (`ROADMAP_V2.2_AMENDMENTS.md`) orders Stage 7 as
+features -> deterministic required tests, and daemon wiring is an implied prerequisite for any
+Stage 7 tool to be usable through the product, so this daemon slice is the correct next
+dependency. Red-team coverage and the remaining documentation are base-roadmap Stage 10
+(`ROADMAP_V2.md.md`/`ROADMAP_V2.1_AMENDMENTS.md.md`) and are still open - **Stage 7 is NOT
+declared complete.**
+
+### Built
+
+- `src/jarvis/tools/registry.py`: `build_default_registry` now registers the Stage 7 specs
+  (`browser_goto/read/click/type`, `ui_list_controls/ui_click`) with local imports, so the
+  daemon's planner can propose them and the engine can decide on them.
+- `src/jarvis/daemon/server.py`:
+  - `_LazyBrowserSession` (BrowserSession-protocol adapter over one `PlaywrightBrowser`): lazily
+    starts on the first call that needs a page, fails every browser interaction closed with a
+    `BrowserError` when Chrome cannot start, and never launches on imports/health-checks/
+    non-browser tasks.
+  - `DaemonServer._browser_start()` (lock-guarded, one session for the daemon's lifetime, a failed
+    start returns None and logs instead of crashing), `_close_browser()` (idempotent, wired into
+    `run()`'s `finally` after `_close_memory`).
+  - `_end_task_runtime(task_id)` in `_worker_run`'s new `finally`: revokes the task's scope grant
+    (`ScopeRegistry.revoke`) and drops its target bindings (`TargetBindingStore.clear_task`) on
+    success, error or cancellation, so nothing is inherited across tasks.
+  - `_build_default_context()` hands the shared `AppContext` `browser=_LazyBrowserSession(self._browser_start)`
+    (the `VoiceToolsFacade` lazy-service pattern); `managed_browser_app="chrome"` therefore blocks
+    generic `type_text` into the managed browser in the daemon.
+
+### Verified (tests/unit/test_daemon_browser_wiring.py, 14 new deterministic tests)
+
+- Lazy adapter: nothing starts at construction; one acquire per needed call; fail-closed on
+  missing/unstartable sessions; `close()` without a session is a no-op.
+- Daemon lifecycle: browser starts on first need only and is reused; a failed start is idempotent
+  and never crashes the daemon; `_close_browser` is idempotent; a `status` request never starts a
+  browser; `_end_task_runtime` cleans only the finished task.
+- Graph round-trips on the daemon-shaped context: scope grant survives run->confirm->resume and is
+  scoped per task (task2 gets a fresh grant + fresh 8-action budget, task1's untouched); the same
+  session is reused across tasks; grants never mutate static config; act consumes the one-shot
+  binding; the checkpoint carries only declared `AgentState` keys and never the registry/bindings/
+  confirmation id; a conversation task never starts the browser.
+- Client can't inject: `_parse_message` drops unknown `confirm_response` fields
+  (`scope_confirmation_id`, `approved_domains`, `max_actions`, `fingerprint`); `_handle_confirm`
+  builds a resume answer containing only `approved`/`action_hash` (+typed marker) and never creates
+  grant or binding state - grants exist only from the graph gate.
+- Registry: the six specs are present with the expected base tiers/budget costs/windows_only, and
+  the engine never decides below a spec's base tier.
+
+Focused run: 331 passed (Slice 8/9 suites + the new wiring file). ruff check + ruff format --check
+clean on the three changed files; PROGRESS.md working tree re-normalized to LF (HEAD is LF); other
+files are LF in the working tree.
+
+### Fragile / notes
+
+- `_end_task_runtime` keyed on `task_id` only: a task whose id collides in tests must not share a
+  context token; real daemon ids are unique (`t<ms>`).
+- `_LazyBrowserSession` acquires on every method call; reuse semantics live in `_browser_start`
+  (lock + single field), so the adapter stays trivial and correct.
+- The unused `# noqa: BLE001` was removed from the new start-failure handler: BLE001 is not enabled,
+  so the directive was flagged RUF100 (bare `except Exception:` is the daemon's existing convention).
+
+### Not committed
+
+One consolidated commit is now authorized: `feat(stage7): integrate scoped browser and UIA
+execution`. Stage 6 entries above this block are committed; Slice 4-10 changes ride together.
+
+### Next step
+
+Remaining Stage 7 work: full-regime regression + red-team exercise (`docs/07`, Stage 10) and the
+outstanding documentation passes; then the phase-9 acceptance list. Manual smoke test recommended
+on the real PC (hampered offline, so deferred): `jarvis daemon --foreground`, open a page, confirm
+the scope prompt, watch the daemon log for the one-session browser line.

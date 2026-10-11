@@ -18,11 +18,14 @@ Design constraints (owner decisions 1/5/7, docs/03):
 * the consumed-action count is preserved across an in-session replan; a changed
   ``plan_hash`` requires fresh authorization with a **new** ``confirmation_id``.
 
-Budget semantics: an action is charged at :meth:`ScopeRegistry.consume`, the
-commitment point immediately before dispatch.  A pre-dispatch validation that
-fails (stale fingerprint, wrong origin) never reaches ``consume`` and therefore
-does not charge; once an action is charged it is **never refunded**, even if the
-dispatch later fails, because execution may already have begun.
+Budget semantics: an action is charged at the commitment point immediately
+before dispatch - either :meth:`ScopeRegistry.consume` (browser actions backed
+by a domain grant) or :meth:`ScopeRegistry.reserve` (grant-independent actions
+such as ``ui_click``).  Both share one per-task counter.  A pre-dispatch
+validation that fails (stale fingerprint, wrong origin) never reaches the
+charge and therefore does not consume; once an action is charged it is **never
+refunded**, even if the dispatch later fails, because execution may already have
+begun.
 """
 
 from __future__ import annotations
@@ -214,6 +217,51 @@ class ScopeRegistry:
             assert grant is not None  # _check_locked guarantees it on ok
             remaining = max(0, grant.max_actions - self._consumed[task])
             return ScopeCheck(True, "", remaining, grant)
+
+    def reserve(
+        self,
+        task_id: str,
+        *,
+        cost: int = 1,
+        cap: int | None = None,
+    ) -> ScopeCheck:
+        """Atomically reserve ``cost`` state-changing actions for ``task_id``.
+
+        Unlike :meth:`consume` this is **grant-independent**: it needs no
+        domain grant and validates no plan/confirmation, because some
+        budget-bearing actions (notably ``ui_click`` on a UIA control) are not
+        backed by a browser domain scope.  It shares the very same per-task
+        counter, lifetime cap and lock as :meth:`consume`, so a browser scope
+        and a plain UIA action can never be double-counted or disagree.
+
+        The effective cap is the task's lifetime cap when one is known (set by
+        a grant) and the registry default otherwise, clamped to
+        :data:`HARD_MAX_ACTIONS`; an optional ``cap`` may only lower it further.
+        Reservations are **never refunded** and a reservation can never be
+        replayed: the charge is applied the moment it succeeds.
+
+        Fail closed with ``"no_task"`` for a blank task id, ``"bad_cost"`` for a
+        non-positive ``cost`` and ``"budget_exhausted"`` when the task has no
+        budget left.
+        """
+        task = str(task_id or "").strip()
+        if not task:
+            return ScopeCheck(False, "no_task")
+        amount = int(cost)
+        if amount <= 0:
+            return ScopeCheck(False, "bad_cost")
+        with self._lock:
+            grant = self._grants.get(task)
+            base = self._task_cap.get(task, self._default_max_actions)
+            if cap is not None:
+                base = min(base, int(cap))
+            effective = min(base, self.HARD_MAX_ACTIONS)
+            consumed = self._consumed.get(task, 0)
+            remaining = effective - consumed
+            if remaining < amount:
+                return ScopeCheck(False, "budget_exhausted", max(0, remaining), grant)
+            self._consumed[task] = consumed + amount
+            return ScopeCheck(True, "", effective - self._consumed[task], grant)
 
     def _check_locked(
         self,

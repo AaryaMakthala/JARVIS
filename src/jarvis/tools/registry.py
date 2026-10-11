@@ -107,12 +107,21 @@ class ToolRegistry:
 
 
 def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
-    """Register the Phase 2 minimum tool set.
+    """Register the closed default tool set.
 
-    ``settings`` is accepted for forward compatibility (aliases, platform
-    choices) but not currently read.
+    Includes the Phase 2 minimum tools plus the Stage 7 managed-browser
+    (``browser_goto/read/click/type``) and UIA (``ui_list_controls/ui_click``)
+    specs, so the daemon's planner can propose them and the policy engine can
+    decide on them.  ``settings`` is accepted for forward compatibility
+    (aliases, platform choices) but not currently read.
     """
     _ = settings
+    from jarvis.browser.tools import (
+        make_browser_click_spec,
+        make_browser_goto_spec,
+        make_browser_read_spec,
+        make_browser_type_spec,
+    )
     from jarvis.tools.apps import make_open_app_spec
     from jarvis.tools.audit import (
         make_audit_run_spec,
@@ -144,6 +153,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     from jarvis.tools.web import make_google_search_spec, make_open_url_spec, make_web_answer_spec
     from jarvis.tools.whatsapp import make_whatsapp_send_spec
     from jarvis.tools.windows_list import make_list_windows_spec
+    from jarvis.uia.tools import make_ui_click_spec, make_ui_list_controls_spec
 
     registry = ToolRegistry()
     for spec in (
@@ -173,6 +183,12 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_stop_dictation_spec(),
         make_save_dictation_spec(),
         make_whatsapp_send_spec(),
+        make_browser_goto_spec(),
+        make_browser_read_spec(),
+        make_browser_click_spec(),
+        make_browser_type_spec(),
+        make_ui_list_controls_spec(),
+        make_ui_click_spec(),
     ):
         registry.register(spec)
     return registry

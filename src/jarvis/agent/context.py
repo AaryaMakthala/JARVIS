@@ -11,11 +11,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from jarvis.agent.target_binding import TargetBindingStore
 from jarvis.config import Settings, load_settings
 from jarvis.llm.client import LLMClient
 from jarvis.logging_setup import get_logger
 from jarvis.memory import MemoryBackend
 from jarvis.policy.engine import PolicyContext, PolicyEngine, RiskClassifier, UnlockManager
+from jarvis.policy.scope import ScopeRegistry
 from jarvis.tools.base import CancelToken, ToolContext
 from jarvis.tools.registry import ToolRegistry, build_default_registry
 
@@ -63,6 +65,21 @@ class AppContext:
     undo_log: Path | None = None  # override for the undo log path (tests)
     voice: VoiceToolsFacade | None = None  # live voice loop for dictation tools
     memory: MemoryBackend | None = None  # bounded, secret-free memory store
+    #: Managed Chrome session (Stage 7).  A passed-in ``BrowserSession`` is
+    #: owned by the daemon and threaded to tools; construction never starts a
+    #: browser, and tool calls fail cleanly when it is ``None``.
+    browser: Any | None = None
+    #: Transient, task-scoped target-bindings store (Stage 7).  In-memory only:
+    #: bindings, scope grants and resolved targets are never written to
+    #: ``AgentState`` or the checkpoint store, so a daemon restart loses them
+    #: and requires fresh authorization (fail closed).  The PolicyEngine remains
+    #: the sole authorization authority; this store holds no decisions.
+    target_bindings: TargetBindingStore = field(default_factory=TargetBindingStore)
+    #: Transient, task-scoped browser/UIA scope-grant registry (Stage 7, Slice 8).
+    #: Holds approved domain scopes and their atomic action budgets; like
+    #: ``target_bindings`` it is in-memory only and never checkpointed, so a
+    #: daemon restart requires fresh authorization.
+    scope_registry: ScopeRegistry = field(default_factory=ScopeRegistry)
 
     def tool_context(self) -> ToolContext:
         """Build a ToolContext for the current step (no secret leaks)."""
@@ -77,6 +94,7 @@ class AppContext:
             unlock=self.unlock,
             undo_log=self.undo_log,
             voice=self.voice,
+            browser=self.browser,
         )
 
 
@@ -92,13 +110,24 @@ def make_app_context(
     undo_log: Path | None = None,
     voice: VoiceToolsFacade | None = None,
     memory: MemoryBackend | None = None,
+    target_bindings: TargetBindingStore | None = None,
+    browser: Any | None = None,
+    scope_registry: ScopeRegistry | None = None,
 ) -> AppContext:
     """Build a ready-to-use :class:`AppContext` with defaults."""
     settings = settings or load_settings()
     registry = registry or build_default_registry(settings)
     engine = PolicyEngine()
+    # The managed browser's app token gates generic ``type_text`` (Slice 9):
+    # only exposed to the engine when a browser session is actually wired up.
+    from jarvis.browser.context import MANAGED_BROWSER_CHANNEL
+
     policy_ctx = PolicyContext(
-        registry=registry, settings=settings, classifier=classifier, unlock=unlock
+        registry=registry,
+        settings=settings,
+        classifier=classifier,
+        unlock=unlock,
+        managed_browser_app=MANAGED_BROWSER_CHANNEL if browser is not None else "",
     )
     return AppContext(
         settings=settings,
@@ -113,4 +142,9 @@ def make_app_context(
         undo_log=undo_log,
         voice=voice,
         memory=memory,
+        target_bindings=target_bindings or TargetBindingStore(),
+        browser=browser,
+        scope_registry=scope_registry
+        if scope_registry is not None
+        else ScopeRegistry(default_max_actions=int(settings.browser.task_scope_max_actions)),
     )

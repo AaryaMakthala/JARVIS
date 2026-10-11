@@ -13,11 +13,14 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from pydantic import BaseModel, Field
 
 from jarvis.config import Settings
+
+if TYPE_CHECKING:
+    from jarvis.policy.targets import ResolvedTarget
 
 T = TypeVar("T")
 
@@ -80,9 +83,26 @@ class ToolContext:
     unlock: Any | None = None  # UnlockManager | None (shared with the policy engine)
     undo_log: Path | None = None  # override for the undo log path (tests)
     voice: Any | None = None  # VoiceToolsFacade | None (live voice loop for dictation tools)
+    browser: Any | None = (
+        None  # BrowserSession | None (managed Chrome, Stage 7; never started here)
+    )
 
 
 ArgsModel = type[BaseModel]
+
+
+class TargetResolver(Protocol):
+    """Optional ``resolve(args, ctx)`` hook that identifies an action's target.
+
+    Implementations come from the Stage-7 browser/UIA backends (Slices 6-7).
+    A resolver only *observes* the runtime (the current page or the active
+    window) and returns identity metadata as a :class:`ResolvedTarget`, or
+    ``None`` when no element is involved or none can be reliably observed.
+    It must never make an authorization decision - the PolicyEngine is the
+    sole authority, and it decides *after* this observation.
+    """
+
+    def __call__(self, args: BaseModel, ctx: ToolContext) -> ResolvedTarget | None: ...
 
 
 @dataclass
@@ -97,6 +117,11 @@ class ToolSpec:
     timeout_s: int = 30
     #: Names of args model fields that are filesystem paths (policy/paths).
     path_args: tuple[str, ...] = ()
+    #: Task-scope action-budget units this tool costs per dispatch (Stage 7,
+    #: Slice 9).  ``0`` (the default, so every existing tool is unaffected) means
+    #: the tool never consumes budget; state-changing browser/UIA actions declare
+    #: ``1`` and the act node reserves it atomically immediately before dispatch.
+    budget_cost: int = 0
     #: Optional callables; defaults keep unknown tools safe.
     run: Callable[[BaseModel, ToolContext], ToolResult] = field(
         default=lambda args, ctx: ToolResult(ok=False, error="tool has no run implementation")
@@ -105,6 +130,14 @@ class ToolSpec:
     describe: Callable[[BaseModel], str] = field(
         default=lambda args: f"{args.__class__.__name__}({_brief_args(args)})"
     )
+    #: Optional runtime target resolver: ``resolve(args, ctx)`` returns the
+    #: ``ResolvedTarget`` the action would operate on, or ``None`` when no
+    #: element is involved or none can be reliably observed.  Deliberately
+    #: separate from ``execute()``: registration and ordinary execution never
+    #: call it - the policy gate resolves and authorizes *before* act()
+    #: dispatches (docs/03 §5 T4).  A resolver must not raise for ordinary
+    #: non-resolution; if one does, ``resolve_target()`` fails closed.
+    resolve: Callable[[BaseModel, ToolContext], ResolvedTarget | None] | None = None
 
     def execute(self, args: BaseModel, ctx: ToolContext) -> ToolResult:
         """Run the tool honouring dry-run, cancellation and timeouts.
@@ -168,6 +201,24 @@ class ToolSpec:
             elif isinstance(value, list):
                 values.extend((name, item) for item in value if isinstance(item, str))
         return values
+
+
+def resolve_target(spec: ToolSpec, args: BaseModel, ctx: ToolContext) -> ResolvedTarget | None:
+    """Resolve the interaction target for ``spec``, failing closed.
+
+    Invokes ``spec.resolve`` when it is set and returns its result.  A resolver
+    that returns ``None`` or raises means "no target could be reliably
+    observed"; both become ``None`` here so a broken resolver can never crash
+    the graph.  Returning ``None`` never approves anything - the caller (the
+    policy gate) treats an unresolvable target as a refusal, because the
+    *decision* to authorize belongs solely to the PolicyEngine.
+    """
+    if spec.resolve is None:
+        return None
+    try:
+        return spec.resolve(args, ctx)
+    except Exception:  # noqa: BLE001 - a resolver must never crash the pipeline
+        return None
 
 
 def _brief_args(args: BaseModel) -> str:

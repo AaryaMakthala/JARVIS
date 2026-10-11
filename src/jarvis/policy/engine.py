@@ -88,6 +88,12 @@ class PolicyContext:
     #: Whether a valid approved task scope currently authorizes browser
     #: actions.  Default ``False`` fails closed.
     scope_approved: bool = False
+    #: App token of the JARVIS-managed browser when one is wired up (else ``""``).
+    #: It lets the engine refuse generic ``type_text`` into that app: typing into
+    #: the managed browser must go through ``browser_type``, which re-resolves
+    #: and authorizes the element, so ``type_text`` cannot be an alternate,
+    #: unauthorized path into a JARVIS-managed page (Stage 7, Slice 9).
+    managed_browser_app: str = ""
 
 
 def _target_checks(ctx: PolicyContext) -> tuple[bool, list[str], int]:
@@ -196,6 +202,24 @@ class PolicyEngine:
                 ["this tool/action is hard-blocked by policy"],
                 spec.describe(args),
             )
+
+        # Managed-browser typing bypass (Stage 7, Slice 9).  Once JARVIS owns a
+        # browser, generic ``type_text`` must not become an alternate,
+        # unauthorized way to type into a managed page: it focuses a whole
+        # application and cannot prove which window/page it pasted into, and it
+        # bypasses ``browser_type``'s element re-resolution and target
+        # authorization.  Hard block - never reachable by a confirmation.
+        if spec.name == "type_text" and ctx.managed_browser_app:
+            target_app = (
+                str(getattr(args, "target_app", "") or "").strip().lower().removesuffix(".exe")
+            )
+            managed_app = str(ctx.managed_browser_app).strip().lower().removesuffix(".exe")
+            if target_app and target_app == managed_app:
+                return _blocked(
+                    step,
+                    ["typing into the managed browser must use browser_type"],
+                    spec.describe(args),
+                )
 
         # Path rules: apply to every declared path argument.  Every resolved
         # path is recorded so act() can re-check nothing changed after the
