@@ -7,6 +7,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from jarvis import config
 
@@ -224,3 +225,48 @@ def test_user_data_dir_unset_uses_platform_default(monkeypatch: pytest.MonkeyPat
     monkeypatch.delenv("JARVIS_DATA_DIR", raising=False)
     assert os.environ.get("JARVIS_DATA_DIR") is None
     assert config.user_data_dir().is_absolute()
+
+
+def test_browser_defaults() -> None:
+    """Stage 7 browser scope defaults (D12/I4)."""
+    browser = config.BrowserSettings()
+    assert browser.allowed_domains == []
+    assert browser.task_scope_max_actions == 8
+    assert browser.scope_expiry_s == 120.0
+
+
+def test_browser_default_config_toml_parses() -> None:
+    parsed = tomllib.loads(config.DEFAULT_CONFIG_TOML)
+    assert parsed["browser"]["allowed_domains"] == []
+    assert parsed["browser"]["task_scope_max_actions"] == 8
+    assert parsed["browser"]["scope_expiry_s"] == 120.0
+
+
+def test_browser_allowed_domains_normalised() -> None:
+    browser = config.BrowserSettings(
+        allowed_domains=["  YouTube.COM.", "spotify.com", "youtube.com", ""]
+    )
+    assert browser.allowed_domains == ["youtube.com", "spotify.com"]
+
+
+def test_browser_allowed_domains_rejects_non_host() -> None:
+    """A scheme or path is a config error, never silently accepted."""
+    with pytest.raises(ValidationError):
+        config.BrowserSettings(allowed_domains=["https://youtube.com"])
+    with pytest.raises(ValidationError):
+        config.BrowserSettings(allowed_domains=["youtube.com/watch"])
+
+
+def test_browser_profile_dirs_are_separate(isolated_data_dir: Path) -> None:
+    """B6: whatsapp and general never share a directory."""
+    whatsapp = config.browser_profile_dir("whatsapp")
+    general = config.browser_profile_dir("general")
+    assert whatsapp != general
+    assert whatsapp == isolated_data_dir / "browser_profile" / "whatsapp"
+    assert general == isolated_data_dir / "browser_profile" / "general"
+    assert config.browser_profile_dir() == general
+
+
+def test_browser_profile_dir_rejects_unknown(isolated_data_dir: Path) -> None:
+    with pytest.raises(ValueError):
+        config.browser_profile_dir("rogue")

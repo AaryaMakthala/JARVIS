@@ -20,6 +20,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettin
 APP_NAME = "jarvis"
 APP_AUTHOR = "jarvis"
 
+#: Names of the two isolated JARVIS-owned browser profiles (**B6**).  They live
+#: in separate directories so an authenticated WhatsApp session is never
+#: reachable from a general browsing task.
+BROWSER_PROFILE_NAMES = ("whatsapp", "general")
+
 # Text written to a freshly generated config.toml by `jarvis init`.
 #
 # FREE-ONLY / STRICT ZERO-COST
@@ -197,6 +202,27 @@ deny_title_fragments = ["password", "bank", "authenticator", "1password", "bitwa
 max_text_chars = 6000
 # Cap on UI Automation elements walked per capture (bounds cost on huge windows).
 max_ui_elements = 400
+
+[browser]
+# Stage 7 browser automation.  JARVIS drives its OWN Playwright/Chrome profile
+# (never the owner's normal Chrome tabs).
+#
+# Domains that browser_click / browser_type may act on (B4/D18).  The list is
+# the boundary; an optional denylist may live inside it.  An empty list means NO
+# domain is pre-approved, so every navigation and interaction needs a
+# confirmation.  Entries are bare hosts (no scheme, no path); subdomains match
+# only if listed explicitly.  `browser_goto` to a domain not in this list still
+# works but requires confirmation.
+allowed_domains = []
+# Maximum number of state-changing browser/UIA actions (goto, click, type,
+# ui_click) one approved task scope may perform.  Read-only observations
+# (browser_read, ui_list_controls) never consume the budget.  The cap does NOT
+# reset across replans within the same task.
+task_scope_max_actions = 8
+# How long an approved task scope stays usable, in seconds.  A scope is
+# per-task, transient, and never checkpointed; on expiry (or daemon restart)
+# fresh authorization is required.
+scope_expiry_s = 120.0
 """
 
 
@@ -572,6 +598,53 @@ class ScreenSettings(BaseModel):
     max_ui_elements: int = 400
 
 
+class BrowserSettings(BaseModel):
+    """Browser/UIA task-scope settings (``[browser]`` in config.toml, Stage 7).
+
+    Implements the **D12/I4** task-scope model: one "proceed" approves a
+    *scope* (plan hash + approved domain scope + expiry + an action budget),
+    not individual clicks, while every action inside the scope still gets a
+    fresh deterministic policy check.
+
+    * ``allowed_domains`` is the domain boundary (**B4**): ``browser_click`` /
+      ``browser_type`` may act only on these hosts.  ``browser_goto`` to a host
+      outside the list still runs but needs confirmation (**D18**).  An empty
+      list pre-approves nothing (fail closed).  Entries must be bare hosts;
+      a scheme or path is rejected rather than silently ignored.
+    * ``task_scope_max_actions`` bounds how many state-changing actions
+      (``browser_goto``, ``browser_click``, ``browser_type``, ``ui_click``) a
+      single approved scope may perform.  Read-only observations do not count,
+      and the budget does not reset across replans in the same task.
+    * ``scope_expiry_s`` bounds how long an approved scope stays usable.
+
+    Scope grants and target bindings are transient daemon/agent state and are
+    never written to the LangGraph checkpoint (docs/03; owner decision 1).
+    """
+
+    allowed_domains: list[str] = []
+    task_scope_max_actions: int = 8
+    scope_expiry_s: float = 120.0
+
+    @field_validator("allowed_domains")
+    @classmethod
+    def _normalise_domains(cls, value: list[str]) -> list[str]:
+        """Lower-case, strip, and reject anything that is not a bare host."""
+        out: list[str] = []
+        seen: set[str] = set()
+        for entry in value:
+            host = str(entry).strip().lower().rstrip(".")
+            if not host:
+                continue
+            if "://" in host or "/" in host or " " in host:
+                raise ValueError(
+                    f"browser.allowed_domains entries must be bare hosts, got {entry!r}"
+                )
+            if host not in seen:
+                seen.add(host)
+                out.append(host)
+        return out
+
+
 class Settings(BaseSettings):
     """Top-level application settings.
 
@@ -599,6 +672,7 @@ class Settings(BaseSettings):
     risk: RiskSettings = RiskSettings()
     tools: ToolsSettings = ToolsSettings()
     screen: ScreenSettings = ScreenSettings()
+    browser: BrowserSettings = BrowserSettings()
     config_version: int = 1
 
     @classmethod
@@ -687,9 +761,20 @@ def reports_dir() -> Path:
     return user_data_dir("reports")
 
 
-def browser_profile_dir() -> Path:
-    """Path to the WhatsApp Web persistent browser profile."""
-    return user_data_dir("browser_profile")
+def browser_profile_dir(profile: str = "general") -> Path:
+    """Path to a JARVIS-owned persistent browser profile (**B6**).
+
+    Two profiles exist and are never shared: ``"whatsapp"`` (WhatsApp Web) and
+    ``"general"`` (Spotify Web, YouTube, everything else).  Keeping them in
+    separate directories means an authenticated WhatsApp session can never be
+    reached by a general browsing task.  An unknown profile name is rejected
+    (fail closed) instead of silently creating a fresh profile.
+    """
+    if profile not in BROWSER_PROFILE_NAMES:
+        raise ValueError(
+            f"unknown browser profile {profile!r}; expected one of {BROWSER_PROFILE_NAMES}"
+        )
+    return user_data_dir("browser_profile", profile)
 
 
 def daemon_runtime_file() -> Path:

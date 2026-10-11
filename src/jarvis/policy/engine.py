@@ -23,7 +23,7 @@ from pydantic import ValidationError
 from jarvis.agent.state import Decision, Step
 from jarvis.config import Settings
 from jarvis.platform_guard import is_windows
-from jarvis.policy import paths, rules, tiers
+from jarvis.policy import paths, rules, targets, tiers
 from jarvis.tools.registry import ToolRegistry, UnknownTool
 
 #: Reason recorded for a ``windows_only`` tool on a host that is not Windows.
@@ -69,6 +69,78 @@ class PolicyContext:
     #: (docs/08 §3), but the rules must not change because the user phrased
     #: something differently, so no rule consults this field.
     user_input: str = ""
+
+    # ── Stage 7 (Slice 4): optional browser/target authorization context ──
+    # All four default to "absent", so every existing caller is byte-for-byte
+    # unchanged.  When a browser step supplies them the engine additionally
+    # enforces canonical-origin scope, control risk and password-field rules;
+    # these checks can only raise a tier or block, never lower one.  The
+    # resolved target is transient metadata about what was observed at runtime
+    # - it is deliberately *not* part of ``action_hash`` (docs/03 §5 T4).
+    #: Canonical origin the browser step targets, resolved by the policy gate.
+    #: ``None`` means "not a browser step" and skips all new checks.
+    origin: str | None = None
+    #: Approved canonical domains for this task's scope.  Empty means no
+    #: approved domain scope, which fails closed for a browser action.
+    allowed_domains: tuple[str, ...] = ()
+    #: The resolved interaction target (browser DOM or UIA control), if any.
+    target: targets.ResolvedTarget | None = None
+    #: Whether a valid approved task scope currently authorizes browser
+    #: actions.  Default ``False`` fails closed.
+    scope_approved: bool = False
+
+
+def _target_checks(ctx: PolicyContext) -> tuple[bool, list[str], int]:
+    """Evaluate optional Stage-7 browser/target context (pure, deterministic).
+
+    Returns ``(blocked, reasons, min_tier)``: ``blocked`` means the step must be
+    refused (Tier 3) and ``min_tier`` is a floor the engine applies with
+    ``max()``.  When no browser origin or target is present this is a no-op, so
+    existing decisions are unchanged.  A browser step must present a valid
+    canonical origin inside the approved domain scope with an approved task
+    scope; a resolved target must have reliable identity, must not be a
+    password field, and a payment/purchase control is blocked while other risky
+    controls force a fresh confirmation even inside an approved scope.
+    """
+    target = ctx.target
+    is_browser = ctx.origin is not None or (target is not None and target.kind == "browser")
+    if not is_browser and target is None:
+        return False, [], tiers.TIER_SAFE
+
+    reasons: list[str] = []
+    min_tier = tiers.TIER_SAFE
+
+    if is_browser:
+        raw_origin = ctx.origin
+        if raw_origin is None and target is not None:
+            raw_origin = target.origin
+        canonical = rules.url_origin(raw_origin) if raw_origin else None
+        if canonical is None:
+            return True, ["browser action with a missing or invalid origin"], tiers.TIER_BLOCKED
+        if not ctx.allowed_domains:
+            return True, ["browser action without an approved domain scope"], tiers.TIER_BLOCKED
+        if not rules.domain_allowed(canonical, list(ctx.allowed_domains)):
+            return True, [f"browser origin not in approved scope: {canonical}"], tiers.TIER_BLOCKED
+        if not ctx.scope_approved:
+            return True, ["browser action without an approved task scope"], tiers.TIER_BLOCKED
+
+    if target is not None:
+        if targets.fingerprint(target) is None:
+            return (
+                True,
+                ["interaction target has ambiguous or missing identity"],
+                tiers.TIER_BLOCKED,
+            )
+        if rules.is_password_target(target):
+            return True, ["refusing to interact with a password field"], tiers.TIER_BLOCKED
+        control = rules.risky_control(target.name, target.role)
+        if control == rules.CONTROL_PAYMENT:
+            return True, ["payment/purchase control is blocked"], tiers.TIER_BLOCKED
+        if control == rules.CONTROL_FRESH_CONFIRM:
+            min_tier = max(min_tier, tiers.TIER_CONFIRM)
+            reasons.append("risky control requires fresh confirmation")
+
+    return False, reasons, min_tier
 
 
 def _blocked(step: Step, reasons: list[str], summary: str) -> Decision:
@@ -174,6 +246,17 @@ class PolicyEngine:
             if classifier_tier > tier:
                 reasons.append(f"risk classifier raised this to tier {classifier_tier}")
             tier = max(tier, classifier_tier)
+
+        # ── Optional Stage-7 browser/target checks (Slice 4) ──────────
+        # Applied after every existing raise so they can only add a tier or
+        # block.  With no browser/target context present the helper is a no-op
+        # and the decision is identical to before.
+        target_blocked, target_reasons, target_tier = _target_checks(ctx)
+        if target_blocked:
+            return _blocked(step, target_reasons, spec.describe(args))
+        if target_tier > tiers.TIER_SAFE:
+            tier = max(tier, target_tier)
+        reasons.extend(target_reasons)
 
         allowed = tier < tiers.TIER_BLOCKED
 
