@@ -59,6 +59,42 @@ def test_one_shot_per_task() -> None:
     assert tts.spoken == ["This is taking a moment"]
 
 
+def test_caller_pattern_speaks_exactly_once_across_wait_iterations() -> None:
+    """The wait-loop caller must speak the notice exactly once.
+
+    Mirrors the call site in ``DaemonServer._voice_submit`` (server.py): the
+    "spoken this call" return value must be OR-ed into a sticky latch, never
+    reassigned from it.  otherwise the False returned by the already_spoken
+    pass clears the latch and the notice repeats every other iteration (the
+    Stage 5a live defect: 4x repetition per slow task).
+    """
+    tts = FakeTTS()
+    clock = _FakeClock()
+    clock.advance(10.0)
+    notice_spoken = False
+    for _ in range(6):
+        if maybe_speak(tts, 0.0, clock=clock, already_spoken=notice_spoken):
+            notice_spoken = True
+    assert tts.spoken == [SLOW_NOTICE_TEXT]
+    assert notice_spoken is True
+
+
+def test_reassigning_return_value_repeats_notice() -> None:
+    """Document the bug the sticky latch prevents.
+
+    A caller that reassigns ``notice_spoken = maybe_speak(...)`` clears the
+    latch on the already-spoken pass and speaks again on the next iteration,
+    so the plain return value must never replace the latch.
+    """
+    tts = FakeTTS()
+    clock = _FakeClock()
+    clock.advance(10.0)
+    notice_spoken = False
+    for _ in range(6):
+        notice_spoken = maybe_speak(tts, 0.0, clock=clock, already_spoken=notice_spoken)
+    assert len(tts.spoken) >= 2
+
+
 def test_suppressed_while_confirmation_owns_mic() -> None:
     tts = FakeTTS()
     spoken = maybe_speak(tts, 0.0, confirmation_owns_mic=True, clock=_FakeClock(now=10.0))

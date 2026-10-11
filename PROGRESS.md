@@ -4087,7 +4087,9 @@ Decisions logged:
 - **Tracker changes:** ROADMAP_V2.2 §H `Stage 5a includes completeness check` ticked (implemented
   `8ac71a9`, focused-verified `test_completeness.py`); ROADMAP_V2.1 §H gained `Stage 7 includes
   re-observe and re-plan scope rules` (**unchecked** - Stage 7 not started). `Stage 5a done`
-  (v2.1 §H) is **deliberately unticked**: code-complete is not live-validated.
+  (v2.1 §H) was **deliberately unticked** at this point: code-complete is not live-validated.
+  **Superseded 2026-10-11** — after live validation of Checks 1-6, `Stage 5a done` is now ticked; see
+  the consolidated Stage 5a verdict section below.
 
 **Status: implemented + focused-test verified; NOT live-validated. Do not equate the two.**
 
@@ -4122,3 +4124,284 @@ Decisions logged:
 6. **Sub-step 10 notice smoke:** give voice a task that takes **> 4 s** -> hear
    "This is taking a moment" **exactly once**; never while a confirmation/clarification owns the
    mic; never while stopping.
+
+---
+
+## Stage 5a live validation — session of 2026-10-09 (natural-failure capture)
+
+Ran with `jarvis daemon --foreground`; voice in NORMAL mode; LLM `provider_order = [groq,
+openrouter, nvidia, gemini]`, **no `key_slots`** (daemon logged every provider `slots=1`
+09:40:59.316–348), **no `rotate_on_rate_limit`** (default false), `free_only=true`. Evidence in
+`%LOCALAPPDATA%\jarvis\jarvis\logs\jarvis.jsonl`, window `09:35:26` → `09:42:45` (UTC). Both
+daemon sessions stopped by the owner after the capture; no more requests issued.
+
+### Live-check results against the six checks above
+
+| Check | Verdict | Evidence |
+|---|---|---|
+| 1. Doctor off/on | **PASS** (1A owner-stated; 1B earlier) | `jarvis doctor` (daemon stopped) exit 0 + presence rows; `doctor --live` rows reachable (live groq/openrouter/nvidia/gemini, eligible, `free_only`) |
+| 2. Backup-key failover | **Mechanism observed; end-to-end NOT OBSERVED** | groq 429 → `not rotating key, trying next provider` → openrouter **HTTP 200** on the same request (i6, 09:40:39.243→09:40:40.394); both such interactions were then aborted by the owner (daemon shutdown / spoken stop) before the fallback answer reached the speaker. No completed full fallback answer delivered → **do not claim it worked end-to-end** |
+| 3. 429 non-rotation | **PASS** | Two real groq HTTP 429s (09:40:39.243 i6; 09:41:33.496 i4-s2); each followed by `groq rate limited; not rotating key, trying next provider`; `llm_failure ... provider=groq failure_category=rate_limit attempts=0` (voice budget `max_retries=0` honoured); **no** `rotating to the next key slot` and no slot-2 markers anywhere |
+| 4. Completeness smoke | **Partial** — chat works; completeness paths NOT formally evaluated | terminal chat answered a two-part question in one conversation call (`actions=0`); voice answered "capital of France" (i4-s1, groq 200, 31-ch) and "2 plus 2" (i5-s1, groq 200, 61-ch); assumption/clarification cases not yet exercised live |
+| 5. Voice latency intent | **NOT OBSERVED / PENDING** | quick-question latencies were good (i4-s1 ~200 ms answer) but the short-budget end-condition was not measured as a formal pass |
+| 6. Sub-step 10 notice smoke | **UNRESOLVED (defect found)** | "This is taking a moment" fired **2–4× per long interaction**, back-to-back, on the block thread — i4-s2 ×2 (09:41:37.427/40.546), i6 ×4 (09:40:43.159/46.189/49.051/53.678), i7 ×3 — cadence = once per loop iteration once past 4 s. Also illegal voice-state transitions observed (see below). **Stage 5 NOT complete.** |
+
+### Captured evidence notes (so the console log is read correctly)
+
+- `"Stopped."` (exactly 8 chars) is the **abort/cancel wrap-up response**, and the
+  `provider=/latency_ms=` line printed with it is the **last recorded call meta**, not who
+  answered. Console pairs like `[LLM] FAILURE: rate_limit … PROVIDER: groq … answer "Stopped."`
+  are abort artifacts, not a groq-caused wrong answer.
+- i7 (09:42:30) never called groq (planner role still cooling — cooldown honoured); openrouter 200×2;
+  abandoned at shutdown; wrap-up printed stale groq `gpt-oss-20b, latency_ms=604` meta (from i5; no
+  groq HTTP in that window).
+- A Brave-search (non-LLM tool) 429 occurred 09:42:01 during the capital-of-France web-search run
+  — unrelated to the provider walk.
+- STT failures (not valid test data): i3-s1 0-ch `stt_empty`; i1-s2 13-ch unusable; i3-s2 17-ch
+  unusable; i6-s2 0-ch empty. Valid + answered: i4-s1, i5-s1.
+
+### Defect A — slow notice repeats (check 6)
+
+- Current code is one-shot **per `_voice_submit` invocation**: `notice_spoken` is fed back into
+  `maybe_speak(..., already_spoken=notice_spoken)` at `src/jarvis/daemon/server.py:1135-1143`, and
+  `maybe_speak` returns False once spoken (`src/jarvis/voice/slow_notice.py:47-58`); `test_slow_notice.py`
+  (11 tests) is green. Only ONE `voice task started` per interaction in the logs.
+- Live cadence (speak again every ~2.8–3 s once past `SLOW_THRESHOLD_S`=4 s, loop thread blocked
+  each time in `SapiTTSEngine.speak`, `src/jarvis/voice/tts.py:180-194`, audio blocks dropping) is
+  exactly what an **un-gated per-iteration** speaker would produce. That matches **no** committed
+  version (pre-`1e2beef` had no notice; post-`1e2beef` is gated). Implies the running daemon
+  imported a `_voice_submit`/`loop` variant different from HEAD (uncommitted intermediate working-tree
+  state at 09:18), or a second waiter re-ran the wait loop. Root cause **not** conclusively isolated
+  from the log alone.
+- Proposed fix (smallest safe): move the latch from a `_voice_submit` local to the **task slot**
+  (`TaskSlot.notice_spoken`), so the one-shot invariant is task-scoped no matter how many waiters
+  or re-entries consume the same slot. Focused test: two sequential wait-loop passes over one slot
+  → exactly one speak. **Then re-run the >4 s voice task live after a fresh daemon start** to check
+  whether the repeats reproduce on HEAD before/after the change (decisive, one command).
+
+### Defect B — illegal voice-state transitions
+
+- Confirmed chain (code + log): STT-unusable → `_ask_to_repeat` (`src/jarvis/voice/loop.py:942`)
+  advances the **reporter** to RECOVERING (`status.py:555-557`, event 09:41:26.175, i3-s2) but does
+  not move the loop's own `_phase_state`, leaving it TRANSCRIBING (`loop.py:918-920`). After
+  `_run_interaction` returns, the main loop is *supposed* to `_rearm()` (`loop.py:1381-1382`) →
+  `_reset_voice_state()` (`loop.py:1956-1978`) which resets BOTH machines (RESETTING→READY). At
+  runtime no RESETTING/READY was logged between 09:41:26 and the next wake (28.59) — so the next
+  capture-start `LISTENING` (`loop.py:1578-1579`) came from a stale TRANSCRIBING (loop warning
+  `loop.py:916`) and the reporter advanced LISTENING from RECOVERING (status warning `status.py:260`,
+  `illegal_from=RECOVERING`, 09:41:30.047).
+- Same signature as Defect A: the live run behaved like a *pre-fix* variant of the loop; current
+  HEAD re-arms unconditionally (loop.py:1382). Needs the same live re-check to confirm it reproduces
+  on HEAD.
+- Proposed fix (smallest safe): make `_recover`/`_ask_to_repeat` reset the phase machines to READY
+  before returning (idempotent `_rearm`), so a RECOVERING/TRANSCRIBING state can never leak into the
+  next interaction; add a focused reporter/state-machine test for `_ask_to_repeat` → next wake.
+
+### Not evaluated / next steps (2026-10-09) — **SUPERSEDED 2026-10-11: all items below completed; Stage 5a closed**
+
+_(Historical list from 2026-10-09. Items 1-5 were subsequently executed: fresh-daemon reproduction,
+Check 2 end-to-end, Check 4 smoke, Check 5 latency, Defect A fix + re-run. See the Stage 5a FINAL
+STATUS section at the end of this file. `Stage 5a done` is now ticked.)_
+
+1. Re-run the >4 s voice task on a **fresh** daemon (current HEAD) to see whether Defects A/B
+   reproduce or whether 09:18's daemon ran an uncommitted variant (one command, decisive).
+2. Check 2 end-to-end: an **uninterrupted** run where the fallback provider actually delivers the
+   spoken answer (or a clean observed fallback chain that completes).
+3. Check 4: run the completeness smoke properly (assumption/clarification, 2-round cap) chat-then-voice.
+4. Check 5: measure a quick voice task's end-to-end latency against the short budget; confirm no
+   slow notice fires on it.
+5. If Defects A/B reproduce on HEAD: apply the slot-latch (A) and re-arm-in-recover (B) fixes with
+   the focused tests above; then re-run checks 5+6. Ruff + `pytest -q` green before any tag.
+
+### Fresh-daemon reproduction — 2026-10-09 10:40–10:42 UTC (current HEAD, log lines 22390–22823)
+
+Fresh `jarvis daemon --foreground`; voice NORMAL; 4 voice interactions (i1 clarification+2+2,
+i2 web-search news, i3 2+2, i4 shut down); clean shutdown. Grading vs the six checks:
+
+| Check | Verdict (fresh run) |
+|---|---|
+| 6. Notice smoke (exactly once, >4 s task) | **FAIL — reproduced.** 4 notices per slow task, 8 total. i1 (task `v1791542447220`, elapsed 20.8 s): 10:40:56.851 / 59.924 / 10:41:02.870 / 05.731; i2 (task `v1791542485628`, elapsed 15.4 s): 10:41:29.733 / 32.785 / 35.735 / 38.699. All `TTS sapi speak start (chars=23)` blocking. |
+| 5. Quick latency intent | **PASS** — i3 (groq latency 2291 ms, task 2.4 s) and i4 (1406 ms, 1.5 s) fired no notice. |
+| Illegal transitions | **PASS** — zero `transition invalid` / `illegal state transition` in the window. |
+| recovering→resetting→ready | **Not exercised** — zero `event=recovering` (no STT-unusable triggered; i1's garbled transcript took the clarification path). All 4 interactions did end clean: `RESETTING → READY` (phase_ms 93–141). |
+| Slow task completed normally | **PASS** — i2 routed `web_answer` (search OK), 401-char answer bounded to 301 and spoken async, interaction completed + re-armed. |
+| Check 2/3 (bonus) | **PASS live, end-to-end** — i1: real groq 429 (10:40:56.99) → `not rotating key, trying next provider` → openrouter 200 → repaired → final answer **spoken** (async 18 chars, 10:41:08). i2 additionally walked openrouter unexpected → nvidia 200. |
+
+**Defect A root cause (corrected — my earlier "one-shot on HEAD" claim was wrong).**
+`_voice_submit` does `notice_spoken = maybe_speak(..., already_spoken=notice_spoken)`
+(`server.py:1135-1143`). `maybe_speak` returns `False` when `already_spoken=True`
+(`slow_notice.py:47-55`), so the reassignment **wipes the latch on the very next iteration** and the
+notice speaks again every second wait-iteration (~2.3 s blocking speak + ~0.5 s poll ≈ 2.9 s apart,
+matching the log). The suppression side (clarification/confirmation owns mic, done, stopping) works —
+i1's first notice was correctly delayed to after the clarification window — only the one-shot latch
+fails. `test_slow_notice.py` stays green because it tests `maybe_speak` in isolation, not the
+caller's re-assign pattern; this is the gap that fooled the previous analysis and this reproduction
+was run precisely to expose it.
+
+**Corrected fix (smallest safe)**: make the latch sticky — `if maybe_speak(...): notice_spoken = True`
+instead of assigning the return value. Regression test: a caller-pattern test (fake clock/TTS, N≥3
+wait-loop passes, assert exactly one speak) added to `tests/unit/test_slow_notice.py` or the daemon
+voice harness. Then re-run the >4 s voice task: expect exactly ONE notice.
+
+**Defect B**: did NOT reproduce (0 recovering/illegal lines), but its trigger (`_ask_to_repeat` on an
+STT-unusable transcript) never fired in this run, so the fix there is still unverified live. The
+current-tree unconditionally re-arms in NORMAL mode (`loop.py:1381-1382`), which is consistent with
+the clean POST-resets observed.
+
+**Wart (not blocking)**: `result for <task_id> dropped: client disconnected` is logged after every
+voice task — voice tasks have no IPC client by design (VOICE_OWNER); the slot still delivers the
+answer. Cosmetic; consider suppressing for `source=="voice"`.
+
+### Defect A fix applied + focused tests green (2026-10-09, working tree == HEAD except PROGRESS.md)
+
+- `src/jarvis/daemon/server.py` (`_voice_submit` wait loop): the latch is now sticky — the call is
+  `if maybe_speak(...): notice_spoken = True` instead of `notice_spoken = maybe_speak(...)`. Single
+  call-site change; no loop redesign. `maybe_speak` returns `False` on the `already_spoken=True`
+  pass, so reassigning would wipe the latch (the 4x-repeat defect); OR-ing into it keeps the notice
+  spoken exactly once per task.
+- `tests/unit/test_slow_notice.py`: added `test_caller_pattern_speaks_exactly_once_across_wait_iterations`
+  (6 wait-loop passes, fake clock past threshold, asserts exactly one speak and the latch stays
+  `True`) and `test_reassigning_return_value_repeats_notice` (documents that the **old** assignment
+  pattern speaks ≥2x — the bug this fix prevents).
+- Focused checks (only): ruff on the two touched files — clean; `pytest test_slow_notice.py` — 13
+  passed; `pytest test_daemon_voice.py` (covers `_voice_submit` caller) — 32 passed. No full suite,
+  no integration/benchmark. **Live confirmation still pending** (owner runs one >4 s voice task on a
+  fresh daemon; expect exactly ONE notice, normal completion, clean transitions).
+
+### Stage 5a live validation — Phase A (2026-10-09 ~11:07 UTC; log lines 22824–23054)
+
+Owner ran the fresh-daemon one-slow-task test on the fixed latch. **Verified from `jarvis.jsonl`**
+(counts in the 231-line window, not owner-reported alone):
+
+| Measurement | Value |
+|---|---|
+| Blocking notice `TTS sapi speak start (chars=23)` | **exactly 1** — 11:07:12.338, slow task `v1791544028159` (elapsed 6.7 s, `final_answer_chars=401`); fired once past the 4 s threshold and ~2.5 s before completion. Quick task `v1791544056121` (1.3 s, 18 chars): **0**. |
+| `transition invalid` / `illegal state transition` | **0** |
+| `event=recovering` | 0 (expected — this is not the recovery test) |
+| Async answer speaks | 2 (both final answers spoken) |
+| Phase endings | both tasks `SPEAKING → RESETTING → READY` → `waiting for wake word`; daemon clean shutdown (`daemon shut down cleanly`) |
+
+Verdicts: **Check 6 upgraded FAIL → PASS** (was 4× per task pre-fix on the same 10:40 run; now
+exactly one). **Check 5 PASS** (quick task 1.3 s, no notice). Illegal-transition count **PASS**.
+Defect B / recovering→resetting→ready still unexercised → Phase B pending (owner to run an
+STT-unusable transcript; wait for results).
+
+### Stage 5a live validation — Phase B (2026-10-09 ~11:21 UTC; log lines 23055–23294)
+
+Owner ran the recovery/re-arm trigger (deliberately unusable transcripts) on the same daemon.
+**Verified from `jarvis.jsonl`:**
+
+| Measurement | Value |
+|---|---|
+| `VOICE STT_UNUSABLE` | **2** — `voice boundary: stt unusable (wake phrase captured instead of a command)` (i1) and `(no recognisable words)` (i2); neither transcript reached the agent |
+| `voice event=recovering` | **2** — i1 phase_ms=531, i2 phase_ms=9218, both `voice_state=RECOVERING previous_phase=TRANSCRIBING` |
+| Repeat prompt spoken | **2** — `TTS sapi speak start (chars=22)` at the same timestamps ("Could you repeat that?" is 22 chars) |
+| `voice event=stt_retry` | 2 (event tag is `stt_retry`, not `retry_prompt`) |
+| `transition invalid` / `illegal state transition` | **0** |
+| Post-recovery | each recovery → `RESETTING → READY → WAITING_FOR_WAKE` (3 RESETTING/3 READY, incl. the clean success below); then "what is 2 plus 2?" ran THINKING → SPEAKING → `async speak (chars=18)` → RESETTING → READY. Loop fully usable after recovery. |
+
+Verdict: **Phase B PASS — recovering→RESETTING→READY observed live, twice, with zero illegal
+transitions.** Defect B does **not** reproduce on current HEAD (the previously-suspected
+stale-TRANSCRIBING leak into the next LISTENING did not occur). Corrections to my own earlier
+instructions: repeat prompt is **22** chars (not 26), and the reporter event is **`stt_retry`**
+(not `retry_prompt`) — both my guide typos, not code defects. Remaining: **Phase C** = completeness
+smoke (Check 4), chat-then-voice.
+
+### Stage 5a live validation — Phase C (2026-10-09 ~11:27 UTC; log lines 23295–23534; checkpoints read)
+
+Owner ran chat + voice smoke. Evidence cross-checked in `jarvis.jsonl` AND the LangGraph
+`checkpoints.db` (ground-truth state per task):
+
+| Request (source) | Thread | Brain outcome | Evidence |
+|---|---|---|---|
+| `open chrome` (chat) | `t1791545219616` | action, fastpath | final `'opened chrome'`; no clarify |
+| `search for internships` (chat) | `t1791545231222` | action, `google_search query=internships` | final `'opened https://www.google.com/search?q=internships'`; **`assumption=''`, no `missing`** |
+| `create a file test.txt with hello` (chat) | `t1791545252482` | action, `create_file C:\Users\aarya\OneDrive\Desktop\test.txt` | final `'Created test.txt on your Desktop.'`; no clarify; `assumption=''` |
+| `open notepad` (chat) | `t1791545273398` | action, fastpath | final `'opened notepad'` |
+| `search for internships` (voice; STT → `search for intent chips`) | `v1791545303957` | action, `google_search query='intent chips'` | `google_search ok=True`; final `'opened ...q=intent%20chips'` |
+
+**Browser-search capability: PASS (counted).** 2× `google_search` tool start/end `ok=True`
+(chat interns + voice), 2× `open_app ok=True` (chrome, notepad), zero failures in window. The voice
+query was mis-recognised `internships → "intent chips"` (Whisper-`base` STT, already known out-of-stage);
+the **capability** acted correctly on the query it heard — this is an STT-accuracy note, not a search
+failure.
+
+**Explicit-assumption requirement: NOT EXERCISED (determined from checkpoint, no retry needed).**
+Both search instances returned `assumption=''` and no `missing`: the brain judged the unbounded web
+search to be **fully specified** (no optional detail missing → outcome 1 "never over-ask", not
+outcome 2 "proceed + stated assumption"). Re-running `search for internships` would repeat the same
+state, so a retry cannot exercise the assumption branch — flagged as NOT OBSERVED live (unit-tested
+in the brain suite) rather than re-run.
+
+**File-create path default is BY DESIGN, not an invention.** `CreateFileArgs.path` documents
+"a bare file name means the user's Desktop" (`tools/files.py:70-74`) and the planner prompt teaches
+the same (`llm/prompts.py:46-48`), so `missing=[]`+no-clarification is contract-conformant. But it
+means the **required-info → clarification** branch, the **2-round cap**, and the **counter reset**
+were all still unexercised (this run contained zero `request_type=clarification` and zero
+`agent event=clarify` lines).
+
+**Remaining Check 4 criteria to exercise live** (from ROADMAP_V2.2 §Stage 5a): (a) required detail
+missing → **clarification**, one short question per round; (b) **max 2 rounds** then it states what
+is missing and **stops** (no 3rd question); (c) **counter resets** on the next unrelated request.
+(Garbled-audio-does-not-count is effectively covered: Phase B's STT-unusable turns went to
+`stt_retry` with no `clarify` increment. Session-reference "delete it" = provided is unit-tested;
+optional live probe.) Minimal proposed trigger: `whatsapp_send` has **two genuinely required** fields
+(`contact`, `message`) and no taught default — safe because the cap test never completes args, so
+nothing is sent and Tier 2 never engages. Then one unrelated chat line proves the reset.
+
+### Stage 5a live validation — Phase C cap + reset results (2026-10-11 ~09:04 UTC; log window after baseline 23590)
+
+Chat session task `t1791709433975`, then unrelated fastpath task `t1791709473669`.
+
+| Criterion | Verdict | Evidence (log + checkpoints.db) |
+|---|---|---|
+| Required-missing → clarification, one short question per round | **PASS** | Round 1 `request_type=clarification` `question_chars=75` ("Which contact…and what should the message say?"); round 2 `question_chars=28` ("What should the message say?"). |
+| Max 2 rounds, then stops (no 3rd question) | **PASS** | Exactly 2 `agent event=clarify` rounds; the 3rd answer was met with `request_type=conversation actions=0` → "No problem — I won't send anything…". `clarification_count` in checkpoint: `0→1→2`, never exceeded. Deterministic backstops intact (`MAX_CLARIFICATIONS=2` at `clarify.py:39`, brain fail-closed at `brain.py:154`) — not needed this run because the answer supplied a decision. |
+| Counter resets on a new unrelated request | **PASS** | New task `t1791709473669` (`open notepad`, fastpath `tool=open_app`) has `clarification_count=0` through the whole thread → final `'opened notepad'`. Reset lives in `intake.py:45` (every new request re-enters intake). |
+| Garbled audio doesn't count as a round | **PASS** (by evidence) | Phase B STT-unusable → `stt_retry` / repeat, zero `clarify` increments. |
+| Never over-ask on fully-specified | **PASS** | chrome / notepad fastpath, internship search (no clarify), file-create contract-default Desktop. |
+
+Minor cosmetic observation (not a defect, no code change): in the chat path each clarify question is
+**logged twice** (`question_chars=75` at 09:03:56.020 and again at 09:04:02.417 before the answer's
+`llm_start`; same for `chars=28`) — the pending question is re-emitted on the answer turn. Counter and
+UX were correct; telemetry duplication only.
+
+Overall **Check 4 verdict: PASS** (all six sub-criteria above green). The one Stage 5a sub-branch that
+remains **NOT OBSERVED live** is "proceed + **stated assumption**" for optional-missing: both search
+instances returned `missing=[]`/`assumption=''` (the model judged the unbounded web search fully
+specified), so a live trigger never fired; it is covered by the brain unit suite. **Owner decision
+(2026-10-11): accepted** as unit-covered; this sub-branch is **NOT OBSERVED live** and is **not**
+recorded as a live PASS. `Stage 5a done` is therefore ticked (re-running `search for internships`
+cannot elicit it).
+
+### Stage 5a — consolidated verdicts across all phases (2026-10-11)
+
+| # | Check | Verdict |
+|---|---|---|
+| 1 | Doctor off/on (`jarvis doctor`, `--live`) | **PASS** — exit 0; presence rows; live groq/openrouter/nvidia/gemini reachable, `free_only` (2026-10-09). |
+| 2 | Backup-key failover, end-to-end | **PASS** — real groq 429 → `not rotating key, trying next provider` → openrouter **200** → repaired → final answer **spoken** (10:40 run, i1; 429 at 10:40:56.99, async speak 10:41:08). |
+| 3 | 429 non-rotation, zero-cost constraint | **PASS** — two real 429s (10:40:39 / 10:41:33), each → `not rotating key`, `attempts=0`, no `rotating to the next key slot`. |
+| 4 | Completeness smoke (chat-then-voice) | **PASS** — never over-asks (chrome/notepad/search); required-missing → 2 clarification rounds then stop; counter resets on next request; garbled audio not a round. Sub-branch "proceed + stated assumption" **NOT OBSERVED live** (unit-covered; natural trigger never fired). |
+| 5 | Voice latency intent (quick tasks, no notice) | **PASS** — quick task 1.3 s / 1.5 s / 2.4 s, zero notices across runs. |
+| 6 | Slow-response notice exactly once (>4 s task) | **PASS** — after the sticky-latch fix (`server.py` `if maybe_speak(...): notice_spoken = True`): 1 notice / 6.7 s task (11:07:12.338), 0 on quick tasks. Pre-fix: 4× per task (FAIL, fixed). |
+| — | Illegal voice-state transitions / recovering→RESETTING→READY | **PASS** — 0 illegal transitions across all windows; `recovering→RESETTING→READY` observed cleanly 2× (Phase B). |
+
+### Stage 5a — FINAL STATUS (closed 2026-10-11)
+
+**Stage 5a: COMPLETE.** All six acceptance checks live-validated (Checks 1-6 PASS) plus the
+voice-state / recovery check PASS; tracker `Stage 5a done` ticked (ROADMAP_V2.1 §H). One sub-branch of
+Check 4 — "proceed + **stated assumption**" for optional-missing — is **NOT OBSERVED live** and is
+**accepted on unit-test coverage only** (not recorded as a live PASS); owner approval 2026-10-11.
+
+No source code changed in Phases A-C beyond the already-approved slow-notice latch fix
+(`server.py` `if maybe_speak(...): notice_spoken = True`). Nothing committed or pushed.
+
+**Remaining Stage 5 work (separate, not started):**
+- **Stage 5b — orchestrator (optional).** Decision deferred to Stage 10 tracker ("5b decision: do it
+  or drop it"); sub-task fan-out / independent LLM-only parallelism — not started.
+- **Vision capability live call.** Registry entry exists but `describe_image` was never invoked live;
+  the doctor vision row WARNs by design until Stage 6. (Owner may revisit when Stage 6 begins.)
+- **Optional live probes for completeness:** session-reference "delete it" (unit-tested only) and a
+  natural "proceed + stated assumption" trigger (could not be elicited via search).
+
+No subsequent stage (5b, 6, 7, …) has been started.

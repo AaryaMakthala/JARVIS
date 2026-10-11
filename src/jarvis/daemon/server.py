@@ -1131,8 +1131,11 @@ class DaemonServer:
             # One-shot slow-response notice: speak "This is taking a moment"
             # once the task has run past the threshold, unless a confirmation
             # or clarification owns the microphone, the slot is done, or the
-            # pipeline is stopping (all decided inside the module).
-            notice_spoken = maybe_speak(
+            # pipeline is stopping (all decided inside the module).  The latch
+            # must be sticky: maybe_speak returns False on the pass where
+            # already_spoken is True, so reassigning the return value into the
+            # latch wipes it and the notice repeats every other iteration.
+            if maybe_speak(
                 voice_tts,
                 started,
                 confirmation_owns_mic=bool(confirm_payload and not clarifying),
@@ -1140,7 +1143,8 @@ class DaemonServer:
                 done=slot.done,
                 stopping=self._voice_stopping.is_set(),
                 already_spoken=notice_spoken,
-            )
+            ):
+                notice_spoken = True
             watched, stop_requested = self._watch_for_stop(
                 slot, min(_VOICE_POLL_INTERVAL_S, remaining)
             )

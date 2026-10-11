@@ -126,6 +126,6 @@ All ten accepted as recommended.
 
 - [x] Stage 0 includes `jarvis benchmark run` import check
 - [x] Stage 4 includes local fast path
-- [ ] Stage 5a done
+- [x] Stage 5a done (2026-10-11) — Checks 1-6 live-validated; "proceed + stated assumption" sub-branch NOT OBSERVED live, accepted on unit-test coverage (see PROGRESS.md)
 - [ ] Stage 7 includes re-observe and re-plan scope rules
 - [ ] Stage 10 includes 5b decision (do it or drop it)
