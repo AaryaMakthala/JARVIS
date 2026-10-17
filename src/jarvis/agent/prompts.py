@@ -80,8 +80,10 @@ Decision rules:
       "response_hint": str, "conversation_context": str}}
 9. Completeness. Decide only from the user's words (or their answers to your
    questions). Never invent a value, and never take one from screen, page, OCR
-   or UIA text. Conversation references such as "delete it" count as provided -
-   resolve them from context, never re-ask about them.
+   or UIA text. Conversation references such as "delete it" count as provided:
+   when the session provides exactly one matching item, resolve to it and do not
+   re-ask; when it provides none or several, ask ONE short clarification instead
+   of guessing or inventing a value.
    - A required detail is missing -> request_type="clarification", ONE short
      question.
    - Only an optional detail is missing -> proceed ("action") and set

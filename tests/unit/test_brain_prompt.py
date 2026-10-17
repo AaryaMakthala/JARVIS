@@ -101,6 +101,22 @@ def test_system_prompt_has_the_four_completeness_outcomes() -> None:
     assert '"missing": [str]' in prompt
 
 
+def test_system_prompt_allows_asking_when_no_session_referent_exists() -> None:
+    """Rule 9 must not forbid asking when the session has no matching item (D19).
+
+    The Stage 8 session-context block tells the brain to ask ONE clarification
+    when a reference such as "delete it" cannot be resolved (empty store after a
+    restart, or several candidates).  The system rule must agree - an absolute
+    "never re-ask about them" would push the model to guess or invent a value
+    instead of asking.
+    """
+    prompt = brain_system_prompt([{"name": "open_app", "description": "x", "args_schema": {}}])
+    assert '"delete it"' in prompt and "count as provided" in prompt
+    assert "never re-ask about them" not in prompt
+    assert "when the session provides exactly one matching item" in prompt
+    assert "ask ONE short clarification" in prompt
+
+
 def test_fully_specified_user_prompt_never_invites_clarification() -> None:
     for source in ("terminal", "voice"):
         prompt = brain_user_prompt("open notepad", source=source)

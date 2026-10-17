@@ -4941,3 +4941,12 @@ tracker). No live "delete it" test run yet.
 `jarvis run "delete the photo"` / `jarvis run "delete it"` -> resolves to the photo just saved and
 moves it to the Recycle Bin; with no prior photo, "delete it" must ask a clarification instead of
 guessing.
+
+**Fix (2026-10-17):** reconciled the brain system-prompt rule 9 with the Stage 8 session block. It
+previously said references like "delete it" must "never re-ask about them", which after 8.3 could
+push the model to guess/invent when the session has no (or several) matching item (e.g. right after
+a daemon restart). Rule 9 now resolves only when the session provides exactly one matching item and
+otherwise asks ONE short clarification. Also tightened the act invalidation comment to state that a
+failed/refused step and a dry run record nothing and leave the run untouched (only a *successful*
+non-artifact step invalidates). Focused test:
+`tests/unit/test_brain_prompt.py::test_system_prompt_allows_asking_when_no_session_referent_exists`.

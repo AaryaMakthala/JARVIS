@@ -230,11 +230,13 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     # Session context (Stage 8, D19): remember the artifact a tool just produced
     # so a later "delete it"/"send it" can resolve to the real path.  The store
-    # accepts only the trusted ``result.data["artifact"]`` dict; any other
-    # action (including an empty artifact, or one carrying only text) closes the
-    # current run, invalidating earlier candidates.  Never recorded on a dry run
-    # or a failed step, and never written to AgentState.  This is memory, not
-    # authorization: the path is re-checked like any other when it is used.
+    # accepts only the trusted ``result.data["artifact"]`` dict; any other step
+    # that *completes successfully* (including one carrying only text) closes the
+    # current run, so an unrelated completed action invalidates earlier
+    # candidates.  A failed or refused step and a dry run record nothing and
+    # leave the run untouched (nothing happened, so the last real artifact still
+    # stands).  Never written to AgentState.  This is memory, not authorization:
+    # the path is re-checked like any other when it is used.
     if not ctx.dry_run and result.ok:
         artifact = result.data.get("artifact") if isinstance(result.data, dict) else None
         ctx.session_context.note_action(SESSION_THREAD, artifact)
