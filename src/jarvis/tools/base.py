@@ -86,6 +86,9 @@ class ToolContext:
     browser: Any | None = (
         None  # BrowserSession | None (managed Chrome, Stage 7; never started here)
     )
+    whatsapp_browser: Any | None = (
+        None  # LazyProfileBrowser | None (WhatsApp profile, Stage 8; never started here)
+    )
 
 
 ArgsModel = type[BaseModel]

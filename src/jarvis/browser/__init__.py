@@ -17,6 +17,7 @@ from jarvis.browser.context import (
     PlaywrightBrowser,
     profile_lock,
 )
+from jarvis.browser.lazy import LazyProfileBrowser
 from jarvis.browser.tools import (
     BrowserClickArgs,
     BrowserGotoArgs,
@@ -36,6 +37,7 @@ __all__ = [
     "BrowserSession",
     "BrowserTypeArgs",
     "ElementRef",
+    "LazyProfileBrowser",
     "Observation",
     "PlaywrightBrowser",
     "make_browser_click_spec",

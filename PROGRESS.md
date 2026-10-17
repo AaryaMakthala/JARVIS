@@ -4950,3 +4950,47 @@ otherwise asks ONE short clarification. Also tightened the act invalidation comm
 failed/refused step and a dry run record nothing and leave the run untouched (only a *successful*
 non-artifact step invalidates). Focused test:
 `tests/unit/test_brain_prompt.py::test_system_prompt_allows_asking_when_no_session_referent_exists`.
+
+## STAGE 8 — SLICE 8.4a: second lazy browser session (WhatsApp profile) (2026-10-17)
+
+**Scope:** sub-step 8.4a only. Lifecycle wiring + holder; no WhatsApp tool yet, no behaviour
+change. Owner decisions for the rest of 8.4: content-hash binding via an opt-in ToolSpec flag
+(default off), file size capped (over-cap refused); the attachment preview is a HARD fail-closed
+gate; a narrow documented page accessor for the WhatsApp driver only (NOT added to
+`BrowserSession`, not reachable from `browser_*` or the planner); args are `contact` + `path` only
+(no caption); `budget_cost=1`; `web.whatsapp.com` is NOT added to `allowed_domains`.
+
+**Built:**
+- `src/jarvis/browser/lazy.py` (new): `LazyProfileBrowser(profile, settings, *, factory, logger)`.
+  Validates the profile against `BROWSER_PROFILE_NAMES`; starts the session only on the first
+  `acquire()` (returns the started `PlaywrightBrowser`), reuses it; returns `None` on any start
+  failure (fail closed, never raises) and drops the failed session; `close()` is idempotent and
+  clears its reference before closing so a concurrent start cannot resurrect a closing session.
+  Construction touches no Chrome/Playwright. Exported from `jarvis.browser`.
+- `src/jarvis/tools/base.py`: `ToolContext.whatsapp_browser: Any | None = None`.
+- `src/jarvis/agent/context.py`: `AppContext.whatsapp_browser` threaded through `tool_context()`
+  and `make_app_context(whatsapp_browser=)`. It deliberately does NOT grant the managed-browser
+  `type_text` app token (that stays tied to the general `browser` session only).
+- `src/jarvis/daemon/server.py` (minimal wiring - flagged against the "do not grow server.py"
+  rule): one long-lived `self._whatsapp_browser = LazyProfileBrowser("whatsapp", ...)`; passed as
+  `whatsapp_browser=` into `_build_default_context`; closed once via the new
+  `_close_whatsapp_browser()` in `run()`'s `finally`. No Chrome starts at construction.
+- `tests/unit/test_browser_lazy.py` (new, 13): holder unit tests (profile validation, lazy start,
+  reuse, fail closed on factory/start error, idempotent close, fresh session after close, default
+  factory binds the profile) + wiring (daemon owns one unstarted holder; the context threads it and
+  it is a *different* object from the general session; `make_app_context` default is `None`;
+  idempotent close). The holder lives only on the app context - never in `AgentState`, so the
+  serde allowlist is unchanged.
+
+**Verified:**
+| Command | Result |
+|---|---|
+| ruff check + format (6 changed files) | PASS |
+| mypy src/jarvis/policy | PASS |
+| pytest test_browser_lazy.py | PASS (13) |
+| pytest test_browser_lazy / browser_tools / browser_context / daemon_browser_wiring / daemon_voice | PASS (115) |
+
+**Next (not done):** 8.4b. First an owner-run `scripts/whatsapp_attach_probe.py` (attach approach,
+chat header, attachment preview), then the WhatsApp Web driver against a fake page. The probe is
+not run by the agent.
+

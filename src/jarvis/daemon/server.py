@@ -33,6 +33,7 @@ import psutil
 
 from jarvis import logging_setup
 from jarvis.browser.context import BrowserError, PlaywrightBrowser
+from jarvis.browser.lazy import LazyProfileBrowser
 from jarvis.config import Settings, daemon_runtime_file, load_settings, log_file
 from jarvis.daemon.confirmations import ConfirmationRegistry, plan_hash
 from jarvis.daemon.protocol import (
@@ -348,6 +349,14 @@ class DaemonServer:
         #: start path.  The session object never enters agent/graph state.
         self._browser: Any | None = None
         self._browser_lock = threading.Lock()
+        #: The WhatsApp-profile managed browser (Stage 8).  A second, separate
+        #: Playwright profile so the authenticated WhatsApp Web session never
+        #: shares the general profile (ROADMAP_V2.1 B6).  Constructed eagerly
+        #: but cheaply - it records the profile only; Chrome and Playwright are
+        #: touched on the first ``acquire()`` by the WhatsApp send tool, and the
+        #: holder fails closed when a start is impossible.  Closed once at
+        #: shutdown.  The session object never enters agent/graph state.
+        self._whatsapp_browser = LazyProfileBrowser("whatsapp", self._settings, logger=logger)
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -380,6 +389,7 @@ class DaemonServer:
         finally:
             self._close_memory()
             self._close_browser()
+            self._close_whatsapp_browser()
             self._cleanup_pid_file()
         logger.info("daemon: stopped cleanly")
 
@@ -614,6 +624,7 @@ class DaemonServer:
             classifier=build_classifier(self._settings, self._registry(), logger=logger),
             voice=VoiceToolsFacade(service=self._voice_service),
             browser=_LazyBrowserSession(self._browser_start),
+            whatsapp_browser=self._whatsapp_browser,
         )
 
     def _registry(self) -> Any:
@@ -695,6 +706,19 @@ class DaemonServer:
             browser.close()
         except Exception:
             logger.debug("closing the managed browser failed", exc_info=True)
+
+    def _close_whatsapp_browser(self) -> None:
+        """Close the WhatsApp-profile browser if it was started (idempotent).
+
+        Called once from :meth:`run`'s ``finally`` on shutdown, alongside
+        :meth:`_close_browser`.  The holder clears its own reference before
+        closing, so a concurrent ``acquire`` can never resurrect a closing
+        session; a profile that was never started is a no-op.
+        """
+        try:
+            self._whatsapp_browser.close()
+        except Exception:
+            logger.debug("closing the WhatsApp browser profile failed", exc_info=True)
 
     def _build_voice_service(self) -> Any:
         """Build a VoiceService with lazy-imported backends.

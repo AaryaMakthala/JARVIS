@@ -70,6 +70,14 @@ class AppContext:
     #: owned by the daemon and threaded to tools; construction never starts a
     #: browser, and tool calls fail cleanly when it is ``None``.
     browser: Any | None = None
+    #: Managed Chrome session on the dedicated WhatsApp profile (Stage 8).  A
+    #: second, independent profile - never the general one - so the
+    #: authenticated WhatsApp Web session is isolated (ROADMAP_V2.1 B6).  It is
+    #: a lazy holder (see ``jarvis.browser.lazy``): construction never starts
+    #: Chrome, and tools fail cleanly when it is ``None`` or cannot start.  It
+    #: deliberately does not grant the managed-browser app token for generic
+    #: ``type_text``; the WhatsApp tool drives this profile internally.
+    whatsapp_browser: Any | None = None
     #: Transient, task-scoped target-bindings store (Stage 7).  In-memory only:
     #: bindings, scope grants and resolved targets are never written to
     #: ``AgentState`` or the checkpoint store, so a daemon restart loses them
@@ -103,6 +111,7 @@ class AppContext:
             undo_log=self.undo_log,
             voice=self.voice,
             browser=self.browser,
+            whatsapp_browser=self.whatsapp_browser,
         )
 
 
@@ -120,6 +129,7 @@ def make_app_context(
     memory: MemoryBackend | None = None,
     target_bindings: TargetBindingStore | None = None,
     browser: Any | None = None,
+    whatsapp_browser: Any | None = None,
     scope_registry: ScopeRegistry | None = None,
     session_context: SessionContext | None = None,
 ) -> AppContext:
@@ -153,6 +163,7 @@ def make_app_context(
         memory=memory,
         target_bindings=target_bindings or TargetBindingStore(),
         browser=browser,
+        whatsapp_browser=whatsapp_browser,
         scope_registry=scope_registry
         if scope_registry is not None
         else ScopeRegistry(default_max_actions=int(settings.browser.task_scope_max_actions)),
