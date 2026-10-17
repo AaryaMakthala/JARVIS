@@ -246,9 +246,6 @@ class PlaywrightBrowser:
                 user_data_dir=str(user_data_dir),
                 channel=MANAGED_BROWSER_CHANNEL,
                 headless=False,
-                # Playwright injects --no-sandbox (weakening Chrome) unless
-                # chromiumSandbox is true; Windows needs no such exemption.
-                chromiumSandbox=True,
             )
             self._pw = playwright
             self._context = context

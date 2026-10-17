@@ -4765,3 +4765,8 @@ a file). An optional extra live click run (goto → read → click → type) wou
 **No tests, linters or type-checks were run in this session** (none were permitted). After any
 code edit, run the focused browser tests once on the PC:
 `pytest tests/unit/test_browser_context.py tests/unit/test_browser_tools.py -q`.
+- **Reverted (2026-10-17 12:30):** `chromiumSandbox=True` broke the real Chrome launch on the
+  owner's PC — the daemon logged "managed browser could not start" at 12:30:03–12:30:05 and every
+  browser tool then reported "the managed browser is not available in this context". Removed again
+  from `src/jarvis/browser/context.py`; the managed browser works live without it. The "unsupported
+  command-line flag" banner is cosmetic and remains (Playwright injects `--no-sandbox` by default).
