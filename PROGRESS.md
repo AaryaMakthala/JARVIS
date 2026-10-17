@@ -4990,7 +4990,17 @@ gate; a narrow documented page accessor for the WhatsApp driver only (NOT added 
 | pytest test_browser_lazy.py | PASS (13) |
 | pytest test_browser_lazy / browser_tools / browser_context / daemon_browser_wiring / daemon_voice | PASS (115) |
 
-**Next (not done):** 8.4b. First an owner-run `scripts/whatsapp_attach_probe.py` (attach approach,
-chat header, attachment preview), then the WhatsApp Web driver against a fake page. The probe is
-not run by the agent.
+**Next (owner):** run the new `scripts/whatsapp_attach_probe.py` - owner-run, standalone, never
+imported by the app (`py_compile` + ruff PASS, **not run by the agent**) - and send its output back
+before 8.4b-e are built:
+
+    .venv\Scripts\python.exe scripts\whatsapp_attach_probe.py            # generated 1x1 PNG
+    .venv\Scripts\python.exe scripts\whatsapp_attach_probe.py --file "C:\path\to\photo.jpg"
+
+Stop the daemon first (`jarvis stop`) so nothing else holds the `whatsapp` profile. The probe opens
+that profile only (B6), waits for you to log in and to open your OWN test chat, then tries attach
+approach B (hidden `input[type=file]`, no clicks) and approach A (attach -> Photos/Videos -> file
+chooser), printing the chat header, the composer preview and which approach worked. It never
+locates, clicks or presses Enter on Send; it prints the send-button count only to prove it was not
+clicked. WhatsApp ToS: your own test number only (risk I9).
 
