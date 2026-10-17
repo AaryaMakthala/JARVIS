@@ -110,7 +110,12 @@ def make_open_url_spec() -> ToolSpec:
     """Build the ``open_url`` tool (Tier 0)."""
     return ToolSpec(
         name="open_url",
-        description="Open a web address in the default browser (http/https only).",
+        description=(
+            "Open a web address in the user's normal default browser for the user "
+            "to look at (http/https only). JARVIS cannot read or inspect the page "
+            "with this tool - use browser_goto when JARVIS must read, inspect or "
+            "interact with the page."
+        ),
         args_model=OpenUrlArgs,
         base_tier=0,
         timeout_s=15,

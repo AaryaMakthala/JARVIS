@@ -284,8 +284,9 @@ def make_browser_goto_spec() -> ToolSpec:
         name="browser_goto",
         description=(
             "Navigate the managed JARVIS browser to an absolute http(s) URL. "
-            "Refuses credentials in the URL and stops the task if a redirect "
-            "leaves the approved domains."
+            "Use this instead of open_url whenever JARVIS must read, inspect or "
+            "interact with the page afterwards. Refuses credentials in the URL "
+            "and stops the task if a redirect leaves the approved domains."
         ),
         args_model=BrowserGotoArgs,
         base_tier=1,

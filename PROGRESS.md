@@ -4709,3 +4709,59 @@ restart it). Re-run that command once interop is healthy.
 
 `tests/unit/test_replan_scope.py` + this PROGRESS.md entry (commit
 `test(stage7): add v2.2 replan and scope graph tests`).
+
+## STAGE 7 — LIVE VALIDATION (2026-10-17)
+
+### Verified live (owner's PC, Windows, real Chrome, Playwright 1.64.0 via `pip install -e ".[browser]"`)
+
+- "use browser_goto to open https://example.org, then use browser_read to read it": domain scope
+  prompt ("Approve browsing example.org for this task?") → owner approved → `browser_goto`
+  navigated to `https://example.org/` → `browser_read` returned 1 element (link "Learn more").
+  The managed Playwright path (lazy start, real Chrome, real profile dir) is live-validated.
+
+### Observed
+
+- A differently-phrased request ("open example.org in the browser and read the page") chose the
+  old Tier 0 `open_url` path by design: `open_url` uses `webbrowser.open` into the user's normal
+  Chrome, so it bypasses the managed browser and its domain scope gate entirely; `browser_read`
+  then read the managed browser's empty start page ("Observed 0 elements on :"). Root cause is
+  tool-description wording (see below), not a policy hole.
+- The second Chrome window (the Playwright-launched managed one) showed Chrome's
+  "unsupported command-line flag" infobar. Inspection found **no** custom flag in our code:
+  `launch_persistent_context` passed only `user_data_dir`, `channel="chrome"` and `headless=False`.
+  The flag is injected by Playwright itself — `coreBundle.js` does
+  `if (options.chromiumSandbox !== true) chromeArguments.push("--no-sandbox")` on both the
+  `launch` and `launchPersistentContext` paths, and we never sent `chromiumSandbox`.
+- Fixed: pass `chromiumSandbox=True` (a Playwright option, not a new Chrome switch) so
+  `--no-sandbox` is no longer injected; Chrome's renderer sandbox stays on, and the infobar
+  disappears. Playwright's own MCP config validator enables the sandbox on every non-Linux
+  platform, so this matches the intended Windows default. Left as-is otherwise: nothing else
+  was added.
+- Also fixed (description-only, no tier/policy/behaviour change): `open_url` now says JARVIS
+  cannot read or inspect the page with it and points at `browser_goto`; `browser_goto` now says
+  "use this instead of open_url" when JARVIS must read/inspect/interact. This steers ordinary
+  "open … and read the page" phrasings onto the managed, scope-gated path.
+- Still true by design: Playwright also passes `--enable-automation`, and its `--disable-infobars`
+  switch is documented as ignored outside Chrome-for-Testing, so real `channel="chrome"` may still
+  show the separate "Chrome is being controlled by automated test software" infobar. Harmless.
+
+### NOT exercised live (unit-tested only)
+
+`browser_click`, `browser_type`, `ui_list_controls`, `ui_click`, the risky-control "Allow"
+re-gate, cross-origin redirect handling, and action-limit refusal.
+
+### Status
+
+Stage 7 code-complete; managed-browser navigate+read live-validated. Remaining Stage 7 work is
+documentation and benchmark coverage, which belongs to Stage 10: `docs/02`, `docs/03` and
+`docs/04` still need Stage 7 tool entries (`docs/04` still documents the old `open_url` as the
+web-open tool, so it is now stale relative to this change), `benchmarks/redteam.yaml` needs Stage
+7 cases, and Stage 7 invariants I1–I8 need entries in `tests/unit/test_invariants.py` (only I3 has
+a file). An optional extra live click run (goto → read → click → type) would close the remaining
+"unit-tested only" gap.
+
+### Note
+
+**No tests, linters or type-checks were run in this session** (none were permitted). After any
+code edit, run the focused browser tests once on the PC:
+`pytest tests/unit/test_browser_context.py tests/unit/test_browser_tools.py -q`.
