@@ -4656,3 +4656,56 @@ Remaining Stage 7 work: full-regime regression + red-team exercise (`docs/07`, S
 outstanding documentation passes; then the phase-9 acceptance list. Manual smoke test recommended
 on the real PC (hampered offline, so deferred): `jarvis daemon --foreground`, open a page, confirm
 the scope prompt, watch the daemon log for the one-session browser line.
+
+## STAGE 7 — v2.2 required replan/scope graph tests added (2026-10-17)
+
+**Scope (this session):** add the six V2.2-required graph-level tests covering re-plan vs. the
+task-scope front end. No policy/engine changes, no live automation, no dependency changes.
+
+### Built
+
+- `tests/unit/test_replan_scope.py` (new): drives the real compiled graph (`run_task`/`resume_task`
+  over a file-backed SQLite checkpointer) with the real browser specs, a scripted `FakeLLM` and a
+  local `FakeSession`/`RedirectSession` (no cross-module test imports). Six tests:
+  1. in-scope re-plan re-confirms the same domain (fresh plan hash, new grant id), then completes;
+     the consumed counter is inherited (1 -> 2).
+  2. out-of-scope re-plan (new domain) needs its own scope prompt; the old grant does not cover the
+     new domain and the new grant carries a new confirmation id.
+  3. a popup `Allow` control gets its own fresh (non-scope) action confirmation after the scope
+     approval.
+  4. a cross-origin redirect hit while running a re-planned step stops the task fail-closed; no
+     read/click runs against the redirect target.
+  5. the action counter survives a re-plan (`task_scope_max_actions=2`): the third action is refused
+     with "action limit"; consumed stays 2 and it never runs.
+  6. a stale approval hash from before the re-plan cannot answer the new scope prompt (no new grant
+     is issued).
+
+### Verified
+
+| Command | Result |
+|---|---|
+| ruff format + ruff check (new file) | PASS |
+| pytest test_replan_scope + test_scope_gate + test_scope + test_act_target_parity + test_replan | 94 passed |
+| mypy src/jarvis/policy | PASS |
+
+Full suite (`pytest -q -m "not slow and not voice and not windows_only"`): the one completed run
+reported 11 pre-existing failures/errors, all in `tests/unit/test_voice_*.py` and
+`tests/unit/test_tools_type_text.py`; none in replan/scope. The working tree equals HEAD except for
+this new (untracked) test file, so those failures are pre-existing at HEAD (no stash needed). The
+follow-up run to capture exact pass/fail counts could not complete: Windows/WSL interop
+(`cmd.exe`, `.venv/Scripts/python.exe`) began failing with `UtilAcceptVsock ... accept4 failed 110`
+after the first full run and stayed down for the rest of the session (no passwordless sudo to
+restart it). Re-run that command once interop is healthy.
+
+### Fragile / notes
+
+- Exhausted budget: `ScopeRegistry.validate` fails (`budget_exhausted`) so the gate offers a *scope*
+  re-confirmation that cannot raise the lifetime cap; approving it is refused at `act` ("blocked by
+  policy"). Fail closed; a wasted confirmation is a UX note only, not a safety bug.
+- A cross-origin redirect surfaces as a failed `browser_goto` step (final answer "Could not
+  complete..."), not a `halted_reason`; both are terminal and fail-closed.
+
+### Not committed
+
+`tests/unit/test_replan_scope.py` + this PROGRESS.md entry (commit
+`test(stage7): add v2.2 replan and scope graph tests`).
