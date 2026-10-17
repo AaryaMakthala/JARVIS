@@ -4848,3 +4848,38 @@ This honours the owner's "add it as a root" choice while working under OneDrive-
 **Manual smoke (owner):** `pip install -e ".[camera]"`; `jarvis run "take a photo"` -> approve ->
 check `%USERPROFILE%\Pictures\JARVIS\photo-*.jpg`; then `jarvis run "show me the photo"` (8.2) and
 `jarvis run "delete the photo"` (Recycle Bin).
+
+## STAGE 8 — SLICE 8.2: `open_path` (viewer only) (2026-10-17)
+
+**Scope:** sub-step 8.2 only. Not committed yet (commit after this entry).
+
+**Built:**
+- `src/jarvis/tools/open_in_app.py`: new `open_path` tool (Tier 0 `TIER_SAFE`, `windows_only`,
+  `path_args=("path",)`). Reuses the hardened `_resolve_target` (absolute, existing regular file,
+  no ADS colon, not a `DENIED_FILE_SUFFIXES` executable/script) and adds a strict
+  `OPENABLE_SUFFIXES` allowlist: images (`.jpg .jpeg .png .gif .bmp .webp .tif .tiff`), `.txt`,
+  `.md`, `.pdf`. Then `is_protected` and `within_any_root` checks (engine also root-checks the arg;
+  act re-checks TOCTOU). Launcher is `os.startfile` behind `platform_guard.require_windows` (lazy
+  `getattr(os, "startfile", None)`), injectable via `make_open_path_spec(launcher=...)`. `verify()`
+  is `verified=None` + `verify_note` (a viewer launch has no observable post-condition;
+  `lock_computer`/`open_in_app` precedent).
+- `src/jarvis/tools/registry.py`: registers `make_open_path_spec()`.
+- `tests/unit/test_open_path.py` (new, 31 tests): all allowlisted suffixes open with the default
+  viewer; refused executable/script suffixes (`.exe .bat .cmd .ps1 .lnk .msi .vbs .js .jar .scr
+  .com .reg .dll .cpl`); non-allowlisted suffix; relative path; ADS path; missing file; outside
+  roots; protected path; dry-run launches nothing; launcher failure -> ok=False; `verified=None`
+  note; registration (Tier 0, windows_only, name passes `matches_blocked`/`_FORBIDDEN_RE`).
+
+**Verified:**
+| Command | Result |
+|---|---|
+| ruff check + format (changed files) | PASS |
+| pytest test_open_path.py | PASS (31) |
+| pytest tools_open_in_app/camera/invariants/risk_classifier/windows_only_enforcement | PASS |
+
+**Next (not done):** 8.3 session-context "it" (D19); 8.4 `whatsapp_send_file` (I10); 8.5 docs
+(`docs/03`, `docs/04`, ROADMAP tracker). No live viewer test run yet.
+
+**Manual smoke (owner):** after `pip install -e ".[camera]"` and a photo exists,
+`jarvis run "show me the photo"` -> the photo opens in the default image viewer; `jarvis run "open
+the evil.exe"` (any executable) must be refused.
