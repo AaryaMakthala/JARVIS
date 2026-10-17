@@ -203,6 +203,18 @@ max_text_chars = 6000
 # Cap on UI Automation elements walked per capture (bounds cost on huge windows).
 max_ui_elements = 400
 
+[camera]
+# Stage 8 take_photo.  Photos are written to `save_dir` when set, otherwise to
+# the user's Pictures folder in a JARVIS subfolder (auto-detected, so it works
+# with OneDrive-redirected Pictures).  That folder is always treated as an
+# allowed root, so open_path/delete_path can view and delete a photo without
+# widening access to the rest of Pictures.  `save_dir` must be absolute.
+save_dir = ""
+# Which camera to open (0 = first/default) and how many frames to discard
+# before the saved shot, so exposure and white balance settle.
+device_index = 0
+warmup_frames = 5
+
 [browser]
 # Stage 7 browser automation.  JARVIS drives its OWN Playwright/Chrome profile
 # (never the owner's normal Chrome tabs).
@@ -598,6 +610,29 @@ class ScreenSettings(BaseModel):
     max_ui_elements: int = 400
 
 
+class CameraSettings(BaseModel):
+    """Camera settings (``[camera]`` in config.toml, Stage 8).
+
+    ``take_photo`` saves into :func:`jarvis.tools.default_dirs.photo_dir`: the
+    configured absolute ``save_dir`` when set, else the user's Pictures folder
+    joined with ``JARVIS`` (read from Windows Known Folders, so an
+    OneDrive-redirected Pictures folder is honoured).  That folder is always
+    treated as an allowed root by :func:`jarvis.policy.paths.roots_from_settings`
+    so a photo can be viewed and deleted by the normal file tools without
+    widening access to the rest of Pictures.  ``device_index`` / ``warmup_frames``
+    tune the capture.
+    """
+
+    save_dir: str = ""
+    device_index: int = 0
+    warmup_frames: int = 5
+
+    @field_validator("save_dir")
+    @classmethod
+    def _save_dir_absolute(cls, value: str) -> str:
+        return _require_absolute(value, "camera.save_dir")
+
+
 class BrowserSettings(BaseModel):
     """Browser/UIA task-scope settings (``[browser]`` in config.toml, Stage 7).
 
@@ -672,6 +707,7 @@ class Settings(BaseSettings):
     risk: RiskSettings = RiskSettings()
     tools: ToolsSettings = ToolsSettings()
     screen: ScreenSettings = ScreenSettings()
+    camera: CameraSettings = CameraSettings()
     browser: BrowserSettings = BrowserSettings()
     config_version: int = 1
 

@@ -35,6 +35,7 @@ __all__ = [
     "default_save_dir",
     "known_folder",
     "location_label",
+    "photo_dir",
     "resolve_location",
 ]
 
@@ -142,6 +143,21 @@ def default_save_dir(settings: Any) -> Path:
     if str(raw).strip():
         return Path(os.path.expandvars(os.path.expanduser(str(raw))))
     return known_folder("desktop") or (Path.home() / "Desktop")
+
+
+def photo_dir(settings: Any) -> Path:
+    """Folder where ``take_photo`` saves pictures (Stage 8).
+
+    ``settings.camera.save_dir`` when set (must be absolute, validated at load),
+    else the user's Pictures Known Folder joined with ``JARVIS`` (falling back
+    to ``~/Pictures/JARVIS`` off-Windows or when the API is unavailable).  The
+    directory is not created here - the tool makes it just before writing.
+    """
+    raw = getattr(getattr(settings, "camera", None), "save_dir", "") or ""
+    if str(raw).strip():
+        return Path(os.path.expandvars(os.path.expanduser(str(raw))))
+    base = known_folder("pictures") or (Path.home() / "Pictures")
+    return base / "JARVIS"
 
 
 def resolve_location(value: str, settings: Any) -> LocationResult:

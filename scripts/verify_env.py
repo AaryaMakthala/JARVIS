@@ -94,6 +94,9 @@ PACKAGES: list[tuple[str, str, int, bool]] = [
     ("rapidocr-onnxruntime", "rapidocr_onnxruntime", 6, False),
     # Stage 7 owns the browser (Playwright); it is not needed for Stage 6.
     ("playwright", "playwright", 7, False),
+    # Stage 8 camera capture (optional [camera] extra).  Missing is WARN - the
+    # take_photo tool then reports that OpenCV is unavailable and takes no shot.
+    ("opencv-python", "cv2", 8, False),
     ("fastembed", "fastembed", 8, False),
     ("tokenizers", "tokenizers", 8, False),
     ("pytest", "pytest", 0, False),
@@ -112,6 +115,7 @@ OPTIONAL = {
     "mss",
     "Pillow",
     "rapidocr-onnxruntime",
+    "opencv-python",
 }
 
 

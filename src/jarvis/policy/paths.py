@@ -166,8 +166,26 @@ def normalise_key(path: Path | str) -> str:
 
 
 def roots_from_settings(settings: config.Settings) -> list[Path]:
-    """Expand ``settings.policy.allowed_roots`` into resolved absolute roots."""
-    return [resolve_safe(value) for value in settings.policy.allowed_roots]
+    """Expand ``settings.policy.allowed_roots`` into resolved absolute roots.
+
+    The camera's photo folder (:func:`jarvis.tools.default_dirs.photo_dir`) is
+    always appended, so a picture taken by ``take_photo`` can be viewed and
+    deleted by the normal file tools.  That folder is JARVIS-owned
+    (``Pictures/JARVIS`` by default) and never the whole Pictures folder, so the
+    rest of the user's pictures stay outside the roots.  The lookup is imported
+    lazily to avoid a policy <-> tools import cycle, and any failure keeps only
+    the configured roots (fail closed: it never widens access on error).
+    """
+    roots = [resolve_safe(value) for value in settings.policy.allowed_roots]
+    try:
+        from jarvis.tools.default_dirs import photo_dir
+
+        camera_root = resolve_safe(str(photo_dir(settings)))
+    except Exception:  # noqa: BLE001 - never widen access on a helper failure
+        return roots
+    if normalise_key(camera_root) not in {normalise_key(root) for root in roots}:
+        roots.append(camera_root)
+    return roots
 
 
 def within_any_root(path: Path, roots: list[Path]) -> bool:

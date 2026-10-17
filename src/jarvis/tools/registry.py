@@ -128,6 +128,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_defender_quick_scan_spec,
         make_defender_status_spec,
     )
+    from jarvis.tools.camera import make_take_photo_spec
     from jarvis.tools.clock import make_get_time_spec
     from jarvis.tools.dictation import (
         make_save_dictation_spec,
@@ -177,6 +178,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_read_file_spec(),
         make_delete_path_spec(),
         make_undo_last_delete_spec(),
+        make_take_photo_spec(),
         make_type_text_spec(),
         make_open_in_app_spec(),
         make_start_dictation_spec(),

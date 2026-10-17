@@ -4801,3 +4801,50 @@ refusal.
 - Spotify web-player route not built (decide in Stage 8/10).
 
 **No tests, linters or type-checks were run in this docs-only session.**
+
+## STAGE 8 — SLICE 8.1: `take_photo` (2026-10-17)
+
+**Scope:** sub-step 8.1 only (camera capture). No 8.2-8.5 work. Not committed yet.
+
+**Built:**
+- `src/jarvis/tools/camera.py` (new): `take_photo` (Tier 1 `TIER_CONFIRM`, `windows_only`,
+  `budget_cost=0`, `TakePhotoArgs` `extra=forbid`). Lazy `cv2` import; injectable `CameraBackend`
+  (`OpenCvCamera` = `cv2.VideoCapture(index, CAP_DSHOW)`, discards warm-up frames, JPEG-encodes).
+  Real `verify()`: exists + non-zero + decodes (OpenCV when present, structural SOI/EOI otherwise).
+  Saves `photo-YYYYmmdd-HHMMSS.jpg` (UTC stamp, collision `-N`) via mkdir + temp write +
+  `os.replace`; 25 MB cap; returns `data["artifact"] = {"path","type":"photo"}` for D19 (8.3).
+- `src/jarvis/config.py`: `CameraSettings` (`save_dir` absolute-validated, `device_index=0`,
+  `warmup_frames=5`) + `[camera]` TOML block + `Settings.camera`.
+- `src/jarvis/tools/default_dirs.py`: `photo_dir(settings)` — configured `save_dir` else Pictures
+  Known Folder / `JARVIS` (OneDrive-redirected aware), `~/Pictures/JARVIS` fallback.
+- `src/jarvis/policy/paths.py::roots_from_settings`: always unions the camera photo dir (function-
+  level lazy import; fail-closed on error). Required because the default `allowed_roots` do NOT
+  include Pictures, so the shot stays viewable/deletable via `open_path`/`delete_path`.
+- `src/jarvis/tools/registry.py`: registers `take_photo`; `pyproject.toml` `[camera]` extra
+  (`opencv-python`); `scripts/verify_env.py` adds `opencv-python` at phase 8, OPTIONAL (WARN).
+- `tests/unit/test_camera.py` (new, 17 tests): success/verify/artifact, dry-run (no capture),
+  no-camera/empty-frame/huge-frame errors, verify-false (corrupt/missing file), outside-roots and
+  protected-dir refusals, `photo_dir` default+config, collision suffix, registration + name safety.
+
+**Verified:**
+| Command | Result |
+|---|---|
+| ruff check (changed files) | PASS |
+| pytest test_camera.py | PASS (17) |
+| pytest config/paths/validate_paths/invariants/tools_open_in_app | PASS |
+| pytest risk_classifier/windows_only_enforcement/tools_type_text/dictation/screen/time | 1 pre-existing FAIL |
+
+The one failure is `test_tools_type_text::TestNoGenericKeyboardTools::test_registry_has_no_press_key_tool`
+(it forbids any tool name containing "click"; `browser_click` from Stage 7 trips it). This is the
+known-red `type_text` test already recorded at line 4798 — not caused by Stage 8. Left untouched.
+
+**Deviation (owner-informed):** the photo folder is auto-detected (Pictures Known Folder + `JARVIS`)
+and always unioned into the allowed roots, rather than only adding a static `~/Pictures/JARVIS` root.
+This honours the owner's "add it as a root" choice while working under OneDrive-redirected Pictures.
+
+**Next (not done):** 8.2 `open_path`; 8.3 session-context "it" (D19); 8.4 `whatsapp_send_file`
+(I10); 8.5 docs (`docs/03`, `docs/04`, ROADMAP tracker). No live camera test run yet.
+
+**Manual smoke (owner):** `pip install -e ".[camera]"`; `jarvis run "take a photo"` -> approve ->
+check `%USERPROFILE%\Pictures\JARVIS\photo-*.jpg`; then `jarvis run "show me the photo"` (8.2) and
+`jarvis run "delete the photo"` (Recycle Bin).
