@@ -27,6 +27,10 @@ from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.clarify import MAX_CLARIFICATIONS
 from jarvis.agent.prompts import brain_system_prompt, brain_user_prompt
 from jarvis.agent.schemas import BrainDecision
+from jarvis.agent.session_context import (
+    SESSION_THREAD,
+    render_resolution,
+)
 from jarvis.agent.state import Plan, Step
 
 #: Deterministic, user-facing halt reasons.  The LLM output never reaches the
@@ -77,6 +81,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     source = state.get("source") or "terminal"
     catalogue = ctx.registry.catalogue_for_llm()
     system = brain_system_prompt(catalogue)
+    session_block = _session_reference_block(state, ctx)
     user = brain_user_prompt(
         state.get("user_input") or "",
         memory_context=[
@@ -87,6 +92,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         repair_error=previous_error,
         source=source,
         clarification_count=int(state.get("clarification_count") or 0),
+        session_context=session_block,
     )
 
     llm_budget: dict[str, Any] = {}
@@ -121,6 +127,22 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         len(model.actions),
     )
     return _project(model, state, usage)
+
+
+def _session_reference_block(state: dict[str, Any], ctx: AppContext) -> str | None:
+    """Resolve a deictic reference ("it", "that photo") to a prompt block.
+
+    The store holds artifacts only from trusted tool results (see
+    :mod:`jarvis.agent.session_context`).  The code - not the LLM - decides
+    whether the words reference a prior item and whether exactly one is
+    resolvable; anything unresolvable (none, or more than one) becomes a plain
+    instruction to ask one clarification.
+    """
+    text = state.get("user_input") or ""
+    answer = state.get("clarification_answer")
+    if answer:
+        text = f"{text}\n{answer}"
+    return render_resolution(ctx.session_context.reference_resolution(SESSION_THREAD, text))
 
 
 def _project(decision: BrainDecision, state: dict[str, Any], usage: Any) -> dict[str, Any]:

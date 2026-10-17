@@ -103,6 +103,7 @@ def brain_user_prompt(
     repair_error: str | None = None,
     source: str = "terminal",
     clarification_count: int | None = None,
+    session_context: str | None = None,
 ) -> str:
     """Build the user prompt for one brain call.
 
@@ -113,7 +114,11 @@ def brain_user_prompt(
     only ``"voice"`` appends :data:`VOICE_SOURCE_LINE`, because a transcript is
     lossy whereas typed input is not.  ``clarification_count`` is the round the
     graph is on (0 on a fresh request); the last round tells the brain to
-    stop asking and state what is missing.
+    stop asking and state what is missing.  ``session_context`` is a plain-text
+    block (from :func:`jarvis.agent.session_context.render_resolution`)
+    describing the single artifact a deictic reference resolves to, or a short
+    instruction to ask one clarification; the code decides which, and the path
+    it may contain is still checked like any other path.
     """
     parts = [f"The user said:\n{user_input!r}"]
     if clarification_question and clarification_answer is not None:
@@ -134,6 +139,8 @@ def brain_user_prompt(
         parts.append(
             "Relevant past examples:\n" + json.dumps(memory_context[:5], default=str, indent=2)
         )
+    if session_context:
+        parts.append(session_context)
     if source == "voice":
         parts.append(VOICE_SOURCE_LINE)
     if clarification_count:

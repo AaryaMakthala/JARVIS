@@ -235,6 +235,17 @@ task_scope_max_actions = 8
 # per-task, transient, and never checkpointed; on expiry (or daemon restart)
 # fresh authorization is required.
 scope_expiry_s = 120.0
+
+[session]
+# Stage 8 (D19): how long JARVIS remembers the artifact a tool just produced
+# (e.g. the photo take_photo saved) so a follow-up like "delete it" or "send it
+# to X" can resolve to the real path.  IN-MEMORY ONLY - never written to the
+# checkpoint store; a daemon restart forgets every artifact (fail closed).
+# `max_artifacts` caps how many are kept per session; `artifact_ttl_seconds`
+# ages them out.  A resolved path is only a proposal - it is re-checked like
+# any other path before a tool acts on it.
+max_artifacts = 5
+artifact_ttl_seconds = 600
 """
 
 
@@ -680,6 +691,23 @@ class BrowserSettings(BaseModel):
         return out
 
 
+class SessionSettings(BaseModel):
+    """Session-context settings (``[session]`` in config.toml, Stage 8 / D19).
+
+    Bounds the in-memory store of artifacts a tool just produced, so a
+    follow-up like "delete it" or "send it" can resolve to a real path.
+
+    * ``max_artifacts`` - how many artifacts are kept per session (oldest are
+      dropped first).  The store is IN-MEMORY ONLY and is never written to the
+      checkpoint store, so a daemon restart forgets every artifact.
+    * ``artifact_ttl_seconds`` - how long an artifact stays referable.  Expired
+      artifacts are never offered as a candidate (fail closed).
+    """
+
+    max_artifacts: int = 5
+    artifact_ttl_seconds: float = 600.0
+
+
 class Settings(BaseSettings):
     """Top-level application settings.
 
@@ -709,6 +737,7 @@ class Settings(BaseSettings):
     screen: ScreenSettings = ScreenSettings()
     camera: CameraSettings = CameraSettings()
     browser: BrowserSettings = BrowserSettings()
+    session: SessionSettings = SessionSettings()
     config_version: int = 1
 
     @classmethod

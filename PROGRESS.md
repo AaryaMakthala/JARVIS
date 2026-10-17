@@ -4883,3 +4883,61 @@ check `%USERPROFILE%\Pictures\JARVIS\photo-*.jpg`; then `jarvis run "show me the
 **Manual smoke (owner):** after `pip install -e ".[camera]"` and a photo exists,
 `jarvis run "show me the photo"` -> the photo opens in the default image viewer; `jarvis run "open
 the evil.exe"` (any executable) must be refused.
+
+## STAGE 8 — SLICE 8.3: session artifact context (`it` / "that photo") (2026-10-17)
+
+**Scope:** sub-step 8.3 only (D19). Not committed yet (commit after this entry).
+
+**Design / invariants:**
+- New in-memory store on `AppContext` (never in `AgentState`/checkpoints; serde allowlist unchanged).
+  A daemon restart forgets every artifact — fail closed.
+- ONE writer, `SessionContext.note_action`, accepts only a trusted `ToolResult.data["artifact"]`
+  dict (`type`+`path`, set by `take_photo`). A path that appears only in tainted output/screen/UIA
+  text is NOT an artifact (I1). Any successful non-artifact step closes the current run, so an
+  unrelated action invalidates the candidate.
+- Deterministic resolution: exactly one unexpired candidate of the current run -> `resolved`;
+  zero -> `none`; more than one -> `ambiguous`. Never "newest wins". Expired entries never offered.
+- The code (not the LLM) decides resolvable/none/ambiguous and whether the words reference a prior
+  item; the LLM only fills the resolved path into tool args or asks ONE clarification. The path is
+  still validated + policy-checked + act-rechecked (TOCTOU) like any other path.
+
+**Built:**
+- `src/jarvis/agent/session_context.py` (new): `SessionContext` (bounded deque, `max_artifacts`,
+  `ttl_seconds`, injectable `clock`, `threading.Lock`), `SessionArtifact`, `Resolution`, `resolve`,
+  `candidates`, `reference_resolution`, `references_prior_item`, `requested_artifact_type`,
+  `render_resolution` (plain text; no JSON, no `<untrusted_data>`, no policy words),
+  `SESSION_THREAD = "local"` (stable; per-request task ids cannot key a session).
+- `src/jarvis/config.py`: `SessionSettings` + `[session]` (`max_artifacts=5`,
+  `artifact_ttl_seconds=600`) + `Settings.session`.
+- `src/jarvis/agent/context.py`: `AppContext.session_context` + `make_app_context(session_context=)`
+  built from settings.
+- `src/jarvis/agent/nodes/act.py`: after a real, successful dispatch (not dry-run, not failed),
+  records `result.data.get("artifact")` — the only recorder, from trusted data.
+- `src/jarvis/agent/prompts.py`: `brain_user_prompt(..., session_context=)` appends the block.
+- `src/jarvis/agent/nodes/brain.py`: `_session_reference_block` resolves and passes the block.
+- `tests/unit/test_session_context.py` (new, 27 tests): trusted-source-only writer; malformed/bare
+  string rejected; bounded (max 5); TTL expiry; zero -> none; two -> ambiguous (never newest);
+  unrelated action invalidates; new run starts fresh; type filter; reference gating; plain-text
+  render; act records trusted artifact only, not tainted/failed/dry-run; NOT in AgentState or the
+  serde allowlist; brain wiring (path only when exactly resolvable, ask line when ambiguous/none,
+  unchanged when no reference).
+
+**Verified:**
+| Command | Result |
+|---|---|
+| ruff check + format (changed files) | PASS |
+| mypy src/jarvis/policy + session_context/context | PASS |
+| pytest test_session_context.py | PASS (27) |
+| pytest test_serializer/brain_prompt/act_node/config/invariants/fastpath | PASS |
+| pytest test_completeness/agent_architecture | PASS |
+
+**Pre-existing red (not caused by Stage 8):** `tests/unit/test_tools_type_text.py` (recorded at
+line 4798). Left untouched.
+
+**Next (not done):** 8.4 `whatsapp_send_file` (I10); 8.5 docs (`docs/03`, `docs/04`, ROADMAP
+tracker). No live "delete it" test run yet.
+
+**Manual smoke (owner):** `jarvis run "take a photo"` (approve) then, in the same session,
+`jarvis run "delete the photo"` / `jarvis run "delete it"` -> resolves to the photo just saved and
+moves it to the Recycle Bin; with no prior photo, "delete it" must ask a clarification instead of
+guessing.

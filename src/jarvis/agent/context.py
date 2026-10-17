@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from jarvis.agent.session_context import SessionContext
 from jarvis.agent.target_binding import TargetBindingStore
 from jarvis.config import Settings, load_settings
 from jarvis.llm.client import LLMClient
@@ -80,6 +81,13 @@ class AppContext:
     #: ``target_bindings`` it is in-memory only and never checkpointed, so a
     #: daemon restart requires fresh authorization.
     scope_registry: ScopeRegistry = field(default_factory=ScopeRegistry)
+    #: Task-session artifact context (Stage 8, D19).  Holds the artifacts a
+    #: tool just produced (e.g. the photo ``take_photo`` saved) so a follow-up
+    #: like "delete it" can resolve to a real path.  IN-MEMORY ONLY and never
+    #: written to ``AgentState`` or the checkpoint store, so a daemon restart
+    #: forgets every artifact; a resolved path is only a proposal and is
+    #: re-checked like any other path before a tool acts on it.
+    session_context: SessionContext = field(default_factory=SessionContext)
 
     def tool_context(self) -> ToolContext:
         """Build a ToolContext for the current step (no secret leaks)."""
@@ -113,6 +121,7 @@ def make_app_context(
     target_bindings: TargetBindingStore | None = None,
     browser: Any | None = None,
     scope_registry: ScopeRegistry | None = None,
+    session_context: SessionContext | None = None,
 ) -> AppContext:
     """Build a ready-to-use :class:`AppContext` with defaults."""
     settings = settings or load_settings()
@@ -147,4 +156,10 @@ def make_app_context(
         scope_registry=scope_registry
         if scope_registry is not None
         else ScopeRegistry(default_max_actions=int(settings.browser.task_scope_max_actions)),
+        session_context=session_context
+        if session_context is not None
+        else SessionContext(
+            max_artifacts=int(settings.session.max_artifacts),
+            ttl_seconds=float(settings.session.artifact_ttl_seconds),
+        ),
     )

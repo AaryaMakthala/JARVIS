@@ -39,6 +39,7 @@ from jarvis.agent.nodes.util import (
     resolve_step_target,
     truncate,
 )
+from jarvis.agent.session_context import SESSION_THREAD
 from jarvis.agent.state import StepResult
 
 logger = logging.getLogger(__name__)
@@ -226,6 +227,17 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     start = time.perf_counter()
     result = spec.execute(args, tool_ctx)
     elapsed_ms = int((time.perf_counter() - start) * 1000)
+
+    # Session context (Stage 8, D19): remember the artifact a tool just produced
+    # so a later "delete it"/"send it" can resolve to the real path.  The store
+    # accepts only the trusted ``result.data["artifact"]`` dict; any other
+    # action (including an empty artifact, or one carrying only text) closes the
+    # current run, invalidating earlier candidates.  Never recorded on a dry run
+    # or a failed step, and never written to AgentState.  This is memory, not
+    # authorization: the path is re-checked like any other when it is used.
+    if not ctx.dry_run and result.ok:
+        artifact = result.data.get("artifact") if isinstance(result.data, dict) else None
+        ctx.session_context.note_action(SESSION_THREAD, artifact)
 
     step_result = StepResult(
         step_id=step.id,
