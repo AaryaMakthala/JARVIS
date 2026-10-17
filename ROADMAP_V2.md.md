@@ -350,7 +350,7 @@ Live test: the common commands feel instant; errors are spoken clearly.
 - [x] Stage 4: Time, apps scan, list windows, open_in_app, Notepad, small VS Code code (4.9 deferred; accepted 2026-10-08, deferred checks listed in PROGRESS.md)
 - [ ] Stage 5: Key pools, orchestrator, speech-aware brain, vision capability (5a done 2026-10-11 — see ROADMAP_V2.1 §H / PROGRESS.md; 5b orchestrator optional, not started)
 - [x] Stage 6: Screen reading and description (2026-10-11 — UIA-first read_screen/describe_screen; live acceptance passed: Notepad, Calculator, desktop, The Hindu (publication named + visible headline, NOT full article-body), sensitive-title refusal live-verified; cloud vision OFF by default, no live screenshot sent; OCR dep NOT installed, OCR accuracy unvalidated — see PROGRESS.md)
-- [ ] Stage 7: Browser DOM + UIA clicking, Spotify
+- [x] Stage 7: Browser DOM + UIA clicking (2026-10-17; navigate+read live-validated, click/type/UIA unit-tested only; Spotify route not built; see PROGRESS.md)
 - [ ] Stage 8: Camera, viewer, delete, WhatsApp photo
 - [ ] Stage 9: UX polish and local fast path
 - [ ] Stage 10: Hardening, docs, benchmarks, full validation

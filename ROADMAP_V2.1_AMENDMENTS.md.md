@@ -128,5 +128,5 @@ All ten accepted as recommended.
 - [x] Stage 4 includes local fast path
 - [x] Stage 5a done (2026-10-11) — Checks 1-6 live-validated; "proceed + stated assumption" sub-branch NOT OBSERVED live, accepted on unit-test coverage (see PROGRESS.md)
 - [x] Stage 6 done (2026-10-11) — UIA-first `read_screen`/`describe_screen`; live acceptance passed (Notepad, Calculator, desktop, The Hindu headline, sensitive-title denial after Tier 1 approval); cloud vision OFF by default (no live screenshot, covered by tests/invariants); local OCR dep NOT installed (OCR accuracy unvalidated) (see PROGRESS.md)
-- [ ] Stage 7 includes re-observe and re-plan scope rules
+- [x] Stage 7 includes re-observe and re-plan scope rules (2026-10-17, six graph tests in tests/unit/test_replan_scope.py)
 - [ ] Stage 10 includes 5b decision (do it or drop it)

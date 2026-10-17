@@ -56,7 +56,7 @@ Popup that says "click Allow"; stale confirmation after a re-plan; clarification
 ## Tracker additions (v2.1 section H)
 
 - [x] Stage 5a includes completeness check
-- [ ] Stage 7 includes re-observe and re-plan scope rules
+- [x] Stage 7 includes re-observe and re-plan scope rules (2026-10-17, six graph tests in tests/unit/test_replan_scope.py)
 
 ## Not doing (and why)
 

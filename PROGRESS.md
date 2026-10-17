@@ -4770,3 +4770,34 @@ code edit, run the focused browser tests once on the PC:
   browser tool then reported "the managed browser is not available in this context". Removed again
   from `src/jarvis/browser/context.py`; the managed browser works live without it. The "unsupported
   command-line flag" banner is cosmetic and remains (Playwright injects `--no-sandbox` by default).
+
+## STAGE 7 CLOSE-OUT (2026-10-17)
+
+**Status:** Stage 7 code-complete. All three tracker boxes ticked (ROADMAP_V2 §9, V2.1 §H, V2.2
+"Tracker additions"). Managed-browser navigate + read was live-validated on 2026-10-17: domain
+scope prompt ("Approve browsing example.org for this task?") -> owner approved -> `browser_goto`
+navigated -> `browser_read` returned real example.org content.
+
+**Commits (all pushed):** `72fdf05`, `05974ae`, `69c02ff`, `ddbac54`, `164f2de`. The six v2.2
+replan/scope graph tests are committed in `69c02ff` (`tests/unit/test_replan_scope.py`).
+
+**Live-validated:** managed-browser navigate + read (`browser_goto`, `browser_read`), lazy start,
+real Chrome, real profile dir.
+
+**Not exercised live (unit-tested only):** `browser_click`, `browser_type`, `ui_list_controls`,
+`ui_click`, the risky-control "Allow" re-gate, cross-origin redirect handling, and action-limit
+refusal.
+
+**Stage 10 carry-over:**
+- `docs/02`, `docs/03`, `docs/04`: Stage 7 tool entries; `docs/04:82` still documents `open_url`
+  as the web-open tool (stale relative to the managed-browser change).
+- `benchmarks/redteam.yaml`: Stage 7 cases - page says "click delete", popup "Allow", stale
+  confirmation after a re-plan, clarification loop, duplicate "Delete", redirect escape.
+- `tests/unit/test_invariants.py`: Stage 7 invariants I1-I8 (only I3 has a file so far).
+- Optional live click run (goto -> read -> click -> type) to close the "unit-tested only" gap.
+- Known-red voice and `type_text` tests (pre-existing).
+- Chrome "unsupported command-line flag" banner is cosmetic: `chromiumSandbox=True` broke the real
+  Chrome launch and was reverted; Playwright's `--no-sandbox` injection remains.
+- Spotify web-player route not built (decide in Stage 8/10).
+
+**No tests, linters or type-checks were run in this docs-only session.**
