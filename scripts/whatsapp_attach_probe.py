@@ -12,6 +12,12 @@ It is deliberately safe:
   * it NEVER locates, clicks or presses Enter on Send. It prints the send
     button's presence after each attempt purely to prove it was not clicked.
 
+After approach B stages a file, a read-only "preview inspection" phase dumps
+the preview surface (region text, role=button accessible names, <img>/<canvas>
+alt/aria-label/src, any node naming the file's basename, and the send-candidate
+counts) and then states plainly whether a filename-preview gate is feasible. It
+screenshots nothing and writes nothing to disk.
+
 Run (stop the daemon first so nothing else holds the profile):
 
     .venv\Scripts\python.exe scripts\whatsapp_attach_probe.py
@@ -29,6 +35,7 @@ import argparse
 import struct
 import sys
 import tempfile
+import time
 import zlib
 from pathlib import Path
 
@@ -66,6 +73,32 @@ DRAFT_REMOVE_SELECTORS = [
 ]
 #: Read-only: printed to prove it was never clicked.
 SEND_SELECTORS = ['[data-testid="send"]', '[data-testid="send-button"]']
+
+#: Preview-inspection send candidates (Stage 8.4b): counted, never clicked.
+SEND_CANDIDATES = [
+    '[aria-label="Send"]',
+    '[data-testid="send"]',
+    '[data-icon="send"]',
+    'span[data-icon="send"]',
+]
+#: Regions that may hold the staged-attachment preview (text only, no clicks).
+PREVIEW_REGION_SELECTORS = [
+    '[role="dialog"]',
+    "#main footer",
+    '[data-testid*="preview"]',
+    '[data-testid*="composer"]',
+]
+#: Media nodes inspected for an alt/aria-label/src that names the file.
+PREVIEW_MEDIA_SELECTORS = [
+    "#main footer img",
+    "#main footer canvas",
+    '[role="dialog"] img',
+    '[role="dialog"] canvas',
+]
+#: Upper bound on how many role=button nodes are enumerated (bounded output).
+_MAX_BUTTONS = 40
+#: Short-accessible-name cap, so a button's name is truncated on print.
+_NAME_CAP = 60
 
 
 def _make_probe_png(path: Path) -> Path:
@@ -195,6 +228,187 @@ def _clear_draft(page) -> bool:
     return False
 
 
+def _clip(value: str, limit: int = 80) -> str:
+    """Truncate a value for printing (text only; nothing is written to disk)."""
+    text = (value or "").replace("\n", " ").replace("\r", " ").strip()
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _css_str(value: str) -> str:
+    """Escape a value for use inside a double-quoted CSS attribute selector."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+#: Read-only accessible-name approximation: aria-label, then title, then text.
+_NAME_JS = """(e) => (e.getAttribute('aria-label')
+  || e.getAttribute('title')
+  || (e.textContent || '').trim().slice(0, 60))"""
+
+
+def _accessible_name(el) -> str:
+    """Best-effort accessible name of an element (evaluate only; never clicks)."""
+    try:
+        return _clip(str(el.evaluate(_NAME_JS)), _NAME_CAP)
+    except Exception:  # noqa: BLE001 - a name we cannot read is reported as empty
+        return ""
+
+
+def _settle(page) -> None:
+    """Let the preview render: network idle, then a short fixed wait."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception as exc:  # noqa: BLE001 - idle may never arrive; proceed anyway
+        print(f"  (networkidle wait: {type(exc).__name__}; continuing)")
+    time.sleep(2.0)
+
+
+def _count_matches(page, selector: str) -> int:
+    try:
+        return page.locator(selector).count()
+    except Exception:  # noqa: BLE001 - an unusable selector counts as zero
+        return 0
+
+
+def _inspect_preview(page, target: Path) -> dict[str, object]:
+    """Dump the staged-attachment surface WITHOUT clicking anything.
+
+    Returns a small findings dict so :func:`_assess_signal` can judge whether
+    the staged file's basename is observable in the DOM (the question behind
+    Stage 8.4b's filename-preview gate).
+    """
+    basename = target.name
+    stem = target.stem
+    findings: dict[str, object] = {}
+
+    print("\n-- preview inspection (read-only; no clicks, no screenshots) --")
+    print(f"  url    : {_clip(page.url, 120)}")
+    try:
+        print(f"  origin : {page.evaluate('() => window.location.origin')}")
+    except Exception:  # noqa: BLE001 - origin is informational only
+        print("  origin : <unreadable>")
+    print(f"  header : {_read_header(page)}")
+
+    # 1. visible text of the dialog / preview region.
+    region_text = ""
+    for selector in PREVIEW_REGION_SELECTORS:
+        n = _count_matches(page, selector)
+        if n == 0:
+            continue
+        try:
+            text = _clip(page.locator(selector).first.inner_text(timeout=3000), 400)
+        except Exception:  # noqa: BLE001, S112 - try the next region selector
+            continue
+        if text:
+            print(f"  region text [{selector}]: {text}")
+            if not region_text:
+                region_text = text
+    if not region_text:
+        print("  region text: <no preview/dialog region matched>")
+
+    # 2. every role=button with its accessible name (bounded).
+    buttons: list[tuple[str, str]] = []
+    for i in range(min(_count_matches(page, '[role="button"]'), _MAX_BUTTONS)):
+        el = page.locator('[role="button"]').nth(i)
+        buttons.append((_accessible_name(el), f"role=button[{i}]"))
+    if buttons:
+        for name, where in buttons:
+            print(f"  button {where}: name={name!r}")
+    else:
+        print("  buttons: <no role=button element found>")
+
+    # 3. <img>/<canvas> in the preview: alt / aria-label / src prefix.
+    media: list[tuple[str, str, str, str]] = []
+    for selector in PREVIEW_MEDIA_SELECTORS:
+        n = _count_matches(page, selector)
+        for i in range(min(n, 6)):
+            el = page.locator(selector).nth(i)
+            try:
+                alt = _clip(el.get_attribute("alt") or "", 60)
+                aria = _clip(el.get_attribute("aria-label") or "", 60)
+                src = _clip(el.get_attribute("src") or "", 40)
+            except Exception:  # noqa: BLE001, S112 - keep describing the other nodes
+                continue
+            media.append((selector, alt, aria, src))
+            print(f"  media {selector}[{i}]: alt={alt!r} aria-label={aria!r} src={src!r}")
+    if not media:
+        print("  media: <no <img>/<canvas> in the preview region>")
+
+    # 4. elements whose text or aria-label contains the basename (with ext),
+    #    plus the bare stem, so we can separate a strong signal from a noisy one.
+    try:
+        basename_text_hits = page.get_by_text(basename, exact=False).count()
+    except Exception:  # noqa: BLE001 - a text scan we cannot run is reported as zero
+        basename_text_hits = 0
+    try:
+        stem_text_hits = page.get_by_text(stem, exact=False).count()
+    except Exception:  # noqa: BLE001
+        stem_text_hits = 0
+    aria_hits = _count_matches(page, f"[aria-label*={_css_str(basename)}]")
+    alt_hits = _count_matches(page, f"img[alt*={_css_str(basename)}]")
+    in_region = basename in region_text
+    print(
+        f"  basename text={basename!r}: page-text={basename_text_hits}, "
+        f"aria-label={aria_hits}, img-alt={alt_hits}, inside preview region={in_region}"
+    )
+    print(f"  bare stem {stem!r}: page-text={stem_text_hits} (may match unrelated UI)")
+
+    # 5. send candidates counted (never clicked) - proves nothing was sent.
+    total_send = 0
+    for selector in SEND_CANDIDATES:
+        n = _count_matches(page, selector)
+        total_send += n
+        print(f"  send candidate {n:>3}  {selector}")
+    named_send = 0
+    for name, _where in buttons:
+        if "send" in name.lower():
+            named_send += 1
+    total_send += named_send
+    print(f"  send-named buttons: {named_send}   total send surface: {total_send} (NOT clicked)")
+
+    findings.update(
+        {
+            "basename_in_text": bool(basename_text_hits) or in_region,
+            "basename_in_aria": bool(aria_hits),
+            "basename_in_alt": bool(alt_hits),
+            "stem_only": bool(stem_text_hits) and not (basename_text_hits or in_region),
+            "basename": basename,
+            "stem": stem,
+        }
+    )
+    return findings
+
+
+def _assess_signal(findings: dict[str, object]) -> None:
+    """Say plainly whether the filename-preview gate is feasible, and from what."""
+    print("\n-- signal assessment (can we prove 'this is the expected file'?) --")
+    reliable: list[str] = []
+    unreliable: list[str] = []
+    if findings.get("basename_in_text"):
+        reliable.append("basename appears as visible text (page and/or preview region)")
+    if findings.get("basename_in_alt"):
+        reliable.append("basename appears in an <img alt=...>")
+    if findings.get("basename_in_aria"):
+        reliable.append("basename appears in an element's aria-label")
+    if findings.get("stem_only"):
+        unreliable.append(
+            f"bare stem {findings.get('stem')!r} matched page text without the full name"
+        )
+    for item in reliable:
+        print(f"  [RELIABLE]   {item}")
+    for item in unreliable:
+        print(f"  [UNRELIABLE] {item}")
+    if reliable:
+        print("  VERDICT: the filename-preview gate is FEASIBLE (a basename signal exists).")
+    else:
+        print("  VERDICT: NO reliable filename signal.")
+        print(
+            "    The preview exposes neither the staged file's name as text nor as"
+            " alt/aria-label, so a 'filename matches expected file' gate cannot be"
+            " built from the DOM. 8.4b must instead rely on the internal sha256"
+            " re-check (hash at attach time vs rehash immediately before Send)."
+        )
+
+
 def _run(target: Path) -> None:
     print("=" * 72)
     print("WhatsApp Web ATTACH PROBE  (owner-run; NEVER presses Send)")
@@ -232,13 +446,20 @@ def _run(target: Path) -> None:
 
             print("\n-- attach approach B: hidden input[type=file] --")
             print("  selector counts:")
+            b_findings: dict[str, object] = {}
             b_ok = _try_hidden_input(page, str(target))
             if b_ok:
                 _report("hidden input", True, "set_input_files accepted the file")
-                print(f"  preview: {_read_preview(page)}")
-            if not _clear_draft(page):
-                print("  could not auto-clear the draft - please remove it (X) manually.")
+                _settle(page)
+                b_findings = _inspect_preview(page, target)
+                _assess_signal(b_findings)
+                # Leave the preview on screen so the owner can eyeball it; the
+                # inspection above clicked nothing, and nothing is auto-clicked
+                # here either - removal is manual so the evidence stays visible.
+                print("  preview left on screen - please remove it manually (X); do NOT send.")
                 input("  press Enter once the attachment is gone...")
+            else:
+                print("  nothing was staged, so there is no draft to remove.")
 
             print("\n-- attach approach A: attach button -> Photos/Videos -> chooser --")
             a_ok = _try_file_chooser(page, str(target))
