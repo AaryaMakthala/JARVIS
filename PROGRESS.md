@@ -5542,3 +5542,35 @@ validation). Manual smoke test (owner, own test number only):
     # 4. jarvis run "send the photo to <your test contact> on WhatsApp" -> approve the file, then
     #    confirm -> the file must arrive; asking again within 10 minutes must be refused.
 
+## STAGE 9 — SLICE 9.1: `system_info` names the disk it measured (2026-10-22)
+
+**Scope:** sub-step 9.1 only — the one Stage 9 item that the roadmap specifies exactly ("Fix
+`system_info` disk label (`"Disk C:"` from `disk_usage("/")`)"). No UX redesign, no audio cues, no
+spoken status, no Stage 10 work.
+
+**Fixed:**
+- `src/jarvis/tools/system.py`: the disk line measured `psutil.disk_usage("/")` (the *current*
+  drive on Windows) but always called it **"Disk C:"** — wrong on a machine whose system drive is
+  not C, and silently misleading in the spoken answer. `_disk_target()` now returns the label and
+  the path of the drive that is actually measured (`%SystemDrive%` on Windows, the root filesystem
+  elsewhere), and the tool reports that label and path in `data`.
+
+**Verified:**
+| Command | Result |
+|---|---|
+| `ruff check` + `ruff format --check` (touched files) | PASS |
+| `pytest tests/unit/test_tools_system_info.py` | PASS (12, new file) |
+
+No full-suite run and no live run.
+
+**Known limitations / decisions:**
+- Only the system drive is reported; there is still no "list the other drives" option (that would
+  need a new argument and a new policy surface).
+- The label falls back to `C:` when `%SystemDrive%` is missing, which is the Windows default.
+
+**Next:** the rest of Stage 9 (audio cues with a `voice.cues` toggle, a short spoken status before
+actions, answer conciseness) — each needs a design decision from the owner. Manual smoke test
+(owner):
+
+    # jarvis run "how much disk space is left" -> the answer must name the drive that was measured.
+

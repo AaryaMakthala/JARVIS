@@ -15,6 +15,8 @@ behind the platform guard, so this module imports on any OS for tests.
 
 from __future__ import annotations
 
+import os
+import platform
 import time
 from typing import Literal
 
@@ -31,6 +33,24 @@ class SystemInfoArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     what: Literal["ram", "cpu", "disk", "battery", "uptime", "top_processes"] = "cpu"
+
+
+def _disk_target() -> tuple[str, str]:
+    """The disk to report on and how to label it.
+
+    The old code measured ``psutil.disk_usage("/")`` (the current drive on
+    Windows) but always called it "Disk C:" - wrong on a machine whose system
+    drive is not C.  The label now follows the drive that was actually
+    measured.
+    """
+    if platform.system() == "Windows":
+        drive = (os.environ.get("SystemDrive") or "C:").strip().rstrip("\\/")
+        if not drive:
+            drive = "C:"
+        if not drive.endswith(":"):
+            drive = f"{drive}:"
+        return drive, f"{drive}\\"
+    return "root", "/"
 
 
 def _read(args: SystemInfoArgs) -> ToolResult:
@@ -57,14 +77,17 @@ def _read(args: SystemInfoArgs) -> ToolResult:
             data={"percent": percent, "cores": count},
         )
     if kind == "disk":
-        usage = psutil.disk_usage("/")
+        label, path = _disk_target()
+        usage = psutil.disk_usage(path)
         return ToolResult(
             ok=True,
-            output=f"Disk C: {usage.used / 1e9:.1f} / {usage.total / 1e9:.1f} GB ({usage.percent}%)",
+            output=f"Disk {label}: {usage.used / 1e9:.1f} / {usage.total / 1e9:.1f} GB ({usage.percent}%)",
             data={
                 "used_gb": round(usage.used / 1e9, 2),
                 "total_gb": round(usage.total / 1e9, 2),
                 "percent": usage.percent,
+                "label": label,
+                "path": path,
             },
         )
     if kind == "battery":
