@@ -31,6 +31,7 @@ nothing (docs/02 Stage 7; config ``[browser]``).
 from __future__ import annotations
 
 import urllib.parse
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -191,6 +192,34 @@ def _safe_goto(url: str) -> str | None:
     return url_origin(url)
 
 
+def _current_page_url(session: Any) -> str:
+    """The URL of the page the managed browser is on (best effort).
+
+    A session that cannot report it (an older fake, a browser that is not
+    started) simply has no page to remember.
+    """
+    getter = getattr(session, "current_url", None)
+    if getter is None:
+        return ""
+    try:
+        return str(getter() or "").strip()
+    except Exception:  # noqa: BLE001 - a session that cannot report it has none
+        return ""
+
+
+def _with_page_url(data: dict[str, Any], session: Any, url: str = "") -> dict[str, Any]:
+    """Add the current page URL so a later turn can refer to this page.
+
+    Stage 8.6, slice 8.6.3.  The URL is a *location*, not an authorization:
+    the next navigation to it still goes through the ordinary domain-scope
+    rules, and it is rendered as untrusted data in the prompt.
+    """
+    page_url = str(url or "").strip() or _current_page_url(session)
+    if page_url:
+        data["page_url"] = page_url
+    return data
+
+
 def _run_browser_goto(args: BrowserGotoArgs, ctx: ToolContext) -> ToolResult:
     if _safe_goto(args.url) is None:
         return ToolResult(
@@ -207,7 +236,7 @@ def _run_browser_goto(args: BrowserGotoArgs, ctx: ToolContext) -> ToolResult:
     return ToolResult(
         ok=True,
         output=f"navigated to {data.get('url', '')}",
-        data=data,
+        data=_with_page_url(dict(data), session, str(data.get("url", ""))),
         verified=True,
         tainted=True,  # title/origin describe an untrusted page
     )
@@ -238,7 +267,7 @@ def _run_browser_read(args: BrowserReadArgs, ctx: ToolContext) -> ToolResult:
     return ToolResult(
         ok=True,
         output=f"Observed {len(observation.elements)} elements on {observation.origin}:\n{block}",
-        data=observation.as_dict(),
+        data=_with_page_url(dict(observation.as_dict()), session, observation.url),
         verified=True,
         tainted=True,  # page-derived content is never instructions (docs/03 §8)
     )
@@ -302,7 +331,7 @@ def _run_browser_click(args: BrowserClickArgs, ctx: ToolContext) -> ToolResult:
     return ToolResult(
         ok=True,
         output=(f"clicked element {data['ref']} ({data['role']} named {data.get('name', '')!r})"),
-        data=data,
+        data=_with_page_url(dict(data), session),
         verified=None,  # the click effect is not reliably observable here
         tainted=True,  # role/name are untrusted page text
     )
@@ -386,7 +415,7 @@ def _run_browser_open_site(args: BrowserOpenSiteArgs, ctx: ToolContext) -> ToolR
     return ToolResult(
         ok=True,
         output=f"opened {name} ({data.get('url', '')})",
-        data={**data, "site": name},
+        data=_with_page_url({**data, "site": name}, session, str(data.get("url", ""))),
         verified=True,
         tainted=True,  # title/origin describe an untrusted page
     )
@@ -442,6 +471,7 @@ def _run_browser_find(args: BrowserFindArgs, ctx: ToolContext) -> ToolResult:
     matches, error = _matched_elements(args, ctx)
     if error is not None:
         return ToolResult(ok=False, error=error)
+    session = _require_session(ctx)
     limit = max(1, int(args.limit))
     shown = matches[:limit]
     lines = [f"[{el.ref}] {el.role} — {el.name!r}" for el in shown]
@@ -455,7 +485,9 @@ def _run_browser_find(args: BrowserFindArgs, ctx: ToolContext) -> ToolResult:
     return ToolResult(
         ok=True,
         output=(f"{len(matches)} element(s) match {args.query!r}{where}{tail}:\n{block}"),
-        data={"matches": [el.as_dict() for el in shown], "count": len(matches)},
+        data=_with_page_url(
+            {"matches": [el.as_dict() for el in shown], "count": len(matches)}, session
+        ),
         verified=True,
         tainted=True,  # page-derived content is never instructions (docs/03 §8)
     )
@@ -482,7 +514,7 @@ def _run_browser_open_result(args: BrowserOpenResultArgs, ctx: ToolContext) -> T
         output=(
             f"opened {data.get('name', '')!r} ({data.get('role', '')}) on {data.get('origin', '')}"
         ),
-        data=data,
+        data=_with_page_url(dict(data), session),
         verified=None,  # the effect of the click is not reliably observable here
         tainted=True,  # role/name are untrusted page text
     )

@@ -327,6 +327,11 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     if not ctx.dry_run and result.ok:
         artifact = result.data.get("artifact") if isinstance(result.data, dict) else None
         ctx.session_context.note_action(SESSION_THREAD, artifact)
+        page_url = result.data.get("page_url") if isinstance(result.data, dict) else None
+        if isinstance(page_url, str) and page_url.strip():
+            # The page JARVIS is on (Stage 8.6, slice 8.6.3).  A location, not
+            # an authorization: the next navigation is checked like any other.
+            ctx.session_context.note_page(SESSION_THREAD, page_url)
 
     step_result = StepResult(
         step_id=step.id,

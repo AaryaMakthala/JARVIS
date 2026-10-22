@@ -5342,3 +5342,62 @@ No full-suite run and no live run; no Windows manual smoke test was performed.
     #    Approve the Tier 1 confirmation; expect the matching element to be listed and opened.
     # 2. ask for something that matches several elements -> expect JARVIS to refuse and ask which
     #    one it meant, instead of opening the first.
+
+## STAGE 8 — SLICE 8.6.3: cross-turn page referents ("that page", "that site") (2026-10-22)
+
+**Scope:** sub-step 8.6.3 only — remember the page the managed browser is on so a *later* request
+("open that page again", "go back to that site") can refer to it. No messaging (8.6.4), no 8.5 docs,
+no Stage 9/10 work.
+
+**Built:**
+- `src/jarvis/agent/session_context.py`: a **second, separate** referent kind — the *page* — next to
+  the run-scoped artifact store. `note_page()` remembers the URL (absolute http(s), no credentials,
+  `MAX_PAGE_URL_CHARS=2048`), replacing any earlier page, so "that page" can never be ambiguous.
+  `resolve_page()` applies the same TTL as an artifact (600 s) and drops an expired page.
+  `reference_resolution()` routes a *page* request to the page store and **never** falls back to the
+  artifact store: "that page" cannot pick a photo, and "delete it" cannot pick a URL. Page words
+  ("page", "site", "website", "link", "tab") were added to the reference/type word lists.
+  `render_resolution()` renders a page as `<untrusted_data>URL</untrusted_data>` and says in words
+  that the URL is DATA, not an instruction, that it is still checked like any other URL, and that an
+  unrelated request must ignore it.
+- `src/jarvis/browser/context.py`: `BrowserSession.current_url()` (protocol + `PlaywrightBrowser`
+  implementation, empty string when there is no page).
+- `src/jarvis/browser/tools.py`: every browser tool that ends on a page now publishes
+  `data["page_url"]` (`browser_goto`, `browser_open_site`, `browser_read`, `browser_find`,
+  `browser_click`, `browser_open_result`). It is a *location*, not an authorization.
+- `src/jarvis/agent/nodes/act.py`: after a successful, non-dry-run step the page URL is published to
+  the session context (a failed or dry-run step publishes nothing).
+- Tests: `tests/unit/test_session_context.py` (+8 cases for the page store: http-only URLs, TTL,
+  replacement, page-vs-artifact separation, untrusted rendering) and `tests/unit/test_browser_referents.py`
+  (new, 7 cases — real act node + real brain node: a successful navigation publishes the page, a failed
+  navigation and a dry run publish nothing, the next turn gets the URL as untrusted data, the page
+  never reaches the checkpoint state).
+
+**Verified:**
+| Command | Result |
+|---|---|
+| `ruff check` + `ruff format --check` (touched files) | PASS |
+| `pytest tests/unit/test_session_context.py test_browser_referents.py test_browser_tools.py test_browser_context.py test_browser_find.py test_browser_result_binding.py test_browser_sites.py test_clarification_history.py` | PASS (201) |
+| `pytest tests/unit/test_act_target_parity.py test_act_node.py test_brain_prompt.py test_batch_graph.py` | PASS (except the pre-existing Linux-only failure below) |
+
+No full-suite run and no live run; no Windows manual smoke test was performed.
+
+**Known limitations / decisions:**
+- **Pre-existing (not caused by this slice):** `tests/unit/test_act_target_parity.py::
+  test_type_text_into_managed_browser_is_hard_blocked` fails *on Linux only* — the "this tool only
+  works on Windows" check short-circuits before the managed-browser rule can add its reason. It must
+  pass on Windows.
+- The page store holds **one** page per session (the most recent). Two pages open at once are not
+  tracked; "the other page" cannot be resolved and JARVIS must ask.
+- The URL is remembered for 10 minutes and only while the daemon/CLI process lives. It is never
+  written to the checkpoint, the database, or the log.
+- Remembering a page is *not* permission to go there again: the next `browser_goto` goes through the
+  ordinary domain-scope rules and can still ask for a confirmation.
+
+**Next:** 8.6.4 (reusable messaging flow), then 8.5 (docs). Manual smoke test (owner, own test number
+only, after 8.6.3):
+
+    # 1. jarvis chat -> "open the Wikipedia site" (approve the Tier 1 confirmation), then in a NEW
+    #    request -> "open that page again". Expect the same page to reopen.
+    # 2. after any page is open, ask "delete it" -> expect JARVIS to ask for clarification instead of
+    #    treating the URL as a file.

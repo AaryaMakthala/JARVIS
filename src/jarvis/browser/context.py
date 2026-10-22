@@ -163,6 +163,9 @@ class BrowserSession(Protocol):
     def resolve(self, ref: str) -> ElementRef | None:
         """Return the observed identity for ``ref`` (transient), else ``None``."""
 
+    def current_url(self) -> str:
+        """The URL of the page the managed browser is on (may be empty)."""
+
     def click(self, ref: str) -> dict[str, Any]:
         """Re-validate then click a ref; return ``{ref, role, name, origin}``."""
 
@@ -549,6 +552,14 @@ class PlaywrightBrowser:
             input_type=snap.input_type,
             is_password=snap.is_password,
         )
+
+    def current_url(self) -> str:
+        """The URL of the page the managed browser is on (may be empty)."""
+        try:
+            page = self._require_page()
+        except BrowserError:
+            return ""
+        return str(getattr(page, "url", "") or "")
 
     def click(self, ref: str) -> dict[str, Any]:
         """Re-validate then click ``ref``; never falls back to coordinates."""

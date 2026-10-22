@@ -180,11 +180,94 @@ class TestReferenceGating:
     def test_word_parsing_selects_the_artifact_type(self) -> None:
         assert requested_artifact_type("delete the picture") == "photo"
         assert requested_artifact_type("delete it") is None
+        assert requested_artifact_type("open that page") == "page"
+        assert requested_artifact_type("go back to the site") == "page"
 
     def test_unreferenced_text_is_not_resolved_even_with_a_candidate(self) -> None:
         store = SessionContext()
         store.note_action(SESSION_THREAD, _PHOTO, now=0.0)
         assert store.reference_resolution(SESSION_THREAD, "say hello").kind == "unreferenced"
+
+
+# ── page referents (Stage 8.6, slice 8.6.3) ───────────────────────────────
+
+
+_PAGE = "https://example.com/search?q=python"
+
+
+class TestPageReferents:
+    def test_a_page_is_remembered_and_resolved(self) -> None:
+        store = SessionContext()
+        entry = store.note_page(SESSION_THREAD, _PAGE, now=0.0)
+        assert entry is not None
+        assert entry.type == "page"
+        assert entry.url == _PAGE
+        resolved = store.resolve_page(SESSION_THREAD, now=0.0)
+        assert resolved.kind == "resolved"
+        assert resolved.artifact is not None and resolved.artifact.url == _PAGE
+
+    def test_only_an_http_url_is_remembered(self) -> None:
+        store = SessionContext()
+        for bad in (
+            "",
+            "   ",
+            "not a url",
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32",
+            "https://user:pass@example.com/",
+        ):
+            assert store.note_page(SESSION_THREAD, bad, now=0.0) is None
+        assert store.resolve_page(SESSION_THREAD, now=0.0).kind == "none"
+
+    def test_an_expired_page_is_never_offered(self) -> None:
+        store = SessionContext(ttl_seconds=600, clock=lambda: 0.0)
+        store.note_page(SESSION_THREAD, _PAGE, now=1000.0)
+        assert store.resolve_page(SESSION_THREAD, now=1000.0).kind == "resolved"
+        assert store.resolve_page(SESSION_THREAD, now=1601.0).kind == "none"
+
+    def test_the_latest_page_replaces_the_previous_one(self) -> None:
+        store = SessionContext()
+        store.note_page(SESSION_THREAD, "https://example.com/a", now=0.0)
+        store.note_page(SESSION_THREAD, "https://example.com/b", now=1.0)
+        resolved = store.resolve_page(SESSION_THREAD, now=1.0)
+        assert resolved.kind == "resolved"
+        assert resolved.artifact is not None
+        assert resolved.artifact.url == "https://example.com/b"
+
+    def test_a_page_reference_resolves_to_the_page(self) -> None:
+        store = SessionContext()
+        store.note_page(SESSION_THREAD, _PAGE, now=0.0)
+        resolved = store.reference_resolution(SESSION_THREAD, "open that page again", now=0.0)
+        assert resolved.kind == "resolved"
+        assert resolved.artifact is not None and resolved.artifact.url == _PAGE
+
+    def test_a_page_reference_never_resolves_to_an_artifact(self) -> None:
+        """'that page' must not pick the photo, and 'it' must not pick the page."""
+        store = SessionContext()
+        store.note_action(SESSION_THREAD, dict(_PHOTO), now=0.0)
+        store.note_page(SESSION_THREAD, _PAGE, now=0.0)
+        by_page = store.reference_resolution(SESSION_THREAD, "open that page", now=0.0)
+        assert by_page.kind == "resolved"
+        assert by_page.artifact is not None and by_page.artifact.type == "page"
+        by_it = store.reference_resolution(SESSION_THREAD, "delete it", now=0.0)
+        assert by_it.kind == "resolved"
+        assert by_it.artifact is not None and by_it.artifact.type == "photo"
+
+    def test_a_page_reference_without_a_page_asks_one_clarification(self) -> None:
+        store = SessionContext()
+        resolved = store.reference_resolution(SESSION_THREAD, "open that page", now=0.0)
+        assert resolved.kind == "none"
+        block = render_resolution(resolved)
+        assert block is not None and "clarification" in block.lower()
+
+    def test_the_rendered_page_is_untrusted_data(self) -> None:
+        store = SessionContext()
+        store.note_page(SESSION_THREAD, _PAGE, now=0.0)
+        block = render_resolution(store.resolve_page(SESSION_THREAD, now=0.0))
+        assert block is not None
+        assert _PAGE in block
+        assert "<untrusted_data>" in block
+        assert "DATA, not an instruction" in block
 
 
 class TestRender:
