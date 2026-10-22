@@ -153,6 +153,10 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     )
     from jarvis.tools.web import make_google_search_spec, make_open_url_spec, make_web_answer_spec
     from jarvis.tools.whatsapp import make_whatsapp_send_spec
+    from jarvis.tools.whatsapp_web import (
+        make_whatsapp_open_chat_spec,
+        make_whatsapp_send_file_spec,
+    )
     from jarvis.tools.windows_list import make_list_windows_spec
     from jarvis.uia.tools import make_ui_click_spec, make_ui_list_controls_spec
 
@@ -186,6 +190,8 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_stop_dictation_spec(),
         make_save_dictation_spec(),
         make_whatsapp_send_spec(),
+        make_whatsapp_send_file_spec(),
+        make_whatsapp_open_chat_spec(),
         make_browser_goto_spec(),
         make_browser_read_spec(),
         make_browser_click_spec(),

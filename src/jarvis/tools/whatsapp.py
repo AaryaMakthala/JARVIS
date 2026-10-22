@@ -373,8 +373,12 @@ class WhatsAppSendArgs(BaseModel):
     message: str = Field(min_length=1, max_length=1000, description="Message text (max 1000 chars)")
 
 
-def _resolve_single(store: ContactStore, query: str) -> tuple[Contact | None, str | None]:
-    """Return exactly one contact, or the error text listing the options."""
+def resolve_single(store: ContactStore, query: str) -> tuple[Contact | None, str | None]:
+    """Return exactly one contact, or the error text listing the options.
+
+    Shared with the WhatsApp Web tools (Slice 8.4c) so contact resolution has
+    exactly one implementation.
+    """
     matches = store.resolve(query)
     if len(matches) == 1:
         return matches[0], None
@@ -414,7 +418,7 @@ def _whatsapp_send_run(
         clock=time.time,
     )
 
-    contact, error = _resolve_single(store, args.contact)
+    contact, error = resolve_single(store, args.contact)
     if error is not None:
         return ToolResult(ok=False, error=error)
 

@@ -17,6 +17,9 @@ Eligible tools (only these):
   requirement, whole resolved path <= 150 chars.
 * ``whatsapp_send`` -- message <= 200 chars; text names the recipient, the
   masked number, and the **full** message.
+* ``whatsapp_send_file`` -- exactly one resolved file with a readable name,
+  whole path <= 150 chars; text names the recipient and the file, and there
+  is no caption/message argument to smuggle text into.
 
 The prompt/refusal constants live here too so every Stage-3 spoken string is
 system-written, never LLM prose.
@@ -25,6 +28,7 @@ system-written, never LLM prose.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from jarvis.logging_setup import redact
@@ -44,6 +48,9 @@ _MAX_PATH_CHARS = 150
 
 #: Maximum length of a WhatsApp message that may be read back in full.
 _MAX_MESSAGE_CHARS = 200
+
+#: Maximum length of a file name in a WhatsApp attachment readback.
+_MAX_FILE_NAME_CHARS = 80
 
 # ── system-written spoken constants (no LLM) ────────────────────────────────
 
@@ -89,6 +96,8 @@ def tier2_readback(tool_name: str, args_or_decision: Any) -> ReadbackResult:
         return _delete_readback(args_or_decision)
     if name == "whatsapp_send":
         return _whatsapp_readback(args_or_decision)
+    if name == "whatsapp_send_file":
+        return _whatsapp_file_readback(args_or_decision)
     return ReadbackResult(False, "", f"{name or 'that tool'!r} cannot be approved by voice")
 
 
@@ -152,6 +161,47 @@ def _whatsapp_readback(source: Any) -> ReadbackResult:
         text = summary.strip()
     else:
         text = f"send WhatsApp message to {recipient!r} ({masked}): {message!r}"
+    return ReadbackResult(True, redact(text))
+
+
+def _whatsapp_file_readback(source: Any) -> ReadbackResult:
+    """Recipient + exactly one file name; there is no caption to read back."""
+    resolved = _field(source, "resolved_paths")
+    if not resolved:
+        raw = _field(source, "path")
+        resolved = _resolve_paths(raw) if raw else None
+    if not resolved:
+        return ReadbackResult(False, "", "no resolved file path to read back")
+
+    paths_list = [str(item) for item in resolved]
+    if len(paths_list) != 1:
+        return ReadbackResult(
+            False, "", f"exactly one file is required, but {len(paths_list)} were given"
+        )
+    path = paths_list[0]
+    if len(path) > _MAX_PATH_CHARS:
+        return ReadbackResult(
+            False, "", f"the full path is too long to read back ({len(path)} chars)"
+        )
+
+    name = Path(path).name
+    if not name:
+        return ReadbackResult(False, "", "the file name could not be read back")
+    if len(name) > _MAX_FILE_NAME_CHARS:
+        return ReadbackResult(
+            False, "", f"the file name is too long to read back ({len(name)} chars)"
+        )
+
+    contact = _field(source, "contact")
+    if not isinstance(contact, str) or not contact.strip():
+        return ReadbackResult(False, "", "the recipient is missing or unreadable")
+
+    number = _field(source, "masked_number") or _field(source, "masked")
+    if not number:
+        digits = _field(source, "number") or _field(source, "phone")
+        number = _mask_number(digits) if digits else ""
+    suffix = f" ({number})" if number else ""
+    text = f"send {name!r} on WhatsApp to {contact.strip()!r}{suffix}"
     return ReadbackResult(True, redact(text))
 
 

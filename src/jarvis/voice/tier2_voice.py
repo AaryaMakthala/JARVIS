@@ -44,8 +44,8 @@ __all__ = [
     "voice_marker_present",
 ]
 
-#: The only two tools whose Tier 2 step a spoken "proceed" may approve.
-VOICE_TIER2_TOOLS = frozenset({"delete_path", "whatsapp_send"})
+#: The only tools whose Tier 2 step a spoken "proceed" may approve.
+VOICE_TIER2_TOOLS = frozenset({"delete_path", "whatsapp_send", "whatsapp_send_file"})
 
 #: Key the daemon sets on the resume answer to say "this approval came from the
 #: voice path, which already re-verified the relaxation".  Advisory only: the

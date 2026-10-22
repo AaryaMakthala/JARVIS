@@ -5081,3 +5081,80 @@ still to be attached afterwards. Manual smoke test (owner, own test number only)
     # then, once 8.4c lands: ask JARVIS to send that photo to your own test contact and confirm
     # the preview showed the file and the header showed the right contact before Send.
 
+
+## STAGE 8 — SLICE 8.4c: guarded `whatsapp_send_file` + `whatsapp_open_chat` (2026-10-22)
+
+**Scope:** sub-step 8.4c only — the two tools, the duplicate-send guard, the contact
+clarification path and the voice Tier 2 wiring. NO docs (8.5) and NO enabling of real sends:
+the content-hash approval binding is Slice 8.4d and is still **uncommitted** (5 files excluded
+from this commit), so on this tree every send is **fail-closed** until 8.4d lands. No live
+WhatsApp login, message or file send was performed. (Commit after this entry.)
+
+**Built:**
+- `src/jarvis/tools/whatsapp_web.py` (new): `WhatsAppSendFileArgs` (`contact`, `path` only — no
+  caption/message argument at all), `WhatsAppOpenChatArgs`, `FileSendGuard` (persisted
+  `{number+sha256: timestamp}`, atomic `claim` written **before** the click, 600 s window,
+  unreadable file treated as empty), and the factories
+  `make_whatsapp_send_file_spec` / `make_whatsapp_open_chat_spec`.
+  - Send order: Windows -> binding available -> resolve contact -> rate limit -> resolve path +
+    size cap -> approved digests -> digest membership -> resend guard -> open chat (header
+    identity) -> attach -> **re-hash and compare** -> claim -> Send -> best-effort
+    `limiter.record()`. The approved bytes on disk immediately before Send must still match.
+  - `whatsapp_send_file`: Tier 2, `budget_cost=1`, `windows_only`, `timeout_s=120`,
+    `path_args=("path",)`; sets `bind_content_hash=True` only when `ToolSpec` has that field
+    (8.4d). `whatsapp_open_chat`: Tier 1, `budget_cost=1`, no path args, never attaches.
+  - Output `data` carries `recipient`, `phone_digits`, `file`, `content_sha256`, `control`,
+    `staged_count`, `chat_confirmed`; the human-readable text masks the number and omits the
+    full path.
+- `src/jarvis/config.py`: `whatsapp.max_file_bytes = 16 MiB` (TOML key + validation),
+  `whatsapp_sent_files_file()` = `user_data_dir("whatsapp_sent_files.json")`, voice docstrings
+  now name three Tier 2 tools.
+- `src/jarvis/tools/whatsapp.py`: `_resolve_single` -> public `resolve_single` (shared with the
+  new tools); no other change.
+- `src/jarvis/tools/registry.py`: registers both new specs.
+- `src/jarvis/voice/tier2_voice.py`: `VOICE_TIER2_TOOLS` = `{delete_path, whatsapp_send,
+  whatsapp_send_file}`.
+- `src/jarvis/voice/readback.py`: `_whatsapp_file_readback` — exactly one resolved path (<= 150
+  chars), non-empty basename (<= 80 chars), required contact, optional masked suffix, `redact()`;
+  refused readbacks carry no text.
+- `tests/unit/test_whatsapp_send_file.py` (new, 21 tests): spec/registration, happy path, no
+  approval -> refuse, binding unavailable -> refuse, wrong approved hash, file changed during
+  attach, missing/over-cap file, rate limit before the browser, unknown/ambiguous contact with
+  options, wrong header, unscoped preview, non-Windows, duplicate-send block + window expiry,
+  dry-run, describe masking, `open_chat` happy/ambiguous/never-stages, and a graph-level
+  clarification test (answer "Rahul" keeps the send intent and records exactly one action).
+
+**Verified:**
+| Command | Result |
+|---|---|
+| `ruff check` + `ruff format --check` (6 touched src files + new test file) | PASS |
+| `pytest tests/unit/test_whatsapp_send_file.py` | PASS (21) |
+| `pytest test_whatsapp.py test_whatsapp_web.py test_config.py test_readback.py test_tier2_voice.py test_announce.py` | PASS (129) |
+| `pytest test_risk_classifier.py test_windows_only_enforcement.py test_completeness.py test_act_node.py` | PASS (84) |
+| `pytest tests/unit/test_invariants.py` | PASS (36) |
+
+No full-suite run and no live run; no Windows manual smoke test was performed.
+
+**Known limitations / decisions:**
+- **Sending is disabled until 8.4d.** On the committed tree `_binding_supported()` is false, so
+  the tool refuses with "cannot bind ... to the approved file"; after 8.4d it reads
+  `ctx.approved_content_hashes` via `getattr` and only sends a hash that is in that tuple. An
+  absent/mismatched binding is refused, never silently allowed.
+- The duplicate-send rule is deliberately conservative: the same file to the same number is
+  refused for 10 minutes even if the user asks again. Window = `RESEND_WINDOW_S`; the ledger is
+  per-user data, not repo state. A failed Send keeps the claim (so a blind retry is refused).
+- `whatsapp_open_chat` is navigation only; it opens the deep link and proves the header. It
+  cannot send and does not need the content binding.
+- Chat identity comes from the deep-link header only; if WhatsApp shows a different header the
+  tool refuses. No screenshot/OCR fallback (fail closed).
+- File cap is `min(settings.whatsapp.max_file_bytes, CONTENT_HASH_MAX_BYTES)`; over-cap is refused
+  before the browser.
+- Voice readback is bounded (path 150 / basename 80) and refuses rather than truncating.
+
+**Next (owner):** review this sub-step, then 8.4d (wire `ToolSpec.bind_content_hash` in act /
+policy gate, add binding tests, commit the 5 already-edited files) and only then 8.4e docs.
+Manual smoke test (own test number only, after 8.4d):
+
+    # 1. add a test contact, then ask JARVIS to send a photo to it and approve the Tier 2 confirm;
+    #    verify the composer preview + header before Send, then check the chat arrives once.
+    # 2. ask again for the same file within 10 minutes -> expect "already sent ... refusing".

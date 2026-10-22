@@ -158,8 +158,9 @@ bare_stop_while_busy = true
 # Stage 3 Tier 2 relaxation.  While this is false (the default) voice may
 # confirm a Tier 1 action only and every Tier 2 confirmation needs the terminal
 # password.  Setting it to true RELAXES the "voice is Tier 1 only" rule: a
-# spoken "proceed" may then approve delete_path / whatsapp_send after a
-# readback.  It never lowers a tier, never unlocks the session, never Tier 3.
+# spoken "proceed" may then approve delete_path / whatsapp_send /
+# whatsapp_send_file after a readback.  It never lowers a tier, never unlocks
+# the session, never Tier 3.
 allow_tier2_by_voice = false
 # Speak "I heard: <transcript>" before a Tier >= 1 confirmation prompt.  The
 # transcript is spoken only; the INFO log records a flag, never the text (B9).
@@ -170,6 +171,10 @@ app_name = "WhatsApp"
 max_per_hour = 10
 min_interval_s = 5.0
 window_timeout_s = 10.0
+# Largest file (bytes) that whatsapp_send_file will attach.  It is checked
+# before anything is staged; raising it above the content-binding cap (16 MiB)
+# does not widen what the policy gate can approve.
+max_file_bytes = 16777216
 
 [memory]
 retrieval_limit = 3
@@ -499,9 +504,10 @@ class VoiceSettings(BaseModel):
     #: ``False`` (the default) voice may confirm a Tier 1 action only, exactly as
     #: docs/03 §7.8 requires, and every Tier 2 confirmation needs the terminal
     #: password.  Setting it to ``True`` RELAXES the "voice is Tier 1 only" rule:
-    #: a spoken ``"proceed"`` may then approve the two named Tier 2 tools
-    #: (``delete_path``, ``whatsapp_send``) after a readback, and only after
-    #: :func:`jarvis.voice.tier2_voice.allowed` re-verifies every condition.
+    #: a spoken ``"proceed"`` may then approve the three named Tier 2 tools
+    #: (``delete_path``, ``whatsapp_send``, ``whatsapp_send_file``) after a
+    #: readback, and only after :func:`jarvis.voice.tier2_voice.allowed`
+    #: re-verifies every condition.
     #: It never lowers a tier, never unlocks the session, and never reaches
     #: Tier 3.  See docs/03 §7.9.
     allow_tier2_by_voice: bool = False
@@ -528,12 +534,15 @@ class WhatsAppSettings(BaseModel):
 
     ``max_per_hour`` and ``min_interval_s`` bound send frequency; they are
     enforced in code before any window is opened (docs/04 §2.6 step 7).
+    ``max_file_bytes`` is the largest file ``whatsapp_send_file`` will stage;
+    the content-hash binding still refuses anything above its own 16 MiB cap.
     """
 
     app_name: str = "WhatsApp"
     max_per_hour: int = 10
     min_interval_s: float = 5.0
     window_timeout_s: float = 10.0
+    max_file_bytes: int = 16 * 1024 * 1024
 
 
 class MemorySettings(BaseModel):
@@ -804,6 +813,11 @@ def contacts_file() -> Path:
 def whatsapp_ratelimit_file() -> Path:
     """Path to the persisted WhatsApp send-history timestamps."""
     return user_data_dir("whatsapp_ratelimit.json")
+
+
+def whatsapp_sent_files_file() -> Path:
+    """Path to the short-lived WhatsApp file resend guard (hashed keys only)."""
+    return user_data_dir("whatsapp_sent_files.json")
 
 
 def memory_db() -> Path:
