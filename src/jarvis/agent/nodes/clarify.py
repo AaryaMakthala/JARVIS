@@ -21,6 +21,7 @@ from langgraph.types import interrupt
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.intake import _CANCEL_RE
 from jarvis.agent.schemas import ClarificationRequest
+from jarvis.agent.state import clarification_rounds
 
 #: Maximum number of clarification questions before the task fails closed.
 MAX_CLARIFICATIONS = 2
@@ -57,8 +58,19 @@ def clarify(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     if _CANCEL_RE.match(answer.strip()):
         return {"cancelled": True, "halted_reason": "Cancelled by the user."}
 
+    # Keep every answered round (Stage 8.4e).  The single
+    # clarification_question/answer pair only holds the newest round, so a
+    # second question would otherwise erase what the human already told us and
+    # the brain would re-plan from scratch.
+    history = [
+        {"question": question_text, "answer": answer_text}
+        for question_text, answer_text in clarification_rounds(state.get("clarification_history"))
+    ]
+    history.append({"question": question.strip(), "answer": answer.strip()})
+
     return {
         "clarification_answer": answer.strip(),
         "clarification_count": asked + 1,
+        "clarification_history": history,
         "halted_reason": None,
     }

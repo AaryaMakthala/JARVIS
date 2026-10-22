@@ -43,6 +43,7 @@ def intake(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         "clarification_question": None,
         "clarification_answer": None,
         "clarification_count": 0,
+        "clarification_history": [],
         "step_index": 0,
         "retry_count": 0,
         "retry_now": False,

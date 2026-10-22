@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 
 from jarvis.agent.nodes.clarify import MAX_CLARIFICATIONS
+from jarvis.agent.state import clarification_rounds
 
 __all__ = ["VOICE_SOURCE_LINE", "brain_system_prompt", "brain_user_prompt"]
 
@@ -106,6 +107,7 @@ def brain_user_prompt(
     source: str = "terminal",
     clarification_count: int | None = None,
     session_context: str | None = None,
+    clarification_history: list[dict[str, str]] | None = None,
 ) -> str:
     """Build the user prompt for one brain call.
 
@@ -121,9 +123,25 @@ def brain_user_prompt(
     describing the single artifact a deictic reference resolves to, or a short
     instruction to ask one clarification; the code decides which, and the path
     it may contain is still checked like any other path.
+    ``clarification_history`` (Stage 8.4e) carries *every* answered round, oldest
+    first; when it is non-empty it replaces the single question/answer pair, so
+    a second question no longer hides what the human already said.
     """
     parts = [f"The user said:\n{user_input!r}"]
-    if clarification_question and clarification_answer is not None:
+    rounds = clarification_rounds(clarification_history)
+    if rounds:
+        answered = "\n".join(
+            f"  Question {n}: {question!r}\n  Answer {n}: {answer!r}"
+            for n, (question, answer) in enumerate(rounds, start=1)
+        )
+        parts.append(
+            "You asked the user earlier in this task:\n"
+            f"{answered}\n"
+            "Use every answer above together with the original request to decide now. "
+            "Do not ask again about anything the user has already answered - only ask "
+            "another question if a detail is truly still ambiguous."
+        )
+    elif clarification_question and clarification_answer is not None:
         parts.append(
             "You asked the user:\n"
             f"{clarification_question!r}\n"

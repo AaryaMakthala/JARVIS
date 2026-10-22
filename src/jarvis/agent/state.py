@@ -143,10 +143,42 @@ class AgentState(TypedDict, total=False):
     clarification_question: str | None
     clarification_answer: str | None
     clarification_count: int
+    # Every answered clarification round, oldest first (Stage 8.4e).  Each entry
+    # is ``{"question": str, "answer": str}``.  The single
+    # ``clarification_question`` / ``clarification_answer`` pair only holds the
+    # *newest* round, so the history is what keeps the pending intent alive
+    # across several questions.  Plain dicts of strings: no new serialised type,
+    # so the checkpoint allowlist stays unchanged.
+    clarification_history: list[dict[str, str]]
     # operational (Phase 8: written by memory_save after respond)
     memory_saved: bool
     memory_saved_reason: str | None
     memory_failure_logged: bool
+
+
+def clarification_rounds(history: object) -> list[tuple[str, str]]:
+    """Return the answered clarification rounds as ``(question, answer)`` pairs.
+
+    ``history`` is the raw value of ``AgentState.clarification_history``.  It is
+    untrusted state (it can come back from a checkpoint), so malformed entries
+    are dropped instead of raising: only dict entries with a non-blank string
+    ``question`` *and* ``answer`` survive.  Order is preserved - oldest first -
+    because the brain has to read the rounds in the order they were asked.
+    """
+    if not isinstance(history, list):
+        return []
+    rounds: list[tuple[str, str]] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        question = entry.get("question")
+        answer = entry.get("answer")
+        if not isinstance(question, str) or not question.strip():
+            continue
+        if not isinstance(answer, str) or not answer.strip():
+            continue
+        rounds.append((question.strip(), answer.strip()))
+    return rounds
 
 
 class Profile(BaseModel):

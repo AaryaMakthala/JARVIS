@@ -93,6 +93,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         source=source,
         clarification_count=int(state.get("clarification_count") or 0),
         session_context=session_block,
+        clarification_history=state.get("clarification_history"),
     )
 
     llm_budget: dict[str, Any] = {}
