@@ -126,6 +126,12 @@ class AgentState(TypedDict, total=False):
     # operational (Phase 1)
     validate_attempts: int
     gated_resolved_paths: dict[str, list[str]]  # step_id -> pre-interrupt resolved paths (TOCTOU)
+    # step_id -> gate-recorded sha256 of each resolved path's content, aligned
+    # with gated_resolved_paths; only for tools with ToolSpec.bind_content_hash
+    # (Stage 8.4d).  Recorded after the approval succeeds and re-checked by act
+    # immediately before dispatch.  All-or-nothing: a file that cannot be hashed
+    # is a refusal, never an empty entry.
+    gated_content_hashes: dict[str, list[str]]
     halted_reason: str | None
     retry_now: bool | None
     # operational (Phase 7: classification, replanning)

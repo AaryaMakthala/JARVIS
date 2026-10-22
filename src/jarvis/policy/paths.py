@@ -415,3 +415,59 @@ def _expand_wildcard(pattern: str) -> list[Path]:
     except OSError:
         return concretes
     return concretes
+
+
+#: Hard cap on the bytes any single file may contain before content-hash
+#: binding refuses to read it (Stage 8.4d).  Checked via ``stat().st_size``
+#: before the first read and enforced again while reading, so an over-cap file
+#: is never fully hashed even if it grows concurrently.
+CONTENT_HASH_MAX_BYTES = 16 * 1024 * 1024
+
+
+class ContentHashError(ValueError):
+    """A file's content could not be hashed for binding (fail closed).
+
+    Raised for a missing file, a path that is not a regular readable file, an
+    unreadable file, or one over :data:`CONTENT_HASH_MAX_BYTES`.  Callers treat
+    this as a refusal - approval is never bound to content that cannot be read.
+    """
+
+
+def content_hash(path: Path, max_bytes: int = CONTENT_HASH_MAX_BYTES) -> str:
+    """sha256 hexdigest of ``path``'s bytes, refusing over-cap or unreadable files.
+
+    Raises :class:`ContentHashError` for anything that must not be bound:
+    missing, not a regular file, unreadable, or larger than ``max_bytes``.  The
+    size is checked via ``stat()`` *before* reading and enforced again while
+    reading, so an over-cap file is not hashed even if it grows concurrently.
+    Used only by the opt-in content-hash binding (Stage 8.4d).
+
+    This is a snapshot, not an atomic file lock: a writer can still replace the
+    bytes after the read.  The act node re-hashes immediately before dispatch to
+    narrow that window, but no filesystem check can eliminate it entirely.
+    """
+    import hashlib
+
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise ContentHashError(f"cannot stat file for content binding: {path}") from exc
+    if not path.is_file():
+        raise ContentHashError(f"not a regular file: {path}")
+    if stat.st_size > max_bytes:
+        raise ContentHashError(f"file is over the {max_bytes}-byte content-binding cap: {path}")
+    digest = hashlib.sha256()
+    budget = max_bytes + 1
+    try:
+        with path.open("rb") as handle:
+            while budget > 0:
+                chunk = handle.read(min(1024 * 1024, budget))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                budget -= len(chunk)
+    except OSError as exc:
+        raise ContentHashError(f"cannot read file for content binding: {path}") from exc
+    if budget <= 0:
+        raise ContentHashError(f"file is over the {max_bytes}-byte content-binding cap: {path}")
+    return digest.hexdigest()

@@ -89,6 +89,12 @@ class ToolContext:
     whatsapp_browser: Any | None = (
         None  # LazyProfileBrowser | None (WhatsApp profile, Stage 8; never started here)
     )
+    #: The sha256 digests the policy gate bound this dispatch's approval to.
+    #: Set by ``act`` only for a ``ToolSpec.bind_content_hash`` tool, and only
+    #: after act has re-hashed the same resolved paths itself (Stage 8.4d).
+    #: Never derived from planner output.  A tool must treat ``None``/empty as
+    #: "no approval binding" and refuse (fail closed).
+    approved_content_hashes: tuple[str, ...] | None = None
 
 
 ArgsModel = type[BaseModel]
@@ -125,6 +131,13 @@ class ToolSpec:
     #: the tool never consumes budget; state-changing browser/UIA actions declare
     #: ``1`` and the act node reserves it atomically immediately before dispatch.
     budget_cost: int = 0
+    #: When true, the policy gate binds the approval to the sha256 *content* of
+    #: every resolved path argument, and the act node recomputes it from a fresh
+    #: read immediately before dispatch, refusing on any change, missing file or
+    #: over-cap file (Stage 8.4d).  Default off, so no existing tool's approval
+    #: or hashing is affected.  Use only for tools whose action must be bound to
+    #: the exact bytes of a file, not just its path (``whatsapp_send_file``).
+    bind_content_hash: bool = False
     #: Optional callables; defaults keep unknown tools safe.
     run: Callable[[BaseModel, ToolContext], ToolResult] = field(
         default=lambda args, ctx: ToolResult(ok=False, error="tool has no run implementation")

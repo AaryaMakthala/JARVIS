@@ -29,8 +29,9 @@ Fail-closed rules honoured here:
 * a send attempt is persisted in a short-lived guard so a retry, a replan or a
   daemon restart can never send the same file to the same contact twice.
 
-Sending stays disabled until the content-hash binding is actually wired by
-Slice 8.4d: without an approved digest on the tool context, the tool refuses.
+Sending stays disabled unless the approval is content-bound: ``act`` places the
+gate-approved sha256 digests on the tool context only after its own re-read of
+the same resolved paths matches, and this tool refuses when they are absent.
 """
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ import json
 import logging
 import threading
 import time
-from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
@@ -72,8 +72,9 @@ __all__ = [
 ]
 
 #: ``act`` sets this attribute on the ``ToolContext`` with the sha256 digests the
-#: policy gate bound the approval to (Slice 8.4d).  Reading it defensively keeps
-#: this module importable and fail-closed when the binding is not wired yet.
+#: policy gate bound the approval to, after act's own re-read matched them
+#: (Slice 8.4d).  Reading it defensively keeps this tool fail-closed on an old
+#: checkpoint or any dispatch that did not pass through the binding.
 APPROVED_HASHES_ATTR = "approved_content_hashes"
 
 #: How long a send attempt blocks an identical retry (same contact + content).
@@ -185,11 +186,6 @@ def _guard_key(contact: Contact, digest: str) -> str:
     """Opaque key for one (contact number, content) send attempt."""
     payload = f"{contact.number}\n{digest}".encode()
     return hashlib.sha256(payload).hexdigest()
-
-
-def _binding_supported() -> bool:
-    """Whether this build's ``ToolSpec`` can bind an approval to file content."""
-    return "bind_content_hash" in {item.name for item in fields(ToolSpec)}
 
 
 def _hash_cap(ctx: ToolContext) -> int:
@@ -345,13 +341,6 @@ def _send_file_run(
     refusal = _require_windows("whatsapp_send_file")
     if refusal is not None:
         return refusal
-
-    if not _binding_supported():
-        return ToolResult(
-            ok=False,
-            error="this build cannot bind a WhatsApp file approval to the file content; "
-            "refusing to send",
-        )
 
     contact, refusal = _resolve_contact(store, args.contact)
     if refusal is not None:
@@ -524,9 +513,8 @@ def make_whatsapp_send_file_spec(
 
     ``store`` / ``limiter`` / ``guard`` are injection points for tests; the
     defaults read the real contacts file, the shared send log and the persisted
-    resend guard.  ``bind_content_hash`` is only requested when this build's
-    ``ToolSpec`` supports it, so the tool remains importable (and fail-closed)
-    on a tree where Slice 8.4d is absent.
+    resend guard.  ``bind_content_hash`` opts this one tool into the 8.4d
+    approval-to-content binding; no other tool is affected.
     """
     options: dict[str, Any] = {
         "name": "whatsapp_send_file",
@@ -543,11 +531,10 @@ def make_whatsapp_send_file_spec(
         "timeout_s": 120,
         "path_args": ("path",),
         "budget_cost": 1,
+        "bind_content_hash": True,
         "run": lambda args, ctx: _send_file_run(store, limiter, guard, args, ctx),
         "describe": lambda args: _describe_send_file(store, args),
     }
-    if _binding_supported():
-        options["bind_content_hash"] = True
     return ToolSpec(**options)
 
 

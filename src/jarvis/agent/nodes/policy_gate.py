@@ -28,6 +28,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
+from pathlib import Path
 from typing import Any
 
 from langgraph.types import interrupt
@@ -49,6 +50,7 @@ from jarvis.agent.nodes.util import (
 from jarvis.agent.schemas import ConfirmationRequest
 from jarvis.agent.state import Decision
 from jarvis.policy import rules, tiers
+from jarvis.policy.paths import ContentHashError, content_hash
 from jarvis.policy.refusal import refusal_text as refusal_sentence
 from jarvis.policy.scope import ScopeError
 from jarvis.voice.tier2_voice import allowed as tier2_voice_allowed
@@ -153,6 +155,9 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
                 updates["gated_resolved_paths"] = gated
             return updates
         gated = updates.get("gated_resolved_paths") or dict(state.get("gated_resolved_paths") or {})
+        # A batch approval covers only contiguous Tier 1 steps; an opted-in
+        # (Tier 2) tool is never batch-eligible, so no content hash is recorded
+        # here.  If one ever were, act would refuse it for a missing binding.
         # Target-bearing steps the batch just approved still need a transient
         # binding: the batch decisions are target-less, so resolve each one now
         # (read-only) and record the binding the act node will re-verify (Slice 9).
@@ -179,6 +184,9 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             "halted_reason": "Refused: a file path changed after you confirmed — not acting on it.",
         }
 
+    # Content-hash binding (Stage 8.4d) happens inside ``_approve_single_step``,
+    # after every approval check has passed: a denied/timed-out/locked
+    # confirmation must not leave a recorded content binding behind.
     return _approve_single_step(
         state,
         ctx,
@@ -524,6 +532,24 @@ def _record_batch_bindings(
 # ── shared single-step approval ────────────────────────────────────────────
 
 
+def _bound_content_hashes(decision: Decision) -> tuple[list[str] | None, str | None]:
+    """Compute the content hashes a ``bind_content_hash`` tool's approval binds to.
+
+    Returns ``(hashes, None)`` on success, where ``hashes`` holds one sha256 per
+    resolved path (aligned with ``decision.resolved_paths``), or ``(None, reason)``
+    when a file is over the size cap, missing or unreadable.  Called only after
+    the approval has succeeded; approval is never bound to content that cannot be
+    read, so the caller refuses (fail closed, before dispatch).  Stage 8.4d.
+    """
+    hashes: list[str] = []
+    for raw in decision.resolved_paths:
+        try:
+            hashes.append(content_hash(Path(raw)))
+        except ContentHashError as exc:
+            return None, str(exc)
+    return hashes, None
+
+
 def _approve_single_step(
     state: dict[str, Any],
     ctx: AppContext,
@@ -535,24 +561,35 @@ def _approve_single_step(
     target: Any,
     scope_cid: str,
 ) -> dict[str, Any]:
-    """Validate a single-step approval, record the binding and approve the action."""
+    """Validate a single-step approval, record the binding and approve the action.
+
+    A ``ToolSpec.bind_content_hash`` tool additionally gets one sha256 per
+    resolved path recorded **only after** every approval check has passed
+    (Stage 8.4d).  A denied, timed-out, typed-mismatch or locked-session answer
+    records no content binding; a file that cannot be hashed is a refusal and
+    the action is not approved.
+    """
+    content_hashes = dict(state.get("gated_content_hashes") or {})
     approved = _answer_matches(answer, decision.action_hash)
     if not approved:
         if isinstance(answer, dict) and answer.get("timed_out") is True:
             return {
                 "decisions": decisions,
                 "gated_resolved_paths": gated,
+                "gated_content_hashes": content_hashes,
                 "halted_reason": "Confirmation timed out. I did not perform the action.",
             }
         return {
             "decisions": decisions,
             "gated_resolved_paths": gated,
+            "gated_content_hashes": content_hashes,
             "halted_reason": refusal_sentence(answer),
         }
     if not _typed_confirmation_ok(answer, decision):
         return {
             "decisions": decisions,
             "gated_resolved_paths": gated,
+            "gated_content_hashes": content_hashes,
             "halted_reason": "Refused: the typed folder-name confirmation did not match the plan.",
         }
     # Stage 3 opt-in: a voice-approved Tier 2 step may satisfy *this* step's
@@ -566,14 +603,35 @@ def _approve_single_step(
         return {
             "decisions": decisions,
             "gated_resolved_paths": gated,
+            "gated_content_hashes": content_hashes,
             "halted_reason": "Refused: Tier 2 action needs an unlocked JARVIS session.",
         }
+
+    # Bind the approval to the file content only now, when it is certain the
+    # action was actually approved.  ``content_hashes`` above deliberately holds
+    # only bindings from earlier steps, so every refusal path returns without
+    # recording anything for this step.
+    spec = ctx.registry.get_optional(str(getattr(step, "tool", "") or ""))
+    if spec is not None and spec.bind_content_hash:
+        hashes, hash_error = _bound_content_hashes(decision)
+        if hash_error is not None:
+            return {
+                "decisions": decisions,
+                "gated_resolved_paths": gated,
+                "gated_content_hashes": content_hashes,
+                "halted_reason": (
+                    "Refused: I could not bind approval to the file's content "
+                    f"({hash_error}) — not confirming it."
+                ),
+            }
+        content_hashes[str(step.id)] = list(hashes or [])
 
     _record_binding_for(ctx, state, step, decision, target, scope_cid)
     approved_hashes = list(state.get("approved_hashes") or []) + [str(decision.action_hash)]
     return {
         "decisions": decisions,
         "gated_resolved_paths": gated,
+        "gated_content_hashes": content_hashes,
         "approved_hashes": approved_hashes,
     }
 

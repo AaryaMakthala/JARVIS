@@ -5158,3 +5158,70 @@ Manual smoke test (own test number only, after 8.4d):
     # 1. add a test contact, then ask JARVIS to send a photo to it and approve the Tier 2 confirm;
     #    verify the composer preview + header before Send, then check the chat arrives once.
     # 2. ask again for the same file within 10 minutes -> expect "already sent ... refusing".
+## STAGE 8 — SLICE 8.4d: approval bound to file content (2026-10-22)
+
+**Scope:** sub-step 8.4d only — wire `ToolSpec.bind_content_hash` through the policy gate and the
+act node, finish `content_hash()` hardening, and add the focused tests. No 8.4e voice integration,
+no 8.5 docs, no Stage 9/10 work, no live WhatsApp run. (Commit after this entry.)
+
+**Built:**
+- `src/jarvis/tools/base.py`: `ToolSpec.bind_content_hash: bool = False` (opt-in; only
+  `whatsapp_send_file` sets it) and `ToolContext.approved_content_hashes: tuple[str, ...] | None`,
+  written by act only after its own re-read matched.
+- `src/jarvis/policy/paths.py`: `CONTENT_HASH_MAX_BYTES = 16 MiB`, `ContentHashError`, and
+  `content_hash()` (sha256; stat size check plus a bounded read so concurrent growth past the cap
+  still refuses; missing/dir/unreadable/over-cap are `ContentHashError`). The docstring states
+  plainly that this is a snapshot, not an atomic lock.
+- `src/jarvis/agent/nodes/policy_gate.py`: one sha256 per resolved path is recorded for an opted-in
+  tool **only after** the action hash, typed confirmation and unlock checks all pass. Denied,
+  timed-out, typed-mismatch and locked answers record no binding; a file that cannot be hashed is a
+  refusal. Batch approvals remain Tier 1 only and record no content hash (act fails closed).
+- `src/jarvis/agent/nodes/act.py`: after the path/target checks and immediately before the budget
+  reservation and dispatch, act recomputes the digests from the same resolved paths and refuses on
+  a changed/missing/over-cap file, a missing/malformed snapshot, or a snapshot not associated with
+  those paths. On success the verified tuple is placed on the tool context. Dry runs skip the check
+  and execute nothing.
+- `src/jarvis/tools/whatsapp_web.py`: always opts in (`bind_content_hash=True`); removed the
+  temporary `_binding_supported()` compatibility shim and its refusal. The tool still refuses when
+  no approved digest reaches it and re-hashes again immediately before Send.
+- `tests/unit/test_content_binding.py` (new, 30 tests): opt-in default, `content_hash` (chunked
+  equals sha256, empty, missing, directory, over-cap via stat and via a lying stat, unreadable, cap
+  constant), graph-level interrupt/resume (approval records exactly one digest and runs once;
+  denial/timeout record none; a file removed, replaced by a directory or grown past the cap before
+  approval is refused with no dispatch), and direct act refusals (changed bytes, missing file,
+  over-cap, missing binding, binding under another step id, malformed snapshot variants, missing
+  resolved-paths snapshot, another file's hash, no approved action hash) plus the non-opt-in and
+  dry-run controls.
+- `tests/unit/test_whatsapp_send_file.py`: the `bind_content_hash` assertion is now unconditional
+  and the obsolete "binding unavailable" test is gone.
+
+**Verified:**
+| Command | Result |
+|---|---|
+| `ruff check` + `ruff format --check` (touched files) | PASS |
+| `mypy src/jarvis/policy` | PASS (9 files) |
+| `pytest tests/unit/test_content_binding.py` | PASS (30) |
+| `pytest test_act_node.py test_act_target_parity.py test_policy_gate_batch.py test_validate_paths.py test_whatsapp_send_file.py test_paths.py` | PASS (100) |
+| `pytest test_batch_graph.py test_invariants.py` | PASS (39) |
+
+No full-suite run and no live run; no Windows manual smoke test was performed.
+
+**Known limitations / decisions:**
+- **Honest race boundary:** the gate hashes when the approval succeeds (resume time) and act
+  re-hashes immediately before dispatch, so a file changed *between* the interrupt and the approval
+  is not detected — the gate binds the bytes the approval applies to at that moment. A change after
+  the binding is detected by act; a change after act's check is narrowed by the tool's own pre-Send
+  re-hash, but no userspace check can be atomic with the send.
+- A malformed/absent `gated_content_hashes` entry is a refusal for an opted-in tool, never "no
+  binding means allowed". Tools that do not opt in are byte-for-byte unchanged.
+- The snapshot is not itself an authorization: act still requires the approved action hash (and the
+  normal policy/target checks), and only the gate-recorded digest is used.
+- Batch approvals can never include a Tier 2 tool, so no content hash is recorded on that path; if
+  one ever appeared there, act would refuse it.
+
+**Next (owner):** review and smoke-test this sub-step, then 8.4e voice integration. Manual test
+(own test number only):
+
+    # 1. ask JARVIS to send a file to your test contact and approve; confirm it arrives once.
+    # 2. modify the file after confirming (before approving, then again after approving) and
+    #    confirm the refusal text; no message should be sent.

@@ -20,7 +20,6 @@ What these tests pin down:
 
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import sqlite3
 from pathlib import Path
@@ -228,8 +227,7 @@ def test_registered_as_tier2_with_budget_and_path_binding() -> None:
     assert spec.windows_only is True
     assert spec.budget_cost == 1
     assert spec.path_args == ("path",)
-    if "bind_content_hash" in {item.name for item in dataclasses.fields(ToolSpec)}:
-        assert spec.bind_content_hash is True
+    assert spec.bind_content_hash is True
     assert "whatsapp_open_chat" in registry.names()
 
 
@@ -283,23 +281,6 @@ def test_send_is_refused_without_an_approved_content_binding(tmp_path: Path) -> 
     assert "not bound" in result.error
     assert holder.acquires == 0
     assert page.staged_paths == [] and page.clicked == []
-
-
-def test_send_is_refused_when_the_content_binding_is_unavailable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr("jarvis.tools.whatsapp_web._binding_supported", lambda: False)
-    target = _file(tmp_path)
-    page = _Page()
-    holder = _Holder(page)
-    ctx = _ctx(holder)
-    _approve(ctx, target)
-
-    result = _spec(tmp_path).execute(WhatsAppSendFileArgs(contact="Rahul", path=str(target)), ctx)
-
-    assert result.ok is False
-    assert "cannot bind" in result.error
-    assert page.clicked == []
 
 
 def test_a_different_file_than_the_approved_one_is_refused(tmp_path: Path) -> None:

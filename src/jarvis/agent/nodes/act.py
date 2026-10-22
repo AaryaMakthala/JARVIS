@@ -14,6 +14,14 @@ gate recorded, recomputed from that fresh observation; a changed, missing or
 unauthorized target fails closed.  The step's task-scope action budget is then
 reserved atomically, immediately before dispatch, and is never refunded.
 
+**Content binding (8.4d).**  A tool whose spec sets ``bind_content_hash`` may
+only run after act has re-read every resolved path and matched the sha256 the
+policy gate recorded when the user approved.  The comparison happens after the
+path/target checks and immediately before the budget is reserved and the tool
+is dispatched; the verified digests are then handed to the tool context.  This
+is a narrow window, not an atomic filesystem lock - an opted-in tool re-checks
+again immediately before its irreversible action.
+
 **Exactly-once execution.**  A step that already produced a ``StepResult`` is
 never executed a second time: :func:`_recorded_result` short-circuits and
 replays the recorded outcome.  This is what makes provider fallback and
@@ -29,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from jarvis.agent.context import AppContext
@@ -41,8 +50,26 @@ from jarvis.agent.nodes.util import (
 )
 from jarvis.agent.session_context import SESSION_THREAD
 from jarvis.agent.state import StepResult
+from jarvis.policy.paths import ContentHashError, content_hash
 
 logger = logging.getLogger(__name__)
+
+
+def _content_hashes_now(decision: Any) -> tuple[list[str] | None, str | None]:
+    """Recompute a ``bind_content_hash`` step's content hashes from a fresh read.
+
+    Returns ``(hashes, None)`` on success (one sha256 per resolved path) or
+    ``(None, reason)`` when a file is over the size cap, missing or unreadable.
+    Mirrors the policy gate's binding so act proves the same content the user
+    confirmed (Stage 8.4d).
+    """
+    hashes: list[str] = []
+    for raw in getattr(decision, "resolved_paths", None) or []:
+        try:
+            hashes.append(content_hash(Path(raw)))
+        except ContentHashError as exc:
+            return None, str(exc)
+    return hashes, None
 
 
 def _recorded_result(state: dict[str, Any], step_id: str) -> StepResult | None:
@@ -210,6 +237,55 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
                 "Refused: the interaction target changed or was not authorized — not acting on it.",
             )
 
+    # Content-hash binding (Stage 8.4d).  A tool that opts in must present the
+    # sha256 the gate recorded, recomputed from a fresh read right here, after
+    # the path/target checks and immediately before the budget is reserved and
+    # the tool is dispatched.  A changed, missing, over-cap, malformed or
+    # never-recorded binding fails closed: the file's *content* is what the
+    # user confirmed, not just its path.
+    #
+    # Boundary: this is a re-read, not an atomic filesystem lock.  A writer can
+    # still replace the bytes after this check; an opted-in tool therefore
+    # re-hashes again immediately before its irreversible action
+    # (``whatsapp_send_file`` does, just before Send).
+    approved_digests: tuple[str, ...] | None = None
+    if spec.bind_content_hash and not ctx.dry_run:
+        snapshot = (state.get("gated_content_hashes") or {}).get(step.id)
+        if prior_paths is None or list(prior_paths) != list(decision.resolved_paths):
+            return _refuse(
+                state,
+                step.id,
+                "content binding is not associated with this action's resolved paths",
+                "Refused: I could not match the approval to this file — not acting on it.",
+            )
+        if (
+            not isinstance(snapshot, (list, tuple))
+            or not snapshot
+            or not all(isinstance(item, str) and item for item in snapshot)
+        ):
+            return _refuse(
+                state,
+                step.id,
+                "content binding is missing or malformed",
+                "Refused: I could not verify the file's content before acting — not acting on it.",
+            )
+        fresh, hash_error = _content_hashes_now(decision)
+        if hash_error is not None:
+            return _refuse(
+                state,
+                step.id,
+                f"content could not be re-verified: {hash_error}",
+                "Refused: the file's content could not be verified immediately before acting — not acting on it.",
+            )
+        if list(snapshot) != list(fresh or []):
+            return _refuse(
+                state,
+                step.id,
+                "file content changed after confirmation",
+                "Refused: the file's content changed after you confirmed — not acting on it.",
+            )
+        approved_digests = tuple(snapshot)
+
     # Objective A (atomic task budget): reserve the step's cost immediately
     # before dispatch, after every pre-dispatch check has passed.  The
     # reservation is atomic (shared per-task counter) and is never refunded.
@@ -224,6 +300,11 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             )
 
     tool_ctx = ctx.tool_context()
+    if approved_digests is not None:
+        # The digests the gate bound the approval to, after act's own re-read
+        # matched them.  The tool may use them only to re-verify, never as a
+        # substitute for its own checks.
+        tool_ctx.approved_content_hashes = approved_digests
     start = time.perf_counter()
     result = spec.execute(args, tool_ctx)
     elapsed_ms = int((time.perf_counter() - start) * 1000)
