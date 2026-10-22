@@ -5401,3 +5401,76 @@ only, after 8.6.3):
     #    request -> "open that page again". Expect the same page to reopen.
     # 2. after any page is open, ask "delete it" -> expect JARVIS to ask for clarification instead of
     #    treating the URL as a file.
+
+## STAGE 8 — SLICE 8.6.4: one reusable messaging flow, channels as adapters (2026-10-22)
+
+**Scope:** sub-step 8.6.4 only — make the messaging rules reusable so a second channel is an adapter
+plus a thin tool, instead of a copy of the rules. No 8.5 docs, no Stage 9/10 work, and **no new
+user-facing tool**: `whatsapp_send`, `whatsapp_send_file` and `whatsapp_open_chat` keep their names,
+arguments, tiers and refusals.
+
+**Built:**
+- New package `src/jarvis/messaging/` — the messaging domain, not a tool:
+  - `contacts.py`: the contact list, phone-number masking and the persisted send rate limit moved
+    here from `jarvis.tools.whatsapp` (which re-exports every name, so `jarvis contacts …` and the
+    old import paths are unchanged). A send is still refused unless **exactly one** contact matches.
+  - `base.py`: the channel contract — `MessageRequest`, `MessageOutcome`, `MessageError`,
+    `MessageChannel` (a channel names itself, says what it can carry, sends one resolved request to
+    one resolved contact) and the channel/capability constants.
+  - `flow.py`: `MessageFlow` — the one pipeline every channel uses: channel → recipient → rate limit
+    → payload → delivery → read-back. The rate limit is checked **before** any side effect and
+    recorded **only after** a successful delivery (a bookkeeping failure never turns a delivered
+    message into a retryable one). A tool that must do policy work in between (resolve the file,
+    bind the approval to its content) calls `prepare()` and `dispatch()` separately.
+  - `whatsapp_desktop.py`: the UIA provider and the text channel adapter.
+  - `whatsapp_web.py`: `FileSendGuard`, `content_digest()`, `guard_key()` and the file channel
+    adapter (the browser mechanics and the fail-closed checks live here now).
+- `src/jarvis/tools/whatsapp.py`: `whatsapp_send` now delegates to the flow + the desktop adapter;
+  `_build_provider()` stays the single monkeypatch point for tests.
+- `src/jarvis/tools/whatsapp_web.py`: `whatsapp_send_file` / `whatsapp_open_chat` delegate to the
+  flow + the web adapter. The tool keeps only what is *policy*: resolve the path inside the sandbox,
+  enforce the size cap, bind the approval to the file's content, and map refusals to `ToolResult`.
+- Tests: new `tests/unit/test_messaging_flow.py` (13 cases — the flow on its own with fake adapters)
+  and new `tests/unit/test_messaging_channels.py` (18 cases — the desktop and web adapters against a
+  fake window and a fake narrow page).
+
+**Verified:**
+| Command | Result |
+|---|---|
+| `ruff check` + `ruff format --check` (touched files) | PASS |
+| `pytest tests/unit/test_messaging_flow.py test_messaging_channels.py test_whatsapp.py test_whatsapp_send_file.py test_whatsapp_web.py test_package.py test_invariants.py` | PASS (215) |
+| `pytest tests/unit/test_cli.py test_contacts_cli.py test_tool_resolver.py test_agent_architecture.py test_completeness.py test_code_limit.py test_content_binding.py test_readback.py test_refusal_reasons.py` | PASS |
+
+No full-suite run and no live run; no Windows manual smoke test was performed.
+
+**Known limitations / decisions:**
+- **Unchanged behaviour on purpose:** `whatsapp_open_chat` still does **not** consume the send rate
+  limit (opening a chat sends nothing); only a send does.
+- The order of the safety checks is unchanged and still fail-closed: recipient → rate limit → file
+  resolution/caps → approval/content binding → duplicate guard → browser. A rate-limited,
+  unbound or duplicate attempt still never opens the browser.
+- The rate-limit message now says "messaging rate limit" instead of "WhatsApp rate limit" (the
+  limiter is channel-agnostic now); the text still contains "rate limit".
+- A channel adapter must fail closed: an unreadable UI, an unverifiable chat or a file that changed
+  while it was staged means **nothing is sent** and the draft is left for the owner.
+- The new package is import-safe on any OS: the Windows-only imports (pywinauto, `os.startfile`)
+  stay inside the functions that need them.
+- A send is now logged **once**, by the adapter that performed it (the tools no longer log it a
+  second time). The log line still carries only the contact name and the *number of digits*.
+- **Pre-existing (not caused by this slice):** the tool result data carries `phone_digits` = the
+  contact's full number. It stays local (checkpoint only) and never reaches a prompt or a log line
+  (the log redaction filter masks phone numbers anyway), but tightening it to the digit count or the
+  masked form is a candidate for a later privacy slice.
+- **Pre-existing (not caused by this slice):** `tests/unit/test_act_target_parity.py::
+  test_type_text_into_managed_browser_is_hard_blocked` fails *on Linux only*. It must pass on Windows.
+
+**Next:** 8.5 (docs: security/policy, tool spec, roadmap amendments, PROGRESS). Manual smoke test
+(owner, own test number only, after 8.6.4):
+
+    # 1. jarvis chat -> "message Rahul on WhatsApp: on my way". Expect the Tier 2 confirmation
+    #    (masked number + the exact message), then the message in WhatsApp.
+    # 2. jarvis chat -> "send this photo to Rahul on WhatsApp" -> approve the file, then confirm the
+    #    Tier 2 confirmation. Expect the file to be sent from the WhatsApp Web profile.
+    # 3. ask for the same photo again within 10 minutes -> expect the refusal ("already sent"),
+    #    not a second message.
+

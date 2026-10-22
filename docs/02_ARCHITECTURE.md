@@ -70,8 +70,15 @@ jarvis/
 │  │   ├─ web.py             # open_url, google_search, web_answer
 │  │   ├─ keyboard.py        # type_text (focus-verified)
 │  │   ├─ dictation.py       # start/stop dictation
-│  │   ├─ whatsapp.py        # whatsapp_send
+│  │   ├─ whatsapp.py        # whatsapp_send (desktop channel)
+│  │   ├─ whatsapp_web.py    # whatsapp_send_file, whatsapp_open_chat (web channel)
 │  │   └─ system.py          # lock_computer, system_info, audit tools
+│  ├─ messaging/             # the messaging domain (one flow, many channels)
+│  │   ├─ contacts.py        # contact list, number masking, persisted send rate limit
+│  │   ├─ base.py            # MessageRequest / MessageOutcome / MessageChannel contract
+│  │   ├─ flow.py            # MessageFlow: recipient → rate limit → payload → delivery
+│  │   ├─ whatsapp_desktop.py # text channel adapter (WhatsApp desktop app)
+│  │   └─ whatsapp_web.py    # file channel adapter (isolated WhatsApp Web profile)
 │  ├─ daemon/
 │  │   ├─ protocol.py        # Pydantic message models (client↔server)
 │  │   ├─ task_runtime.py    # the single answer window (TaskRuntime, TimeoutSink, timeout_answer)

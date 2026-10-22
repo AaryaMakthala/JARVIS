@@ -1,4 +1,12 @@
-"""Guarded WhatsApp Web file send and chat open (Stage 8, Slice 8.4c).
+"""Guarded WhatsApp Web file send and chat open (Stage 8, Slices 8.4c/8.6.4).
+
+Both tools are thin: the reusable messaging flow
+(:mod:`jarvis.messaging.flow`) resolves the recipient and checks the send
+rate limit, and the WhatsApp Web channel adapter
+(:mod:`jarvis.messaging.whatsapp_web`) owns the browser mechanics and fails
+closed.  What is left here is the *policy* work the tools must do before a
+message can leave the machine: resolving the file inside the policy sandbox,
+enforcing the size cap and binding the approval to the file's content.
 
 Two tools live here, and they are deliberately separate:
 
@@ -36,10 +44,7 @@ the same resolved paths matches, and this tool refuses when they are absent.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -47,17 +52,17 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from jarvis import config
-from jarvis.browser.whatsapp_web import WhatsAppDriver, WhatsAppError
+from jarvis.messaging.base import CHANNEL_WHATSAPP_WEB, MessageError, MessageRequest
+from jarvis.messaging.contacts import ContactStore, RateLimiter, masked_number
+from jarvis.messaging.flow import MessageFlow
+from jarvis.messaging.whatsapp_web import (
+    RESEND_WINDOW_S,
+    FileSendGuard,
+    WhatsAppWebAdapter,
+    content_digest,
+)
 from jarvis.policy import paths
 from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
-from jarvis.tools.whatsapp import (
-    Contact,
-    ContactStore,
-    RateLimiter,
-    RateLimitError,
-    masked_number,
-    resolve_single,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +81,6 @@ __all__ = [
 #: (Slice 8.4d).  Reading it defensively keeps this tool fail-closed on an old
 #: checkpoint or any dispatch that did not pass through the binding.
 APPROVED_HASHES_ATTR = "approved_content_hashes"
-
-#: How long a send attempt blocks an identical retry (same contact + content).
-#: Long enough to absorb retries/replans/restarts, short enough that a genuine
-#: "send it again" later in the day is not blocked forever.
-RESEND_WINDOW_S = 600.0
 
 #: Fallback cap when the policy module does not expose its content-hash cap.
 _DEFAULT_HASH_CAP = 16 * 1024 * 1024
@@ -112,99 +112,11 @@ class WhatsAppOpenChatArgs(BaseModel):
     )
 
 
-class FileSendGuard:
-    """Persisted, short-lived "this file was already attempted" guard.
-
-    ``claim`` atomically records an attempt and returns ``False`` when the same
-    (contact, content) pair was attempted inside :data:`RESEND_WINDOW_S`.  The
-    key is a sha256, so the file holds no readable phone numbers or paths.
-    This is a safety guard, not an authorization control: a corrupt/missing
-    file is treated as empty, while the content-hash approval binding remains
-    the security boundary.
-    """
-
-    def __init__(
-        self,
-        path: Path | str,
-        *,
-        window_s: float = RESEND_WINDOW_S,
-        clock: Any = None,
-    ) -> None:
-        self.path = Path(path)
-        self.window_s = float(window_s)
-        self._clock = clock if clock is not None else time.time
-        self._lock = threading.Lock()
-
-    def is_recent(self, key: str) -> bool:
-        """Whether ``key`` was attempted inside the window (read-only)."""
-        with self._lock:
-            entries = self._prune(self._load(), float(self._clock()))
-            return key in entries
-
-    def claim(self, key: str) -> bool:
-        """Atomically record ``key``; ``False`` when an attempt is recent."""
-        with self._lock:
-            now = float(self._clock())
-            entries = self._prune(self._load(), now)
-            if key in entries:
-                return False
-            entries[key] = now
-            self._write(entries)
-            return True
-
-    def _load(self) -> dict[str, float]:
-        if not self.path.is_file():
-            return {}
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            records = data.get("entries", {})
-        except Exception:  # noqa: BLE001 - a bad guard file must not authorize a send
-            logger.warning("the WhatsApp resend guard is unreadable; treating it as empty")
-            return {}
-        if not isinstance(records, dict):
-            return {}
-        entries: dict[str, float] = {}
-        for key, timestamp in records.items():
-            try:
-                entries[str(key)] = float(timestamp)
-            except (TypeError, ValueError):
-                continue
-        return entries
-
-    def _prune(self, entries: dict[str, float], now: float) -> dict[str, float]:
-        cutoff = now - self.window_s
-        return {key: ts for key, ts in entries.items() if ts > cutoff}
-
-    def _write(self, entries: dict[str, float]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"entries": entries}), encoding="utf-8")
-        tmp.replace(self.path)
-
-
-def _guard_key(contact: Contact, digest: str) -> str:
-    """Opaque key for one (contact number, content) send attempt."""
-    payload = f"{contact.number}\n{digest}".encode()
-    return hashlib.sha256(payload).hexdigest()
-
-
 def _hash_cap(ctx: ToolContext) -> int:
     """The effective cap: the setting, never above the content-binding cap."""
     configured = max(1, int(ctx.settings.whatsapp.max_file_bytes))
     hard = int(getattr(paths, "CONTENT_HASH_MAX_BYTES", _DEFAULT_HASH_CAP))
     return min(configured, hard)
-
-
-def _content_digest(target: Path, max_bytes: int) -> str | None:
-    """sha256 of ``target``, or ``None`` when hashing is unavailable/refused."""
-    content_hash = getattr(paths, "content_hash", None)
-    if content_hash is None:
-        return None
-    try:
-        return str(content_hash(target, max_bytes=max_bytes))
-    except Exception:  # noqa: BLE001 - any refusal means "cannot bind this file"
-        logger.warning("the attachment could not be hashed for content binding")
-        return None
 
 
 def _approved_digests(ctx: ToolContext) -> tuple[str, ...]:
@@ -247,28 +159,6 @@ def _require_windows(tool_name: str) -> ToolResult | None:
     return None
 
 
-def _resolve_contact(
-    store: ContactStore | None, query: str
-) -> tuple[Contact | None, ToolResult | None]:
-    """Resolve exactly one contact, or the refusal listing the options."""
-    store = store or ContactStore(config.contacts_file())
-    contact, error = resolve_single(store, query)
-    if contact is None:
-        return None, ToolResult(
-            ok=False, error=error or f"no contact matches {query!r}; refusing to continue"
-        )
-    return contact, None
-
-
-def _resend_refusal(contact: Contact, guard: FileSendGuard) -> str:
-    """The refusal text for a duplicate (contact, content) send attempt."""
-    minutes = max(1, int(guard.window_s // 60))
-    return (
-        f"this file was already sent to {contact.name} in the last {minutes} minutes; "
-        "refusing to send it again"
-    )
-
-
 def _limiter_for(limiter: RateLimiter | None, ctx: ToolContext) -> RateLimiter:
     """Use the injected limiter (tests) or the shared persisted one."""
     if limiter is not None:
@@ -279,25 +169,6 @@ def _limiter_for(limiter: RateLimiter | None, ctx: ToolContext) -> RateLimiter:
         min_interval_s=ctx.settings.whatsapp.min_interval_s,
         clock=time.time,
     )
-
-
-def _open_page(ctx: ToolContext) -> Any | None:
-    """Start/return the WhatsApp profile's narrow page, or ``None`` (fail closed)."""
-    holder = ctx.whatsapp_browser
-    if holder is None:
-        return None
-    try:
-        session = holder.acquire()
-    except Exception:
-        logger.warning("the WhatsApp browser holder failed", exc_info=True)
-        return None
-    if session is None:
-        return None
-    try:
-        return session.whatsapp_page()
-    except Exception:
-        logger.warning("the WhatsApp page is not available", exc_info=True)
-        return None
 
 
 def _resolve_file(raw: str, ctx: ToolContext) -> tuple[Path | None, int, ToolResult | None]:
@@ -330,6 +201,15 @@ def _resolve_file(raw: str, ctx: ToolContext) -> tuple[Path | None, int, ToolRes
     return target, size, None
 
 
+def _adapter(ctx: ToolContext, guard: FileSendGuard | None) -> WhatsAppWebAdapter:
+    """The WhatsApp Web channel adapter, wired to this context."""
+    return WhatsAppWebAdapter(
+        holder=ctx.whatsapp_browser,
+        guard=guard or FileSendGuard(config.whatsapp_sent_files_file()),
+        max_bytes=_hash_cap(ctx),
+    )
+
+
 def _send_file_run(
     store: ContactStore | None,
     limiter: RateLimiter | None,
@@ -342,19 +222,19 @@ def _send_file_run(
     if refusal is not None:
         return refusal
 
-    contact, refusal = _resolve_contact(store, args.contact)
-    if refusal is not None:
-        return refusal
-    if contact is None:  # unreachable; keeps the type check honest
-        return ToolResult(ok=False, error="the contact could not be resolved")
-
+    store = store or ContactStore(config.contacts_file())
     limiter = _limiter_for(limiter, ctx)
+    flow = MessageFlow([_adapter(ctx, guard)], store=store, limiter=limiter)
+    request = MessageRequest(channel=CHANNEL_WHATSAPP_WEB, contact=args.contact)
+
+    # 1. the recipient and the rate limit, before anything is opened
     try:
-        limiter.check()
-    except RateLimitError as exc:
+        prepared = flow.prepare(request)
+    except MessageError as exc:
         return ToolResult(ok=False, error=str(exc))
 
-    target, size, refusal = _resolve_file(args.path, ctx)
+    # 2. the file, its size cap and the approval's content binding
+    target, _size, refusal = _resolve_file(args.path, ctx)
     if refusal is not None:
         return refusal
     if target is None:  # unreachable; keeps the type check honest
@@ -366,7 +246,7 @@ def _send_file_run(
             ok=False,
             error="the file's content is not bound to this approval; refusing to send",
         )
-    digest = _content_digest(target, _hash_cap(ctx))
+    digest = content_digest(target, _hash_cap(ctx))
     if digest is None:
         return ToolResult(
             ok=False,
@@ -379,94 +259,24 @@ def _send_file_run(
             error="the file's content does not match the approved file; refusing to send",
         )
 
-    guard = guard or FileSendGuard(config.whatsapp_sent_files_file())
-    key = _guard_key(contact, digest)
-    try:
-        recent = guard.is_recent(key)
-    except OSError as exc:
-        return ToolResult(
-            ok=False,
-            error=f"the duplicate-send guard could not be read ({exc}); refusing to send",
-        )
-    if recent:
-        return ToolResult(ok=False, error=_resend_refusal(contact, guard))
-
-    page = _open_page(ctx)
-    if page is None:
-        return ToolResult(
-            ok=False,
-            error="the WhatsApp browser session is not available; refusing to send",
-        )
-    driver = WhatsAppDriver(page)
-
-    try:
-        driver.open_chat_by_phone(contact.number, contact.name)
-    except WhatsAppError as exc:
-        return ToolResult(ok=False, error=f"could not open the WhatsApp chat: {exc}")
-
-    try:
-        driver.attach(target, expect_name=target.name)
-    except WhatsAppError as exc:
-        return ToolResult(ok=False, error=f"could not stage the attachment: {exc}")
-
-    # The gate hashed at approval time and act re-hashed immediately before
-    # dispatch; this last read proves the bytes are still the approved ones at
-    # the moment of the click (the file could have changed while attaching).
-    if _content_digest(target, _hash_cap(ctx)) != digest:
-        return ToolResult(
-            ok=False,
-            error="the file changed while the attachment was being prepared; "
-            "refusing to send (the draft is left in WhatsApp)",
-        )
-
-    # Claim immediately before the click: a retry, replan or restarted daemon
-    # cannot send the same bytes to the same contact twice inside the window.
-    try:
-        claimed = guard.claim(key)
-    except OSError as exc:
-        return ToolResult(
-            ok=False,
-            error=f"the duplicate-send guard could not be recorded ({exc}); refusing to send",
-        )
-    if not claimed:
-        return ToolResult(ok=False, error=_resend_refusal(contact, guard))
-
-    try:
-        outcome = driver.send(expect_name=target.name)
-    except WhatsAppError as exc:
-        return ToolResult(
-            ok=False,
-            error=f"the WhatsApp file send could not be confirmed: {exc} "
-            "(the duplicate-send guard stays in place)",
-        )
-
-    try:
-        limiter.record()
-    except OSError:
-        # The send already happened; a bookkeeping failure must not turn this
-        # into a retryable failure (that could send the file twice).
-        logger.warning("the WhatsApp rate-limit record could not be written", exc_info=True)
-
-    logger.info(
-        "whatsapp file sent contact=%s phone_digits=%d name=%s bytes=%d",
-        contact.name,
-        len(contact.number),
-        target.name,
-        size,
+    # 3. the delivery itself: the adapter re-hashes the file immediately
+    #    before the click and claims the duplicate-send guard
+    request = MessageRequest(
+        channel=CHANNEL_WHATSAPP_WEB,
+        contact=args.contact,
+        path=str(target),
+        digest=digest,
     )
+    try:
+        outcome = flow.dispatch(prepared, request)
+    except MessageError as exc:
+        return ToolResult(ok=False, error=str(exc))
+
     return ToolResult(
         ok=True,
-        output=f"sent WhatsApp file {target.name!r} to {contact.name}",
+        output=outcome.detail,
         verified=True,
-        data={
-            "recipient": contact.name,
-            "phone_digits": contact.number,
-            "file": target.name,
-            "content_sha256": digest,
-            "control": outcome.control,
-            "staged_count": outcome.staged_count,
-            "chat_confirmed": True,
-        },
+        data=dict(outcome.data),
     )
 
 
@@ -480,22 +290,14 @@ def _open_chat_run(
     if refusal is not None:
         return refusal
 
-    contact, refusal = _resolve_contact(store, args.contact)
-    if refusal is not None:
-        return refusal
-    if contact is None:  # unreachable; keeps the type check honest
-        return ToolResult(ok=False, error="the contact could not be resolved")
-
-    page = _open_page(ctx)
-    if page is None:
-        return ToolResult(
-            ok=False, error="the WhatsApp browser session is not available; refusing to open"
-        )
-    driver = WhatsAppDriver(page)
+    store = store or ContactStore(config.contacts_file())
+    adapter = _adapter(ctx, None)
+    flow = MessageFlow([adapter], store=store)
     try:
-        header = driver.open_chat_by_phone(contact.number, contact.name)
-    except WhatsAppError as exc:
-        return ToolResult(ok=False, error=f"could not open the WhatsApp chat: {exc}")
+        contact = flow.resolve_contact(args.contact)
+        header = adapter.open_chat(contact)
+    except MessageError as exc:
+        return ToolResult(ok=False, error=str(exc))
     return ToolResult(
         ok=True,
         output=f"opened the WhatsApp chat with {contact.name}",
