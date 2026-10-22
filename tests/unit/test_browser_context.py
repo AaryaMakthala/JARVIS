@@ -579,3 +579,49 @@ def test_type_rejects_empty_or_oversized(monkeypatch: pytest.MonkeyPatch) -> Non
             browser.type_text("e1", "x" * 5000)
     finally:
         browser.close()
+
+
+# ── WhatsApp page accessor (Stage 8, Slice 8.4b) ───────────────────────────
+
+
+def _started_whatsapp(monkeypatch: pytest.MonkeyPatch):
+    driver = _FakeDriver(_FakePage())
+    _install(monkeypatch, driver)
+    browser = PlaywrightBrowser(settings=Settings(), profile="whatsapp")
+    browser.start()
+    return browser, driver
+
+
+def test_whatsapp_page_is_only_for_the_whatsapp_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    browser, _ = _started(monkeypatch)
+    try:
+        with pytest.raises(BrowserError, match="whatsapp profile"):
+            browser.whatsapp_page()
+    finally:
+        browser.close()
+
+
+def test_whatsapp_page_requires_a_started_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    browser = PlaywrightBrowser(settings=Settings(), profile="whatsapp")
+    with pytest.raises(BrowserError, match="not started"):
+        browser.whatsapp_page()
+
+
+def test_whatsapp_page_returns_the_narrow_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    from jarvis.browser.whatsapp_page import PlaywrightWhatsAppPage
+
+    browser, _ = _started_whatsapp(monkeypatch)
+    try:
+        page = browser.whatsapp_page()
+        assert isinstance(page, PlaywrightWhatsAppPage)
+        # The narrow surface has no generic DOM handle.
+        assert not hasattr(page, "evaluate")
+        assert not hasattr(page, "locator")
+    finally:
+        browser.close()
+
+
+def test_the_whatsapp_accessor_is_not_part_of_the_session_protocol() -> None:
+    from jarvis.browser.context import BrowserSession
+
+    assert "whatsapp_page" not in getattr(BrowserSession, "__protocol_attrs__", set())

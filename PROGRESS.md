@@ -5004,3 +5004,80 @@ chooser), printing the chat header, the composer preview and which approach work
 locates, clicks or presses Enter on Send; it prints the send-button count only to prove it was not
 clicked. WhatsApp ToS: your own test number only (risk I9).
 
+## STAGE 8 — SLICE 8.4b: fail-closed WhatsApp Web driver (2026-10-22)
+
+**Scope:** sub-step 8.4b only — the driver and its page adapter. NO tool is registered (that is
+8.4c), no content-hash binding is attached to a tool (8.4d), no docs (8.5). The agent never logged
+into WhatsApp and never sent a message; all DOM verification ran against **local HTML fixtures** in
+real Chrome.
+
+**Owner decisions applied (probe output + the brief):**
+- **The attachment preview is a HARD fail-closed gate.** The staged file's name must be visible
+  *inside the chat composer of the active panel*, and the DOM node that names it must sit in a
+  small container **strictly below the panel root** (<= 200 chars of text, so a chip counts and a
+  chat transcript does not). A name seen only elsewhere on the page — an old message, another pane,
+  the panel itself — is **not** proof of what is staged: refuse.
+- **The Send control is found by enumerating named controls and matching the accessible name — no
+  selector is guessed.** The probe only ever saw the control as an accessible name (`Send 1
+  selected`), never as a stable selector. Exactly one control may look like Send, and it must state
+  the count; a count other than one is refused, and a bare `Send` is only accepted when the file
+  input itself lists exactly the expected file.
+- **Fail closed everywhere else too:** exact origin, header identity (contact name / digits), the
+  name search must resolve to exactly one chat, and the header + preview + Send control are all
+  re-verified immediately before the click.
+
+**Built:**
+- `src/jarvis/browser/whatsapp_web.py` (new): `WhatsAppError`, `WHATSAPP_ORIGIN` /
+  `WHATSAPP_BASE_URL` / `WHATSAPP_SEND_URL`, dataclasses `SearchHit`, `SendControl`,
+  `AttachmentCandidate`, `AttachmentScan` (with `composer_scoped`), `SendOutcome`, the narrow
+  `WhatsAppPage` protocol (a deliberately small surface — no `evaluate`, no `locator`, so the driver
+  cannot reach the page), helpers `normalize_text`, `digits_only`, `header_matches`, `is_send_name`,
+  `send_count`, and `WhatsAppDriver` with `open_chat_by_phone` (deep link
+  `https://web.whatsapp.com/send?phone={digits}`), `open_chat_by_name` (search; must resolve
+  uniquely), `attach` and `send`.
+- `src/jarvis/browser/whatsapp_page.py` (new): `PlaywrightWhatsAppPage` — the only module that
+  touches Playwright, imported lazily (no module-level Playwright import, so the package still
+  imports on any OS). It reads the header, the search results, the staged file names, the
+  attachment candidates with their ancestry, the named controls, and clicks the Send control by
+  exact accessible name (refusing when it is not unique).
+- `src/jarvis/browser/context.py`: `PlaywrightBrowser.whatsapp_page()` — the WhatsApp profile only,
+  and only for a started session. Deliberately NOT part of `BrowserSession`, so `browser_*` tools
+  and the planner can never reach it.
+- `src/jarvis/browser/__init__.py`: exports for the new names; the package docstring records the
+  narrow-surface rule.
+
+**Verified:**
+| Command | Result |
+|---|---|
+| `ruff check` + `ruff format --check` (8 touched files) | PASS ("All checks passed!", "8 files already formatted") |
+| `pytest tests/unit/test_whatsapp_web.py` | PASS (48) — fake page, no network, no Chrome |
+| `pytest tests/windows_only/test_whatsapp_page.py` | PASS (8) — local HTML fixtures, real Chrome (`channel="chrome"`, headless) |
+| `pytest tests/unit/test_browser_context.py` | PASS (34) |
+| `pytest tests/unit/test_invariants.py` | PASS (36) |
+| all four files together | PASS (126) |
+
+The windows-only tests skip cleanly when Playwright/Chrome is unavailable, so the unit set stays
+platform-independent. A **full** `pytest -q` was accidentally started earlier and interrupted: it is
+**not** a result and no full-suite claim is made. `mypy src/jarvis/policy` was not re-run (no
+policy file changed in 8.4b).
+
+**New invariant test:** `test_invariant_9_whatsapp_web_surface_is_not_reachable_from_the_planner`
+— no `whatsapp_web` tool is registered, the WhatsApp page accessor is not on `BrowserSession`, the
+protocol exposes no generic DOM handle, and `web.whatsapp.com` is not in `allowed_domains`.
+
+**Known limitations (deliberate, not bugs to fix casually):**
+- The DOM selectors for the panel (`#main`), the composer (`footer`, `[data-testid=...]`) come from
+  the probe. WhatsApp changes its markup; when a selector stops matching, the driver **refuses**
+  (fails closed) rather than clicking something it cannot identify.
+- `open_chat_by_name` is the secondary path. The primary path is `open_chat_by_phone` with a number
+  resolved by the existing contact store (8.4c).
+
+**Next (owner):** review this sub-step, then 8.4c — the `whatsapp_send_file` tool (Tier 2,
+`contact` + `path` only, `budget_cost=1`), wired to this driver, with the 8.4d content-hash binding
+still to be attached afterwards. Manual smoke test (owner, own test number only):
+
+    .venv\Scripts\python.exe scripts\whatsapp_attach_probe.py --file "C:\path\to\photo.jpg"
+
+    # then, once 8.4c lands: ask JARVIS to send that photo to your own test contact and confirm
+    # the preview showed the file and the header showed the right contact before Send.
+

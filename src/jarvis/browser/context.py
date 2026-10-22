@@ -444,6 +444,30 @@ class PlaywrightBrowser:
             "characters": len(text),
         }
 
+    # ── WhatsApp (Stage 8, Slice 8.4b) ─────────────────────────────────────
+
+    def whatsapp_page(self) -> Any:
+        """Return a narrow WhatsApp page handle for the ``whatsapp`` profile.
+
+        The returned object is a
+        :class:`jarvis.browser.whatsapp_page.PlaywrightWhatsAppPage`: it
+        exposes only the read/act methods the WhatsApp driver needs and no
+        generic DOM handle.
+
+        This accessor is deliberately **not** part of :class:`BrowserSession`,
+        so the ``browser_*`` tools and the planner can never reach WhatsApp
+        through it, and it refuses to hand out a page for any other profile
+        (the two profiles never share an authenticated context, B6).
+        """
+        if self._profile != "whatsapp":
+            raise BrowserError(
+                "the WhatsApp page accessor is only available on the whatsapp profile"
+            )
+        page = self._require_page()
+        from jarvis.browser.whatsapp_page import PlaywrightWhatsAppPage
+
+        return PlaywrightWhatsAppPage(page)
+
     # ── identity re-validation ─────────────────────────────────────────────
 
     def _relocate(self, page: Any, ref: str) -> tuple[_ObservedElement, Any, ElementRef]:

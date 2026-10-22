@@ -358,6 +358,38 @@ def test_invariant_9_whatsapp_unverifiable_window_never_sends(
     assert not result.data  # no recipient/success payload escaped
 
 
+def test_invariant_9_whatsapp_web_surface_is_not_reachable_from_the_planner() -> None:
+    """docs/03 #9 + B6: WhatsApp Web stays out of the generic browser tools.
+
+    The WhatsApp driver owns a narrow page surface of its own.  The
+    ``browser_*`` tools, the planner's catalogue and the domain allow-list
+    must never reach ``web.whatsapp.com``.
+    """
+    from jarvis.browser.context import BrowserSession
+    from jarvis.browser.whatsapp_page import PlaywrightWhatsAppPage
+    from jarvis.config import Settings
+    from jarvis.policy.rules import domain_allowed
+    from jarvis.tools.registry import build_default_registry
+
+    # 1. The allow-list never contains WhatsApp, so the generic browser tools
+    #    cannot navigate there.
+    settings = Settings()
+    assert "web.whatsapp.com" not in settings.browser.allowed_domains
+    assert domain_allowed("https://web.whatsapp.com", settings.browser.allowed_domains) is False
+
+    # 2. The narrow accessor is not part of the session contract the tools use.
+    assert "whatsapp_page" not in getattr(BrowserSession, "__protocol_attrs__", set())
+
+    # 3. The narrow adapter exposes no generic DOM handle.
+    generic = {"evaluate", "locator", "query_selector", "content", "mouse", "keyboard"}
+    assert not generic & set(dir(PlaywrightWhatsAppPage))
+
+    # 4. No registered tool offers a WhatsApp web surface yet (8.4b is the
+    #    driver only; the tool arrives in 8.4c).
+    registry = build_default_registry()
+    assert not [name for name in registry.names() if "whatsapp_web" in name]
+
+
 # ---------------------------------------------------------------------------
 # Invariant 11: Tier 2 needs an unlocked session even if the user says yes
 # ---------------------------------------------------------------------------
