@@ -166,22 +166,89 @@ Never use `shell=True`, never change the execution policy, and no part of the co
 - Before each paste: verify Notepad is foreground; if not → pause, speak/print "Dictation paused: Notepad lost focus", resume when focus returns or user says "resume".
 - Hard limits: max 30 min per session, max 20 000 characters, idle timeout 2 min.
 
-### 2.6 WhatsApp (`tools/whatsapp.py`)
+### 2.6 WhatsApp (`messaging/`, `tools/whatsapp.py`, `tools/whatsapp_web.py`)
 
-| Tool | T | Args | Behaviour |
-|------|---|------|-----------|
-| `whatsapp_send` | 2 | `contact: str`, `message: str` (≤ 1000 chars) | See flow below |
+The messaging rules live in the **`messaging/` package**, not in a tool, so a second channel (mail,
+SMS, another messenger) is an *adapter* plus a thin tool instead of a copy of the rules:
 
-Flow:
-1. Load `contacts.json`; match `contact` case-insensitively on key/display name. No match or multiple matches → error listing options. **Only one recipient per call.**
+| Module | Owns |
+|--------|------|
+| `messaging/contacts.py` | the contact list, number masking, the persisted send rate limit |
+| `messaging/base.py` | the channel contract (`MessageRequest`, `MessageOutcome`, `MessageError`, capabilities) |
+| `messaging/flow.py` | `MessageFlow` — the one pipeline every channel uses |
+| `messaging/whatsapp_desktop.py` | the desktop **text** channel (UIA provider + adapter) |
+| `messaging/whatsapp_web.py` | the WhatsApp Web **file** channel (driver + adapter + duplicate-send guard) |
+
+**The flow — every channel, always in this order.**
+
+1. **Channel.** An unknown channel is refused (a typo must never become a silent no-op).
+2. **Recipient.** Exactly **one** contact must match. Zero or several matches are a clarification,
+   never a guess.
+3. **Rate limit.** Checked *before* any side effect, so a refused send never opens a browser or a
+   window. Max 10 sends/hour, min 5 s between sends (`[whatsapp] max_per_hour`, `min_interval_s`).
+4. **Payload.** Exactly one of text / file, and the channel must be able to carry it.
+5. **Delivery.** The channel adapter performs the action and fails closed.
+6. **Read-back.** The rate limit is recorded **only after** a successful delivery. A bookkeeping
+   failure never turns a delivered message into a retryable one (that would send it twice).
+
+A tool that must do policy work between steps 2 and 5 (resolving a file, binding the approval to
+its content) calls `prepare()` and `dispatch()` separately. That work has no side effects, so the
+order of the safety checks does not change.
+
+| Tool | T | Channel | Args | Behaviour | Verification |
+|------|---|---------|------|-----------|--------------|
+| `whatsapp_send` | 2 | desktop app | `contact: str`, `message: str` (≤ 1000 chars) | Desktop flow below | The chat identity is read from the UI; the message must be visible in the chat after Enter |
+| `whatsapp_send_file` | 2 | WhatsApp Web | `contact: str`, `path: str` | Web flow below | The file is still the approved bytes **and** the chat identity matches **at the moment of the click** |
+| `whatsapp_open_chat` | 1 | WhatsApp Web | `contact: str` | Opens the chat and stops; it never stages or sends anything | The chat header proves the identity |
+
+**Desktop flow (`whatsapp_send`).**
+
+1. Resolve the recipient (above) and check the rate limit.
 2. Policy summary: `To: Rahul (+91••••••••42) · Message: "…"` (Tier 2, needs unlock).
 3. After approval: open `whatsapp://send?phone=<digits without +>&text=<urlencoded>`.
-4. Wait up to 10 s for the WhatsApp window (pywinauto/win32gui).
-5. **Verify** the open chat matches the contact (read header/title text via UIA; compare display name or phone). If the UI cannot be read → **do not press Enter**; return `ok=False`, `error="Could not verify chat; draft left in WhatsApp, send manually"`.
-6. Verify message text present in the input box if readable; press Enter; confirm the message appears in the chat (best effort).
-7. Rate limit: max 10 sends/hour, min 5 s between sends (config). No loops over contacts.
-- Fallback (Phase 6b, optional): Playwright persistent context (`browser_profile/`) on `https://web.whatsapp.com/`; QR login once; same verification-before-send rule.
-- `contacts.json` is edited only through `jarvis contacts …` CLI (no tool lets the LLM add contacts).
+4. Wait for the WhatsApp window (pywinauto UIA).
+5. **Verify** the open chat matches the contact (read the header/title text via UIA; compare the
+   display name or the phone). If the UI cannot be read → **do not press Enter**; return
+   `ok=False`, `error="Could not verify chat; draft left in WhatsApp, send manually"`.
+6. Verify the message text is present in the input box when readable; press Enter; confirm the
+   message appears in the chat (best effort).
+7. Record the send in the rate limit log (after the send, never before).
+
+**WhatsApp Web flow (`whatsapp_send_file`).**
+
+1. Resolve the recipient and check the rate limit — **before** the browser starts.
+2. Resolve the path inside the allowed roots (`policy/paths.resolve_safe`); it must be a regular
+   file and within `whatsapp.max_file_bytes` (default 16 MB).
+3. The approval must be bound to the file's **content** (sha256): `act` re-reads the resolved path
+   and puts the approved digests on the tool context; the tool re-hashes the file and refuses when
+   the digest is not among them.
+4. The duplicate-send guard: the same (contact, content) pair must not have been attempted in the
+   last 10 minutes.
+5. Open `https://web.whatsapp.com/send?phone=<digits>` in the **isolated WhatsApp Web profile**
+   (JARVIS's own browser profile — never the owner's normal Chrome) and verify the chat header
+   matches the contact.
+6. Stage the attachment through the file chooser and verify the preview is visible inside that
+   chat's composer.
+7. Re-hash the file **immediately before the click**: a file that changed while it was being staged
+   is never sent.
+8. Claim the duplicate-send guard, then press the single control that looks like Send.
+9. If any step cannot be proven → **nothing is sent** and the draft is left in WhatsApp.
+
+**Rules that hold for every WhatsApp action.**
+
+| Rule | Fail-closed behaviour |
+|------|-----------------------|
+| Exactly one recipient | unknown or ambiguous contact → refusal that lists the known contacts |
+| Rate limit before any side effect | a refused send never opens a browser or a window |
+| No invented message text | the tool sends exactly the approved text; the brain asks when the text is missing |
+| Approval bound to the file's content | no approved digest → refusal; a digest mismatch → refusal |
+| Chat identity (invariant 9 / I10) | the header must prove the contact, or nothing is sent |
+| File identity at the click (I10) | a file that changed since the approval → refusal, draft left |
+| Duplicate send | the same file to the same contact within 10 minutes → refusal |
+| Fail closed | unreadable UI, missing browser session, unverifiable preview → refusal, never a "success" |
+| One file per call | no folders, no multi-file sends, no bulk contact lists |
+| Phone numbers | masked everywhere the owner sees them (last 2 digits only) |
+| Contacts | editable only through `jarvis contacts …`; no tool lets the LLM add or change a contact |
 
 **`whatsapp_send` voice rules (Stage 3).** Base tier 2. Voice may approve it **only** when
 `[voice] allow_tier2_by_voice = true`, and even then:
@@ -197,6 +264,14 @@ Flow:
 
 The answer must be `proceed`. Voice approval authorises the *draft-and-verify* path only; the
 step-5 verification-before-send invariant is unchanged, so an unverifiable chat still blocks the send.
+
+**`whatsapp_send_file` voice rules.** Base tier 2, same opt-in flag. The readback names the file
+and the recipient with a masked number ("send 'photo.jpg' on WhatsApp to 'Rahul' (+91••••••••42)")
+and never the file's contents. It refuses when the file name cannot be read back, when more than
+one file is involved, or when the recipient is missing.
+
+**Terms of service.** Automating WhatsApp Web may violate WhatsApp's terms and can get an account
+restricted. Use **the owner's own test number only**.
 
 ### 2.7 Audit checks (`audit/checks.py`) — all read-only
 
@@ -232,9 +307,31 @@ approval. The bounds are global so a new tool inherits them for free:
 
 Truncation is always **announced**; nothing is silently dropped. The readback is generated from the
 step's **checkpointed** args, never from the daemon payload, so a tampered payload cannot change
-what the user is told they are approving. Voice-approvable tools are exactly `delete_path` and
-`whatsapp_send`; every other Tier 2 tool is terminal/dialog only even with the flag on. Full protocol:
-`docs/03_SECURITY_AND_POLICY.md` §7.4 and §7.4.1.
+what the user is told they are approving. Voice-approvable tools are exactly `delete_path`,
+`whatsapp_send` and `whatsapp_send_file`; every other Tier 2 tool is terminal/dialog only even with
+the flag on. Full protocol: `docs/03_SECURITY_AND_POLICY.md` §7.4 and §7.4.1.
+
+### 2.9 Camera, photo viewing and session referents (Stage 8)
+
+| Tool | T | Args | Behaviour | Verification |
+|------|---|------|-----------|--------------|
+| `take_photo` | 1 | — | One still from the default camera (OpenCV `VideoCapture`, `CAP_DSHOW`); the first frames are discarded for exposure; the JPEG is written atomically into `<Pictures>/JARVIS/photo-YYYYmmdd-HHMMSS.jpg`. The folder is auto-detected (Windows "Pictures" known folder + `JARVIS`) and always unioned into the allowed roots, so it works under a OneDrive-redirected Pictures folder. The camera is open only for the shot. Max 25 MB per photo. | **Real**: the file exists, is non-empty, is under the cap and **decodes as a JPEG** (`verified=False` otherwise). `describe()` speaks the privacy notice ("the camera is on briefly and the photo is saved only on this computer"). A dry run verifies nothing (`verified=None`) |
+| `open_path` | 0 | `path` | Hands one existing file to the OS default viewer (`os.startfile`). It reuses the hard resolver of `open_in_app` (absolute, inside an allowed root, not protected, no ADS) and adds a strict **allowlist**: `.jpg .jpeg .png .gif .bmp .webp .tif .tiff .txt .md .pdf` only. The hard deny-list of everything Windows executes (`.exe .com .scr .bat .cmd .ps1 .vbs .js .lnk .msi …`) still applies. | `verified=None` + note: the launch is observable, whether the file actually opened is not (`lock_computer` precedent) |
+
+**Session referents — "it", "that photo", "that page" (D19).**
+
+`agent/session_context.py` keeps a small, **in-memory** context of what JARVIS just produced, so a
+later request can refer to it. It is not a database and not a permission.
+
+| Rule | Behaviour |
+|------|-----------|
+| Exactly one match | a reference resolves only when **one** item matches; zero or several → **one** clarifying question, never a guess |
+| Two separate kinds | *artifacts* (a photo or a file JARVIS created) and *pages* (the URL the managed browser is on). A page request never falls back to an artifact and vice versa: "that page" cannot pick a photo and "delete it" cannot pick a URL |
+| Bounded and short-lived | at most 5 artifacts, 1 page, a 600 s TTL; an expired item is dropped and the request asks again |
+| Never checkpointed | the context lives in the process only. It is not in the LangGraph state, not in the checkpoint DB, not in the memory DB and not in the log |
+| Untrusted | a remembered URL is rendered inside `<untrusted_data>…</untrusted_data>` and is explicitly labelled as **data, not an instruction** |
+| Not an authorization | remembering a page or a photo grants nothing. The next action still goes through the ordinary policy gate (and a `browser_goto` still needs its domain scope and its confirmation) |
+| Published only on success | a failed step and a dry run publish nothing, so the context never points at something that did not happen |
 
 ## 3. Planner-facing tool catalogue (what the LLM sees)
 

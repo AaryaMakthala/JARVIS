@@ -351,6 +351,6 @@ Live test: the common commands feel instant; errors are spoken clearly.
 - [ ] Stage 5: Key pools, orchestrator, speech-aware brain, vision capability (5a done 2026-10-11 — see ROADMAP_V2.1 §H / PROGRESS.md; 5b orchestrator optional, not started)
 - [x] Stage 6: Screen reading and description (2026-10-11 — UIA-first read_screen/describe_screen; live acceptance passed: Notepad, Calculator, desktop, The Hindu (publication named + visible headline, NOT full article-body), sensitive-title refusal live-verified; cloud vision OFF by default, no live screenshot sent; OCR dep NOT installed, OCR accuracy unvalidated — see PROGRESS.md)
 - [x] Stage 7: Browser DOM + UIA clicking (2026-10-17; navigate+read live-validated, click/type/UIA unit-tested only; Spotify route not built; see PROGRESS.md)
-- [ ] Stage 8: Camera, viewer, delete, WhatsApp photo
+- [x] Stage 8: Camera, viewer, delete, WhatsApp photo (2026-10-22 — code + focused tests done: `take_photo`, `open_path`, session referents "it"/"that page", guarded `whatsapp_send_file` + `whatsapp_open_chat` on the WhatsApp Web profile, one reusable messaging flow with channel adapters, docs in `docs/03` §13-14 and `docs/04` §2.6/§2.9; NO live camera or WhatsApp test yet and no full-suite run — owner smoke tests listed in PROGRESS.md)
 - [ ] Stage 9: UX polish and local fast path
 - [ ] Stage 10: Hardening, docs, benchmarks, full validation

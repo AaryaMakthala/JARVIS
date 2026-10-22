@@ -5474,3 +5474,71 @@ No full-suite run and no live run; no Windows manual smoke test was performed.
     # 3. ask for the same photo again within 10 minutes -> expect the refusal ("already sent"),
     #    not a second message.
 
+## STAGE 8 — SLICE 8.5: documentation (2026-10-22)
+
+**Scope:** sub-step 8.5 only — document the Stage 8 work. No code behaviour changes (one
+invariant test was added, see below), no Stage 9/10 work, no live run.
+
+**Written:**
+- `docs/03_SECURITY_AND_POLICY.md`:
+  - **§13 Messaging safety (Stage 8)** — the order of the checks every channel runs (channel →
+    recipient → rate limit → payload → delivery → read-back), **I10** stated explicitly (a
+    WhatsApp file send binds recipient + file identity + current chat identity and verifies all
+    three immediately before the irreversible click), and the surrounding rules (no invented
+    message text, one recipient/one file, masked numbers, the draft is left behind, WhatsApp Web
+    is reachable only through the narrow driver, own test number only).
+  - **§14 Session referents** — the rules for "it" / "that photo" / "that page": exactly one match
+    or one question, artifacts and pages are separate stores, in-memory only, a remembered URL is
+    untrusted data, a referent is not a permission, only successful steps publish, bounded (5
+    artifacts, 1 page, 600 s TTL).
+  - §11 (invariant tests) gained rows 16 and 17 for the two rules above.
+- `docs/04_TOOLS_SPEC.md`:
+  - **§2.6 WhatsApp** rewritten for the new shape: the `messaging/` package and what each module
+    owns, the shared flow and its order, the three tools (`whatsapp_send` desktop, Tier 2;
+    `whatsapp_send_file` WhatsApp Web, Tier 2; `whatsapp_open_chat`, Tier 1) with their
+    arguments and verification, the desktop flow, the nine-step WhatsApp Web flow, the
+    fail-closed rules table, the voice rules (incl. the new `whatsapp_send_file` readback) and the
+    terms-of-service warning.
+  - **§2.9 Camera, photo viewing and session referents (Stage 8)** — `take_photo` (Tier 1, real
+    verify: exists, non-empty, under the cap, decodes as a JPEG) and `open_path` (Tier 0, viewer
+    only, strict suffix allow-list), plus the session-referent rules.
+  - §2.8 corrected: `whatsapp_send_file` is voice-approvable (opt-in) too.
+- `docs/02_ARCHITECTURE.md`: the repository layout now lists the `messaging/` package.
+- `ROADMAP_V2.md.md`: Stage 8 ticked, with what is and is not verified stated in the tick itself.
+
+**Code change (one test, no behaviour change):** `tests/unit/test_invariants.py` gained
+`test_invariant_i10_whatsapp_file_send_binds_recipient_hash_and_chat`, because docs/03 now states
+I10 and every stated invariant needs an automated test. It drives the real tool with a fake page
+and proves that a foreign chat, a file that changed after the approval and an unresolved recipient
+each send nothing, click nothing and record no send.
+
+**Verified:**
+| Command | Result |
+|---|---|
+| `ruff check` + `ruff format --check` (touched files) | PASS |
+| `pytest tests/unit/test_invariants.py` | PASS (37) |
+| `pytest tests/unit/test_messaging_flow.py test_messaging_channels.py test_whatsapp.py test_whatsapp_send_file.py test_whatsapp_web.py test_session_context.py test_browser_referents.py` | PASS |
+
+No full-suite run and no live run; the docs are checked against the code by reading, not by a
+documentation test.
+
+**Known limitations / decisions:**
+- The docs describe the **code as it is**; the live acceptance of `take_photo`,
+  `whatsapp_send_file` and the WhatsApp Web profile is still unverified on the owner's PC.
+- Stage 7's browser tools (`browser_goto`, `browser_read`, `browser_click`, `browser_type`,
+  `browser_find`, `browser_open_result`, `browser_open_site`, `ui_list_controls`, `ui_click`) are
+  still **not** in docs/04 — that documentation debt belongs to Stage 10 ("docs/04 (all new tools,
+  section 2.3)") and is listed there as such.
+- `docs/04` §2.6 now describes the messaging *domain*; the desktop-app fallback note from Phase 6
+  ("Playwright persistent context on web.whatsapp.com") is covered by the WhatsApp Web flow now,
+  since that is what the code actually does.
+
+**Next:** Stage 9 (UX polish and the local fast path) or Stage 10 (hardening, benchmarks, full
+validation). Manual smoke test (owner, own test number only):
+
+    # 1. jarvis run "take a photo" -> approve -> the photo must appear in Pictures\JARVIS.
+    # 2. jarvis run "show me the photo" -> the default viewer must open it.
+    # 3. jarvis run "delete the photo" -> Recycle Bin; "undo" must bring it back.
+    # 4. jarvis run "send the photo to <your test contact> on WhatsApp" -> approve the file, then
+    #    confirm -> the file must arrive; asking again within 10 minutes must be refused.
+

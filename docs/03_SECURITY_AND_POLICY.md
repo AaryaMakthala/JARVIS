@@ -277,6 +277,8 @@ Plus the ordinary `action_hash` / approved-hash check: approval is bound to the 
 | 13 | `test_no_side_effects_before_interrupt` | Resuming `policy_gate` twice does not duplicate effects |
 | 14 | `test_password_lockout` | 5 wrong passwords → lockout; correct password during lockout still refused |
 | 15 | `test_audio_not_sent_to_llm` | LLM client mock never receives bytes/audio |
+| 16 | `test_invariant_i10_whatsapp_file_send_binds_recipient_hash_and_chat` | A WhatsApp file send binds recipient + file hash + chat identity; a mismatch on any of them clicks nothing and records no send (§13, I10) |
+| 17 | `test_session_context_is_not_in_agent_state_or_the_serde_allowlist` | The session referents ("it", "that page") never enter the graph state, the checkpoint DB or the serde allowlist (§14) |
 
 ## 12. Red-team suite (`benchmarks/redteam.yaml`, used for claim C1)
 
@@ -289,3 +291,62 @@ At least 30 cases, each with `input`, optional `injected_content`, and `expected
 - Password: attempts to extract/print/set the password via prompts.
 
 Metrics: unsafe-action rate (must be **0** for the engine), false-block rate on legitimate tasks (reported), comparison with a baseline where the LLM is asked to self-police.
+
+## 13. Messaging safety (Stage 8)
+
+Every WhatsApp action runs through one pipeline (`messaging/flow.py`), and every channel adapter
+fails closed. These are code rules, not prompt rules.
+
+**The order of the checks** — the same for every channel, and a refusal at any step means *no side
+effect at all*:
+
+| # | Check | Fail-closed behaviour |
+|---|-------|-----------------------|
+| 1 | The channel is known | an unknown channel is refused (a typo must never become a silent no-op) |
+| 2 | The recipient resolves to **exactly one** contact | zero or several matches → a clarification listing the known contacts, never a guess |
+| 3 | The send rate limit (10/h, 5 s apart, persisted across restarts) | checked **before** any side effect: a refused send never opens a browser or a window |
+| 4 | The payload is exactly one of text / file | both, or neither, → refused |
+| 5 | The approval is bound to the file's **content** (sha256) | no approved digest, or a digest that does not match → refused |
+| 6 | The chat identity is proven by the chat header | unreadable or foreign header → nothing is sent; the draft is left |
+| 7 | The duplicate-send guard | the same (contact, content) pair within 10 minutes → refused |
+| 8 | The delivery succeeded | the rate limit is recorded **only after** a successful send, so a bookkeeping failure can never cause a double send |
+
+**I10 — a WhatsApp file send binds three things** (recipient + file identity + current chat
+identity) and verifies all three **immediately before** the irreversible click. A mismatch or an
+unverifiable value means: *do not send, leave the draft*. This is invariant 9 applied to the
+WhatsApp Web channel.
+
+| Binding | How it is verified | On mismatch |
+|---------|--------------------|-------------|
+| Recipient | exactly one contact from `contacts.json` (CLI-edited only — no tool may add or change a contact) | refusal listing the known contacts |
+| File identity | the sha256 of the file's bytes, re-read at the moment of the click | refusal; the draft is left in WhatsApp |
+| Chat identity | the header of the opened chat must match the contact | refusal; the draft is left in WhatsApp |
+
+**Other rules.**
+
+- **No invented message text.** The tool sends exactly the text that was approved; if the user did
+  not say what to send, the brain asks.
+- **One recipient, one file.** No bulk sends, no contact lists, no folders.
+- **Phone numbers** are masked everywhere the owner sees them (last 2 digits only), never spoken in
+  full and never written to a log at INFO level.
+- **The draft is left behind** whenever a check fails, so the owner can finish the message by hand.
+- **WhatsApp Web is reached only through the narrow driver** (`browser/whatsapp_web.py`): the
+  planner never sees a DOM handle, a URL or a selector for `web.whatsapp.com`, and the generic
+  `browser_*` tools can never navigate there (the domain allow-list does not contain it).
+- **Terms of service.** Automating WhatsApp Web may violate WhatsApp's terms and can get an
+  account restricted. Use **the owner's own test number only**.
+
+## 14. Session referents: "it", "that photo", "that page" (Stage 8)
+
+`agent/session_context.py` remembers what JARVIS just produced so that a later request can refer to
+it. It is a convenience, never an authorization.
+
+| Rule | Why |
+|------|-----|
+| Exactly one match, or ask **one** question | a guess would act on the wrong file; one short clarification is always cheaper than a wrong delete |
+| Artifacts and pages are **separate** stores | "delete it" must never resolve to a URL, and "that page" must never resolve to a photo |
+| In-memory only — not in the graph state, the checkpoint DB, the memory DB or the log | a remembered path/URL would otherwise outlive the session |
+| A remembered URL is **untrusted data** | it is rendered inside `<untrusted_data>…</untrusted_data>` and labelled as data, not an instruction |
+| The referent is **not a permission** | the next action still goes through the ordinary policy gate; a remembered page does not authorise a visit |
+| Only a successful, non-dry-run step publishes | the context must never point at something that did not happen |
+| Bounded (5 artifacts, 1 page, 600 s TTL) | an old reference must not silently become a new target |

@@ -18,6 +18,7 @@ resume) that the Phase 2+ tools plug into:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -1217,6 +1218,147 @@ def test_invariant_i11_screenshots_never_leave_the_pc_by_default(
     assert result.ok is True
     assert sent == []  # no image bytes were handed to any vision client
     assert "cloud" not in result.data
+
+
+# ---------------------------------------------------------------------------
+# Invariant I10 (Stage 8): a WhatsApp file send binds the recipient, the
+# file's content and the current chat identity - and verifies all three
+# immediately before the irreversible click.
+# ---------------------------------------------------------------------------
+
+
+def test_invariant_i10_whatsapp_file_send_binds_recipient_hash_and_chat(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """docs/03 I10: a mismatch on any of the three means nothing is sent.
+
+    The three bindings are checked in this order, all of them *after* the
+    approval was granted and *before* the Send button is pressed:
+
+    1. the recipient resolves to exactly one known contact;
+    2. the file is still the bytes the approval was bound to (sha256);
+    3. the open chat is the one that was approved (chat header).
+
+    A mismatch leaves the draft in WhatsApp and never clicks Send.
+    """
+    from jarvis.browser.whatsapp_web import (
+        WHATSAPP_BASE_URL,
+        AttachmentCandidate,
+        AttachmentScan,
+        SendControl,
+    )
+    from jarvis.messaging.contacts import ContactStore, RateLimiter
+    from jarvis.tools.base import ToolContext
+    from jarvis.tools.whatsapp_web import (
+        APPROVED_HASHES_ATTR,
+        WhatsAppSendFileArgs,
+        make_whatsapp_send_file_spec,
+    )
+
+    class _Page:
+        """A fake narrow WhatsApp page that records every action."""
+
+        def __init__(self, header: str, *, on_stage: Any = None) -> None:
+            self.header = header
+            self.on_stage = on_stage
+            self.clicked: list[str] = []
+            self.staged: tuple[str, ...] = ()
+
+        def url(self) -> str:
+            return WHATSAPP_BASE_URL
+
+        def goto(self, url: str) -> None:
+            self.current_url = url
+
+        def chat_header(self) -> str:
+            return self.header
+
+        def fill_search(self, query: str) -> None:
+            del query
+
+        def search_results(self) -> tuple[Any, ...]:
+            return ()
+
+        def open_search_result(self, hit: Any) -> None:
+            del hit
+
+        def set_input_files(self, path: str) -> None:
+            self.staged = (Path(path).name,)
+            if self.on_stage is not None:
+                self.on_stage()
+
+        def staged_file_names(self) -> tuple[str, ...]:
+            return self.staged
+
+        def attachment_scan(self, filename: str) -> AttachmentScan:
+            return AttachmentScan(
+                panel_found=True,
+                composer=(
+                    AttachmentCandidate(scope="composer", source="aria-label", text=filename),
+                ),
+                panel=(),
+                composer_container_below_panel=True,
+            )
+
+        def send_controls(self) -> tuple[SendControl, ...]:
+            return (SendControl(name="Send", index=0),)
+
+        def click_send(self, name: str) -> None:
+            self.clicked.append(name)
+
+    class _Session:
+        def __init__(self, page: _Page) -> None:
+            self._page = page
+
+        def whatsapp_page(self) -> _Page:
+            return self._page
+
+    class _Holder:
+        def __init__(self, page: _Page) -> None:
+            self._page = page
+            self.acquires = 0
+
+        def acquire(self) -> _Session:
+            self.acquires += 1
+            return _Session(self._page)
+
+    target = tmp_path / "photo.jpg"
+    target.write_bytes(b"approved bytes")
+    digest = hashlib.sha256(b"approved bytes").hexdigest()
+
+    store = ContactStore(tmp_path / "contacts.json")
+    store.add("Tester", "+9112345678")
+    limiter = RateLimiter(tmp_path / "rl.json", max_per_hour=10, min_interval_s=0.0)
+
+    monkeypatch.setattr("jarvis.platform_guard.is_windows", lambda: True)
+
+    # (a) the chat is not the approved one -> nothing is sent
+    page = _Page("Someone Else")
+    ctx = ToolContext(settings=Settings(), whatsapp_browser=_Holder(page))
+    setattr(ctx, APPROVED_HASHES_ATTR, (digest,))
+    spec = make_whatsapp_send_file_spec(store=store, limiter=limiter)
+    result = spec.run(WhatsAppSendFileArgs(contact="Tester", path=str(target)), ctx)
+    assert result.ok is False
+    assert page.clicked == []  # Send was never pressed
+    assert limiter.traffic_count() == 0  # nothing was recorded as sent
+
+    # (b) the file changed after the approval -> nothing is sent
+    page = _Page("Tester", on_stage=lambda: target.write_bytes(b"tampered"))
+    ctx = ToolContext(settings=Settings(), whatsapp_browser=_Holder(page))
+    setattr(ctx, APPROVED_HASHES_ATTR, (digest,))
+    result = spec.run(WhatsAppSendFileArgs(contact="Tester", path=str(target)), ctx)
+    assert result.ok is False
+    assert page.clicked == []
+    assert limiter.traffic_count() == 0
+
+    # (c) the recipient does not resolve to exactly one contact -> nothing is sent
+    page = _Page("Tester")
+    ctx = ToolContext(settings=Settings(), whatsapp_browser=_Holder(page))
+    setattr(ctx, APPROVED_HASHES_ATTR, (digest,))
+    result = spec.run(WhatsAppSendFileArgs(contact="Nobody", path=str(target)), ctx)
+    assert result.ok is False
+    assert page.clicked == []
+    assert limiter.traffic_count() == 0
 
 
 # ---------------------------------------------------------------------------
