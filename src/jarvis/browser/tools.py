@@ -35,6 +35,7 @@ import urllib.parse
 from pydantic import BaseModel, ConfigDict, Field
 
 from jarvis.browser.context import BrowserError, BrowserSession
+from jarvis.browser.sites import sites_from_settings
 from jarvis.policy.rules import url_origin
 from jarvis.policy.targets import ResolvedTarget
 from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
@@ -43,10 +44,12 @@ from jarvis.tools.web import is_allowed_http_url
 __all__ = [
     "BrowserClickArgs",
     "BrowserGotoArgs",
+    "BrowserOpenSiteArgs",
     "BrowserReadArgs",
     "BrowserTypeArgs",
     "make_browser_click_spec",
     "make_browser_goto_spec",
+    "make_browser_open_site_spec",
     "make_browser_read_spec",
     "make_browser_type_spec",
 ]
@@ -55,6 +58,7 @@ _URL_MAX = 2083
 _TEXT_MAX = 4096
 _READ_MAX = 80
 _REF_MAX = 64
+_SITE_MAX = 64
 
 
 class BrowserGotoArgs(BaseModel):
@@ -93,6 +97,18 @@ class BrowserTypeArgs(BaseModel):
 
     ref: str = Field(min_length=1, max_length=_REF_MAX, description="Element reference.")
     text: str = Field(min_length=1, max_length=_TEXT_MAX, description="Text to type.")
+
+
+class BrowserOpenSiteArgs(BaseModel):
+    """Arguments for ``browser_open_site`` (Stage 8.6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    site: str = Field(
+        min_length=1,
+        max_length=_SITE_MAX,
+        description="Name of a site from the configured site directory.",
+    )
 
 
 # ── session helpers ────────────────────────────────────────────────────────
@@ -275,6 +291,73 @@ def _verify_best_effort(args: BaseModel, result: ToolResult, ctx: ToolContext) -
     return result.model_copy(update={"verified": None})
 
 
+# ── named sites (Stage 8.6) ────────────────────────────────────────────────
+
+
+def _resolve_site(args: BaseModel, ctx: ToolContext) -> tuple[str, str] | None:
+    """Resolve the site's name to its configured URL, else ``None``.
+
+    Only owner-configured entries resolve.  There is no fallback and no
+    "search for it" - an unknown name is simply not a site (fail closed).
+    """
+    name = getattr(args, "site", "")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    site = sites_from_settings(ctx.settings).resolve(name)
+    if site is None:
+        return None
+    return site.name, site.url
+
+
+def _run_browser_open_site(args: BrowserOpenSiteArgs, ctx: ToolContext) -> ToolResult:
+    resolved = _resolve_site(args, ctx)
+    if resolved is None:
+        known = ", ".join(sites_from_settings(ctx.settings).names())
+        known = known or "(no sites configured)"
+        return ToolResult(
+            ok=False,
+            error=f"unknown site {args.site!r}. Known sites: {known}",
+        )
+    name, url = resolved
+    session = _require_session(ctx)
+    if session is None:
+        return ToolResult(ok=False, error="the managed browser is not available in this context")
+    try:
+        data = session.goto(url)
+    except BrowserError as exc:
+        return ToolResult(ok=False, error=f"browser_open_site failed: {exc}")
+    return ToolResult(
+        ok=True,
+        output=f"opened {name} ({data.get('url', '')})",
+        data={**data, "site": name},
+        verified=True,
+        tainted=True,  # title/origin describe an untrusted page
+    )
+
+
+def _resolve_browser_open_site(args: BaseModel, ctx: ToolContext) -> ResolvedTarget | None:
+    """The site's document is the target, exactly as for ``browser_goto``.
+
+    Listing a site in ``config.toml`` grants no permission: the target still
+    has to pass the engine's domain-scope rules (docs/03 B4/D18).
+    """
+    resolved = _resolve_site(args, ctx)
+    if resolved is None:
+        return None
+    _, url = resolved
+    origin = url_origin(url)
+    if origin is None:
+        return None
+    host = urllib.parse.urlsplit(url).hostname or ""
+    return ResolvedTarget(
+        kind="browser",
+        ref=origin,  # document identity is its canonical origin
+        name=host,
+        role="document",
+        origin=origin,
+    )
+
+
 # ── specs ──────────────────────────────────────────────────────────────────
 
 
@@ -353,4 +436,24 @@ def make_browser_type_spec() -> ToolSpec:
         verify=_verify_best_effort,
         describe=lambda args: f"Type text into element {args.ref}",
         resolve=_resolve_browser_element,
+    )
+
+
+def make_browser_open_site_spec() -> ToolSpec:
+    """Build the ``browser_open_site`` tool (Tier 1; 1 budget unit)."""
+    return ToolSpec(
+        name="browser_open_site",
+        description=(
+            "Open one of the configured web sites by name in the JARVIS-managed "
+            "browser. Use this instead of browser_goto when the site is in the "
+            "site directory, so no URL has to be invented."
+        ),
+        args_model=BrowserOpenSiteArgs,
+        base_tier=1,
+        timeout_s=30,
+        budget_cost=1,
+        run=lambda args, ctx: _run_browser_open_site(args, ctx),
+        verify=_verify_browser_goto,
+        describe=lambda args: f"Open site: {args.site}",
+        resolve=_resolve_browser_open_site,
     )

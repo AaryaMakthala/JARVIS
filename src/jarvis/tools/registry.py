@@ -119,6 +119,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     from jarvis.browser.tools import (
         make_browser_click_spec,
         make_browser_goto_spec,
+        make_browser_open_site_spec,
         make_browser_read_spec,
         make_browser_type_spec,
     )
@@ -196,6 +197,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_browser_read_spec(),
         make_browser_click_spec(),
         make_browser_type_spec(),
+        make_browser_open_site_spec(),
         make_ui_list_controls_spec(),
         make_ui_click_spec(),
     ):

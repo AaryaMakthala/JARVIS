@@ -32,6 +32,7 @@ from jarvis.agent.session_context import (
     render_resolution,
 )
 from jarvis.agent.state import Plan, Step
+from jarvis.browser.sites import render_site_catalogue, sites_from_settings
 
 #: Deterministic, user-facing halt reasons.  The LLM output never reaches the
 #: user verbatim on failure; a code path decides which of these is shown.
@@ -82,6 +83,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     catalogue = ctx.registry.catalogue_for_llm()
     system = brain_system_prompt(catalogue)
     session_block = _session_reference_block(state, ctx)
+    sites_block = render_site_catalogue(sites_from_settings(ctx.settings))
     user = brain_user_prompt(
         state.get("user_input") or "",
         memory_context=[
@@ -94,6 +96,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         clarification_count=int(state.get("clarification_count") or 0),
         session_context=session_block,
         clarification_history=state.get("clarification_history"),
+        sites=sites_block,
     )
 
     llm_budget: dict[str, Any] = {}

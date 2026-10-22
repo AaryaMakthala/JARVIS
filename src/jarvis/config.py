@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from platformdirs import PlatformDirs
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
 
 APP_NAME = "jarvis"
@@ -700,6 +700,35 @@ class BrowserSettings(BaseModel):
         return out
 
 
+class SiteSettings(BaseModel):
+    """One named web site (``[[sites]]`` in config.toml, Stage 8.6).
+
+    The owner writes down the sites JARVIS may open by name, so the planner
+    never has to invent a URL:
+
+    .. code-block:: toml
+
+        [[sites]]
+        name = "youtube"
+        url = "https://www.youtube.com"
+        aliases = ["yt"]
+
+    * ``name`` is what the user says ("open YouTube") and what the brain passes
+      to ``browser_open_site``; it is matched case-insensitively.
+    * ``url`` must be absolute http(s) without credentials - an entry that is
+      not is dropped when the directory is built (with a warning).
+    * ``aliases`` are extra names for the same site ("yt" -> youtube).
+
+    Listing a site here grants **no** permission: ``browser_open_site`` is
+    decided by the same PolicyEngine and the same domain-scope rules as
+    ``browser_goto`` (docs/03 B4/D18).
+    """
+
+    name: str = Field(min_length=1, max_length=64)
+    url: str = Field(min_length=1, max_length=2083)
+    aliases: list[str] = Field(default_factory=list)
+
+
 class SessionSettings(BaseModel):
     """Session-context settings (``[session]`` in config.toml, Stage 8 / D19).
 
@@ -746,6 +775,7 @@ class Settings(BaseSettings):
     screen: ScreenSettings = ScreenSettings()
     camera: CameraSettings = CameraSettings()
     browser: BrowserSettings = BrowserSettings()
+    sites: list[SiteSettings] = []
     session: SessionSettings = SessionSettings()
     config_version: int = 1
 

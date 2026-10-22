@@ -108,6 +108,7 @@ def brain_user_prompt(
     clarification_count: int | None = None,
     session_context: str | None = None,
     clarification_history: list[dict[str, str]] | None = None,
+    sites: str | None = None,
 ) -> str:
     """Build the user prompt for one brain call.
 
@@ -126,6 +127,9 @@ def brain_user_prompt(
     ``clarification_history`` (Stage 8.4e) carries *every* answered round, oldest
     first; when it is non-empty it replaces the single question/answer pair, so
     a second question no longer hides what the human already said.
+    ``sites`` (Stage 8.6) is the pre-rendered site directory: the model picks a
+    *name* and the code supplies the URL, so no URL is ever copied out of the
+    prompt.
     """
     parts = [f"The user said:\n{user_input!r}"]
     rounds = clarification_rounds(clarification_history)
@@ -161,6 +165,11 @@ def brain_user_prompt(
         )
     if session_context:
         parts.append(session_context)
+    if sites:
+        parts.append(
+            sites + "\nUse browser_open_site with the exact name when the user asks for one "
+            "of these sites. Never invent a URL for a site that is listed here."
+        )
     if source == "voice":
         parts.append(VOICE_SOURCE_LINE)
     if clarification_count:
