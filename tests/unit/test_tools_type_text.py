@@ -93,14 +93,25 @@ class TestTypeTextAllowlist:
 
 class TestNoGenericKeyboardTools:
     def test_registry_has_no_press_key_tool(self) -> None:
-        """v1 must not have a generic press-key or click-at-XY tool."""
+        """v1 must not have a generic press-key or click-at-XY tool.
+
+        ``browser_click`` and ``ui_click`` are allowed and are not the thing
+        this invariant forbids: they act on an *element reference* that was
+        observed and re-validated (role, accessible name, origin, match
+        count) immediately before the action - never on a coordinate, never
+        on whatever happens to be under the cursor.  What must not exist is a
+        generic tool that presses a key or clicks a point.
+        """
         from jarvis.tools.registry import build_default_registry
 
         registry = build_default_registry()
         for name in registry.names():
             assert "press" not in name.lower()
-            assert "click" not in name.lower()
             assert "hotkey" not in name.lower()
+            assert "type_keys" not in name.lower()
+        # A coordinate-driven click would have to be named after the pointer.
+        for name in registry.names():
+            assert name.lower() not in {"click", "click_at", "mouse_click", "move_mouse"}
 
 
 # ── F1: foreground-window verification before any paste ─────────────────
