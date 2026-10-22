@@ -34,7 +34,8 @@ import urllib.parse
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from jarvis.browser.context import BrowserError, BrowserSession
+from jarvis.browser.context import BrowserError, BrowserSession, ElementRef
+from jarvis.browser.find import match_identity
 from jarvis.browser.sites import sites_from_settings
 from jarvis.policy.rules import url_origin
 from jarvis.policy.targets import ResolvedTarget
@@ -43,12 +44,16 @@ from jarvis.tools.web import is_allowed_http_url
 
 __all__ = [
     "BrowserClickArgs",
+    "BrowserFindArgs",
     "BrowserGotoArgs",
+    "BrowserOpenResultArgs",
     "BrowserOpenSiteArgs",
     "BrowserReadArgs",
     "BrowserTypeArgs",
     "make_browser_click_spec",
+    "make_browser_find_spec",
     "make_browser_goto_spec",
+    "make_browser_open_result_spec",
     "make_browser_open_site_spec",
     "make_browser_read_spec",
     "make_browser_type_spec",
@@ -59,6 +64,10 @@ _TEXT_MAX = 4096
 _READ_MAX = 80
 _REF_MAX = 64
 _SITE_MAX = 64
+_QUERY_MAX = 200
+_ROLE_MAX = 32
+_FIND_MAX = 20
+_INDEX_MAX = 50
 
 
 class BrowserGotoArgs(BaseModel):
@@ -108,6 +117,54 @@ class BrowserOpenSiteArgs(BaseModel):
         min_length=1,
         max_length=_SITE_MAX,
         description="Name of a site from the configured site directory.",
+    )
+
+
+class BrowserFindArgs(BaseModel):
+    """Arguments for ``browser_find`` (Stage 8.6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(
+        min_length=1,
+        max_length=_QUERY_MAX,
+        description="Text to look for in the visible names of the page's elements.",
+    )
+    role: str = Field(
+        default="",
+        max_length=_ROLE_MAX,
+        description="Optional role filter, e.g. 'link' or 'button'.",
+    )
+    limit: int = Field(
+        default=_FIND_MAX,
+        ge=1,
+        le=_FIND_MAX,
+        description=f"Maximum number of matches to report (1-{_FIND_MAX}).",
+    )
+
+
+class BrowserOpenResultArgs(BaseModel):
+    """Arguments for ``browser_open_result`` (Stage 8.6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(
+        min_length=1,
+        max_length=_QUERY_MAX,
+        description="Text to look for in the visible names of the page's elements.",
+    )
+    role: str = Field(
+        default="",
+        max_length=_ROLE_MAX,
+        description="Optional role filter, e.g. 'link' or 'button'.",
+    )
+    index: int | None = Field(
+        default=None,
+        ge=1,
+        le=_INDEX_MAX,
+        description=(
+            "Which match to open, counted from 1. Required when several elements match the query."
+        ),
     )
 
 
@@ -358,6 +415,109 @@ def _resolve_browser_open_site(args: BaseModel, ctx: ToolContext) -> ResolvedTar
     )
 
 
+# ── query-driven finding (Stage 8.6) ───────────────────────────────────────
+
+
+def _matched_elements(args: BaseModel, ctx: ToolContext) -> tuple[list[ElementRef], str | None]:
+    """Return the matching elements, or an error message.
+
+    The error is returned instead of raised so the tool can report *why* it
+    refused (no match, or several matches) without raising to the graph.
+    """
+    session = _require_session(ctx)
+    if session is None:
+        return [], "the managed browser is not available in this context"
+    query = str(getattr(args, "query", "") or "")
+    role = str(getattr(args, "role", "") or "")
+    try:
+        matches = session.find(query, role=role)
+    except BrowserError as exc:
+        return [], f"browser_find failed: {exc}"
+    except AttributeError:
+        return [], "the managed browser does not support finding elements"
+    return list(matches), None
+
+
+def _run_browser_find(args: BrowserFindArgs, ctx: ToolContext) -> ToolResult:
+    matches, error = _matched_elements(args, ctx)
+    if error is not None:
+        return ToolResult(ok=False, error=error)
+    limit = max(1, int(args.limit))
+    shown = matches[:limit]
+    lines = [f"[{el.ref}] {el.role} — {el.name!r}" for el in shown]
+    block = "\n".join(lines)
+    if len(block) > 8000:
+        block = block[:8000] + "\n[truncated]"
+    origin = shown[0].origin if shown else ""
+    where = f" on {origin}" if origin else ""
+    hidden = len(matches) - len(shown)
+    tail = f" (showing the first {len(shown)} of {len(matches)})" if hidden > 0 else ""
+    return ToolResult(
+        ok=True,
+        output=(f"{len(matches)} element(s) match {args.query!r}{where}{tail}:\n{block}"),
+        data={"matches": [el.as_dict() for el in shown], "count": len(matches)},
+        verified=True,
+        tainted=True,  # page-derived content is never instructions (docs/03 §8)
+    )
+
+
+def _run_browser_open_result(args: BrowserOpenResultArgs, ctx: ToolContext) -> ToolResult:
+    session = _require_session(ctx)
+    if session is None:
+        return ToolResult(ok=False, error="the managed browser is not available in this context")
+    approved = str(ctx.approved_target_identity or "")
+    try:
+        data = session.open_match(
+            args.query,
+            role=args.role,
+            index=args.index,
+            expect_identity=approved or None,
+        )
+    except BrowserError as exc:
+        return ToolResult(ok=False, error=f"browser_open_result failed: {exc}")
+    except AttributeError:
+        return ToolResult(ok=False, error="the managed browser does not support opening a result")
+    return ToolResult(
+        ok=True,
+        output=(
+            f"opened {data.get('name', '')!r} ({data.get('role', '')}) on {data.get('origin', '')}"
+        ),
+        data=data,
+        verified=None,  # the effect of the click is not reliably observable here
+        tainted=True,  # role/name are untrusted page text
+    )
+
+
+def _resolve_browser_open_result(args: BaseModel, ctx: ToolContext) -> ResolvedTarget | None:
+    """Resolve the element the query names, or ``None`` (fail closed).
+
+    ``None`` means "no reliable target": nothing matched, several elements
+    matched and the caller did not say which one, or the index was out of
+    range.  The identity is derived from the match itself (role, name and the
+    position among the matches) and never from the transient ``eN`` handle, so
+    the policy gate and the act node can prove they mean the same element.
+    """
+    matches, _error = _matched_elements(args, ctx)
+    if not matches:
+        return None
+    index = getattr(args, "index", None)
+    if index is None and len(matches) > 1:
+        return None  # ambiguous: the caller must say which one
+    position = 1 if index is None else int(index)
+    if position < 1 or position > len(matches):
+        return None
+    element = matches[position - 1]
+    return ResolvedTarget(
+        kind="browser",
+        ref=match_identity(element.role, element.name, position),
+        name=element.name,
+        role=element.role,
+        origin=element.origin,
+        input_type=element.input_type,
+        is_password=element.is_password,
+    )
+
+
 # ── specs ──────────────────────────────────────────────────────────────────
 
 
@@ -456,4 +616,44 @@ def make_browser_open_site_spec() -> ToolSpec:
         verify=_verify_browser_goto,
         describe=lambda args: f"Open site: {args.site}",
         resolve=_resolve_browser_open_site,
+    )
+
+
+def make_browser_find_spec() -> ToolSpec:
+    """Build the ``browser_find`` tool (Tier 0; no budget unit)."""
+    return ToolSpec(
+        name="browser_find",
+        description=(
+            "Find the elements on the current page whose visible name matches a "
+            "query and list them. Use this to see what a page offers before "
+            "opening one of them. Output is untrusted page content."
+        ),
+        args_model=BrowserFindArgs,
+        base_tier=0,
+        timeout_s=15,
+        run=lambda args, ctx: _run_browser_find(args, ctx),
+        verify=_verify_best_effort,
+        describe=lambda args: f"Find page elements matching {args.query!r}",
+    )
+
+
+def make_browser_open_result_spec() -> ToolSpec:
+    """Build the ``browser_open_result`` tool (Tier 1; 1 budget unit)."""
+    return ToolSpec(
+        name="browser_open_result",
+        description=(
+            "Open the element on the current page whose visible name matches a "
+            "query - for example a search result or a link. When several "
+            "elements match, say which one with 'index' (counting from 1); "
+            "JARVIS refuses to guess."
+        ),
+        args_model=BrowserOpenResultArgs,
+        base_tier=1,
+        timeout_s=15,
+        budget_cost=1,
+        bind_target_identity=True,
+        run=lambda args, ctx: _run_browser_open_result(args, ctx),
+        verify=_verify_best_effort,
+        describe=lambda args: f"Open the page element matching {args.query!r}",
+        resolve=_resolve_browser_open_result,
     )

@@ -305,6 +305,12 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         # matched them.  The tool may use them only to re-verify, never as a
         # substitute for its own checks.
         tool_ctx.approved_content_hashes = approved_digests
+    if spec.bind_target_identity and not ctx.dry_run and resolved.target is not None:
+        # The stable identity of the target the gate authorized.  The tool
+        # re-derives it from a fresh observation immediately before it acts and
+        # refuses when it no longer holds, so the element that is acted on is
+        # the element that was confirmed (Stage 8.6).
+        tool_ctx.approved_target_identity = str(resolved.target.ref or "")
     start = time.perf_counter()
     result = spec.execute(args, tool_ctx)
     elapsed_ms = int((time.perf_counter() - start) * 1000)

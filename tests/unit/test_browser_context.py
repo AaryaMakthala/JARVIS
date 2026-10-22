@@ -15,6 +15,7 @@ import pytest
 
 from jarvis.browser import context as context_mod
 from jarvis.browser.context import BrowserError, PlaywrightBrowser, profile_lock
+from jarvis.browser.find import match_identity
 from jarvis.config import Settings, browser_profile_dir
 
 _TAG_ROLES = {
@@ -530,6 +531,121 @@ def test_click_after_page_navigation_refused(monkeypatch: pytest.MonkeyPatch) ->
         page.url = "https://other.example.org/page"
         with pytest.raises(BrowserError, match="navigated"):
             browser.click("e1")
+    finally:
+        browser.close()
+
+
+# ── find / open_match (Stage 8.6, slice 8.6.2) ───────────────────────────
+
+
+def _result_page() -> _FakePage:
+    return _FakePage(
+        [
+            _FakeElement("a", "Python Tutorial - Part 1"),
+            _FakeElement("a", "Python Tutorial - Part 2"),
+            _FakeElement("a", "Java Basics"),
+            _FakeElement("button", "Search"),
+        ]
+    )
+
+
+def test_find_lists_the_matching_elements(monkeypatch: pytest.MonkeyPatch) -> None:
+    browser, _ = _started(monkeypatch, _result_page())
+    try:
+        matches = browser.find("Python")
+        assert [m.name for m in matches] == ["Python Tutorial - Part 1", "Python Tutorial - Part 2"]
+        assert all(m.origin == "https://example.com" for m in matches)
+    finally:
+        browser.close()
+
+
+def test_find_honours_the_role_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    browser, _ = _started(monkeypatch, _result_page())
+    try:
+        assert [m.name for m in browser.find("Search", role="button")] == ["Search"]
+        assert browser.find("Search", role="link") == []
+    finally:
+        browser.close()
+
+
+def test_find_reports_no_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    browser, _ = _started(monkeypatch, _result_page())
+    try:
+        assert browser.find("nothing like this") == []
+    finally:
+        browser.close()
+
+
+def test_find_keeps_its_refs_transient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new observation invalidates the previous one (unchanged contract)."""
+    browser, _ = _started(monkeypatch, _result_page())
+    try:
+        browser.read()
+        assert browser.resolve("e1") is not None
+        browser.find("Java")
+        assert browser.resolve("e1") is None
+    finally:
+        browser.close()
+
+
+def test_open_match_clicks_the_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _result_page()
+    browser, _ = _started(monkeypatch, page)
+    try:
+        data = browser.open_match("Java Basics")
+        assert data["name"] == "Java Basics"
+        assert data["position"] == 1
+        assert data["matches"] == 1
+        assert page._elements[2].clicks == 1
+    finally:
+        browser.close()
+
+
+def test_open_match_refuses_an_ambiguous_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _result_page()
+    browser, _ = _started(monkeypatch, page)
+    try:
+        with pytest.raises(BrowserError, match="elements match"):
+            browser.open_match("Python")
+        assert all(e.clicks == 0 for e in page._elements)
+    finally:
+        browser.close()
+
+
+def test_open_match_opens_the_chosen_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _result_page()
+    browser, _ = _started(monkeypatch, page)
+    try:
+        data = browser.open_match("Python", index=2)
+        assert data["name"] == "Python Tutorial - Part 2"
+        assert data["position"] == 2
+        assert page._elements[1].clicks == 1
+        assert page._elements[0].clicks == 0
+    finally:
+        browser.close()
+
+
+def test_open_match_refuses_an_out_of_range_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _result_page()
+    browser, _ = _started(monkeypatch, page)
+    try:
+        with pytest.raises(BrowserError, match="out of range"):
+            browser.open_match("Python", index=9)
+        assert all(e.clicks == 0 for e in page._elements)
+    finally:
+        browser.close()
+
+
+def test_open_match_refuses_a_changed_element(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The confirmed identity no longer holds: nothing is clicked."""
+    page = _result_page()
+    browser, _ = _started(monkeypatch, page)
+    try:
+        approved = match_identity("link", "Java Basics", 1)
+        page._elements[2].name = "Java Basics 2024"
+        with pytest.raises(BrowserError, match="changed after you confirmed"):
+            browser.open_match("Java", expect_identity=approved)
+        assert all(e.clicks == 0 for e in page._elements)
     finally:
         browser.close()
 

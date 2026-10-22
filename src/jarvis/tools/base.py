@@ -95,6 +95,12 @@ class ToolContext:
     #: Never derived from planner output.  A tool must treat ``None``/empty as
     #: "no approval binding" and refuse (fail closed).
     approved_content_hashes: tuple[str, ...] | None = None
+    #: The stable identity of the interaction target the policy gate bound this
+    #: dispatch's approval to.  Set by ``act`` only for a
+    #: ``ToolSpec.bind_target_identity`` tool, and only after act has
+    #: re-resolved the target itself.  A tool must treat ``None``/empty as
+    #: "no approval binding" and refuse (fail closed).
+    approved_target_identity: str | None = None
 
 
 ArgsModel = type[BaseModel]
@@ -138,6 +144,13 @@ class ToolSpec:
     #: or hashing is affected.  Use only for tools whose action must be bound to
     #: the exact bytes of a file, not just its path (``whatsapp_send_file``).
     bind_content_hash: bool = False
+    #: When true, the act node hands the tool the *stable identity* of the
+    #: target the gate authorized (``ResolvedTarget.ref``) and the tool must
+    #: re-derive that identity from a fresh observation immediately before it
+    #: acts, refusing when it no longer holds (Stage 8.6).  Default off, so no
+    #: existing tool is affected.  Use only for tools whose target is named by
+    #: a query rather than by a handle the backend issued (``browser_open_result``).
+    bind_target_identity: bool = False
     #: Optional callables; defaults keep unknown tools safe.
     run: Callable[[BaseModel, ToolContext], ToolResult] = field(
         default=lambda args, ctx: ToolResult(ok=False, error="tool has no run implementation")

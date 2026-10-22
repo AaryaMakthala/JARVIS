@@ -5225,3 +5225,120 @@ No full-suite run and no live run; no Windows manual smoke test was performed.
     # 1. ask JARVIS to send a file to your test contact and approve; confirm it arrives once.
     # 2. modify the file after confirming (before approving, then again after approving) and
     #    confirm the refusal text; no message should be sent.
+
+## STAGE 8 — SLICE 8.4e: every answered clarification round is kept (2026-10-22)
+
+**Scope:** sub-step 8.4e only — keep the full clarification history in the prompt so a second
+question no longer hides what the human already said. No 8.5 docs, no Stage 9/10 work.
+(Commit `a9a819b`.)
+
+**Built:**
+- `src/jarvis/agent/state.py`: `AgentState.clarification_history: list[dict[str, str]]` plus
+  `clarification_rounds(history)`, which drops malformed entries and returns the answered
+  `(question, answer)` pairs oldest-first. No new serialized type (plain dicts/strings only).
+- `src/jarvis/agent/nodes/clarify.py`: every *answered* round is appended; a blank or cancelled
+  answer records no round.
+- `src/jarvis/agent/prompts.py`: `brain_user_prompt(..., clarification_history=...)` renders every
+  round and tells the brain not to ask again about anything already answered. The single-pair
+  fallback is unchanged when there is no history.
+- `src/jarvis/agent/nodes/brain.py` passes the history through; `src/jarvis/agent/nodes/intake.py`
+  initialises it to `[]`.
+- `tests/unit/test_clarification_history.py` (new, 9 tests).
+
+**Verified:** `pytest tests/unit/test_clarification_history.py test_brain_prompt.py
+test_agent_architecture.py test_replan.py test_completeness.py` PASS; `ruff check` +
+`ruff format --check` on the touched files PASS.
+
+**Known limitations:** the history lives in the LangGraph state, so it is checkpointed with the
+task. It contains only the user's own words, never secrets.
+
+## STAGE 8 — SLICE 8.6.1: named site directory and `browser_open_site` (2026-10-22)
+
+**Scope:** sub-step 8.6.1 only — let the brain open a *configured* site by name instead of
+inventing a URL. No messaging work, no 8.5 docs, no Stage 9/10 work. (Commit `d6ef643`.)
+
+**Built:**
+- `src/jarvis/browser/sites.py` (new): `Site`, `SiteDirectory` (exact name match after case/
+  whitespace folding, first entry wins on duplicates), `sites_from_settings(settings)` and
+  `render_site_catalogue(directory)`. The catalogue shows **names and hosts only** — no URL ever
+  reaches the prompt. Non-http(s) URLs and URLs with userinfo are dropped with a warning;
+  `MAX_SITES=50`, `MAX_KEY_CHARS=64`, `MAX_ALIASES=8`.
+- `src/jarvis/config.py`: `SiteSettings` (`name`, `url`, `aliases`) and `Settings.sites`, read from
+  `[[sites]]` in `config.toml` (round-trip verified).
+- `src/jarvis/browser/tools.py`: `browser_open_site` (Tier 1, `budget_cost=1`, `timeout_s=30`,
+  `verify=_verify_browser_goto`). An unknown name is refused; there is no "search for it" fallback.
+- `src/jarvis/tools/registry.py`: the tool is registered.
+- `src/jarvis/agent/prompts.py` / `nodes/brain.py`: the site block is rendered into the brain
+  prompt with the instruction to use the exact name and never invent a URL.
+- `tests/unit/test_browser_sites.py` (new, 19 tests).
+
+**Verified:** `pytest tests/unit/test_browser_sites.py test_browser_tools.py test_config.py
+test_brain_prompt.py` PASS; `ruff check` + `ruff format --check` PASS.
+
+**Known limitations / decisions:**
+- Listing a site in `config.toml` grants **no** permission: the resolved document target still has
+  to pass the engine's domain-scope rules (docs/03 B4/D18), exactly like `browser_goto`.
+- The directory is owner configuration, not agent-writable; the agent cannot add a site by itself.
+
+## STAGE 8 — SLICE 8.6.2: find and open a page element by name (2026-10-22)
+
+**Scope:** sub-step 8.6.2 only — a generic, query-driven way to act on a page element (a search
+result, a link) without the model copying a handle out of a numbered list. No cross-turn referent
+context (8.6.3), no messaging (8.6.4), no 8.5 docs, no Stage 9/10 work.
+
+**Built:**
+- `src/jarvis/browser/find.py` (new, pure): `normalise()`, `match_indexes()` (exact -> prefix ->
+  contains, document order inside a tier, optional `role` filter, empty query matches nothing) and
+  `match_identity(role, name, position)` — the **stable** identity of the n-th match. It contains no
+  transient ``e1..eN`` handle, so it is the same for the gate's observation and for act's
+  re-observation, and it changes exactly when the page changes.
+- `src/jarvis/browser/context.py`: `read()` now shares `_collect_candidates()`/`_register()` with the
+  new `find()` (read-only, returns matching `ElementRef`s) and `open_match()` (finds the match and
+  clicks it through the ordinary re-validation path — no coordinate fallback). `open_match` refuses
+  when nothing matches, when several elements match and the caller did not say which one, and when
+  the index is out of range. With `expect_identity` it refuses **before** the click when the
+  confirmed element is no longer the one it would click.
+- `src/jarvis/browser/tools.py`: `browser_find` (Tier 0, no budget unit, read-only, output tainted)
+  and `browser_open_result` (Tier 1, `budget_cost=1`, tainted). The latter's resolver returns
+  `None` (fail closed) when nothing matched, when the match was ambiguous, or when the index was
+  out of range.
+- `src/jarvis/tools/base.py`: `ToolSpec.bind_target_identity` (opt-in) and
+  `ToolContext.approved_target_identity` — the mirror of the existing `bind_content_hash` /
+  `approved_content_hashes` mechanism, for a target that is named by a query instead of by a
+  backend-issued handle.
+- `src/jarvis/agent/nodes/act.py`: for an opted-in tool, act hands the tool the stable identity the
+  gate authorized, after its own re-resolution and the one-shot binding check have passed.
+- `src/jarvis/tools/registry.py`: both tools are registered.
+- Tests: `tests/unit/test_browser_find.py` (new, 26 tests — matcher, tools, resolver, identity
+  stability), `tests/unit/test_browser_result_binding.py` (new, 4 tests — real act node: the
+  confirmed element is the one that is opened; a changed page is refused with no click; an
+  ambiguous query never binds), and 8 new cases in `tests/unit/test_browser_context.py` for the
+  live driver.
+
+**Verified:**
+| Command | Result |
+|---|---|
+| `ruff check` + `ruff format --check` (touched files) | PASS |
+| `pytest tests/unit/test_browser_find.py test_browser_context.py test_browser_tools.py test_browser_sites.py test_browser_result_binding.py` | PASS (67) |
+| `pytest tests/unit/test_agent_architecture.py test_invariants.py test_tools_type_text.py test_brain_prompt.py test_act_node.py test_content_binding.py` | PASS |
+
+No full-suite run and no live run; no Windows manual smoke test was performed.
+
+**Known limitations / decisions:**
+- **Pre-existing (not caused by this slice):** `tests/unit/test_act_target_parity.py::
+  test_type_text_into_managed_browser_is_hard_blocked` fails *on Linux only* — the
+  "this tool only works on Windows" check short-circuits before the managed-browser rule can add its
+  reason. Confirmed by stashing this slice's changes. It must pass on Windows.
+- The element is found by *accessible name*, so a page with no useful name (an icon-only button)
+  cannot be opened by query; `browser_read` + `browser_click` still cover that case.
+- One match is opened per action. There is no "open the top N results" tool, and no bulk action.
+- The identity is the match (role, name, position). A page that re-orders the same two elements
+  changes the identity and is therefore refused — the conservative direction.
+
+**Next:** 8.6.3 (cross-turn referent context), then 8.6.4 (reusable messaging flow), then 8.5
+(docs). Manual smoke test (owner, own test number only, after 8.6.2):
+
+    # 1. jarvis chat -> "open the Wikipedia site and find the Python article, then open it".
+    #    Approve the Tier 1 confirmation; expect the matching element to be listed and opened.
+    # 2. ask for something that matches several elements -> expect JARVIS to refuse and ask which
+    #    one it meant, instead of opening the first.

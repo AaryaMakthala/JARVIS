@@ -31,6 +31,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from jarvis.browser.find import match_identity, match_indexes
 from jarvis.config import BROWSER_PROFILE_NAMES, Settings, browser_profile_dir
 from jarvis.platform_guard import is_windows
 from jarvis.policy.rules import domain_allowed, url_origin
@@ -53,6 +54,9 @@ MANAGED_BROWSER_CHANNEL = "chrome"
 
 #: Hard cap on observed interactive elements reported by one ``read``.
 _MAX_OBSERVED_ELEMENTS = 80
+#: Hard cap on the elements scanned while *finding* a match (a query may
+#: target an element that lies past the ``read`` limit).
+_MAX_FIND_ELEMENTS = 300
 #: Hard cap on a single accessible name returned to the caller.
 _MAX_ELEMENT_NAME_CHARS = 120
 _NAV_TIMEOUT_MS = 30_000
@@ -141,6 +145,21 @@ class BrowserSession(Protocol):
     def read(self, max_elements: int = _MAX_OBSERVED_ELEMENTS) -> Observation:
         """Observe the current page (bounded); refs are page-scoped handles."""
 
+    def find(
+        self, query: str, *, role: str = "", limit: int = _MAX_FIND_ELEMENTS
+    ) -> list[ElementRef]:
+        """Return the observed elements whose accessible name matches ``query``."""
+
+    def open_match(
+        self,
+        query: str,
+        *,
+        role: str = "",
+        index: int | None = None,
+        expect_identity: str | None = None,
+    ) -> dict[str, Any]:
+        """Find the matching element and click it; refuse when ambiguous."""
+
     def resolve(self, ref: str) -> ElementRef | None:
         """Return the observed identity for ``ref`` (transient), else ``None``."""
 
@@ -166,6 +185,17 @@ class _ObservedElement:
     is_password: bool
     nth: int
     total: int
+
+
+@dataclass
+class _Candidate:
+    """One observed interactive element, before it is given a transient ref."""
+
+    loc: Any
+    role: str
+    name: str
+    input_type: str
+    is_password: bool
 
 
 _PROFILE_LOCKS: dict[str, threading.Lock] = {}
@@ -336,11 +366,109 @@ class PlaywrightBrowser:
                 "interactions are blocked after an unauthorized redirect; "
                 "authorize a valid navigation first"
             )
-        max_elems = max(1, min(int(max_elements), _MAX_OBSERVED_ELEMENTS))
         url = str(page.url)
         origin = url_origin(url) or ""
 
-        candidates: list[tuple[Any, str, str, str, bool]] = []
+        max_elems = max(1, min(int(max_elements), _MAX_OBSERVED_ELEMENTS))
+        candidates, groups = self._collect_candidates(page, max_elems)
+        elements = self._register(candidates, groups, origin)
+        return Observation(
+            url=url,
+            origin=origin,
+            title=_norm_text(self._safe_title(page), 200),
+            elements=tuple(elements),
+        )
+
+    # ── query-driven finding (Stage 8.6) ──────────────────────────────────
+
+    def find(
+        self, query: str, *, role: str = "", limit: int = _MAX_FIND_ELEMENTS
+    ) -> list[ElementRef]:
+        """Return the observed elements whose accessible name matches ``query``.
+
+        The match order and the rules are :func:`jarvis.browser.find.match_indexes`
+        (exact, then prefix, then contains).  The returned refs are transient
+        page-scoped handles, exactly like :meth:`read`; a fresh observation
+        invalidates the refs of the previous one.
+        """
+        page = self._require_page()
+        if self._redirect_blocked:
+            raise BrowserError(
+                "interactions are blocked after an unauthorized redirect; "
+                "authorize a valid navigation first"
+            )
+        origin = url_origin(str(page.url)) or ""
+        candidates, groups = self._collect_candidates(page, _MAX_FIND_ELEMENTS)
+        pairs = [(item.role, item.name) for item in candidates]
+        indexes = match_indexes(pairs, query, role=role)
+        elements = self._register(candidates, groups, origin)
+        matched = [elements[index] for index in indexes[: max(1, int(limit))]]
+        return matched
+
+    def open_match(
+        self,
+        query: str,
+        *,
+        role: str = "",
+        index: int | None = None,
+        expect_identity: str | None = None,
+    ) -> dict[str, Any]:
+        """Find the matching element and activate it (click it).
+
+        The element is located by the same deterministic rules as :meth:`find`
+        and is then clicked through the ordinary re-validation path (role,
+        accessible name, origin and match count are re-checked immediately
+        before the click; there is no coordinate fallback).
+
+        Refuses when nothing matches and when several elements match and the
+        caller did not say which one it meant - an ambiguous "the result" is
+        never guessed (fail closed).
+
+        ``expect_identity`` is the stable identity of the element the user
+        confirmed.  When it is given and the freshly observed match no longer
+        has that identity (the page changed after the confirmation), the click
+        is **not** performed and an error is raised.
+        """
+        page = self._require_page()
+        if self._redirect_blocked:
+            raise BrowserError("interactions are blocked after an unauthorized redirect")
+        origin = url_origin(str(page.url)) or ""
+        candidates, groups = self._collect_candidates(page, _MAX_FIND_ELEMENTS)
+        pairs = [(item.role, item.name) for item in candidates]
+        indexes = match_indexes(pairs, query, role=role)
+        if not indexes:
+            raise BrowserError(f"no element on the page matches {query!r}")
+        if index is None and len(indexes) > 1:
+            names = ", ".join(repr(pairs[i][1]) for i in indexes[:5])
+            raise BrowserError(
+                f"{len(indexes)} elements match {query!r} ({names}); "
+                "say which one (index) instead of guessing"
+            )
+        position = 1 if index is None else int(index)
+        if position < 1 or position > len(indexes):
+            raise BrowserError(
+                f"index {position} is out of range: {len(indexes)} element(s) match {query!r}"
+            )
+        chosen_index = indexes[position - 1]
+        if expect_identity:
+            identity = match_identity(pairs[chosen_index][0], pairs[chosen_index][1], position)
+            if identity != expect_identity:
+                raise BrowserError(
+                    "the page element changed after you confirmed it; nothing was opened"
+                )
+        elements = self._register(candidates, groups, origin)
+        chosen = elements[chosen_index]
+        data = self.click(chosen.ref)
+        data["position"] = position
+        data["matches"] = len(indexes)
+        return data
+
+    def _collect_candidates(
+        self, page: Any, max_elements: int
+    ) -> tuple[list[_Candidate], dict[tuple[str, str], int]]:
+        """Collect the visible interactive elements of ``page`` (bounded)."""
+        limit = max(1, min(int(max_elements), _MAX_FIND_ELEMENTS))
+        candidates: list[_Candidate] = []
         groups: dict[tuple[str, str], int] = {}
         for loc in page.locator(_INTERACTIVE_SELECTOR).all():
             if not loc.is_visible():
@@ -353,45 +481,60 @@ class PlaywrightBrowser:
             is_password = input_type == "password" or role in _PASSWORD_ROLES
             group = (role, name)
             groups[group] = groups.get(group, 0) + 1
-            candidates.append((loc, role, name, input_type, is_password))
-            if len(candidates) >= max_elems:
+            candidates.append(
+                _Candidate(
+                    loc=loc,
+                    role=role,
+                    name=name,
+                    input_type=input_type,
+                    is_password=is_password,
+                )
+            )
+            if len(candidates) >= limit:
                 break
+        return candidates, groups
 
+    def _register(
+        self,
+        candidates: list[_Candidate],
+        groups: dict[tuple[str, str], int],
+        origin: str,
+    ) -> list[ElementRef]:
+        """Assign fresh transient refs to the candidates and record them.
+
+        Every observation replaces the previous one: the refs are page-scoped
+        handles, so a stale ref must not resolve to a new element.
+        """
         self._snapshots.clear()
         seen: dict[tuple[str, str], int] = {}
         elements: list[ElementRef] = []
-        for loc, role, name, input_type, is_password in candidates:
-            group = (role, name)
+        for item in candidates:
+            group = (item.role, item.name)
             nth = seen.get(group, 0)
             seen[group] = nth + 1
             ref = f"e{self._next_ref}"
             self._next_ref += 1
             self._snapshots[ref] = _ObservedElement(
                 ref=ref,
-                role=role,
-                name=name,
+                role=item.role,
+                name=item.name,
                 origin=origin,
-                input_type=input_type,
-                is_password=is_password,
+                input_type=item.input_type,
+                is_password=item.is_password,
                 nth=nth,
                 total=groups[group],
             )
             elements.append(
                 ElementRef(
                     ref=ref,
-                    role=role,
-                    name=name,
+                    role=item.role,
+                    name=item.name,
                     origin=origin,
-                    input_type=input_type,
-                    is_password=is_password,
+                    input_type=item.input_type,
+                    is_password=item.is_password,
                 )
             )
-        return Observation(
-            url=url,
-            origin=origin,
-            title=_norm_text(self._safe_title(page), 200),
-            elements=tuple(elements),
-        )
+        return elements
 
     def resolve(self, ref: str) -> ElementRef | None:
         """Return the transient observed identity for ``ref``, else ``None``."""
