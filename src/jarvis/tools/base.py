@@ -101,6 +101,11 @@ class ToolContext:
     #: re-resolved the target itself.  A tool must treat ``None``/empty as
     #: "no approval binding" and refuse (fail closed).
     approved_target_identity: str | None = None
+    #: The shared, in-memory browser result sets (Stage 8, P2).  A
+    #: ``jarvis.browser.results.BrowserResultStore`` or ``None`` when the caller
+    #: wired none; ``None`` simply disables position/title selection against a
+    #: result list (the tool then refuses instead of guessing).
+    browser_results: Any | None = None
 
 
 ArgsModel = type[BaseModel]
@@ -155,6 +160,14 @@ class ToolSpec:
     run: Callable[[BaseModel, ToolContext], ToolResult] = field(
         default=lambda args, ctx: ToolResult(ok=False, error="tool has no run implementation")
     )
+    #: Optional read-only precondition check: ``precheck(args, ctx)`` returns an
+    #: error string when the action must not even be offered for confirmation,
+    #: or ``None`` when it passes.  It must have no side effects and must never
+    #: authorize anything - a failure can only block.  The policy gate runs it
+    #: *before* ``interrupt()`` (so an invalid target is not confirmed or
+    #: unlocked) and ``act`` runs it again immediately before dispatch.  An
+    #: exception is treated as a failure (fail closed).
+    precheck: Callable[[BaseModel, ToolContext], str | None] | None = None
     verify: Callable[[BaseModel, ToolResult, ToolContext], ToolResult] | None = None
     describe: Callable[[BaseModel], str] = field(
         default=lambda args: f"{args.__class__.__name__}({_brief_args(args)})"

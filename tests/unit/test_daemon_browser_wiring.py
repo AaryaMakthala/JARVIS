@@ -90,6 +90,31 @@ class _FakeSession:
         self.calls.append(("resolve", ref))
         return self.resolved.get(ref)
 
+    def find(self, query: str, *, role: str = "", limit: int = 300) -> list[ElementRef]:
+        self.calls.append(("find", query, role, limit))
+        return list(self.resolved.values())
+
+    def open_match(
+        self,
+        query: str,
+        *,
+        role: str = "",
+        index: int | None = None,
+        expect_identity: str | None = None,
+    ) -> dict[str, object]:
+        self.calls.append(("open_match", query, role, index, expect_identity))
+        element = next(iter(self.resolved.values()))
+        return {
+            "ref": element.ref,
+            "role": element.role,
+            "name": element.name,
+            "origin": element.origin,
+        }
+
+    def current_url(self) -> str:
+        self.calls.append(("current_url",))
+        return self.observation.url
+
     def click(self, ref: str) -> dict[str, object]:
         self.calls.append(("click", ref))
         el = self.resolved[ref]
@@ -197,6 +222,35 @@ class TestLazyBrowserSession:
         assert lazy.type_text("e1", "hi")["characters"] == 2
         assert [call[0] for call in session.calls] == ["resolve", "read", "goto", "type_text"]
 
+    def test_delegates_result_selection_and_the_page_url(self) -> None:
+        """``browser_find``/``browser_open_result`` must work through the adapter.
+
+        Regression: the adapter used to expose only goto/read/resolve/click/
+        type_text, so every query-driven selection failed live with "the
+        managed browser does not support finding elements" even though direct
+        navigation worked.
+        """
+        session = _FakeSession()
+        lazy = _LazyBrowserSession(lambda: session)
+        assert [element.name for element in lazy.find("Details", role="link")] == ["Details"]
+        assert lazy.current_url() == f"{_ORIGIN}/page"
+        opened = lazy.open_match("Details", role="link", index=1, expect_identity="identity")
+        assert opened["name"] == "Details"
+        assert lazy.session_id(), "the adapter reports a stable scope id"
+        assert lazy.session_id() == lazy.session_id()
+        assert [call[0] for call in session.calls] == ["find", "current_url", "open_match"]
+
+    def test_the_scope_id_never_starts_the_browser(self) -> None:
+        started: list[str] = []
+
+        def acquire() -> Any:
+            started.append("acquire")
+            return None
+
+        lazy = _LazyBrowserSession(acquire)
+        assert lazy.session_id()
+        assert started == [], "reading the result-set scope must not launch Chrome"
+
     def test_fails_closed_when_no_session_is_available(self) -> None:
         lazy = _LazyBrowserSession(lambda: None)
         for call in (
@@ -205,6 +259,9 @@ class TestLazyBrowserSession:
             lambda: lazy.resolve("e1"),
             lambda: lazy.click("e1"),
             lambda: lazy.type_text("e1", "x"),
+            lambda: lazy.find("Details"),
+            lambda: lazy.open_match("Details"),
+            lambda: lazy.current_url(),
         ):
             with pytest.raises(BrowserError, match="not available"):
                 call()

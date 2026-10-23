@@ -46,6 +46,7 @@ def decide_and_build_payload(
     step_index: int = 0,
     approved_hashes: Any = (),
     summary_budget: int = 600,
+    blocked_steps: Any = (),
 ) -> dict[str, Any]:
     """Return the interrupt payload policy_gate should use for the current step.
 
@@ -54,13 +55,22 @@ def decide_and_build_payload(
     step the gate is on, which made a plan-level batch unreachable in the real
     graph.
 
+    ``blocked_steps`` names steps whose read-only precheck already failed (an
+    unknown or ambiguous messaging recipient).  They are never offered for
+    approval, and - because a batch is one contiguous run - a blocked step ends
+    the run exactly like a non-eligible tier does.
+
     When **2 or more contiguous** batch-eligible Tier 1 steps start at
     ``step_index``, returns a single ``plan_approval`` payload naming all of
     them.  Otherwise returns the existing per-step ``confirm`` payload for the
     *current* step, unchanged (behaviour preserved for 0-or-1 eligible steps).
     """
     eligible = _eligible_steps(
-        plan, decisions, step_index=step_index, approved_hashes=approved_hashes
+        plan,
+        decisions,
+        step_index=step_index,
+        approved_hashes=approved_hashes,
+        blocked_steps=blocked_steps,
     )
     if len(eligible) < 2:
         return _single_step_payload(
@@ -102,6 +112,7 @@ def _eligible_steps(
     *,
     step_index: int = 0,
     approved_hashes: Any = (),
+    blocked_steps: Any = (),
 ) -> list[tuple[str, str]]:
     """Ordered (step_id, action_hash) pairs that may be batch-approved.
 
@@ -112,20 +123,24 @@ def _eligible_steps(
     * step.resolved_from_runtime is False
     * decision.allowed (not blocked / refused)
     * its action_hash is **not** already in ``approved_hashes``
+    * its read-only precheck did not fail (``blocked_steps``)
     Everything else is gated individually, exactly as today.
 
     Only steps at index ``>= step_index`` are considered, and only as one
     **contiguous run starting at ``step_index``**: collection stops at the first
     step that is not eligible.  A batch therefore never spans a step the user
     has to look at on its own (Tier 2, Tier 3, runtime-derived, already
-    approved), and never re-offers a batch for steps that are already done.
-    Fail closed: a missing decision also ends the run.
+    approved, precheck-failed), and never re-offers a batch for steps that are
+    already done.  Fail closed: a missing decision also ends the run.
     """
     already = {str(h) for h in (approved_hashes or ())}
+    blocked = {str(item) for item in (blocked_steps or ())}
     out: list[tuple[str, str]] = []
     for step in _steps(plan)[max(int(step_index), 0) :]:
         decision = _decision(decisions, step)
         if decision is None:
+            break
+        if str(getattr(step, "id", "") or "") in blocked:
             break
         if not _batch_eligible(decision, step, already):
             break
@@ -227,6 +242,8 @@ def recompute_and_resolve_batch(
     decisions: dict[str, Any],
     state: dict[str, Any],
     answer: Any,
+    *,
+    blocked_steps: Any = (),
 ) -> tuple[dict[str, Any], list[str]]:
     """On resume, recompute each eligible step's decision and decide per step.
 
@@ -271,6 +288,7 @@ def recompute_and_resolve_batch(
         decisions,
         step_index=int(state.get("step_index") or 0),
         approved_hashes=state.get("approved_hashes") or (),
+        blocked_steps=blocked_steps,
     )
     if not eligible:
         return {"decisions": decisions}, []

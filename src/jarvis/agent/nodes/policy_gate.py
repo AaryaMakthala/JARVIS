@@ -47,6 +47,11 @@ from jarvis.agent.nodes.util import (
     policy_context_for,
     resolve_step_target,
 )
+from jarvis.agent.precheck import (
+    blocked_precheck_steps,
+    precheck_refusal,
+    step_precheck_error,
+)
 from jarvis.agent.schemas import ConfirmationRequest
 from jarvis.agent.state import Decision
 from jarvis.policy import rules, tiers
@@ -80,6 +85,18 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     # classifier sees the original request (docs/08 §3).
     base_pctx = policy_context_for(state, ctx.policy_ctx)
     spec = ctx.registry.get_optional(step.tool)
+
+    # Read-only precondition (e.g. the messaging recipient).  It runs *before*
+    # any interrupt, so an unknown or ambiguous contact is refused without
+    # asking the user to approve the action or unlock the session.  A failure
+    # can only block; the engine still owns the tier decision.
+    precheck_error = step_precheck_error(spec, step, ctx.tool_context())
+    if precheck_error is not None:
+        decision = precheck_refusal(step, precheck_error)
+        decisions = dict(state.get("decisions") or {})
+        decisions[step.id] = decision
+        return {"decisions": decisions, "halted_reason": refusal_text(decision, decision.step_id)}
+
     plan_hash_v = plan_hash_for(plan, base_pctx, ctx.engine)
 
     # Resolve the interaction target (if any) and build the context the engine
@@ -139,16 +156,23 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     # No side effects before the interrupt: the payload is built from decisions
     # the engine already produced.
     decisions = {**compute_all_decisions(plan, base_pctx, ctx.engine), step.id: decision}
+    # A later step whose read-only precondition already fails must never be
+    # folded into this plan-level approval: it ends the contiguous eligible run
+    # and is refused on its own when the gate reaches it.
+    blocked = blocked_precheck_steps(plan, ctx.registry, ctx.tool_context())
     payload = decide_and_build_payload(
         plan,
         decisions,
         step_index=idx,
         approved_hashes=already_approved,
+        blocked_steps=blocked,
     )
     answer = interrupt(payload)  # graph pauses; checkpoint saved; no side effects above
 
     if _is_plan_approval_payload(payload):
-        updates, newly_approved = recompute_and_resolve_batch(plan, decisions, state, answer)
+        updates, newly_approved = recompute_and_resolve_batch(
+            plan, decisions, state, answer, blocked_steps=blocked
+        )
         if "halted_reason" in updates:
             gated = dict(state.get("gated_resolved_paths") or {})
             if "gated_resolved_paths" not in updates:

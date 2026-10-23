@@ -93,6 +93,10 @@ class FakeSession:
         el = self.resolved[ref]
         return {"ref": ref, "role": el.role, "name": el.name, "origin": el.origin}
 
+    def current_url(self) -> str:
+        self.calls.append(("current_url",))
+        return str(self.observation.url)
+
     def type_text(self, ref: str, text: str) -> dict[str, object]:
         self.calls.append(("type_text", ref, text))
         if self.type_error:
@@ -317,6 +321,16 @@ def test_type_never_leaks_text() -> None:
     blob = f"{result.output}\n{result.data}\n{result.error}\n{spec.describe(args)}"
     assert _SECRET not in blob
     assert ("type_text", "e1", _SECRET) in session.calls  # the session did receive it
+
+
+def test_type_publishes_the_current_page_so_the_page_referent_survives() -> None:
+    """Typing is a browser action, not an unrelated action (Stage 8, P3)."""
+    session = FakeSession(elements={"e1": _element("e1", "Search", role="textbox")})
+    result = make_browser_type_spec().execute(
+        BrowserTypeArgs(ref="e1", text="python"), _ctx(session)
+    )
+    assert result.ok is True
+    assert result.data["page_url"] == session.observation.url
 
 
 def test_type_refuses_password_field() -> None:

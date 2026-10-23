@@ -13,6 +13,7 @@ from typing import Any
 
 from jarvis.agent.session_context import SessionContext
 from jarvis.agent.target_binding import TargetBindingStore
+from jarvis.browser.results import BrowserResultStore
 from jarvis.config import Settings, load_settings
 from jarvis.llm.client import LLMClient
 from jarvis.logging_setup import get_logger
@@ -96,6 +97,13 @@ class AppContext:
     #: forgets every artifact; a resolved path is only a proposal and is
     #: re-checked like any other path before a tool acts on it.
     session_context: SessionContext = field(default_factory=SessionContext)
+    #: Bounded, in-memory result sets of the managed browser (Stage 8, P2).  The
+    #: entries ``browser_find`` listed are remembered per browser session so a
+    #: later turn can say "open the first link".  IN-MEMORY ONLY and never
+    #: written to ``AgentState`` or the checkpoint store.  A selection is a
+    #: proposal: the policy gate and the target binding still authorize the
+    #: action, and a stale, expired or navigated-away set is refused.
+    browser_results: BrowserResultStore = field(default_factory=BrowserResultStore)
 
     def tool_context(self) -> ToolContext:
         """Build a ToolContext for the current step (no secret leaks)."""
@@ -112,6 +120,7 @@ class AppContext:
             voice=self.voice,
             browser=self.browser,
             whatsapp_browser=self.whatsapp_browser,
+            browser_results=self.browser_results,
         )
 
 
@@ -132,6 +141,7 @@ def make_app_context(
     whatsapp_browser: Any | None = None,
     scope_registry: ScopeRegistry | None = None,
     session_context: SessionContext | None = None,
+    browser_results: BrowserResultStore | None = None,
 ) -> AppContext:
     """Build a ready-to-use :class:`AppContext` with defaults."""
     settings = settings or load_settings()
@@ -173,4 +183,5 @@ def make_app_context(
             max_artifacts=int(settings.session.max_artifacts),
             ttl_seconds=float(settings.session.artifact_ttl_seconds),
         ),
+        browser_results=browser_results if browser_results is not None else BrowserResultStore(),
     )

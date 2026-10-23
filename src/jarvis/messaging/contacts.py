@@ -24,8 +24,15 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
+
+    from jarvis.tools.base import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +41,10 @@ __all__ = [
     "ContactStore",
     "RateLimitError",
     "RateLimiter",
+    "make_recipient_precheck",
     "masked_number",
     "normalize_number",
+    "recipient_error",
     "resolve_single",
 ]
 
@@ -255,3 +264,36 @@ def resolve_single(store: ContactStore, query: str) -> tuple[Contact | None, str
         )
     names = ", ".join(c.name for c in matches)
     return None, f"multiple contacts match {query!r}: {names} — be more specific"
+
+
+def recipient_error(store: ContactStore, query: str) -> str | None:
+    """The recipient failure for ``query``, or ``None`` when exactly one matches.
+
+    This is the read-only form of :func:`resolve_single`, used by the messaging
+    tools' ``precheck`` hook.  It has no side effects and never guesses.
+    """
+    _contact, error = resolve_single(store, query)
+    return error
+
+
+def make_recipient_precheck(
+    store: ContactStore | None = None,
+) -> Callable[[BaseModel, ToolContext], str | None]:
+    """Build a read-only ``ToolSpec.precheck`` that validates the recipient.
+
+    ``store`` is the test injection point; the default reads the real contacts
+    file at check time.  The check runs before any confirmation and again just
+    before dispatch, so an unknown or ambiguous recipient is refused without
+    opening a chat, staging a file, prompting for approval or unlocking.
+    """
+
+    def precheck(args: BaseModel, ctx: ToolContext) -> str | None:
+        del ctx
+        chosen = store
+        if chosen is None:
+            from jarvis import config
+
+            chosen = ContactStore(config.contacts_file())
+        return recipient_error(chosen, str(getattr(args, "contact", "") or ""))
+
+    return precheck

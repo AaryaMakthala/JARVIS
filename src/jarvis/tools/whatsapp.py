@@ -37,6 +37,7 @@ from jarvis.messaging.contacts import (
     ContactStore,
     RateLimiter,
     RateLimitError,
+    make_recipient_precheck,
     masked_number,
     normalize_number,
     resolve_single,
@@ -166,6 +167,7 @@ def make_whatsapp_send_spec(
         windows_only=True,
         timeout_s=30,
         run=lambda args, ctx: _whatsapp_send_run(store, limiter, args, ctx),
+        precheck=make_recipient_precheck(store),
         verify=lambda args, result, ctx: _whatsapp_send_verify(store, limiter, args, result, ctx),
         describe=lambda args: _describe_whatsapp(store, args),
     )

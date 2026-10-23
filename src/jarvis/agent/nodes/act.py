@@ -48,6 +48,7 @@ from jarvis.agent.nodes.util import (
     resolve_step_target,
     truncate,
 )
+from jarvis.agent.precheck import step_precheck_error
 from jarvis.agent.session_context import SESSION_THREAD
 from jarvis.agent.state import StepResult
 from jarvis.policy.paths import ContentHashError, content_hash
@@ -221,6 +222,19 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             state, step.id, f"invalid args: {exc}", "Refused: step arguments are invalid."
         )
 
+    # Read-only precondition (e.g. the messaging recipient), re-run here to
+    # close the window between the gate's check and dispatch.  It happens
+    # before any target binding is consumed and before budget is reserved, so a
+    # refused step never spends either.
+    precheck_error = step_precheck_error(spec, step, ctx.tool_context())
+    if precheck_error is not None:
+        return _refuse(
+            state,
+            step.id,
+            f"precondition failed: {precheck_error}",
+            f"Refused: {precheck_error}",
+        )
+
     # Objective A (target identity): a target-bearing action must present the
     # binding the gate recorded, recomputed from a *fresh* observation.  A
     # changed, missing, expired or unauthorized target fails closed.  Dry runs
@@ -328,6 +342,12 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         artifact = result.data.get("artifact") if isinstance(result.data, dict) else None
         ctx.session_context.note_action(SESSION_THREAD, artifact)
         page_url = result.data.get("page_url") if isinstance(result.data, dict) else None
+        # D19: an unrelated action in between invalidates a prior referent.  A
+        # page is therefore re-published only by a browser step that reports
+        # the page it is on; every other successful step clears it, so a time
+        # query cannot leave "that page" (or a model reading "it" as a site)
+        # silently pointing at an earlier page.
+        ctx.session_context.invalidate_page(SESSION_THREAD)
         if isinstance(page_url, str) and page_url.strip():
             # The page JARVIS is on (Stage 8.6, slice 8.6.3).  A location, not
             # an authorization: the next navigation is checked like any other.

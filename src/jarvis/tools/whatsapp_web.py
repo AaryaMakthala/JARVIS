@@ -53,7 +53,12 @@ from pydantic import BaseModel, Field
 
 from jarvis import config
 from jarvis.messaging.base import CHANNEL_WHATSAPP_WEB, MessageError, MessageRequest
-from jarvis.messaging.contacts import ContactStore, RateLimiter, masked_number
+from jarvis.messaging.contacts import (
+    ContactStore,
+    RateLimiter,
+    make_recipient_precheck,
+    masked_number,
+)
 from jarvis.messaging.flow import MessageFlow
 from jarvis.messaging.whatsapp_web import (
     RESEND_WINDOW_S,
@@ -335,6 +340,7 @@ def make_whatsapp_send_file_spec(
         "budget_cost": 1,
         "bind_content_hash": True,
         "run": lambda args, ctx: _send_file_run(store, limiter, guard, args, ctx),
+        "precheck": make_recipient_precheck(store),
         "describe": lambda args: _describe_send_file(store, args),
     }
     return ToolSpec(**options)
@@ -360,5 +366,6 @@ def make_whatsapp_open_chat_spec(store: ContactStore | None = None) -> ToolSpec:
         timeout_s=60,
         budget_cost=1,
         run=lambda args, ctx: _open_chat_run(store, args, ctx),
+        precheck=make_recipient_precheck(store),
         describe=lambda args: _describe_open_chat(store, args),
     )

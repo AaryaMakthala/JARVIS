@@ -20,6 +20,7 @@ from typing import Any
 
 from tests.support import brain_conversation, registry_with
 
+from jarvis.agent import fastpath
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import _ALLOWED_MSGPACK_TYPES
 from jarvis.agent.nodes.act import act
@@ -31,6 +32,7 @@ from jarvis.config import BrowserSettings, Settings
 from jarvis.llm.client import Usage
 from jarvis.policy import rules
 from jarvis.tools.base import resolve_target
+from jarvis.tools.clock import make_get_time_spec
 
 _ORIGIN = "https://example.com"
 _TASK = "t1"
@@ -62,7 +64,7 @@ def _ctx(session: FakeSession, *, dry_run: bool = False) -> Any:
     settings = Settings(browser=BrowserSettings(allowed_domains=["example.com"]))
     return make_app_context(
         settings,
-        registry=registry_with(make_browser_goto_spec()),
+        registry=registry_with(make_browser_goto_spec(), make_get_time_spec()),
         browser=session,
         dry_run=dry_run,
     )
@@ -115,6 +117,31 @@ def _navigate(session: FakeSession, *, dry_run: bool = False) -> tuple[Any, Step
     return ctx, step
 
 
+def _run_time_query(ctx: Any) -> None:
+    """Run the real "what time is it" fast-path plan through the real act node."""
+    update = fastpath.brain_update(
+        {"user_input": "What time is it?", "source": "terminal", "task_id": "t-time"},
+        ctx,
+    )
+    assert update is not None
+    plan = update["plan"]
+    step = plan.steps[0]
+    spec = ctx.registry.get(step.tool)
+    args = spec.args_model.model_validate(step.args)
+    result = act(
+        {
+            "plan": plan,
+            "step_index": 0,
+            "task_id": "t-time",
+            "approved_hashes": [str(rules.action_hash(spec, args))],
+            "gated_resolved_paths": {},
+            "results": [],
+        },
+        ctx,
+    )
+    assert result["results"][-1].ok is True
+
+
 def test_a_successful_navigation_publishes_the_page() -> None:
     session = FakeSession()
     ctx, _ = _navigate(session)
@@ -135,6 +162,50 @@ def test_a_dry_run_publishes_nothing() -> None:
     session = FakeSession()
     ctx, _ = _navigate(session, dry_run=True)
     assert ctx.session_context.resolve_page("local").kind == "none"
+
+
+# ── reference invalidation: unrelated action in between (Stage 8, P3) ──────
+
+
+def test_an_unrelated_time_query_invalidates_the_page_referent() -> None:
+    """The acceptance sequence: navigate, ask the time, then refer to the page."""
+    session = FakeSession()
+    ctx, _ = _navigate(session)
+    assert ctx.session_context.resolve_page("local").kind == "resolved"
+
+    _run_time_query(ctx)
+
+    assert ctx.session_context.resolve_page("local").kind == "none"
+
+
+def test_after_an_unrelated_query_a_page_follow_up_asks() -> None:
+    """'open it' and 'open that page' must not silently reopen the old site."""
+    session = FakeSession()
+    ctx, _ = _navigate(session)
+    _run_time_query(ctx)
+
+    for text in ("Open it.", "open that page again"):
+        recorder = _RecorderLLM(brain_conversation("Which page do you mean?"))
+        brain_ctx = _brain_ctx(recorder, session, session_context=ctx.session_context)
+        brain({"user_input": text, "source": "terminal", "task_id": "t-next"}, brain_ctx)
+
+        assert recorder.user is not None
+        assert f"{_ORIGIN}/page" not in recorder.user
+        assert "clarification" in recorder.user.lower()
+
+
+def test_a_page_follow_up_with_no_intervening_action_still_resolves() -> None:
+    """The invalidation must not break legitimate immediate references."""
+    session = FakeSession()
+    ctx, _ = _navigate(session)
+
+    recorder = _RecorderLLM(brain_conversation("Opening it."))
+    brain_ctx = _brain_ctx(recorder, session, session_context=ctx.session_context)
+    brain({"user_input": "open that page again", "source": "terminal", "task_id": "t2"}, brain_ctx)
+
+    assert recorder.user is not None
+    assert f"{_ORIGIN}/page" in recorder.user
+    assert "<untrusted_data>" in recorder.user
 
 
 def test_the_page_never_becomes_a_file_artifact() -> None:

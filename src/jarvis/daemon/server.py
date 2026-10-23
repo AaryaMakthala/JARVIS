@@ -24,6 +24,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -256,6 +257,9 @@ class _LazyBrowserSession:
 
     def __init__(self, acquire: Callable[[], Any | None]) -> None:
         self._acquire = acquire
+        #: Stable id of this adapter, used to scope the in-memory result sets.
+        #: Cheap and never starts the browser (which ``_session`` would).
+        self._session_id = f"browser-{uuid.uuid4().hex}"
 
     def _session(self) -> Any:
         session = self._acquire()
@@ -268,6 +272,27 @@ class _LazyBrowserSession:
 
     def read(self, max_elements: int = 80) -> Any:
         return self._session().read(max_elements)
+
+    def find(self, query: str, *, role: str = "", limit: int = 300) -> list[Any]:
+        return self._session().find(query, role=role, limit=limit)
+
+    def open_match(
+        self,
+        query: str,
+        *,
+        role: str = "",
+        index: int | None = None,
+        expect_identity: str | None = None,
+    ) -> dict[str, Any]:
+        return self._session().open_match(
+            query, role=role, index=index, expect_identity=expect_identity
+        )
+
+    def current_url(self) -> str:
+        return str(self._session().current_url())
+
+    def session_id(self) -> str:
+        return self._session_id
 
     def resolve(self, ref: str) -> Any | None:
         return self._session().resolve(ref)

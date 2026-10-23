@@ -260,6 +260,21 @@ class TestPageReferents:
         block = render_resolution(resolved)
         assert block is not None and "clarification" in block.lower()
 
+    def test_invalidating_a_page_removes_the_referent(self) -> None:
+        """An unrelated completed action must not leave an older page reachable."""
+        store = SessionContext()
+        store.note_page(SESSION_THREAD, _PAGE, now=0.0)
+        assert store.resolve_page(SESSION_THREAD, now=0.0).kind == "resolved"
+        store.invalidate_page(SESSION_THREAD)
+        assert store.resolve_page(SESSION_THREAD, now=0.0).kind == "none"
+        assert store.reference_resolution(SESSION_THREAD, "open that page", now=0.0).kind == "none"
+
+    def test_a_page_referent_is_scoped_to_its_thread(self) -> None:
+        store = SessionContext()
+        store.note_page("thread-a", _PAGE, now=0.0)
+        assert store.resolve_page("thread-a", now=0.0).kind == "resolved"
+        assert store.resolve_page("thread-b", now=0.0).kind == "none"
+
     def test_the_rendered_page_is_untrusted_data(self) -> None:
         store = SessionContext()
         store.note_page(SESSION_THREAD, _PAGE, now=0.0)

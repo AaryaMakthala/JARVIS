@@ -11,8 +11,10 @@ site" across turns.  It is deliberately kept apart from the artifact store:
 * an artifact referent ("it", "the photo") is *run scoped* - any unrelated
   action invalidates it, because only the artifact the user just produced is
   meant;
-* a page referent ("that page") is *position scoped* - it means the page the
-  managed browser is on, and it is replaced whenever JARVIS navigates.
+* a page referent ("that page") is *action scoped* - it is the page the
+  managed browser last reported, refreshed by every browser step that ends on
+  a page, and cleared by any unrelated completed action (D19: "an unrelated
+  action in between invalidates the candidate").
 
 Both are in-memory, TTL-bounded, deterministic and never persisted.
 
@@ -174,7 +176,9 @@ class SessionContext:
         self._run: dict[str, str | None] = {}
         #: The page JARVIS last had open, per thread (Stage 8.6, slice 8.6.3).
         #: Only the most recent page is kept: "that page" has exactly one
-        #: meaning, so it can never be ambiguous.
+        #: meaning, so it can never be ambiguous.  It is cleared by any
+        #: unrelated completed action (Stage 8, P3), so a time query or an app
+        #: launch cannot leave an older page silently reachable.
         self._pages: dict[str, SessionArtifact] = {}
 
     # ── configuration ───────────────────────────────────────────────────
@@ -321,6 +325,17 @@ class SessionContext:
             )
             self._pages[thread_id] = entry
             return entry
+
+    def invalidate_page(self, thread_id: str) -> None:
+        """Forget the remembered page because an unrelated action completed.
+
+        D19: an unrelated action in between invalidates the candidate.  A page
+        is only re-published by a browser step that reports the page it is on,
+        so a time query, an app launch or a photo cannot leave "that page"
+        pointing at a page from an earlier request.
+        """
+        with self._lock:
+            self._pages.pop(thread_id, None)
 
     def resolve_page(self, thread_id: str, *, now: float | None = None) -> Resolution:
         """Resolve "that page" to the page JARVIS last had open."""

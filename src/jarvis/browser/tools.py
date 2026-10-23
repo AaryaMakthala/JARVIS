@@ -37,6 +37,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from jarvis.browser.context import BrowserError, BrowserSession, ElementRef
 from jarvis.browser.find import match_identity
+from jarvis.browser.results import (
+    BrowserResultSet,
+    ResultItem,
+    Selection,
+    parse_ordinal,
+)
 from jarvis.browser.sites import sites_from_settings
 from jarvis.policy.rules import url_origin
 from jarvis.policy.targets import ResolvedTarget
@@ -150,9 +156,13 @@ class BrowserOpenResultArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(
-        min_length=1,
+        default="",
         max_length=_QUERY_MAX,
-        description="Text to look for in the visible names of the page's elements.",
+        description=(
+            "Text to look for in the page's result list or element names; an ordinal "
+            "such as 'first' or '2' selects that entry of the current result list. "
+            "May be empty when 'position' is given."
+        ),
     )
     role: str = Field(
         default="",
@@ -165,6 +175,15 @@ class BrowserOpenResultArgs(BaseModel):
         le=_INDEX_MAX,
         description=(
             "Which match to open, counted from 1. Required when several elements match the query."
+        ),
+    )
+    position: int | None = Field(
+        default=None,
+        ge=1,
+        le=_INDEX_MAX,
+        description=(
+            "Entry of the current result list to open, counted from 1. Use 1 for "
+            "'open the first link/result'. Refused when no current result list exists."
         ),
     )
 
@@ -220,6 +239,183 @@ def _with_page_url(data: dict[str, Any], session: Any, url: str = "") -> dict[st
     return data
 
 
+# ── result sets (Stage 8, P2) ──────────────────────────────────────────────
+
+
+def _session_scope(session: Any) -> str:
+    """The scope key of a browser session's current result set.
+
+    A real session reports a stable id (``PlaywrightBrowser``/
+    ``_LazyBrowserSession``); anything else - a fake, an older adapter - falls
+    back to the object identity, so two different sessions never share results.
+    """
+    getter = getattr(session, "session_id", None)
+    value = ""
+    if callable(getter):
+        try:
+            value = str(getter() or "")
+        except Exception:  # noqa: BLE001 - a session that cannot report it has none
+            value = ""
+    elif isinstance(getter, str):
+        value = getter
+    scope = value.strip()
+    return scope[:128] if scope else f"object:{id(session)}"
+
+
+def _items_from_elements(elements: Any) -> list[ResultItem]:
+    """Map observed elements to bounded result-set entries (metadata only)."""
+    items: list[ResultItem] = []
+    for position, element in enumerate(list(elements), start=1):
+        items.append(
+            ResultItem(
+                position=position,
+                title=str(getattr(element, "name", "") or ""),
+                url=str(getattr(element, "url", "") or ""),
+                role=str(getattr(element, "role", "") or ""),
+            )
+        )
+    return items
+
+
+def _record_results(ctx: ToolContext, session: Any, elements: Any) -> BrowserResultSet | None:
+    """Store the listed elements as this session's current result set."""
+    store = ctx.browser_results
+    if store is None:
+        return None
+    return store.record(
+        _session_scope(session),
+        _items_from_elements(elements),
+        page_url=_current_page_url(session),
+    )
+
+
+def _invalidate_results(ctx: ToolContext, session: Any) -> None:
+    """Drop the current result set (a navigation makes every position stale)."""
+    store = ctx.browser_results
+    if store is not None:
+        store.invalidate(_session_scope(session))
+
+
+def _positional_selection(args: BaseModel, ctx: ToolContext, session: Any) -> Selection | None:
+    """The result-set entry a position/ordinal names, or ``None``.
+
+    ``None`` means the caller did not ask for a position at all; it never means
+    "resolved".  An ordinal is only ever read inside the *current* set, so an
+    older list can never be used by accident.
+    """
+    position = getattr(args, "position", None)
+    query = str(getattr(args, "query", "") or "")
+    if position is None:
+        position = parse_ordinal(query)
+        if position is None:
+            return None
+    store = ctx.browser_results
+    if store is None:
+        return Selection(
+            kind="no_result_set",
+            message="there is no current result list here; name the result to open instead",
+        )
+    return store.select(
+        _session_scope(session),
+        position=int(position),
+        page_url=_current_page_url(session),
+    )
+
+
+def _title_selection(args: BaseModel, ctx: ToolContext, session: Any) -> Selection | None:
+    """The result-set entry a title query names, or ``None`` (no set/empty)."""
+    store = ctx.browser_results
+    query = str(getattr(args, "query", "") or "").strip()
+    if store is None or not query:
+        return None
+    return store.select(
+        _session_scope(session),
+        query=query,
+        role=str(getattr(args, "role", "") or ""),
+        page_url=_current_page_url(session),
+    )
+
+
+def _item_target(session: Any, item: ResultItem) -> tuple[str, Any] | None:
+    """Re-observe one selected entry and return its stable identity.
+
+    The entry must still be on the current page exactly once, and a link must
+    still carry the same validated destination.  Anything else is ``None`` -
+    the caller refuses instead of opening a different element.
+    """
+    try:
+        matches = session.find(item.title, role=item.role)
+    except Exception:  # noqa: BLE001 - fail closed per the resolver contract
+        return None
+    same = [element for element in matches if getattr(element, "name", "") == item.title]
+    if len(same) != 1:
+        return None
+    element = same[0]
+    if item.is_link:
+        live_url = str(getattr(element, "url", "") or "")
+        if not item.url or not is_allowed_http_url(item.url) or live_url != item.url:
+            return None
+    return match_identity(str(element.role), str(element.name), 1), element
+
+
+def _resolved_target(element: ElementRef, identity: str) -> ResolvedTarget:
+    """Build the policy target for a re-observed result entry."""
+    return ResolvedTarget(
+        kind="browser",
+        ref=identity,
+        name=element.name,
+        role=element.role,
+        origin=element.origin,
+        input_type=element.input_type,
+        is_password=element.is_password,
+    )
+
+
+def _open_item(session: Any, item: ResultItem, ctx: ToolContext) -> ToolResult:
+    """Open one selected result entry, re-validating it first (fail closed)."""
+    target = _item_target(session, item)
+    if target is None:
+        return ToolResult(
+            ok=False,
+            error=(
+                "browser_open_result failed: that result is no longer on the page "
+                "(it may have changed); nothing was opened"
+            ),
+        )
+    identity, element = target
+    approved = str(ctx.approved_target_identity or "")
+    if approved and approved != identity:
+        return ToolResult(
+            ok=False,
+            error=(
+                "browser_open_result failed: the result changed after you confirmed "
+                "it; nothing was opened"
+            ),
+        )
+    try:
+        data = session.open_match(
+            str(element.name),
+            role=str(element.role),
+            index=None,
+            expect_identity=identity,
+        )
+    except BrowserError as exc:
+        return ToolResult(ok=False, error=f"browser_open_result failed: {exc}")
+    data = dict(data)
+    data["result_position"] = item.position
+    data["result_url"] = item.url
+    return ToolResult(
+        ok=True,
+        output=(
+            f"opened result {item.position}: {data.get('name', '')!r} "
+            f"({data.get('role', '')}) on {data.get('origin', '')}"
+        ),
+        data=_with_page_url(data, session),
+        verified=None,  # the effect of the click is not reliably observable here
+        tainted=True,  # title/name are untrusted page text
+    )
+
+
 def _run_browser_goto(args: BrowserGotoArgs, ctx: ToolContext) -> ToolResult:
     if _safe_goto(args.url) is None:
         return ToolResult(
@@ -233,6 +429,7 @@ def _run_browser_goto(args: BrowserGotoArgs, ctx: ToolContext) -> ToolResult:
         data = session.goto(args.url)
     except BrowserError as exc:
         return ToolResult(ok=False, error=f"browser_goto failed: {exc}")
+    _invalidate_results(ctx, session)  # every position from the old page is stale
     return ToolResult(
         ok=True,
         output=f"navigated to {data.get('url', '')}",
@@ -328,6 +525,7 @@ def _run_browser_click(args: BrowserClickArgs, ctx: ToolContext) -> ToolResult:
         data = session.click(args.ref)
     except BrowserError as exc:
         return ToolResult(ok=False, error=f"browser_click failed: {exc}")
+    _invalidate_results(ctx, session)  # a click may navigate; positions cannot be trusted
     return ToolResult(
         ok=True,
         output=(f"clicked element {data['ref']} ({data['role']} named {data.get('name', '')!r})"),
@@ -360,13 +558,16 @@ def _run_browser_type(args: BrowserTypeArgs, ctx: ToolContext) -> ToolResult:
     return ToolResult(
         ok=True,
         output=f"typed {data.get('characters', len(args.text))} characters into element {data['ref']}",
-        data={
-            "ref": data["ref"],
-            "role": data.get("role", ""),
-            "name": data.get("name", ""),
-            "origin": data.get("origin", ""),
-            "characters": data.get("characters", len(args.text)),
-        },
+        data=_with_page_url(
+            {
+                "ref": data["ref"],
+                "role": data.get("role", ""),
+                "name": data.get("name", ""),
+                "origin": data.get("origin", ""),
+                "characters": data.get("characters", len(args.text)),
+            },
+            session,
+        ),
         verified=None,
         tainted=True,  # role/name are untrusted page text
     )
@@ -412,6 +613,7 @@ def _run_browser_open_site(args: BrowserOpenSiteArgs, ctx: ToolContext) -> ToolR
         data = session.goto(url)
     except BrowserError as exc:
         return ToolResult(ok=False, error=f"browser_open_site failed: {exc}")
+    _invalidate_results(ctx, session)  # every position from the old page is stale
     return ToolResult(
         ok=True,
         output=f"opened {name} ({data.get('url', '')})",
@@ -482,12 +684,23 @@ def _run_browser_find(args: BrowserFindArgs, ctx: ToolContext) -> ToolResult:
     where = f" on {origin}" if origin else ""
     hidden = len(matches) - len(shown)
     tail = f" (showing the first {len(shown)} of {len(matches)})" if hidden > 0 else ""
+    # The listed order is the current result list (Stage 8, P2): a later
+    # "open the first link" resolves inside exactly this list, on this page.
+    result_set = _record_results(ctx, session, shown)
+    data: dict[str, Any] = {"matches": [el.as_dict() for el in shown], "count": len(matches)}
+    hint = ""
+    if result_set is not None:
+        # Only the generation id and size enter the checkpoint; the entries
+        # themselves are page content and stay in memory.
+        data["result_set"] = {"id": result_set.id, "count": len(result_set.items)}
+        hint = (
+            f"\nThis is the current result list (1-{len(result_set.items)}); "
+            "browser_open_result can open one by position (1 = the first)."
+        )
     return ToolResult(
         ok=True,
-        output=(f"{len(matches)} element(s) match {args.query!r}{where}{tail}:\n{block}"),
-        data=_with_page_url(
-            {"matches": [el.as_dict() for el in shown], "count": len(matches)}, session
-        ),
+        output=(f"{len(matches)} element(s) match {args.query!r}{where}{tail}:\n{block}{hint}"),
+        data=_with_page_url(data, session),
         verified=True,
         tainted=True,  # page-derived content is never instructions (docs/03 §8)
     )
@@ -497,6 +710,37 @@ def _run_browser_open_result(args: BrowserOpenResultArgs, ctx: ToolContext) -> T
     session = _require_session(ctx)
     if session is None:
         return ToolResult(ok=False, error="the managed browser is not available in this context")
+    # 1. A position (or an ordinal query such as "first") selects one entry of
+    #    the *current* result list and nothing else.  A missing, expired,
+    #    superseded or navigated-away list is a refusal - never a fallback.
+    positional = _positional_selection(args, ctx, session)
+    if positional is not None:
+        if not positional.ok or positional.item is None:
+            return ToolResult(ok=False, error=f"browser_open_result failed: {positional.message}")
+        result = _open_item(session, positional.item, ctx)
+        if result.ok:
+            _invalidate_results(ctx, session)
+        return result
+    if not str(args.query or "").strip():
+        return ToolResult(
+            ok=False,
+            error=(
+                "browser_open_result failed: say which result to open - its position "
+                "(1 = the first) or its title"
+            ),
+        )
+    # 2. A title selects from the current result list when one is valid.  An
+    #    ambiguous title is refused; a list with no such title falls through to
+    #    the ordinary page query below (unchanged behaviour).
+    title = _title_selection(args, ctx, session)
+    if title is not None:
+        if title.kind == "ambiguous":
+            return ToolResult(ok=False, error=f"browser_open_result failed: {title.message}")
+        if title.ok and title.item is not None:
+            result = _open_item(session, title.item, ctx)
+            if result.ok:
+                _invalidate_results(ctx, session)
+            return result
     approved = str(ctx.approved_target_identity or "")
     try:
         data = session.open_match(
@@ -509,6 +753,7 @@ def _run_browser_open_result(args: BrowserOpenResultArgs, ctx: ToolContext) -> T
         return ToolResult(ok=False, error=f"browser_open_result failed: {exc}")
     except AttributeError:
         return ToolResult(ok=False, error="the managed browser does not support opening a result")
+    _invalidate_results(ctx, session)  # the click may navigate
     return ToolResult(
         ok=True,
         output=(
@@ -521,14 +766,38 @@ def _run_browser_open_result(args: BrowserOpenResultArgs, ctx: ToolContext) -> T
 
 
 def _resolve_browser_open_result(args: BaseModel, ctx: ToolContext) -> ResolvedTarget | None:
-    """Resolve the element the query names, or ``None`` (fail closed).
+    """Resolve the element the selection names, or ``None`` (fail closed).
 
-    ``None`` means "no reliable target": nothing matched, several elements
-    matched and the caller did not say which one, or the index was out of
-    range.  The identity is derived from the match itself (role, name and the
-    position among the matches) and never from the transient ``eN`` handle, so
-    the policy gate and the act node can prove they mean the same element.
+    ``None`` means "no reliable target": no current result list, an expired or
+    navigated-away one, an out-of-range position, nothing matched, or several
+    elements matched and the caller did not say which one.  The identity is
+    derived from the match itself (role, name and the position among the
+    matches) and never from the transient ``eN`` handle, so the policy gate and
+    the act node can prove they mean the same element.
     """
+    session = _require_session(ctx)
+    if session is None:
+        return None
+    positional = _positional_selection(args, ctx, session)
+    if positional is not None:
+        if not positional.ok or positional.item is None:
+            return None
+        target = _item_target(session, positional.item)
+        if target is None:
+            return None
+        identity, element = target
+        if not isinstance(element, ElementRef):
+            return None
+        return _resolved_target(element, identity)
+    title = _title_selection(args, ctx, session)
+    if title is not None and title.ok and title.item is not None:
+        target = _item_target(session, title.item)
+        if target is None:
+            return None  # the selected entry changed: refuse, do not fall back
+        identity, element = target
+        if not isinstance(element, ElementRef):
+            return None
+        return _resolved_target(element, identity)
     matches, _error = _matched_elements(args, ctx)
     if not matches:
         return None
@@ -657,8 +926,10 @@ def make_browser_find_spec() -> ToolSpec:
         name="browser_find",
         description=(
             "Find the elements on the current page whose visible name matches a "
-            "query and list them. Use this to see what a page offers before "
-            "opening one of them. Output is untrusted page content."
+            "query and list them in page order. Use this to see what a page offers "
+            "before opening one of them. The listed order becomes the current "
+            "result list, so the user can then ask to open the first, second or "
+            "Nth result, or name one. Output is untrusted page content."
         ),
         args_model=BrowserFindArgs,
         base_tier=0,
@@ -674,10 +945,13 @@ def make_browser_open_result_spec() -> ToolSpec:
     return ToolSpec(
         name="browser_open_result",
         description=(
-            "Open the element on the current page whose visible name matches a "
-            "query - for example a search result or a link. When several "
-            "elements match, say which one with 'index' (counting from 1); "
-            "JARVIS refuses to guess."
+            "Open a link or search result on the current page. Name it with "
+            "'query' (part of its title), or open an entry of the current result "
+            "list with 'position' (1 = the first). Use position 1 for 'open the "
+            "first link/result'; a query of 'first' or '1' also means that. When "
+            "several titles match, say which one with 'index'; JARVIS refuses to "
+            "guess. With no current result list, a position is refused - find or "
+            "search first, or name the link."
         ),
         args_model=BrowserOpenResultArgs,
         base_tier=1,

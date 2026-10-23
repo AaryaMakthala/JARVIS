@@ -28,6 +28,8 @@ Design rules
 from __future__ import annotations
 
 import threading
+import urllib.parse
+import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -91,9 +93,10 @@ class ElementRef:
     """Public metadata for one observed interactive element.
 
     Only identity metadata is exposed: the transient handle (``ref``), the
-    accessible role/name and the page origin.  Never a value, never typed
-    text, never credentials.  ``input_type``/``is_password`` are included so
-    policy can refuse credential fields before any interaction.
+    accessible role/name, the page origin and - for a link - its validated
+    destination.  Never a value, never typed text, never credentials.
+    ``input_type``/``is_password`` are included so policy can refuse credential
+    fields before any interaction.
     """
 
     ref: str
@@ -102,6 +105,9 @@ class ElementRef:
     origin: str
     input_type: str = ""
     is_password: bool = False
+    #: Absolute http(s) destination of a link, resolved against the page URL and
+    #: validated; empty for anything that is not a safe link.
+    url: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         """A JSON-safe dict for the caller (no values, no text)."""
@@ -112,6 +118,7 @@ class ElementRef:
             "origin": self.origin,
             "input_type": self.input_type,
             "is_password": self.is_password,
+            "url": self.url,
         }
 
 
@@ -166,6 +173,9 @@ class BrowserSession(Protocol):
     def current_url(self) -> str:
         """The URL of the page the managed browser is on (may be empty)."""
 
+    def session_id(self) -> str:
+        """A stable identifier for this browser session (result-set scope)."""
+
     def click(self, ref: str) -> dict[str, Any]:
         """Re-validate then click a ref; return ``{ref, role, name, origin}``."""
 
@@ -188,6 +198,7 @@ class _ObservedElement:
     is_password: bool
     nth: int
     total: int
+    url: str = ""
 
 
 @dataclass
@@ -199,6 +210,7 @@ class _Candidate:
     name: str
     input_type: str
     is_password: bool
+    url: str = ""
 
 
 _PROFILE_LOCKS: dict[str, threading.Lock] = {}
@@ -254,6 +266,9 @@ class PlaywrightBrowser:
         self._next_ref = 1
         self._profile_lease: threading.Lock | None = None
         self._started = False
+        #: Stable id of this session object; scopes the in-memory result sets
+        #: (never persisted, never page-derived).
+        self._session_id = f"browser-{uuid.uuid4().hex}"
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -261,6 +276,10 @@ class PlaywrightBrowser:
     def started(self) -> bool:
         """Whether the persistent context is currently attached (``start()`` ok)."""
         return self._started
+
+    def session_id(self) -> str:
+        """A stable identifier for this browser session (result-set scope)."""
+        return self._session_id
 
     def start(self) -> None:
         """Launch the persistent Chrome context (blocking, never at import time)."""
@@ -482,6 +501,7 @@ class PlaywrightBrowser:
                 continue  # unnamed controls cannot be safely re-validated
             input_type = self._live_input_type(loc)
             is_password = input_type == "password" or role in _PASSWORD_ROLES
+            url = self._live_url(loc, str(page.url))
             group = (role, name)
             groups[group] = groups.get(group, 0) + 1
             candidates.append(
@@ -491,6 +511,7 @@ class PlaywrightBrowser:
                     name=name,
                     input_type=input_type,
                     is_password=is_password,
+                    url=url,
                 )
             )
             if len(candidates) >= limit:
@@ -526,6 +547,7 @@ class PlaywrightBrowser:
                 is_password=item.is_password,
                 nth=nth,
                 total=groups[group],
+                url=item.url,
             )
             elements.append(
                 ElementRef(
@@ -535,6 +557,7 @@ class PlaywrightBrowser:
                     origin=origin,
                     input_type=item.input_type,
                     is_password=item.is_password,
+                    url=item.url,
                 )
             )
         return elements
@@ -551,6 +574,7 @@ class PlaywrightBrowser:
             origin=snap.origin,
             input_type=snap.input_type,
             is_password=snap.is_password,
+            url=snap.url,
         )
 
     def current_url(self) -> str:
@@ -653,6 +677,7 @@ class PlaywrightBrowser:
             origin=origin or snap.origin,
             input_type=live_input_type,
             is_password=live_input_type == "password" or live_role in _PASSWORD_ROLES,
+            url=self._live_url(loc, str(page.url)),
         )
         return snap, loc, live
 
@@ -676,6 +701,28 @@ class PlaywrightBrowser:
             return _TAG_ROLES.get(cls._live_tag(loc), "unknown")
         except Exception:  # noqa: BLE001 - best-effort observation
             return "unknown"
+
+    @staticmethod
+    def _live_url(loc: Any, page_url: str) -> str:
+        """The validated absolute destination of a link, else ``""``.
+
+        Page-derived and untrusted: only an absolute http(s) URL without
+        userinfo is ever exposed, and only as metadata - it is never used to
+        authorize anything (the page's own origin still decides policy).
+        """
+        try:
+            raw = str(loc.get_attribute("href") or "").strip()
+        except Exception:  # noqa: BLE001 - best-effort observation
+            return ""
+        if not raw:
+            return ""
+        try:
+            absolute = urllib.parse.urljoin(page_url, raw)
+        except ValueError:
+            return ""
+        if not is_allowed_http_url(absolute):
+            return ""
+        return absolute[:2048]
 
     @staticmethod
     def _live_input_type(loc: Any) -> str:
