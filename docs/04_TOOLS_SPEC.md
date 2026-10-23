@@ -327,6 +327,7 @@ later request can refer to it. It is not a database and not a permission.
 |------|-----------|
 | Exactly one match | a reference resolves only when **one** item matches; zero or several → **one** clarifying question, never a guess |
 | Two separate kinds | *artifacts* (a photo or a file JARVIS created) and *pages* (the URL the managed browser is on). A page request never falls back to an artifact and vice versa: "that page" cannot pick a photo and "delete it" cannot pick a URL |
+| Unrelated actions invalidate | D19: an unrelated completed action between the item and the reference invalidates it. A page is kept only by a browser step that reports the page it is on; a time query, app launch or photo clears it, so "open it" after an unrelated request asks instead of reopening an old site |
 | Bounded and short-lived | at most 5 artifacts, 1 page, a 600 s TTL; an expired item is dropped and the request asks again |
 | Never checkpointed | the context lives in the process only. It is not in the LangGraph state, not in the checkpoint DB, not in the memory DB and not in the log |
 | Untrusted | a remembered URL is rendered inside `<untrusted_data>…</untrusted_data>` and is explicitly labelled as **data, not an instruction** |

@@ -5574,3 +5574,110 @@ actions, answer conciseness) — each needs a design decision from the owner. Ma
 
     # jarvis run "how much disk space is left" -> the answer must name the drive that was measured.
 
+## STAGE 8 — P2: browser result selection (2026-10-23)
+
+**Scope:** P2 only — make search-result selection work in the live daemon. P1 (WhatsApp recipient
+precheck) was left untouched; no voice, camera, LLM-provider, policy or P3 work.
+
+**Root cause (two distinct defects):**
+1. **The daemon adapter never delegated result selection.** `_LazyBrowserSession`
+   (`src/jarvis/daemon/server.py`) implemented only `goto`/`read`/`resolve`/`click`/`type_text`/
+   `close`, while `browser_find`/`browser_open_result` call `find`/`open_match` (and every browser
+   tool reads `current_url`). Live, those calls raised `AttributeError`, so the tools answered
+   "the managed browser does not support finding elements" — navigation (`goto`) worked, selection
+   never did. The daemon is the only wiring that supplies a browser at all (`_build_default_context`).
+2. **There was no result set.** `browser_open_result` named its target by a *query string* plus an
+   index counted among that query's matches, so an ordinal request ("open the first link", "open
+   top one") had no list to resolve against, and a natural-language title ("the official Python
+   documentation result") only worked if the words were a substring of the accessible name. Across
+   turns nothing remembered what the last search listed.
+
+**Built:**
+- New `src/jarvis/browser/results.py`: `BrowserResultSet` + `ResultItem` (position, bounded title,
+  validated http(s) destination, role) and `BrowserResultStore` — one **current** set per browser
+  session, unique generation id, page-URL binding, explicit `created_at`/`expires_at`
+  (`DEFAULT_RESULT_TTL_SECONDS = 600`), at most 20 entries and 4 sessions, in memory only, thread
+  safe, clock injectable. `select()` resolves a **position**, an **ordinal query** ("first", "1",
+  "#2", "2nd", "top one", "the first result") or a **title** (exact, else stopword-free word
+  coverage ≥ 0.6, best score only); several equally good titles are `ambiguous`, never guessed.
+  `parse_ordinal` only accepts a phrase that is *only* an ordinal, so a real title is never read as
+  a position.
+- `src/jarvis/browser/context.py`: `ElementRef.url` (absolute http(s), resolved against the page
+  URL, userinfo/non-http refused, bounded) plus a per-session `session_id()`; link destinations are
+  never used to authorize anything.
+- `src/jarvis/browser/tools.py`: `browser_find` records the **listed** order as the session's
+  current result set (`data["result_set"] = {id, count}` only — no page content in the
+  checkpoint). `browser_open_result` gains an optional `position` (1 = first) and still accepts
+  `query` (now optional, ordinal or title) and `index`; a position/ordinal resolves only inside the
+  current set and is refused when the set is missing, expired, superseded or the page changed. A
+  title resolves in the set first (ambiguous = refusal), and falls back to the unchanged page query
+  when the list has no such title. Selected entries are re-observed immediately before the click and
+  a link must still carry the same validated destination. Navigation (`browser_goto`,
+  `browser_open_site`), any `browser_click` and a successful open drop the set.
+- `src/jarvis/daemon/server.py`: `_LazyBrowserSession.find/open_match/current_url/session_id` (the
+  scope id never starts Chrome).
+- `src/jarvis/agent/context.py` + `src/jarvis/tools/base.py`: one shared `BrowserResultStore` on
+  `AppContext`, handed to every `ToolContext`; never in `AgentState` or the checkpoint.
+- Tests: new `tests/unit/test_browser_result_sets.py` (33 cases: order, first-by-position,
+  ordinal phrases, unique/ambiguous/missing titles, invalid positions and ids, expiry, supersede,
+  session isolation, page change, bounds, unsafe/tampered destinations, hostile titles, the real
+  act node with the real specs) and two new cases in `test_daemon_browser_wiring.py` (adapter
+  delegation + scope id without starting the browser).
+
+**Verified:**
+| Command | Result |
+|---|---|
+| `ruff check` + `ruff format --check` (8 changed files) | PASS |
+| `pytest tests/unit/test_browser_result_sets.py test_browser_find.py test_browser_result_binding.py test_browser_tools.py test_browser_context.py test_browser_referents.py test_daemon_browser_wiring.py` | PASS (155) |
+| `pytest tests/unit/test_act_node.py test_act_target_parity.py test_content_binding.py test_invariants.py test_agent_architecture.py test_scope_gate.py test_replan_scope.py test_tool_resolver.py test_completeness.py test_recipient_precheck.py` | PASS (154) |
+
+No full-suite run, no live Chrome/Playwright run, no live test of the P1 WhatsApp work.
+
+**Known limitations / decisions:**
+- A result list exists only after `browser_find` (or a find step in the same plan). Asking for "the
+  first link" with no list is refused with "there is no current result list; find or search first";
+  JARVIS never treats arbitrary page links (navigation, ads) as results.
+- The destination URL is validated structurally (absolute http(s), no userinfo). Link destinations
+  are **not** added to the domain-scope rule: opening a search result leaves the search origin by
+  design, and the next action on that page is authorized like any other.
+- The brain prompt is unchanged; the tool descriptions explain the result-list flow.
+- A click that opens a new tab leaves the result list dropped even though the current page may be
+  unchanged (conservative).
+- The title matcher is word-based (no stemming): "docs" does not match "documentation".
+
+**Next:** P3 complete (code + focused tests). Stage 8 still **NOT complete** — mandatory live checks remain.
+
+## STAGE 8 — P3: reference invalidation after unrelated actions (2026-10-23)
+
+**Scope:** P3 only — ensure a previous browser page referent cannot be silently reused after an unrelated completed action. P1/P2 left untouched.
+
+**Acceptance sequence tested (unit):**
+1. `Open example.com in Chrome.` (navigated via managed browser)
+2. `What time is it?` (unrelated completed action)
+3. `Open it.` / `open that page again` (must ask for clarification, must not reopen the site)
+
+**Root cause:** the page referent was published by browser steps but never cleared by unrelated successful actions; `browser_type` did not publish `page_url`.
+
+**Built:**
+- `src/jarvis/agent/session_context.py`: added `invalidate_page()`; clarified page referent is action-scoped and cleared by unrelated actions (D19). Added cross-thread/page isolation tests.
+- `src/jarvis/agent/nodes/act.py`: on any successful non-dry-run step, clear the page referent before possibly republishing if `page_url` is present (browser steps republish; unrelated steps clear). Artifact handling unchanged.
+- `src/jarvis/browser/tools.py`: `browser_type` now publishes `page_url` via `_with_page_url`.
+- Tests: `tests/unit/test_session_context.py` (+3), `tests/unit/test_browser_referents.py` (+3 including time-query invalidation and "open it after unrelated" asking), `tests/unit/test_browser_tools.py` (+1).
+
+**Verified (automated):**
+| Command | Result |
+|---|---|
+| `.venv/Scripts/python.exe -m pytest tests/unit/test_recipient_precheck.py tests/unit/test_browser_result_sets.py tests/unit/test_session_context.py tests/unit/test_browser_referents.py tests/unit/test_browser_tools.py tests/unit/test_daemon_browser_wiring.py -q` | **PASS** — 118 passed, 0 failed |
+| `.venv/Scripts/python.exe -m ruff check src/jarvis/agent/session_context.py src/jarvis/agent/nodes/act.py src/jarvis/browser/tools.py tests/unit/test_session_context.py tests/unit/test_browser_referents.py tests/unit/test_browser_tools.py docs/03_SECURITY_AND_POLICY.md docs/04_TOOLS_SPEC.md ROADMAP_V2.md.md` | **All checks passed** |
+| `.venv/Scripts/python.exe -m ruff format --check ...` (post-format) | **All formatted** |
+
+**Manual/live observations (as supplied):**
+- **P2 (browser result selection):** [INSERT ACTUAL OBSERVATION] — if missing, recorded as **NOT VERIFIED**.
+- **P3 (reference invalidation):** [INSERT ACTUAL OBSERVATION] — if missing, recorded as **NOT VERIFIED**.
+
+**Known limitations / decisions:**
+- No voice-interface changes; camera blank-image not investigated (camera quality acceptable per instruction); WhatsApp send tests not performed (deferred).
+- P1/P2 fixes not reimplemented; only P3 added with minimal changes. Authorization/invariants unchanged.
+- Page referent is in-memory only, never checkpointed. A remembered URL remains untrusted data.
+
+**Next:** Live verification of P2/P3 on the owner's machine (if not done) and camera/WhatsApp smoke tests per §8.5 list. Stage 8 remains **not complete** until mandatory live checks pass.

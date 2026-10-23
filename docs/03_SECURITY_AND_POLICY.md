@@ -349,4 +349,5 @@ it. It is a convenience, never an authorization.
 | A remembered URL is **untrusted data** | it is rendered inside `<untrusted_data>…</untrusted_data>` and labelled as data, not an instruction |
 | The referent is **not a permission** | the next action still goes through the ordinary policy gate; a remembered page does not authorise a visit |
 | Only a successful, non-dry-run step publishes | the context must never point at something that did not happen |
+| An **unrelated completed action invalidates** the candidate (D19) | after "open example.com", "what time is it?", "open it" must ask instead of silently reopening the site. A page is re-published only by a browser step that reports the page it is on; a time query, an app launch or a photo clears it |
 | Bounded (5 artifacts, 1 page, 600 s TTL) | an old reference must not silently become a new target |
