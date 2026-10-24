@@ -38,6 +38,7 @@ from jarvis.config import BROWSER_PROFILE_NAMES, Settings, browser_profile_dir
 from jarvis.platform_guard import is_windows
 from jarvis.policy.rules import domain_allowed, url_origin
 from jarvis.tools.web import is_allowed_http_url
+from jarvis.tools.default_dirs import photo_dir
 
 __all__ = [
     "MANAGED_BROWSER_CHANNEL",
@@ -624,6 +625,140 @@ class PlaywrightBrowser:
 
     # ── WhatsApp (Stage 8, Slice 8.4b) ─────────────────────────────────────
 
+
+    # primitives
+    def press_key(self, key: str) -> dict[str, Any]:
+        if key not in KEY_ALLOWLIST:
+            raise BrowserError(f"key {key!r} not allowed")
+        page = self._require_page()
+        try:
+            page.keyboard.press(key)
+        except Exception as exc:
+            raise BrowserError(str(exc)) from exc
+        _recheck_origin_after_action(self)
+        return {"key": key}
+
+    def scroll(self, direction: str, amount: int = 1) -> dict[str, Any]:
+        page = self._require_page()
+        amt = max(1, min(int(amount), 10))
+        if direction == "up":
+            try:
+                page.mouse.wheel(0, -200 * amt)
+            except Exception as exc:
+                raise BrowserError(str(exc)) from exc
+        elif direction == "down":
+            try:
+                page.mouse.wheel(0, 200 * amt)
+            except Exception as exc:
+                raise BrowserError(str(exc)) from exc
+        else:
+            raise BrowserError("direction must be up or down")
+        _recheck_origin_after_action(self)
+        return {"direction": direction, "amount": amt}
+
+    def wait(self, seconds: float = 1.0, *, load_state: str | None = None) -> dict[str, Any]:
+        page = self._require_page()
+        secs = max(0.0, min(float(seconds), 10.0))
+        import time
+
+        if load_state:
+            try:
+                page.wait_for_load_state(load_state, timeout=min(int(secs * 1000), 10000))
+            except Exception as exc:
+                raise BrowserError(str(exc)) from exc
+        else:
+            time.sleep(secs)
+        _recheck_origin_after_action(self)
+        return {"seconds": secs}
+
+    def back(self) -> dict[str, Any]:
+        page = self._require_page()
+        try:
+            page.go_back(wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+        except Exception as exc:
+            raise BrowserError(str(exc)) from exc
+        self._snapshots.clear()
+        _recheck_origin_after_action(self)
+        return {"url": str(page.url)}
+
+    def forward(self) -> dict[str, Any]:
+        page = self._require_page()
+        try:
+            page.go_forward(wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+        except Exception as exc:
+            raise BrowserError(str(exc)) from exc
+        self._snapshots.clear()
+        _recheck_origin_after_action(self)
+        return {"url": str(page.url)}
+
+    def list_tabs(self) -> list[dict[str, Any]]:
+        if not self._started or self._context is None:
+            raise BrowserError("the managed browser session is not started")
+        tabs = []
+        for i, p in enumerate(self._context.pages):
+            try:
+                tabs.append({"index": i, "url": str(p.url), "title": _norm_text(p.title(), 200)})
+            except Exception:
+                tabs.append({"index": i, "url": "", "title": ""})
+        return tabs
+
+    def switch_tab(self, index: int) -> dict[str, Any]:
+        if not self._started or self._context is None:
+            raise BrowserError("the managed browser session is not started")
+        pages = list(self._context.pages)
+        if index < 0 or index >= len(pages):
+            raise BrowserError("tab index out of range")
+        self._page = pages[index]
+        try:
+            self._page.bring_to_front()
+        except Exception:
+            pass
+        _recheck_origin_after_action(self)
+        return {"index": index, "url": str(self._page.url)}
+
+    def close_extra_tab(self) -> dict[str, Any]:
+        if not self._started or self._context is None:
+            raise BrowserError("the managed browser session is not started")
+        pages = list(self._context.pages)
+        if len(pages) <= 1:
+            return {"closed": 0}
+        current = self._page
+        closed = 0
+        for p in pages:
+            if p is current:
+                continue
+            try:
+                p.close()
+                closed += 1
+            except Exception:
+                pass
+        _recheck_origin_after_action(self)
+        return {"closed": closed}
+
+    def screenshot(self, path: str | None = None) -> dict[str, Any]:
+        page = self._require_page()
+        from pathlib import Path
+        import time
+
+        out_dir = photo_dir(self._settings)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if path is None:
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            fname = f"screenshot-{ts}.png"
+            out_path = out_dir / fname
+        else:
+            out_path = Path(path)
+            if not out_path.is_absolute():
+                out_path = out_dir / out_path.name
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            page.screenshot(path=str(out_path))
+        except Exception as exc:
+            raise BrowserError(str(exc)) from exc
+        _recheck_origin_after_action(self)
+        return {"path": str(out_path)}
+
+
     def whatsapp_page(self) -> Any:
         """Return a narrow WhatsApp page handle for the ``whatsapp`` profile.
 
@@ -745,3 +880,27 @@ class PlaywrightBrowser:
             return str(page.title() or "")
         except Exception:  # noqa: BLE001 - best-effort observation
             return ""
+
+
+#: Allowlist for press_key (no modifiers)
+KEY_ALLOWLIST = {"Enter", "Tab", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Backspace"}
+
+def _recheck_origin_after_action(browser: "PlaywrightBrowser") -> None:
+    """Re-validate the origin after an action and refuse if ended on disallowed domain."""
+    try:
+        page = getattr(browser, "_page", None)
+        if page is None:
+            raise BrowserError("no active page")
+        final_url = str(page.url)
+        final_origin = url_origin(final_url)
+        allowed = browser._settings.browser.allowed_domains
+        if final_origin is None:
+            raise BrowserError("invalid origin after action")
+        if allowed and final_origin not in allowed and not domain_allowed(final_url, allowed):
+            raise BrowserError(f"action ended on disallowed domain {final_origin!r}")
+        if getattr(browser, "_redirect_blocked", False) and allowed and final_origin not in allowed:
+            raise BrowserError(f"action ended on disallowed domain {final_origin!r}")
+    except BrowserError:
+        raise
+    except Exception as exc:
+        raise BrowserError(str(exc)) from exc

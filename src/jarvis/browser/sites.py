@@ -63,6 +63,7 @@ class Site:
     name: str
     url: str
     aliases: tuple[str, ...] = ()
+    search_url_template: str | None = None
 
     @property
     def host(self) -> str:
@@ -152,17 +153,49 @@ def sites_from_settings(settings: Settings) -> SiteDirectory:
     Unusable entries are dropped (with a warning) rather than failing the whole
     directory: one bad line in ``config.toml`` must not disable every other
     site.
+
+    Defaults are merged in; config sites override defaults by name.
     """
     entries: Sequence[object] = getattr(settings, "sites", None) or ()
-    sites: list[Site] = []
+    # Start with defaults (copy so we can override)
+    merged: dict[str, Site] = {}
+    for site in DEFAULT_SITES:
+        merged[_clean_key(site.name)] = site
+    # Config overrides/adds
     for entry in entries:
-        if len(sites) >= MAX_SITES:
-            logger.warning("site directory: only the first %d sites are used", MAX_SITES)
-            break
         site = _site_from_entry(entry)
         if site is not None:
-            sites.append(site)
-    return SiteDirectory(sites)
+            merged[_clean_key(site.name)] = site
+            # also add aliases as overrides? just set by name key
+    # Build list in a stable order: defaults first (in DEFAULT_SITES order) then config-only
+    # But easier: preserve DEFAULT_SITES order for names that remain defaults; append others
+    result: list[Site] = []
+    seen_keys: set[str] = set()
+    # First pass defaults (respect overrides)
+    for site in DEFAULT_SITES:
+        key = _clean_key(site.name)
+        if key in seen_keys:
+            continue
+        # use merged version (may be overridden)
+        merged_site = merged.get(key, site)
+        result.append(merged_site)
+        seen_keys.add(key)
+        if len(result) >= MAX_SITES:
+            break
+    # Append any config-only entries not seen
+    if len(result) < MAX_SITES:
+        for entry in entries:
+            site = _site_from_entry(entry)
+            if site is None:
+                continue
+            key = _clean_key(site.name)
+            if key in seen_keys:
+                continue  # already added (overridden)
+            result.append(site)
+            seen_keys.add(key)
+            if len(result) >= MAX_SITES:
+                break
+    return SiteDirectory(result)
 
 
 def render_site_catalogue(directory: SiteDirectory) -> str:
@@ -179,3 +212,22 @@ def render_site_catalogue(directory: SiteDirectory) -> str:
         suffix = f" (also: {aliases})" if aliases else ""
         lines.append(f"- {site.name} [{site.host}]{suffix}")
     return "\n".join(lines)
+
+
+#: Built-in default sites (used when not overridden by config).
+DEFAULT_SITES: tuple[Site, ...] = (
+    Site("Google", "https://www.google.com", ("google",), "https://www.google.com/search?q={q}"),
+    Site("YouTube", "https://www.youtube.com", ("youtube", "yt"), "https://www.youtube.com/results?search_query={q}"),
+    Site("Amazon", "https://www.amazon.com", ("amazon",), "https://www.amazon.com/s?k={q}"),
+    Site("Gmail", "https://mail.google.com", ("gmail",), None),
+    Site("Google Maps", "https://maps.google.com", ("google maps", "maps"), "https://maps.google.com/maps?q={q}"),
+    Site("Wikipedia", "https://www.wikipedia.org", ("wikipedia", "wiki"), "https://en.wikipedia.org/wiki/Special:Search?search={q}"),
+    Site("GitHub", "https://github.com", ("github",), "https://github.com/search?q={q}&type=repositories"),
+    Site("Reddit", "https://www.reddit.com", ("reddit",), "https://www.reddit.com/search/?q={q}"),
+    Site("Stack Overflow", "https://stackoverflow.com", ("stackoverflow", "stack overflow"), "https://stackoverflow.com/search?q={q}"),
+    Site("LinkedIn", "https://www.linkedin.com", ("linkedin",), "https://www.linkedin.com/search/results/all/?keywords={q}"),
+    Site("Spotify web", "https://open.spotify.com", ("spotify", "spotify web"), "https://open.spotify.com/search/{q}"),
+    Site("Netflix", "https://www.netflix.com", ("netflix",), None),
+    Site("X", "https://x.com", ("x", "twitter"), "https://x.com/search?q={q}&f=live"),
+    Site("Flipkart", "https://www.flipkart.com", ("flipkart",), "https://www.flipkart.com/search?q={q}"),
+)
