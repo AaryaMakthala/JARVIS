@@ -18,6 +18,7 @@ from jarvis.config import Settings, load_settings
 from jarvis.llm.client import LLMClient
 from jarvis.logging_setup import get_logger
 from jarvis.memory import MemoryBackend
+from jarvis.policy.browse_grant import BrowseGrantRegistry
 from jarvis.policy.engine import PolicyContext, PolicyEngine, RiskClassifier, UnlockManager
 from jarvis.policy.scope import ScopeRegistry
 from jarvis.tools.base import CancelToken, ToolContext
@@ -90,6 +91,10 @@ class AppContext:
     #: ``target_bindings`` it is in-memory only and never checkpointed, so a
     #: daemon restart requires fresh authorization.
     scope_registry: ScopeRegistry = field(default_factory=ScopeRegistry)
+    #: Transient, task-scoped *browsing* grant (Phase 4).  Deliberately separate
+    #: from ``scope_registry``: no plan hash, its own 30-action / 600 s caps.
+    #: In-memory only, so a daemon restart requires fresh authorization.
+    browse_grants: BrowseGrantRegistry = field(default_factory=BrowseGrantRegistry)
     #: Task-session artifact context (Stage 8, D19).  Holds the artifacts a
     #: tool just produced (e.g. the photo ``take_photo`` saved) so a follow-up
     #: like "delete it" can resolve to a real path.  IN-MEMORY ONLY and never
@@ -140,6 +145,7 @@ def make_app_context(
     browser: Any | None = None,
     whatsapp_browser: Any | None = None,
     scope_registry: ScopeRegistry | None = None,
+    browse_grants: BrowseGrantRegistry | None = None,
     session_context: SessionContext | None = None,
     browser_results: BrowserResultStore | None = None,
 ) -> AppContext:
@@ -177,6 +183,13 @@ def make_app_context(
         scope_registry=scope_registry
         if scope_registry is not None
         else ScopeRegistry(default_max_actions=int(settings.browser.task_scope_max_actions)),
+        browse_grants=browse_grants
+        if browse_grants is not None
+        else BrowseGrantRegistry(
+            enabled=bool(settings.browser.task_grant_enabled),
+            max_actions=int(settings.browser.task_grant_max_actions),
+            ttl_s=float(settings.browser.task_grant_ttl_s),
+        ),
         session_context=session_context
         if session_context is not None
         else SessionContext(

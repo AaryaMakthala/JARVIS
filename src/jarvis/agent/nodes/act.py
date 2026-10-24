@@ -43,9 +43,11 @@ from typing import Any
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.util import (
     active_scope_cid,
+    browse_grant_check,
     plan_hash_for,
     policy_context_for,
     resolve_step_target,
+    specialist_active,
     truncate,
 )
 from jarvis.agent.precheck import step_precheck_error
@@ -179,6 +181,7 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         scope_registry=ctx.scope_registry,
         task_id=task_id,
         plan_hash_v=plan_hash_v,
+        browse_grants=ctx.browse_grants,
     )
     if resolved.refused:
         return _refuse(
@@ -194,7 +197,26 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             state, step.id, "blocked by policy", f"Refused: blocked by policy ({step.tool})."
         )
 
-    if decision.needs_confirm and decision.action_hash not in (state.get("approved_hashes") or []):
+    # Phase 4: a task-scoped browsing grant may pre-approve this exact step.
+    # The coverage rules are re-run independently here, against the freshly
+    # re-observed target (`resolve_step_target` above) - a changed or risky
+    # element fails closed and the step keeps its normal confirmation path.
+    grant_id = ""
+    if decision.needs_confirm and specialist_active(state):
+        grant, _host, _reason = browse_grant_check(
+            state, ctx, step=step, decision=decision, resolved=resolved
+        )
+        if grant is not None:
+            grant_id = grant.grant_id
+            decision = decision.model_copy(
+                update={"reasons": [*decision.reasons, f"browse grant {grant_id}"]}
+            )
+
+    if (
+        decision.needs_confirm
+        and not grant_id
+        and decision.action_hash not in (state.get("approved_hashes") or [])
+    ):
         return _refuse(
             state,
             step.id,
@@ -304,7 +326,12 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     # before dispatch, after every pre-dispatch check has passed.  The
     # reservation is atomic (shared per-task counter) and is never refunded.
     if spec.budget_cost > 0 and not ctx.dry_run:
-        budget = ctx.scope_registry.reserve(task_id, cost=int(spec.budget_cost))
+        # A granted skip charges the browsing registry, not the scope registry;
+        # every other step keeps the unchanged task-scope reservation.
+        if grant_id:
+            budget = ctx.browse_grants.charge(task_id)
+        else:
+            budget = ctx.scope_registry.reserve(task_id, cost=int(spec.budget_cost))
         if not budget.ok:
             return _refuse(
                 state,
@@ -340,7 +367,15 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         # invalidation, or TTL. Keep SessionContext API working.
         try:
             from jarvis.agent import referents
-            from jarvis.agent.referents import REFERENT_STORE, PageRef, ResultSetRef, ResultItem, FileRef, ActionRef, origin_from_url
+            from jarvis.agent.referents import (
+                REFERENT_STORE,
+                ActionRef,
+                FileRef,
+                PageRef,
+                ResultItem,
+                ResultSetRef,
+                origin_from_url,
+            )
 
             cid = str(state.get("conversation_id") or "local")
             tool_name = str(getattr(step, "tool", "") or "")

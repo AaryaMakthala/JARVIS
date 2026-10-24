@@ -43,6 +43,7 @@ from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.util import (
     StepTarget,
     active_scope_cid,
+    browse_grant_check,
     plan_hash_for,
     policy_context_for,
     record_specialist_note,
@@ -57,6 +58,7 @@ from jarvis.agent.precheck import (
 from jarvis.agent.schemas import ConfirmationRequest
 from jarvis.agent.state import Decision
 from jarvis.policy import rules, tiers
+from jarvis.policy.browse_grant import BROWSE_TOOLS, BrowseGrantError
 from jarvis.policy.paths import ContentHashError, content_hash
 from jarvis.policy.refusal import refusal_text as refusal_sentence
 from jarvis.policy.scope import ScopeError
@@ -117,6 +119,7 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         scope_registry=ctx.scope_registry,
         task_id=str(state.get("task_id") or ""),
         plan_hash_v=plan_hash_v,
+        browse_grants=ctx.browse_grants,
     )
     if resolved.refused:
         return _resolution_refusal(state, step, resolved.reason)
@@ -136,6 +139,11 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     if not decision.needs_confirm:
         return {"decisions": decisions}
+
+    # Phase 4: a specialist browser task may hold a task-scoped browsing grant.
+    grant_update = _browse_grant_gate(state, ctx, step, resolved, decision, decisions, plan_hash_v)
+    if grant_update is not None:
+        return grant_update
 
     already_approved = [str(h) for h in (state.get("approved_hashes") or [])]
 
@@ -228,6 +236,89 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         resolved.target,
         _active_scope_cid(ctx, state),
     )
+
+
+# ── Phase 4: task-scoped browsing grant ──────────────────────────────────
+
+
+def _browse_grant_gate(
+    state: dict[str, Any],
+    ctx: AppContext,
+    step: Any,
+    resolved: Any,
+    decision: Decision,
+    decisions: dict[str, Any],
+    plan_hash_v: str,
+) -> dict[str, Any] | None:
+    """Cover a Tier 1 browser step with the task's browsing grant, or ask once.
+
+    Returns ``None`` when the grant feature does not apply (flag off, not a
+    specialist task, non-browser tool, or a grant exists but does not cover this
+    step) so the ordinary confirmation path runs unchanged.  When no grant
+    exists yet, the user is asked exactly once - "Allow JARVIS to browse <host>
+    for this task?" - and an approval issues the grant.  No grant is issued on a
+    refusal or a timeout, and the task halts exactly as before.
+    """
+    registry = getattr(ctx, "browse_grants", None)
+    if registry is None or not getattr(registry, "enabled", False):
+        return None
+    if not specialist_active(state):
+        return None
+    if str(getattr(step, "tool", "") or "") not in BROWSE_TOOLS:
+        return None
+    grant, host, _reason = browse_grant_check(
+        state, ctx, step=step, decision=decision, resolved=resolved
+    )
+    if grant is not None:
+        covered = decision.model_copy(
+            update={"reasons": [*decision.reasons, f"browse grant {grant.grant_id}"]}
+        )
+        # act still requires the transient target binding the gate issues; a
+        # browsing grant is not a ScopeGrant, so its scope id is empty.
+        _record_binding_for(ctx, state, step, decision, getattr(resolved, "target", None), "")
+        logger.info("browse grant %s covers step %s", grant.grant_id, step.id)
+        return {"decisions": {**decisions, step.id: covered}}
+    if not host:
+        return None  # not even one host to ask about; ordinary confirmation
+    if registry.active_for_task(str(state.get("task_id") or "")) is not None:
+        return None  # a grant exists but does not cover this step
+
+    answer = interrupt(_browse_payload(step, host, decision, plan_hash_v))
+    if not _answer_matches(answer, plan_hash_v):
+        if isinstance(answer, dict) and answer.get("timed_out") is True:
+            return {
+                "decisions": decisions,
+                "halted_reason": "Confirmation timed out. I did not perform the action.",
+            }
+        return {"decisions": decisions, "halted_reason": refusal_sentence(answer)}
+    try:
+        grant = registry.issue(
+            str(state.get("task_id") or ""),
+            host=host,
+            max_actions=int(ctx.settings.browser.task_grant_max_actions),
+            ttl_s=float(ctx.settings.browser.task_grant_ttl_s),
+        )
+    except BrowseGrantError:
+        logger.warning("browse grant not issued for task %s", state.get("task_id"))
+        return {
+            "decisions": decisions,
+            "halted_reason": "Refused: the approved browsing scope could not be issued.",
+        }
+    covered = decision.model_copy(
+        update={"reasons": [*decision.reasons, f"browse grant {grant.grant_id}"]}
+    )
+    _record_binding_for(ctx, state, step, decision, getattr(resolved, "target", None), "")
+    return {"decisions": {**decisions, step.id: covered}}
+
+
+def _browse_payload(
+    step: Any, host: str, decision: Decision, plan_hash_v: str
+) -> dict[str, Any]:
+    """The single task-scope confirmation payload for a browsing grant."""
+    payload = _scope_payload(step, host, decision, plan_hash_v)
+    payload["browse_grant"] = True
+    payload["summary"] = f"Allow JARVIS to browse {host} for this task?"
+    return payload
 
 
 # ── specialist loop: recoverable refusals ────────────────────────────────
@@ -608,6 +699,7 @@ def _record_batch_bindings(
             scope_registry=ctx.scope_registry,
             task_id=task_id,
             plan_hash_v=plan_hash_v,
+            browse_grants=ctx.browse_grants,
         )
         if resolved.refused or resolved.target is None:
             continue

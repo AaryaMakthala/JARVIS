@@ -293,3 +293,27 @@ WhatsApp: send a message to mom saying running late (T032) - make_send_whatsapp_
   code (SiteDirectory: defaults + config), in BOTH policy_gate and act. Unknown site = not covered.
   The tool itself is not changed.
 - Wiring into policy_gate / act / daemon _end_task_runtime is in progress.
+
+## Phase 4 results (complete)
+
+- Task-scoped browsing grant in `src/jarvis/policy/browse_grant.py`, fully separate from ScopeRegistry
+  (no plan hash, own 30-action / 600 s caps). Engine, tiers and ScopeRegistry untouched.
+- policy_gate: a specialist Tier 1 browser step with no grant raises one prompt
+  "Allow JARVIS to browse <host> for this task?"; approval issues the grant and covers that step.
+  Later steps run coverage(); covered steps skip the interrupt and carry the grant id in the
+  Decision reasons. "no"/timeout issues no grant and halts as before. Batch approval never mixes
+  covered and normal steps (the covered path returns before the batch machinery).
+- act: re-runs coverage() against the freshly re-observed target, charges the BROWSE registry (not
+  scope_registry.reserve), keeps the tier unchanged, and records the target binding the gate issued.
+- `browser_search`: the model supplies only the site name; the host is resolved in code via the
+  SiteDirectory in BOTH gate and act. Unknown site = not covered.
+- daemon `_end_task_runtime` revokes the browsing grant with the scope grant and bindings.
+- Tests: tests/unit/test_browse_grant.py (15) and tests/unit/test_browse_grant_wiring.py (7) pass;
+  tests/unit/test_invariants.py passes (37).
+- Commits: 0f78c4e (module + rules), f369f2f (wiring), 99c2fe4 (target binding + wiring tests),
+  a70b622 (pre-wiring note).
+- Known limits: browser_press_key Enter is never covered in the wired path (the previous step's
+  role is not retained in specialist_history, so the rule fails closed; the pure rule supports it);
+  payment/purchase controls are Tier 3-blocked rather than re-confirmed; browser_search coverage
+  needs a known site.
+- NEXT STEP: "Phase 5 design spec (compose, persona, guarded final click)".

@@ -1708,11 +1708,17 @@ class DaemonServer:
             return
         registry = getattr(ctx, "scope_registry", None)
         bindings = getattr(ctx, "target_bindings", None)
+        browse_grants = getattr(ctx, "browse_grants", None)
         if registry is not None:
             try:
                 registry.revoke(task_id)
             except Exception:
                 logger.debug("scope cleanup for %s failed", task_id, exc_info=True)
+        if browse_grants is not None:
+            try:
+                browse_grants.revoke(task_id)
+            except Exception:
+                logger.debug("browse grant cleanup for %s failed", task_id, exc_info=True)
         if bindings is not None:
             try:
                 bindings.clear_task(task_id)

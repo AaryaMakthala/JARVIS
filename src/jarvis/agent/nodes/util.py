@@ -9,9 +9,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from jarvis.agent.state import StepResult
+from jarvis.browser.sites import sites_from_settings
 from jarvis.config import Settings
 from jarvis.platform_guard import is_windows
 from jarvis.policy import rules
+from jarvis.policy.browse_grant import BROWSE_TOOLS, coverage
 from jarvis.policy.scope import ScopeRegistry
 from jarvis.policy.targets import ResolvedTarget
 from jarvis.tools.base import resolve_target
@@ -89,6 +91,7 @@ def resolve_step_target(
     scope_registry: ScopeRegistry | None,
     task_id: str,
     plan_hash_v: str,
+    browse_grants: Any | None = None,
 ) -> StepTarget:
     """Resolve and contextualise the current step's interaction target.
 
@@ -125,7 +128,7 @@ def resolve_step_target(
         return StepTarget(context=dataclasses.replace(pctx, target=target), target=target)
 
     host = _host_of(target.origin)
-    allowed = _effective_allowed(settings, scope_registry, task_id, plan_hash_v)
+    allowed = _effective_allowed(settings, scope_registry, task_id, plan_hash_v, browse_grants)
     augmented = dataclasses.replace(
         pctx,
         origin=target.origin,
@@ -134,6 +137,64 @@ def resolve_step_target(
         target=target,
     )
     return StepTarget(context=augmented, target=target, host=host)
+
+
+def browse_step_host(step: Any, settings: Settings) -> str:
+    """Host a ``browser_search`` step will search, resolved in code.
+
+    The model supplies only the site name, so the host is looked up in the
+    SiteDirectory (defaults + config).  An unknown site returns ``""``, which
+    fails closed (never covered by a grant).
+    """
+    if str(getattr(step, "tool", "") or "") != "browser_search":
+        return ""
+    args = getattr(step, "args", None)
+    if not isinstance(args, dict):
+        return ""
+    try:
+        site = sites_from_settings(settings).resolve(str(args.get("site") or ""))
+    except Exception:  # noqa: BLE001 - a lookup failure fails closed
+        return ""
+    return site.host if site is not None else ""
+
+
+def browse_grant_check(
+    state: dict[str, Any], ctx: Any, *, step: Any, decision: Any, resolved: Any
+) -> tuple[Any | None, str, str]:
+    """``(grant, host, reason)`` when ``coverage`` covers this exact step.
+
+    Shared by the policy gate and act so both run the identical pure rules
+    (act re-observes the target first, so a changed element is refused).  The
+    grant is returned only on success; any doubt yields ``None``.
+    """
+    registry = getattr(ctx, "browse_grants", None)
+    if registry is None or not getattr(registry, "enabled", False):
+        return None, "", "disabled"
+    tool = str(getattr(step, "tool", "") or "")
+    if tool not in BROWSE_TOOLS:
+        return None, "", "tool_not_allowed"
+    task_id = str(state.get("task_id") or "")
+    grant = registry.active_for_task(task_id)
+    host = str(getattr(resolved, "host", "") or "") or browse_step_host(step, ctx.settings)
+    target = getattr(resolved, "target", None)
+    history = list(state.get("specialist_history") or [])
+    previous_tool = str(history[-1].get("tool") or "") if history else ""
+    ok, reason = coverage(
+        grant,
+        task_id=task_id,
+        tool=tool,
+        tier=int(getattr(decision, "tier", 0)),
+        host=host,
+        label=str(getattr(target, "name", "") or "") if target is not None else "",
+        role=str(getattr(target, "role", "") or "") if target is not None else "",
+        is_password=bool(getattr(target, "is_password", False)) if target is not None else False,
+        actions_used=registry.consumed(task_id),
+        needs_unlock=bool(getattr(decision, "needs_unlock", False)),
+        needs_typed_confirmation=bool(getattr(decision, "needs_typed_confirmation", False)),
+        previous_tool=previous_tool,
+        previous_role="",
+    )
+    return (grant if ok else None), host, reason
 
 
 def specialist_active(state: dict[str, Any]) -> bool:
@@ -202,6 +263,7 @@ def _effective_allowed(
     scope_registry: ScopeRegistry | None,
     task_id: str,
     plan_hash_v: str,
+    browse_grants: Any | None = None,
 ) -> list[str]:
     """Static ``[browser] allowed_domains`` plus valid live-grant domains.
 
@@ -210,6 +272,16 @@ def _effective_allowed(
     are excluded — fail closed), so an old approval can never widen the scope.
     """
     domains = [str(d) for d in (settings.browser.allowed_domains or [])]
+    # A valid task-scoped browsing grant contributes exactly its one host, so the
+    # engine's target checks pass for steps the user approved for this task.
+    if browse_grants is not None:
+        grant = browse_grants.active_for_task(task_id)
+        if (
+            grant is not None
+            and browse_grants.validate(task_id).ok
+            and grant.host not in domains
+        ):
+            domains.append(grant.host)
     for domain in _valid_grant_domains(scope_registry, task_id, plan_hash_v):
         if domain not in domains:
             domains.append(domain)
