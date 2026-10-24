@@ -462,10 +462,11 @@ def _run_browser_goto(args: BrowserGotoArgs, ctx: ToolContext) -> ToolResult:
     session = _require_session(ctx)
     if session is None:
         return ToolResult(ok=False, error="the managed browser is not available in this context")
+    url = args.url
     try:
         data = session.goto(url)
     except BrowserError as exc:
-        return ToolResult(ok=False, error=f"browser_open_site failed: {exc}")
+        return ToolResult(ok=False, error=f"browser_goto failed: {exc}")
     _invalidate_results(ctx, session)  # every position from the old page is stale
     try:
         _note_navigation(ctx, session, str(data.get("url", url)))

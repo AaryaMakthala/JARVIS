@@ -156,7 +156,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         model.request_type,
         len(model.actions),
     )
-    return _project(model, state, usage)
+    return _project(model, state, usage, ctx)
 
 
 def _session_reference_block(state: dict[str, Any], ctx: AppContext) -> str | None:
@@ -175,7 +175,7 @@ def _session_reference_block(state: dict[str, Any], ctx: AppContext) -> str | No
     return render_resolution(ctx.session_context.reference_resolution(SESSION_THREAD, text))
 
 
-def _project(decision: BrainDecision, state: dict[str, Any], usage: Any) -> dict[str, Any]:
+def _project(decision: BrainDecision, state: dict[str, Any], usage: Any, ctx: AppContext | None = None) -> dict[str, Any]:
     """Map the transient BrainDecision onto checkpointable state updates."""
     update: dict[str, Any] = {
         "api_calls": int(state.get("api_calls") or 0) + usage.calls,
@@ -241,20 +241,23 @@ def _project(decision: BrainDecision, state: dict[str, Any], usage: Any) -> dict
 
     if decision.request_type == "browse":
         try:
-            if getattr(getattr(ctx, "settings", None).agent, "use_specialists", False):
+            c = ctx
+            if c is None:
+                # try to get from closure not possible; fall back
+                raise Exception()
+            if getattr(getattr(c, "settings", None).agent, "use_specialists", False):
                 return {
                     **update,
                     "plan": None,
-                "request_kind": RequestKind.BROWSE.value if hasattr(RequestKind, "BROWSE") else "browse",
-                "specialist_goal": decision.goal or "",
-                "specialist_phase": "decide",
-                "specialist_calls": 0,
-                "specialist_history": [],
-                "error": None,
+                    "request_kind": RequestKind.BROWSE.value if hasattr(RequestKind, "BROWSE") else "browse",
+                    "specialist_goal": decision.goal or decision.response_text or state.get("user_input") or "",
+                    "specialist_phase": "decide",
+                    "specialist_calls": 0,
+                    "specialist_history": [],
+                    "error": None,
                 }
         except Exception:
             pass
-        # if flag off, fall through to normal handling? but browse has no actions; better treat as clarify/unsupported
         return {
             **update,
             "plan": None,
