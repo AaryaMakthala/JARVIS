@@ -2316,6 +2316,64 @@ def voice_doctor(
         raise typer.Exit(code=1)
 
 
+# ── tasks (telemetry) ────────────────────────────────────────────────────
+
+
+@app.command()
+def tasks(
+    n: Annotated[int, typer.Option("--n", help="Number of recent tasks to show.")] = 20,
+) -> None:
+    """Show recent tasks from the task log (with failure telemetry)."""
+    from jarvis import config
+    from jarvis.memory import store as memory_store
+
+    settings = config.load_settings()
+    memory = memory_store.open_memory(settings)
+    try:
+        rows = memory.task_log.recent(limit=int(n))
+    except Exception as exc:
+        console.print(f"[red]could not read task log: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    if not rows:
+        console.print("[dim]no tasks[/dim]")
+        return
+    table = Table(show_header=True, box=None)
+    table.add_column("task_id", style="dim")
+    table.add_column("status")
+    table.add_column("source")
+    table.add_column("api_calls")
+    table.add_column("tokens")
+    table.add_column("steps")
+    table.add_column("halt_reason")
+    table.add_column("failure_code")
+    table.add_column("first_failing_step")
+    table.add_column("tools_used")
+    table.add_column("error_text")
+    table.add_column("llm_ms")
+    table.add_column("llm_calls")
+    table.add_column("provider_chain")
+    table.add_column("tool_ms")
+    for r in rows:
+        table.add_row(
+            r.task_id[:12],
+            r.status,
+            r.source or "",
+            str(r.api_calls),
+            str(r.tokens),
+            str(r.steps),
+            r.halt_reason or "",
+            r.failure_code or "",
+            r.first_failing_step or "",
+            r.tools_used or "",
+            (r.error_text or "")[:60],
+            str(r.llm_ms) if r.llm_ms is not None else "",
+            str(r.llm_calls) if r.llm_calls is not None else "",
+            r.provider_chain or "",
+            str(r.tool_ms) if r.tool_ms is not None else "",
+        )
+    console.print(table)
+
+
 # ── benchmark (Phase 9) ───────────────────────────────────────────────────
 
 benchmark_app = typer.Typer(

@@ -98,7 +98,16 @@ CREATE TABLE IF NOT EXISTS task_log (
   started_at TEXT,
   finished_at TEXT,
   duration_ms INTEGER,
-  peak_rss_mb REAL
+  peak_rss_mb REAL,
+  halt_reason TEXT,
+  failure_code TEXT,
+  tools_used TEXT,
+  first_failing_step TEXT,
+  error_text TEXT,
+  llm_ms INTEGER,
+  llm_calls INTEGER,
+  provider_chain TEXT,
+  tool_ms INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_skills_last_used ON skills (last_used_at DESC);
@@ -268,6 +277,28 @@ def connect(path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_task_log_v3(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("PRAGMA table_info(task_log)")
+    cols = {row[1] for row in cur.fetchall()}
+    additions = [
+        ("halt_reason", "TEXT"),
+        ("failure_code", "TEXT"),
+        ("tools_used", "TEXT"),
+        ("first_failing_step", "TEXT"),
+        ("error_text", "TEXT"),
+        ("llm_ms", "INTEGER"),
+        ("llm_calls", "INTEGER"),
+        ("provider_chain", "TEXT"),
+        ("tool_ms", "INTEGER"),
+    ]
+    for name, typ in additions:
+        if name not in cols:
+            try:
+                conn.execute(f"ALTER TABLE task_log ADD COLUMN {name} {typ}")
+            except sqlite3.OperationalError:
+                pass
+
+
 def init_schema(conn: sqlite3.Connection) -> sqlite3.Connection:
     """Create every table/index if missing and bring the DB to the current schema.
 
@@ -277,6 +308,7 @@ def init_schema(conn: sqlite3.Connection) -> sqlite3.Connection:
     """
     conn.executescript(SCHEMA)
     migrate_failures(conn)
+    _migrate_task_log_v3(conn)
     if user_version(conn) < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     return conn
@@ -479,6 +511,15 @@ def insert_task_log(conn: sqlite3.Connection, row: dict) -> None:
         "finished_at",
         "duration_ms",
         "peak_rss_mb",
+        "halt_reason",
+        "failure_code",
+        "tools_used",
+        "first_failing_step",
+        "error_text",
+        "llm_ms",
+        "llm_calls",
+        "provider_chain",
+        "tool_ms",
     )
     values = [row.get(name) for name in columns]
     placeholders = ", ".join("?" for _ in columns)

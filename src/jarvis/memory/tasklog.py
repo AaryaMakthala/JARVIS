@@ -95,6 +95,15 @@ class TaskRecord:
     finished_at: str = ""
     duration_ms: int | None = None
     peak_rss_mb: float | None = None
+    halt_reason: str | None = None
+    failure_code: str | None = None
+    tools_used: str | None = None
+    first_failing_step: str | None = None
+    error_text: str | None = None
+    llm_ms: int | None = None
+    llm_calls: int | None = None
+    provider_chain: str | None = None
+    tool_ms: int | None = None
 
     @property
     def finished(self) -> bool:
@@ -158,6 +167,15 @@ class TaskLogStore:
         replans: int = 0,
         source: str = "",
         user_input: str = "",
+        halt_reason: str | None = None,
+        failure_code: str | None = None,
+        tools_used: str | None = None,
+        first_failing_step: str | None = None,
+        error_text: str | None = None,
+        llm_ms: int | None = None,
+        llm_calls: int | None = None,
+        provider_chain: str | None = None,
+        tool_ms: int | None = None,
     ) -> None:
         """Upsert the terminal row, keeping the ``started_at`` already stored.
 
@@ -180,6 +198,15 @@ class TaskLogStore:
             replans=replans,
             started_at=None,  # keep whatever intake recorded
             finished_at=finished_at,
+            halt_reason=halt_reason,
+            failure_code=failure_code,
+            tools_used=tools_used,
+            first_failing_step=first_failing_step,
+            error_text=error_text,
+            llm_ms=llm_ms,
+            llm_calls=llm_calls,
+            provider_chain=provider_chain,
+            tool_ms=tool_ms,
         )
 
     # ------------------------------------------------------------- reading
@@ -292,6 +319,15 @@ class TaskLogStore:
         replans: int = 0,
         started_at: str | None = None,
         finished_at: str | None = None,
+        halt_reason: str | None = None,
+        failure_code: str | None = None,
+        tools_used: str | None = None,
+        first_failing_step: str | None = None,
+        error_text: str | None = None,
+        llm_ms: int | None = None,
+        llm_calls: int | None = None,
+        provider_chain: str | None = None,
+        tool_ms: int | None = None,
     ) -> None:
         """Merge one write into the existing row for ``task_id``.
 
@@ -302,30 +338,53 @@ class TaskLogStore:
         if not task_id:
             return
         previous = self.get(task_id)
-        insert_task_log(
-            self._conn,
-            {
-                "task_id": task_id,
-                "source": source or (previous.source if previous else ""),
-                "user_input": safe_input(user_input) or (previous.user_input if previous else ""),
-                "status": status,
-                "api_calls": api_calls,
-                "tokens": tokens,
-                "steps": steps,
-                "replans": replans,
-                "started_at": started_at or (previous.started_at if previous else "") or now_iso(),
-                "finished_at": finished_at or (previous.finished_at if previous else ""),
-                "duration_ms": _duration_ms(
-                    started_at or (previous.started_at if previous else ""),
-                    finished_at or (previous.finished_at if previous else ""),
-                ),
-                "peak_rss_mb": _current_rss_mb(),
-            },
-        )
+
+        def _safe_extra(v: str | None, is_error: bool = False) -> str | None:
+            if v is None:
+                return None
+            s = redact_secrets(str(v))
+            if looks_secret(s):
+                return _REDACTED_INPUT
+            if is_error or len(s) > 300:
+                s = s[:300]
+            return s
+
+        row = {
+            "task_id": task_id,
+            "source": source or (previous.source if previous else ""),
+            "user_input": safe_input(user_input) or (previous.user_input if previous else ""),
+            "status": status,
+            "api_calls": api_calls,
+            "tokens": tokens,
+            "steps": steps,
+            "replans": replans,
+            "started_at": started_at or (previous.started_at if previous else "") or now_iso(),
+            "finished_at": finished_at or (previous.finished_at if previous else ""),
+            "duration_ms": _duration_ms(
+                started_at or (previous.started_at if previous else ""),
+                finished_at or (previous.finished_at if previous else ""),
+            ),
+            "peak_rss_mb": _current_rss_mb(),
+            "halt_reason": _safe_extra(halt_reason) if halt_reason is not None else (getattr(previous, "halt_reason", None)),
+            "failure_code": _safe_extra(failure_code) if failure_code is not None else (getattr(previous, "failure_code", None)),
+            "tools_used": _safe_extra(tools_used) if tools_used is not None else (getattr(previous, "tools_used", None)),
+            "first_failing_step": _safe_extra(first_failing_step) if first_failing_step is not None else (getattr(previous, "first_failing_step", None)),
+            "error_text": _safe_extra(error_text, is_error=True) if error_text is not None else (getattr(previous, "error_text", None)),
+            "llm_ms": llm_ms if llm_ms is not None else (getattr(previous, "llm_ms", None)),
+            "llm_calls": llm_calls if llm_calls is not None else (getattr(previous, "llm_calls", None)),
+            "provider_chain": _safe_extra(provider_chain) if provider_chain is not None else (getattr(previous, "provider_chain", None)),
+            "tool_ms": tool_ms if tool_ms is not None else (getattr(previous, "tool_ms", None)),
+        }
+        insert_task_log(self._conn, row)
         prune_task_log(self._conn, self._max_rows)
 
     @staticmethod
     def _to_record(row: Any) -> TaskRecord:
+        def _get(name: str):
+            try:
+                return row[name]
+            except (KeyError, TypeError):
+                return None
         return TaskRecord(
             task_id=str(row["task_id"]),
             source=str(row["source"] or ""),
@@ -339,6 +398,15 @@ class TaskLogStore:
             finished_at=str(row["finished_at"] or ""),
             duration_ms=None if row["duration_ms"] is None else int(row["duration_ms"]),
             peak_rss_mb=None if row["peak_rss_mb"] is None else float(row["peak_rss_mb"]),
+            halt_reason=str(_get("halt_reason") or "") or None,
+            failure_code=str(_get("failure_code") or "") or None,
+            tools_used=str(_get("tools_used") or "") or None,
+            first_failing_step=str(_get("first_failing_step") or "") or None,
+            error_text=str(_get("error_text") or "") or None,
+            llm_ms=None if _get("llm_ms") is None else int(_get("llm_ms")),
+            llm_calls=None if _get("llm_calls") is None else int(_get("llm_calls")),
+            provider_chain=str(_get("provider_chain") or "") or None,
+            tool_ms=None if _get("tool_ms") is None else int(_get("tool_ms")),
         )
 
 

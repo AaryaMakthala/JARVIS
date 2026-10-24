@@ -68,6 +68,88 @@ def _sandbox_default_protected_sources(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(paths, "_wildcard_patterns", _patterns)
 
 
+@pytest.fixture(autouse=True)
+def _block_dangerous_calls_in_tests(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """Block subprocess/os/webbrowser/pyautogui/pywinauto/cv2/sounddevice calls during tests."""
+    markers = {m.name for m in request.node.iter_markers()}
+    if "live" in markers or "windows_only" in markers:
+        return
+
+    import subprocess as _subprocess
+    import os as _os
+    import webbrowser as _webbrowser
+
+    def _blocked(*args, **kwargs):
+        raise RuntimeError("blocked in tests")
+
+    # Allow existing tests that intentionally use subprocess.run/call in controlled ways
+    # by not blocking if test module is in allowlist? Keep strict but some tests need to run in same process
+    test_file = str(request.node.fspath)
+    allow_subprocess = (
+        "test_daemon_single_instance" in test_file
+        or "test_tools_dictation" in test_file
+        or "test_tools_open_in_app" in test_file
+        or "test_tools_apps" in test_file
+        or "test_memory.py" in test_file and "embed_is_process_stable" in request.node.name
+    )
+    if not allow_subprocess:
+        monkeypatch.setattr(_subprocess, "Popen", _blocked)
+        monkeypatch.setattr(_subprocess, "run", _blocked)
+        monkeypatch.setattr(_subprocess, "call", _blocked)
+        monkeypatch.setattr(_subprocess, "check_call", _blocked)
+        monkeypatch.setattr(_subprocess, "check_output", _blocked)
+    else:
+        pass
+
+    try:
+        monkeypatch.setattr(_os, "startfile", _blocked)
+    except Exception:
+        pass
+
+    try:
+        monkeypatch.setattr(_webbrowser, "open", _blocked)
+        monkeypatch.setattr(_webbrowser, "open_new", _blocked)
+        monkeypatch.setattr(_webbrowser, "open_new_tab", _blocked)
+    except Exception:
+        pass
+
+    try:
+        import pyautogui as _pyautogui
+
+        monkeypatch.setattr(_pyautogui, "hotkey", _blocked)
+        monkeypatch.setattr(_pyautogui, "press", _blocked)
+        monkeypatch.setattr(_pyautogui, "typewrite", _blocked)
+        monkeypatch.setattr(_pyautogui, "click", _blocked)
+        monkeypatch.setattr(_pyautogui, "moveTo", _blocked)
+    except Exception:
+        pass
+
+    try:
+        import pywinauto as _pywinauto
+
+        monkeypatch.setattr(_pywinauto, "Desktop", _blocked)
+    except Exception:
+        pass
+
+    try:
+        import cv2 as _cv2
+
+        monkeypatch.setattr(_cv2, "VideoCapture", _blocked)
+    except Exception:
+        pass
+
+    try:
+        import sounddevice as _sd
+
+        monkeypatch.setattr(_sd, "play", _blocked)
+        monkeypatch.setattr(_sd, "rec", _blocked)
+        monkeypatch.setattr(_sd, "record", _blocked)
+        monkeypatch.setattr(_sd, "InputStream", _blocked)
+        monkeypatch.setattr(_sd, "OutputStream", _blocked)
+    except Exception:
+        pass
+
+
 @pytest.fixture
 def _fast_logging() -> None:
     """Stub: keeps phase-1 tests that import logging trivially importable."""
