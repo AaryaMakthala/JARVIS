@@ -511,3 +511,60 @@
   auto_confirm: false
   repeats: 3
   notes: "A pronoun with no antecedent: must ask."
+
+
+# ── Scenario tasks (real tools, fixture-based) ─────────────────────────────
+
+- id: S001
+  category: scenario
+  command: "search on the fixture search page then open first result"
+  expected: {type: url_opened, value: "result1"}
+  tier_expected: 1
+  auto_confirm: true
+  repeats: 1
+  notes: "Uses browser_find/browser_open_result against fixture."
+
+- id: S002
+  category: scenario
+  command: "open the first link as a new message"
+  expected: {type: text_contains, value: "message"}
+  tier_expected: 0
+  auto_confirm: false
+  repeats: 1
+  notes: "Uses browser primitives where available."
+
+- id: S003
+  category: scenario
+  command: "play a specific video on the fixture video site"
+  expected: {type: text_contains, value: "Funny Cat"}
+  tier_expected: 1
+  auto_confirm: true
+  repeats: 1
+  notes: "Uses browser_find/open_result/click."
+
+- id: S004
+  category: scenario
+  command: "take a screenshot"
+  expected: {type: file_exists}
+  tier_expected: 1
+  auto_confirm: true
+  repeats: 1
+  notes: "Uses take_screenshot tool (to be added) or screen capture; baseline may fail."
+
+- id: S005
+  category: scenario
+  command: "send a WhatsApp message to a contact with emoji (mock)"
+  expected: {type: refused}
+  tier_expected: 1
+  auto_confirm: true
+  repeats: 1
+  notes: "Uses whatsapp_send with mock adapter; baseline may fail."
+
+- id: S006
+  category: scenario
+  command: "open the picture just taken"
+  expected: {type: file_exists}
+  tier_expected: 0
+  auto_confirm: false
+  repeats: 1
+  notes: "Uses open_path/referent resolution; baseline may fail."

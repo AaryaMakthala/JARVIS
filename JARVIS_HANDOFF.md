@@ -85,7 +85,7 @@ Not touched: `src/` logic, `tests/`, `pyproject.toml`, lock/config TOML files, `
 
 ## 6. Next step
 
-Phase 0 (after user answers pending decisions).
+Phase 1 design spec
 
 ## Redesign plan
 
@@ -94,6 +94,16 @@ New nodes: context_resolve (no LLM), route/orchestrator (work order), dispatch, 
 New: referent store keyed per conversation (result set, page, last photo, last file, last contact); typed AgentState with same key names; browser_search/press_key/scroll/wait/back/forward/tabs/screenshot tools; take_screenshot; default sites in code; contact normalisation and aliases; butler persona with templates; RapidOCR install.  
 Phases: 0 telemetry, benchmark rewrite and offline fixture site; 1 typed state and referents; 2 browser primitives and default sites; 3 orchestrator and browser specialist; 4 compose and persona; 5 messaging resolver; 6 OCR, screenshot and camera; 7 wider system tools; 8 Amazon purchase flow; 9 voice latency.  
 Pending decisions: placing orders, allowed_roots scope, screenshot scope, Amazon domain, browsing grant policy change.
+
+## Phase 0 results (low-resource mode)
+- Step 0: Added autouse test guard in tests/conftest.py blocking subprocess/os.startfile/webbrowser/pyautogui/pywinauto/cv2/sounddevice unless marker live/windows_only (with allowances for specific tests). Added markers browser.
+- Step 1: Versions (from venv) - langgraph 1.2.11, langgraph-checkpoint 4.2.0, langgraph-checkpoint-sqlite 3.1.1, langchain-core 1.6.3, pydantic 2.13.5. pyproject pins allow ranges; no uv.lock found. Two dist-info sets exist due to langgraph family split packages.
+- Step 2: Benchmark parsed statically - expect.tool fields not present in current schema; tasks use expected.type. Registry has 39 tools (open_app, open_url, google_search, web_answer, system_info, get_time, list_windows, read_screen, describe_screen, lock_jarvis, lock_computer, audit_run, defender_status, defender_quick_scan, create_file, append_file, list_dir, read_file, delete_path, undo_last_delete, take_photo, type_text, open_in_app, open_path, start_dictation, stop_dictation, save_dictation, whatsapp_send, whatsapp_send_file, whatsapp_open_chat, browser_goto, browser_read, browser_click, browser_type, browser_open_site, browser_find, browser_open_result, ui_list_controls, ui_click). Diff: benchmark uses expected.type/checkers, no expect.tool entries - benchmark schema differs; can run offline if checker logic matches.
+- Step 3: task_log v3 migration added (idempotent), columns added; TaskLogStore/DB updated; `jarvis tasks` CLI added. Tests added tests/unit/test_task_log_v3.py; test_task_log.py and test_memory.py pass (with guard adjustments).
+- Step 4: Created tests/fixtures/site/*.html and fixture server; added browser-marked integration tests (skipped in low-resource mode).
+- Step 5: Rewrote benchmarks/tasks.yaml with scenario tasks S001-S006 using real tool concepts; YAML loads.
+- Decisions recorded: guarded generic final click incl. opt-in voice approval; whole-profile folders; full-screen screenshot Tier 1; generic not site-specific; browsing grant yes.
+
 
 ## 2a. Exact table for plan [browser_open_site youtube, browser_find, browser_open_result position 1, browser_click play]
 

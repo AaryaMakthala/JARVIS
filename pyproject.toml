@@ -54,7 +54,7 @@ jarvis = "jarvis.cli:main"
 where = ["src"]
 
 [tool.pytest.ini_options]
-markers = ["windows_only", "voice", "slow", "live"]
+markers = ["windows_only", "voice", "slow", "live", "browser"]
 addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["tests"]
