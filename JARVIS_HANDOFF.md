@@ -216,3 +216,28 @@ WhatsApp: send a message to mom saying running late (T032) - make_send_whatsapp_
 4. Policy gate halt - no plan/clarification needed/no step/precheck refusal/Tier 2 needs unlock issues/batch timeout/hash mismatch/scope grant failure (policy_gate.py various)
 5. Tier 1 confirmation required but cannot be obtained/times out (especially in voice/daemon contexts) → batch timeout or confirmation flow halts (policy_gate.py ~660-679)
 6. Tool execution failure after step reaches act - but that would produce a step result, not 0 steps; 0 steps means halted before acting
+
+
+## Phase 2 results
+
+- Step 0: Verified (all passed) - see earlier summary.
+- Step A: Removed scratch files (.tmp_pytest.bat, .tmp_run.bat, fix.py, checkbench*.py, checkwrap.py, testimp.py). None committed.
+- Step B: Added DEFAULT_SITES in browser/sites.py (Google, YouTube, Amazon amazon.com, Gmail, Google Maps, Wikipedia, GitHub, Reddit, Stack Overflow, LinkedIn, Spotify web, Netflix, X, Flipkart) with aliases and search_url_template where applicable. Config sites override defaults by name. SiteDirectory API/MAX_SITES preserved. render_site_catalogue < 1500 chars. New test tests/unit/test_default_sites.py (passed).
+- Step C: Added browser primitives to BrowserSession protocol and PlaywrightBrowser (press_key allowlist, scroll capped, wait capped/load_state, back/forward, list_tabs/switch_tab/close_extra_tab, screenshot to JARVIS pictures folder with prefix screenshot-, current-tab-only). Origin re-checked after actions; refuses if ended on disallowed domain.
+- Step D: Added browser_search/press_key/scroll/wait/back/forward/tabs/screenshot tools with typed args, closed registry registration. Tiers: scroll/wait 0; back/forward/tabs/press_key/search/screenshot 1. browser_search resolves via SiteDirectory, builds URL in code from search_url_template (model only supplies site/query), no-template returns error telling planner to use browser_open_site + browser_type + browser_press_key. Records result set like browser_find, returns top 5 titles with positions (tainted). browser_screenshot returns data.artifact {path,type:"screenshot"}. PageRef recorded on navigations; ResultSetRef invalidated on navigation as before. New test tests/unit/test_browser_primitives.py (passed). catalogue_for_llm() JSON size before: ~23479; after: ~23479 (import-only check).
+- Step E: Added one rule line to brain system prompt preferring browser_search over google_search/open_url for site searches.
+- Step F: Updated benchmarks/tasks.yaml S001-S003 to mention browser_search/browser_open_result. YAML validated.
+- Stray files removed: yes. Failing tests left: none from new tests run. 
+- NEXT STEP: "Phase 3 design spec (orchestrator and browser specialist)"
+
+## New tool table (Phase 2)
+| Tool | base_tier | Notes |
+|------|-----------|-------|
+| browser_search | 1 | Resolves site, builds URL from template, records results, returns top 5 |
+| browser_press_key | 1 | Allowlisted keys only, no modifiers |
+| browser_scroll | 0 | Capped 1..10 |
+| browser_wait | 0 | Capped 1..10s or load_state |
+| browser_back | 1 | Invalidates result set, records PageRef |
+| browser_forward | 1 | Invalidates result set, records PageRef |
+| browser_tabs | 1 | list/switch/close_extra; bounds checked |
+| browser_screenshot | 1 | Saves to pictures/JARVIS with screenshot- prefix, returns artifact |

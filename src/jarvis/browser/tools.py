@@ -31,7 +31,7 @@ nothing (docs/02 Stage 7; config ``[browser]``).
 from __future__ import annotations
 
 import urllib.parse
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -155,37 +155,46 @@ class BrowserOpenResultArgs(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    query: str = Field(
-        default="",
-        max_length=_QUERY_MAX,
-        description=(
-            "Text to look for in the page's result list or element names; an ordinal "
-            "such as 'first' or '2' selects that entry of the current result list. "
-            "May be empty when 'position' is given."
-        ),
-    )
-    role: str = Field(
-        default="",
-        max_length=_ROLE_MAX,
-        description="Optional role filter, e.g. 'link' or 'button'.",
-    )
-    index: int | None = Field(
-        default=None,
-        ge=1,
-        le=_INDEX_MAX,
-        description=(
-            "Which match to open, counted from 1. Required when several elements match the query."
-        ),
-    )
-    position: int | None = Field(
-        default=None,
-        ge=1,
-        le=_INDEX_MAX,
-        description=(
-            "Entry of the current result list to open, counted from 1. Use 1 for "
-            "'open the first link/result'. Refused when no current result list exists."
-        ),
-    )
+    query: str = Field(default="")
+    role: str = ""
+    index: int | None = Field(default=None, ge=1)
+    position: int | None = Field(default=None, ge=1)
+
+
+class BrowserSearchArgs(BaseModel):
+    site: str = Field(min_length=1, max_length=64)
+    query: str = Field(min_length=1, max_length=200)
+
+
+class BrowserPressKeyArgs(BaseModel):
+    key: Literal["Enter", "Tab", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Backspace"]
+
+
+class BrowserScrollArgs(BaseModel):
+    direction: Literal["up", "down"]
+    amount: int = Field(default=1, ge=1, le=10)
+
+
+class BrowserWaitArgs(BaseModel):
+    seconds: int = Field(default=1, ge=1, le=10)
+
+
+class BrowserBackArgs(BaseModel):
+    pass
+
+
+class BrowserForwardArgs(BaseModel):
+    pass
+
+
+class BrowserTabsArgs(BaseModel):
+    action: Literal["list", "switch", "close_extra"]
+    index: int | None = None
+
+
+class BrowserScreenshotArgs(BaseModel):
+    path: str | None = None
+
 
 
 # ── session helpers ────────────────────────────────────────────────────────
@@ -198,6 +207,34 @@ def _require_session(ctx: ToolContext) -> BrowserSession | None:
         return None
     return session  # type: ignore[return-value]
 
+
+
+def _note_navigation(ctx: ToolContext, session: Any, url: str = ""):
+    try:
+        page_url = url or _current_page_url(session)
+        if not page_url:
+            return
+        # get conversation id
+        cid = getattr(getattr(ctx, "run_id", None), "__str__", lambda: None)()
+        if cid is None:
+            # try from state
+            pass
+        # store in referents if possible
+        try:
+            from jarvis.agent.referents import origin_from_url
+            from jarvis.agent import referents as _ref
+            origin = origin_from_url(page_url)
+            REFERENT_STORE.set_page(str(getattr(ctx, "session_context", None) and getattr(ctx.session_context, "_id", None) or id(ctx)), PageRef(url=page_url, title=None, origin=origin, created_at=_ref.now_ts()))
+        except Exception:
+            pass
+        try:
+            if hasattr(ctx, "session_context") and ctx.session_context is not None:
+                from jarvis.agent.session_context import SESSION_THREAD
+                ctx.session_context.note_page(SESSION_THREAD, page_url)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 def _safe_goto(url: str) -> str | None:
     """Return the canonical origin of a structurally safe URL, else ``None``.
@@ -426,10 +463,14 @@ def _run_browser_goto(args: BrowserGotoArgs, ctx: ToolContext) -> ToolResult:
     if session is None:
         return ToolResult(ok=False, error="the managed browser is not available in this context")
     try:
-        data = session.goto(args.url)
+        data = session.goto(url)
     except BrowserError as exc:
-        return ToolResult(ok=False, error=f"browser_goto failed: {exc}")
+        return ToolResult(ok=False, error=f"browser_open_site failed: {exc}")
     _invalidate_results(ctx, session)  # every position from the old page is stale
+    try:
+        _note_navigation(ctx, session, str(data.get("url", url)))
+    except Exception:
+        pass
     return ToolResult(
         ok=True,
         output=f"navigated to {data.get('url', '')}",
@@ -612,8 +653,12 @@ def _run_browser_open_site(args: BrowserOpenSiteArgs, ctx: ToolContext) -> ToolR
     try:
         data = session.goto(url)
     except BrowserError as exc:
-        return ToolResult(ok=False, error=f"browser_open_site failed: {exc}")
+        return ToolResult(ok=False, error=f"browser_goto failed: {exc}")
     _invalidate_results(ctx, session)  # every position from the old page is stale
+    try:
+        _note_navigation(ctx, session, str(data.get("url", url)))
+    except Exception:
+        pass
     return ToolResult(
         ok=True,
         output=f"opened {name} ({data.get('url', '')})",
@@ -747,13 +792,15 @@ def _run_browser_open_result(args: BrowserOpenResultArgs, ctx: ToolContext) -> T
             args.query,
             role=args.role,
             index=args.index,
-            expect_identity=approved or None,
+            expect_identity=expect_identity,
         )
     except BrowserError as exc:
         return ToolResult(ok=False, error=f"browser_open_result failed: {exc}")
-    except AttributeError:
-        return ToolResult(ok=False, error="the managed browser does not support opening a result")
     _invalidate_results(ctx, session)  # the click may navigate
+    try:
+        _note_navigation(ctx, session, str(data.get("url", "")))
+    except Exception:
+        pass
     return ToolResult(
         ok=True,
         output=(
@@ -962,4 +1009,296 @@ def make_browser_open_result_spec() -> ToolSpec:
         verify=_verify_best_effort,
         describe=lambda args: f"Open the page element matching {args.query!r}",
         resolve=_resolve_browser_open_result,
+    )
+
+
+
+def _run_browser_search(args: BrowserSearchArgs, ctx: ToolContext) -> ToolResult:
+    directory = sites_from_settings(ctx.settings)
+    site = directory.resolve(args.site)
+    if site is None:
+        known = ", ".join(directory.names())
+        known = known or "(no sites configured)"
+        return ToolResult(ok=False, error=f"unknown site {args.site!r}. Known sites: {known}")
+    if not site.search_url_template:
+        return ToolResult(
+            ok=False,
+            error=(
+                f"site {site.name!r} has no search_url_template. "
+                "Use browser_open_site then browser_type + browser_press_key."
+            ),
+        )
+    # build URL in code - model supplies only site and query
+    from urllib.parse import quote_plus
+
+    url = site.search_url_template.format(q=quote_plus(args.query))
+    session = _require_session(ctx)
+    if session is None:
+        return ToolResult(ok=False, error="the managed browser is not available in this context")
+    try:
+        data = session.goto(url)
+    except BrowserError as exc:
+        return ToolResult(ok=False, error=f"browser_search failed: {exc}")
+    _invalidate_results(ctx, session)
+    try:
+        _note_navigation(ctx, session, str(data.get("url", url)))
+    except Exception:
+        pass
+    # Try to find results on the page like browser_find does
+    shown: list[ElementRef] = []
+    try:
+        if hasattr(session, "find"):
+            shown = session.find(args.query, limit=50)
+    except Exception:
+        shown = []
+    result_set = None
+    if shown:
+        try:
+            result_set = _record_results(ctx, session, shown)
+        except Exception:
+            result_set = None
+    items = []
+    for el in shown[:5]:
+        items.append({"position": getattr(el, "ref", "") and shown.index(el) + 1 if False else None, "title": getattr(el, "name", "")})
+    # compute positions
+    items_out = []
+    for i, el in enumerate(shown[:5], start=1):
+        items_out.append({"position": i, "title": getattr(el, "name", ""), "role": getattr(el, "role", "")})
+    out = {
+        "site": site.name,
+        "query": args.query,
+        "url": data.get("url", url),
+        "results": items_out,
+        "count": len(items_out),
+    }
+    if result_set is not None:
+        out["result_set_id"] = getattr(result_set, "id", "")
+    return ToolResult(
+        ok=True,
+        output=f"Searched {site.name} for {args.query!r}; {len(items_out)} top results",
+        data=_with_page_url(out, session, str(data.get("url", url))),
+        verified=True,
+        tainted=True,
+    )
+
+
+def _run_browser_press_key(args: BrowserPressKeyArgs, ctx: ToolContext) -> ToolResult:
+    session = _require_session(ctx)
+    if session is None:
+        return ToolResult(ok=False, error="the managed browser is not available in this context")
+    try:
+        data = session.press_key(args.key)
+    except BrowserError as exc:
+        return ToolResult(ok=False, error=f"browser_press_key failed: {exc}")
+    try:
+        _note_navigation(ctx, session, _current_page_url(session))
+    except Exception:
+        pass
+    return ToolResult(ok=True, output=f"pressed {args.key}", data=_with_page_url(dict(data), session), verified=None, tainted=True)
+
+
+def _run_browser_scroll(args: BrowserScrollArgs, ctx: ToolContext) -> ToolResult:
+    session = _require_session(ctx)
+    if session is None:
+        return ToolResult(ok=False, error="the managed browser is not available in this context")
+    try:
+        data = session.scroll(args.direction, args.amount)
+    except BrowserError as exc:
+        return ToolResult(ok=False, error=f"browser_scroll failed: {exc}")
+    return ToolResult(ok=True, output=f"scrolled {args.direction} {args.amount}", data=_with_page_url(dict(data), session), verified=None, tainted=True)
+
+
+def _run_browser_wait(args: BrowserWaitArgs, ctx: ToolContext) -> ToolResult:
+    session = _require_session(ctx)
+    if session is None:
+        return ToolResult(ok=False, error="the managed browser is not available in this context")
+    try:
+        data = session.wait(float(args.seconds))
+    except BrowserError as exc:
+        return ToolResult(ok=False, error=f"browser_wait failed: {exc}")
+    return ToolResult(ok=True, output=f"waited {args.seconds}s", data=_with_page_url(dict(data), session), verified=None, tainted=True)
+
+
+def _run_browser_back(args: BrowserBackArgs, ctx: ToolContext) -> ToolResult:
+    session = _require_session(ctx)
+    if session is None:
+        return ToolResult(ok=False, error="the managed browser is not available in this context")
+    try:
+        data = session.back()
+    except BrowserError as exc:
+        return ToolResult(ok=False, error=f"browser_back failed: {exc}")
+    _invalidate_results(ctx, session)
+    try:
+        _note_navigation(ctx, session, str(data.get("url", "")))
+    except Exception:
+        pass
+    return ToolResult(ok=True, output="went back", data=_with_page_url(dict(data), session), verified=True, tainted=True)
+
+
+def _run_browser_forward(args: BrowserForwardArgs, ctx: ToolContext) -> ToolResult:
+    session = _require_session(ctx)
+    if session is None:
+        return ToolResult(ok=False, error="the managed browser is not available in this context")
+    try:
+        data = session.forward()
+    except BrowserError as exc:
+        return ToolResult(ok=False, error=f"browser_forward failed: {exc}")
+    _invalidate_results(ctx, session)
+    try:
+        _note_navigation(ctx, session, str(data.get("url", "")))
+    except Exception:
+        pass
+    return ToolResult(ok=True, output="went forward", data=_with_page_url(dict(data), session), verified=True, tainted=True)
+
+
+def _run_browser_tabs(args: BrowserTabsArgs, ctx: ToolContext) -> ToolResult:
+    session = _require_session(ctx)
+    if session is None:
+        return ToolResult(ok=False, error="the managed browser is not available in this context")
+    try:
+        if args.action == "list":
+            data = session.list_tabs()
+            return ToolResult(ok=True, output=f"{len(data)} tabs", data={"tabs": data}, verified=None, tainted=True)
+        elif args.action == "switch":
+            if args.index is None:
+                return ToolResult(ok=False, error="index required for switch")
+            data = session.switch_tab(int(args.index))
+            _invalidate_results(ctx, session)
+            try:
+                _note_navigation(ctx, session, str(data.get("url", "")))
+            except Exception:
+                pass
+            return ToolResult(ok=True, output=f"switched to tab {args.index}", data=_with_page_url(dict(data), session), verified=True, tainted=True)
+        elif args.action == "close_extra":
+            data = session.close_extra_tab()
+            _invalidate_results(ctx, session)
+            return ToolResult(ok=True, output=f"closed {data.get('closed', 0)} extra tabs", data=data, verified=None, tainted=True)
+        else:
+            return ToolResult(ok=False, error="invalid action")
+    except BrowserError as exc:
+        return ToolResult(ok=False, error=f"browser_tabs failed: {exc}")
+
+
+def _run_browser_screenshot(args: BrowserScreenshotArgs, ctx: ToolContext) -> ToolResult:
+    session = _require_session(ctx)
+    if session is None:
+        return ToolResult(ok=False, error="the managed browser is not available in this context")
+    try:
+        data = session.screenshot(args.path)
+    except BrowserError as exc:
+        return ToolResult(ok=False, error=f"browser_screenshot failed: {exc}")
+    path = data.get("path", "")
+    return ToolResult(
+        ok=True,
+        output=f"screenshot saved to {path}",
+        data={"path": path, "artifact": {"path": path, "type": "screenshot"}},
+        verified=None,
+        tainted=False,
+    )
+
+
+
+
+def make_browser_search_spec() -> ToolSpec:
+    return ToolSpec(
+        name="browser_search",
+        description="Search a named site via its search template and list top results.",
+        args_model=BrowserSearchArgs,
+        base_tier=1,
+        timeout_s=30,
+        budget_cost=1,
+        run=lambda args, ctx: _run_browser_search(args, ctx),
+        verify=_verify_best_effort,
+        describe=lambda args: f"Search {args.site} for {args.query!r}",
+    )
+
+
+def make_browser_press_key_spec() -> ToolSpec:
+    return ToolSpec(
+        name="browser_press_key",
+        description="Press an allowed key in the managed browser.",
+        args_model=BrowserPressKeyArgs,
+        base_tier=1,
+        timeout_s=10,
+        run=lambda args, ctx: _run_browser_press_key(args, ctx),
+        verify=_verify_best_effort,
+        describe=lambda args: f"Press {args.key}",
+    )
+
+
+def make_browser_scroll_spec() -> ToolSpec:
+    return ToolSpec(
+        name="browser_scroll",
+        description="Scroll the page up or down.",
+        args_model=BrowserScrollArgs,
+        base_tier=0,
+        timeout_s=10,
+        run=lambda args, ctx: _run_browser_scroll(args, ctx),
+        verify=_verify_best_effort,
+        describe=lambda args: f"Scroll {args.direction}",
+    )
+
+
+def make_browser_wait_spec() -> ToolSpec:
+    return ToolSpec(
+        name="browser_wait",
+        description="Wait briefly or for load state.",
+        args_model=BrowserWaitArgs,
+        base_tier=0,
+        timeout_s=15,
+        run=lambda args, ctx: _run_browser_wait(args, ctx),
+        verify=_verify_best_effort,
+        describe=lambda args: f"Wait {args.seconds}s",
+    )
+
+
+def make_browser_back_spec() -> ToolSpec:
+    return ToolSpec(
+        name="browser_back",
+        description="Go back in browser history.",
+        args_model=BrowserBackArgs,
+        base_tier=1,
+        timeout_s=15,
+        run=lambda args, ctx: _run_browser_back(args, ctx),
+        verify=_verify_best_effort,
+        describe=lambda args: "Go back",
+    )
+
+
+def make_browser_forward_spec() -> ToolSpec:
+    return ToolSpec(
+        name="browser_forward",
+        description="Go forward in browser history.",
+        args_model=BrowserForwardArgs,
+        base_tier=1,
+        timeout_s=15,
+        run=lambda args, ctx: _run_browser_forward(args, ctx),
+        verify=_verify_best_effort,
+        describe=lambda args: "Go forward",
+    )
+
+
+def make_browser_tabs_spec() -> ToolSpec:
+    return ToolSpec(
+        name="browser_tabs",
+        description="List, switch, or close extra tabs.",
+        args_model=BrowserTabsArgs,
+        base_tier=1,
+        timeout_s=10,
+        run=lambda args, ctx: _run_browser_tabs(args, ctx),
+        verify=_verify_best_effort,
+        describe=lambda args: f"Tabs: {args.action}",
+    )
+
+
+def make_browser_screenshot_spec() -> ToolSpec:
+    return ToolSpec(
+        name="browser_screenshot",
+        description="Take a screenshot of the current tab.",
+        args_model=BrowserScreenshotArgs,
+        base_tier=1,
+        timeout_s=15,
+        run=lambda args, ctx: _run_browser_screenshot(args, ctx),
+        verify=_verify_best_effort,
+        describe=lambda args: "Take screenshot",
     )

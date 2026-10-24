@@ -165,8 +165,18 @@ def sites_from_settings(settings: Settings) -> SiteDirectory:
     for entry in entries:
         site = _site_from_entry(entry)
         if site is not None:
-            merged[_clean_key(site.name)] = site
-            # also add aliases as overrides? just set by name key
+            key = _clean_key(site.name)
+            # Merge with default to preserve search_url_template if not specified
+            base = merged.get(key)
+            if base is not None:
+                merged[key] = Site(
+                    name=site.name or base.name,
+                    url=site.url,
+                    aliases=site.aliases or base.aliases,
+                    search_url_template=base.search_url_template,
+                )
+            else:
+                merged[key] = site
     # Build list in a stable order: defaults first (in DEFAULT_SITES order) then config-only
     # But easier: preserve DEFAULT_SITES order for names that remain defaults; append others
     result: list[Site] = []

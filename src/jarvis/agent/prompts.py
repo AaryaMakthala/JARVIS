@@ -96,6 +96,7 @@ Decision rules:
    did not state; "missing" lists only real gaps in the user's words. Both are
    stated plainly - they are never nested JSON, never templates.
 11. When the user refers to 'the first link', 'that page' or 'the picture', use the referents block; for result sets use browser_open_result with position; never invent a URL.
+12. To search a site and read or open its results, use browser_search; use google_search or open_url only when the user wants it shown in their own browser. After browser_search you may use browser_open_result with a position.
 """
 
 

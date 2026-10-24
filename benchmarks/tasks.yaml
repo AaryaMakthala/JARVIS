@@ -522,7 +522,7 @@
   tier_expected: 1
   auto_confirm: true
   repeats: 1
-  notes: "Uses browser_find/browser_open_result against fixture."
+  notes: "Uses browser_search/browser_open_result against fixture."
 
 - id: S002
   category: scenario
@@ -531,7 +531,7 @@
   tier_expected: 0
   auto_confirm: false
   repeats: 1
-  notes: "Uses browser primitives where available."
+  notes: "Uses browser_search/browser_open_result where available."
 
 - id: S003
   category: scenario
@@ -540,7 +540,7 @@
   tier_expected: 1
   auto_confirm: true
   repeats: 1
-  notes: "Uses browser_find/open_result/click."
+  notes: "Uses browser_search/browser_open_result/click."
 
 - id: S004
   category: scenario
