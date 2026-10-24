@@ -28,6 +28,7 @@ from typing import Any
 from jarvis.agent.nodes.act import act
 from jarvis.agent.nodes.brain import brain
 from jarvis.agent.nodes.clarify import clarify
+from jarvis.agent.nodes.context_resolve import context_resolve
 from jarvis.agent.nodes.intake import intake
 from jarvis.agent.nodes.memory_retrieve import memory_retrieve
 from jarvis.agent.nodes.memory_save import memory_save
@@ -42,6 +43,7 @@ __all__ = [
     "act",
     "brain",
     "clarify",
+    "context_resolve",
     "intake",
     "memory_retrieve",
     "memory_save",

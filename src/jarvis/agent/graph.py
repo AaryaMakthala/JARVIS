@@ -35,28 +35,28 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from jarvis.agent.context import AppContext
-from jarvis.agent.nodes import (
-    act,
-    brain,
-    clarify,
-    intake,
-    memory_retrieve,
-    memory_save,
-    policy_gate,
-    replan,
-    respond,
-    route_after_act,
-    route_after_brain,
-    route_after_clarify,
-    route_after_intake,
-    route_after_policy_gate,
-    route_after_replan,
-    route_after_validate,
-    route_after_verify,
-    validate,
-    verify,
-    wrap,
-)
+    from jarvis.agent.nodes import (
+        act,
+        brain,
+        clarify,
+        context_resolve,
+        intake,
+        memory_retrieve,
+        memory_save,
+        policy_gate,
+        replan,
+        respond,
+        route_after_act,
+        route_after_brain,
+        route_after_clarify,
+        route_after_intake,
+        route_after_policy_gate,
+        route_after_replan,
+        route_after_validate,
+        route_after_verify,
+        validate,
+        verify,
+    )
 from jarvis.agent.state import AgentState
 
 __all__ = ["build_graph", "build_secure_serde", "open_sqlite_checkpointer"]
@@ -121,6 +121,7 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
     """
     g = StateGraph(AgentState)
     g.add_node("intake", wrap(intake, ctx, cancel))
+    g.add_node("context_resolve", wrap(context_resolve, ctx, cancel))
     g.add_node("memory_retrieve", wrap(memory_retrieve, ctx, cancel))
     g.add_node("brain", wrap(brain, ctx, cancel))
     g.add_node("clarify", wrap(clarify, ctx, cancel))
@@ -134,9 +135,9 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
 
     g.add_edge(START, "intake")
     g.add_conditional_edges(
-        "intake", route_after_intake, {"memory_retrieve": "memory_retrieve", "respond": "respond"}
+        "intake", route_after_intake, {"memory_retrieve": "context_resolve", "respond": "respond"}
     )
-
+    g.add_edge("context_resolve", "memory_retrieve")
     g.add_edge("memory_retrieve", "brain")
     g.add_conditional_edges(
         "brain",

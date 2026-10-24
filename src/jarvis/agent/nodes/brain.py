@@ -84,6 +84,26 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     system = brain_system_prompt(catalogue)
     session_block = _session_reference_block(state, ctx)
     sites_block = render_site_catalogue(sites_from_settings(ctx.settings))
+    # build referent summary
+    referent_summary = None
+    try:
+        rr = state.get("resolved_refs") or {}
+        if isinstance(rr, dict):
+            parts = []
+            if rr.get("has_result_set") and rr.get("result_set_positions"):
+                parts.append("REFERENTS: result set positions: " + ",".join(str(x) for x in rr.get("result_set_positions", [])))
+            if rr.get("has_page") and rr.get("page_url"):
+                parts.append(f"REFERENTS: current page: <untrusted_data>{rr['page_url']}</untrusted_data>")
+            if rr.get("has_photo") and rr.get("photo_path"):
+                parts.append(f"REFERENTS: last photo: {rr['photo_path']}")
+            elif rr.get("has_file") and rr.get("file_path"):
+                parts.append(f"REFERENTS: last file: {rr['file_path']}")
+            if parts:
+                referent_summary = "\n".join(parts)
+                if len(referent_summary) > 1200:
+                    referent_summary = referent_summary[:1200]
+    except Exception:
+        referent_summary = None
     user = brain_user_prompt(
         state.get("user_input") or "",
         memory_context=[
@@ -97,6 +117,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         session_context=session_block,
         clarification_history=state.get("clarification_history"),
         sites=sites_block,
+        referent_summary=referent_summary,
     )
 
     llm_budget: dict[str, Any] = {}

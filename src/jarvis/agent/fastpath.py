@@ -129,6 +129,52 @@ def brain_update(state: dict[str, Any], ctx: AppContext) -> dict[str, Any] | Non
     ``tokens`` unchanged (+0), clarification fields cleared, ``request_kind``
     set to ``"tool"``. The only difference is that no LLM call happens.
     """
+    # Referent-aware fast path (closed vocabulary)
+    try:
+        resolved_refs = state.get("resolved_refs") or {}
+        if isinstance(resolved_refs, dict):
+            t = (state.get("user_input") or "").strip().lower()
+            if resolved_refs.get("resolved_action") == "open_picture" and resolved_refs.get("has_photo") and resolved_refs.get("photo_path"):
+                plan = Plan(kind="tool", steps=[Step(id="s1", tool="open_path", args={"path": resolved_refs["photo_path"]})])
+                ctx.logger.info(
+                    "agent event=fastpath task_id=%s tool=%s",
+                    state.get("task_id"),
+                    plan.steps[0].tool,
+                )
+                return {
+                    "api_calls": int(state.get("api_calls") or 0),
+                    "tokens": int(state.get("tokens") or 0),
+                    "clarification_question": None,
+                    "clarification_answer": None,
+                    "plan": plan,
+                    "request_kind": "tool",
+                    "error": None,
+                }
+            if isinstance(resolved_refs.get("resolved_action"), str) and resolved_refs.get("resolved_action", "").startswith("open_result:"):
+                pos = resolved_refs["resolved_action"].split(":", 1)[1]
+                if re.match(r"^open the (first|second|third|1st|2nd|3rd|\d+)( (result|link|one))?\.?$", t):
+                    try:
+                        p = int(pos)
+                    except Exception:
+                        p = None
+                    if p and resolved_refs.get("has_result_set") and p in (resolved_refs.get("result_set_positions") or []):
+                        plan = Plan(kind="tool", steps=[Step(id="s1", tool="browser_open_result", args={"position": p})])
+                        ctx.logger.info(
+                            "agent event=fastpath task_id=%s tool=%s",
+                            state.get("task_id"),
+                            plan.steps[0].tool,
+                        )
+                        return {
+                            "api_calls": int(state.get("api_calls") or 0),
+                            "tokens": int(state.get("tokens") or 0),
+                            "clarification_question": None,
+                            "clarification_answer": None,
+                            "plan": plan,
+                            "request_kind": "tool",
+                            "error": None,
+                        }
+    except Exception:
+        pass
     plan = plan_for(state.get("user_input") or "", ctx.settings)
     if plan is None:
         return None

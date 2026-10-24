@@ -330,28 +330,74 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     elapsed_ms = int((time.perf_counter() - start) * 1000)
 
     # Session context (Stage 8, D19): remember the artifact a tool just produced
-    # so a later "delete it"/"send it" can resolve to the real path.  The store
-    # accepts only the trusted ``result.data["artifact"]`` dict; any other step
-    # that *completes successfully* (including one carrying only text) closes the
-    # current run, so an unrelated completed action invalidates earlier
-    # candidates.  A failed or refused step and a dry run record nothing and
-    # leave the run untouched (nothing happened, so the last real artifact still
-    # stands).  Never written to AgentState.  This is memory, not authorization:
-    # the path is re-checked like any other when it is used.
+    # so a later "delete it"/"send it" can resolve to the real path.
     if not ctx.dry_run and result.ok:
         artifact = result.data.get("artifact") if isinstance(result.data, dict) else None
         ctx.session_context.note_action(SESSION_THREAD, artifact)
         page_url = result.data.get("page_url") if isinstance(result.data, dict) else None
-        # D19: an unrelated action in between invalidates a prior referent.  A
-        # page is therefore re-published only by a browser step that reports
-        # the page it is on; every other successful step clears it, so a time
-        # query cannot leave "that page" (or a model reading "it" as a site)
-        # silently pointing at an earlier page.
-        ctx.session_context.invalidate_page(SESSION_THREAD)
-        if isinstance(page_url, str) and page_url.strip():
-            # The page JARVIS is on (Stage 8.6, slice 8.6.3).  A location, not
-            # an authorization: the next navigation is checked like any other.
-            ctx.session_context.note_page(SESSION_THREAD, page_url)
+        # Phase 1: do NOT clear page referent on unrelated successful steps.
+        # Clear only on browser navigation to a different origin, explicit
+        # invalidation, or TTL. Keep SessionContext API working.
+        try:
+            from jarvis.agent import referents
+            from jarvis.agent.referents import REFERENT_STORE, PageRef, ResultSetRef, ResultItem, FileRef, ActionRef, origin_from_url
+
+            cid = str(state.get("conversation_id") or "local")
+            tool_name = str(getattr(step, "tool", "") or "")
+            # record action
+            try:
+                REFERENT_STORE.set_action(cid, ActionRef(tool=tool_name, ok=True, created_at=referents.now_ts()))
+            except Exception:
+                pass
+            # browser navigation -> set/update page; clear only if different origin? spec says clear only on nav to different origin or explicit/TTL
+            if tool_name in ("browser_goto", "browser_open_site", "browser_open_result") and isinstance(page_url, str) and page_url.strip():
+                prev = REFERENT_STORE.get(cid).page
+                new_origin = origin_from_url(page_url)
+                old_origin = origin_from_url(prev.url) if prev else None
+                if prev is None or old_origin != new_origin or prev.url != page_url:
+                    # different origin or new page -> update page (and per spec clear only in those cases; just set)
+                    REFERENT_STORE.set_page(cid, PageRef(url=page_url, title=None, origin=new_origin, created_at=referents.now_ts()))
+                else:
+                    REFERENT_STORE.set_page(cid, PageRef(url=page_url, title=None, origin=new_origin, created_at=referents.now_ts()))
+                ctx.session_context.note_page(SESSION_THREAD, page_url)
+            elif isinstance(page_url, str) and page_url.strip() and tool_name in ("browser_read",):
+                # reading doesn't necessarily change page; don't force clear
+                pass
+            # browser_find results
+            if tool_name == "browser_find":
+                results = None
+                if isinstance(result.data, dict):
+                    results = result.data.get("results") or result.data.get("items")
+                if isinstance(results, list) and results:
+                    items = []
+                    for i, it in enumerate(results):
+                        if isinstance(it, dict):
+                            items.append(ResultItem(
+                                position=int(it.get("position") or i + 1),
+                                title=str(it.get("title") or it.get("name") or ""),
+                                host=str(it.get("host") or it.get("origin") or origin_from_url(it.get("url") or page_url or "") or ""),
+                                url=str(it.get("url") or ""),
+                                ref=it.get("ref"),
+                            ))
+                    if items and isinstance(page_url, str) and page_url.strip():
+                        REFERENT_STORE.set_result_set(cid, ResultSetRef(id=f"rs_{int(referents.now_ts())}", page_url=page_url, items=items, created_at=referents.now_ts()))
+            # browser_open_result may produce page_url
+            # files/photos
+            if tool_name in ("take_photo",):
+                p = None
+                if isinstance(artifact, dict):
+                    p = artifact.get("path") or result.data.get("path")
+                if isinstance(p, str) and p:
+                    REFERENT_STORE.set_file(cid, FileRef(path=p, kind="photo", created_at=referents.now_ts()))
+            if tool_name in ("create_file", "write_file", "append_file", "save_dictation"):
+                p = None
+                if isinstance(artifact, dict):
+                    p = artifact.get("path") or result.data.get("path")
+                if isinstance(p, str) and p:
+                    REFERENT_STORE.set_file(cid, FileRef(path=p, kind="file", created_at=referents.now_ts()))
+        except Exception:
+            pass
+        # For non-browser unrelated steps, do NOT clear page referent (Phase 1 fix)
 
     step_result = StepResult(
         step_id=step.id,

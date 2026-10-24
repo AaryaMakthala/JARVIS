@@ -95,6 +95,7 @@ Decision rules:
 10. "assumption" is empty unless you proceeded on an optional default the user
    did not state; "missing" lists only real gaps in the user's words. Both are
    stated plainly - they are never nested JSON, never templates.
+11. When the user refers to 'the first link', 'that page' or 'the picture', use the referents block; for result sets use browser_open_result with position; never invent a URL.
 """
 
 
@@ -109,6 +110,7 @@ def brain_user_prompt(
     session_context: str | None = None,
     clarification_history: list[dict[str, str]] | None = None,
     sites: str | None = None,
+    referent_summary: str | None = None,
 ) -> str:
     """Build the user prompt for one brain call.
 
@@ -170,6 +172,8 @@ def brain_user_prompt(
             sites + "\nUse browser_open_site with the exact name when the user asks for one "
             "of these sites. Never invent a URL for a site that is listed here."
         )
+    if referent_summary:
+        parts.append(referent_summary)
     if source == "voice":
         parts.append(VOICE_SOURCE_LINE)
     if clarification_count:
