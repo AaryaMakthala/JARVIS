@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from jarvis.agent.context import AppContext
@@ -10,9 +11,9 @@ from jarvis.agent.prompts import specialist_system_prompt, specialist_user_promp
 from jarvis.agent.schemas import SpecialistDecision
 from jarvis.agent.state import AgentState, Plan, Step
 from jarvis.browser.context import BrowserSession
-from jarvis.browser.tools import _current_page_url, _items_from_elements, _session_scope
-from jarvis.browser.find import match_identity, match_indexes
-from jarvis.tools.base import ToolContext
+from jarvis.browser.tools import _current_page_url, _session_scope
+
+logger = logging.getLogger(__name__)
 
 BROWSER_TOOL_NAMES = {
     "browser_goto",
@@ -50,8 +51,8 @@ def _build_digest(state: AgentState, ctx: AppContext) -> str:
             url = _current_page_url(session)
             if url:
                 parts.append(f"URL: {url}")
-        except Exception:
-            pass
+        except Exception:  # a digest failure must never stop the loop
+            logger.debug("specialist digest: page url unavailable", exc_info=True)
         try:
             # try to read
             if hasattr(session, "read"):
@@ -65,8 +66,8 @@ def _build_digest(state: AgentState, ctx: AppContext) -> str:
                     elems.append(f"- {ref} [{role}] {name}")
                 if elems:
                     parts.append("Elements:\n" + "\n".join(elems))
-        except Exception:
-            pass
+        except Exception:  # a digest failure must never stop the loop
+            logger.debug("specialist digest: page elements unavailable", exc_info=True)
     # result set
     try:
         store = getattr(ctx, "browser_results", None)
@@ -79,8 +80,8 @@ def _build_digest(state: AgentState, ctx: AppContext) -> str:
                     items.append(f"- {it.position}: {str(it.title)[:80]} ({it.url})")
                 if items:
                     parts.append("Results:\n" + "\n".join(items))
-    except Exception:
-        pass
+    except Exception:  # a digest failure must never stop the loop
+        logger.debug("specialist digest: result set unavailable", exc_info=True)
     digest = "\n\n".join(parts)
     if len(digest) > 2500:
         digest = digest[:2500]
@@ -93,7 +94,7 @@ def _args_summary(args: dict[str, Any]) -> str:
         import json
 
         s = json.dumps(args)
-    except Exception:
+    except Exception:  # noqa: BLE001 - fall back to str() for args that cannot be serialised
         s = str(args)
     if len(s) > 200:
         s = s[:200]
@@ -132,27 +133,28 @@ def decide(state: AgentState, ctx: AppContext) -> dict[str, Any]:
     allowed = []
     try:
         reg = ctx.registry
-        for name in sorted(list(BROWSER_TOOL_NAMES)):
+        for name in sorted(BROWSER_TOOL_NAMES):
             spec = reg.get(name)
             if spec is None:
                 continue
             allowed.append({"name": name, "description": spec.description[:160], "args_schema": spec.args_model.model_json_schema() if hasattr(spec.args_model, "model_json_schema") else {}})
-    except Exception:
-        for name in sorted(list(BROWSER_TOOL_NAMES)):
+    except Exception:  # noqa: BLE001 - fall back to a bare tool list
+        for name in sorted(BROWSER_TOOL_NAMES):
             allowed.append({"name": name, "description": "", "args_schema": {}})
     system = specialist_system_prompt(allowed)
     user = specialist_user_prompt(goal, history, digest)
     timeout_s = min(getattr(getattr(ctx, "settings", None).llm, "timeout_seconds", 30.0), getattr(getattr(ctx, "settings", None).agent, "specialist_call_timeout_s", 12.0))
     try:
-        decision = ctx.llm.structured(
+        decision, _usage = ctx.llm.structured(
             system=system,
             user=user,
             schema=SpecialistDecision,
-            timeout_s=timeout_s,
+            model_role="planner",
+            temperature=0.0,
             max_retries=0,
-            role="planner",
+            timeout_s=timeout_s,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - an LLM failure stops this task only
         reason = _llm_halted_reason(exc)
         return {"halted_reason": reason, "final_answer": "I couldn't proceed with the browser task.", "specialist_phase": "idle"}
     if decision.kind == "done":
@@ -190,12 +192,12 @@ def observe(state: AgentState, ctx: AppContext) -> dict[str, Any]:
             last_tool = getattr(steps[-1], "tool", None) or steps[-1].get("tool") if isinstance(steps[-1], dict) else None
             if last_tool in {"browser_read", "browser_find", "browser_search"}:
                 return {"specialist_phase": "decide"}
-    except Exception:
-        pass
+    except Exception:  # a malformed plan must not break the loop
+        logger.debug("specialist observe: could not inspect the last step", exc_info=True)
     # build plan to read
     step = Step(id="s1", tool="browser_read", args={}, rationale="Refresh page", expect="See current page")
     new_plan = Plan(kind="tool", goal=state.get("specialist_goal") or state.get("goal") or "Browse", steps=[step])
     return {"plan": new_plan, "step_index": 0, "decisions": {}, "specialist_phase": "decide"}
 
 
-__all__ = ["decide", "observe", "BROWSER_TOOL_NAMES"]
+__all__ = ["BROWSER_TOOL_NAMES", "decide", "observe"]

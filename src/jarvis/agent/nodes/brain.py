@@ -82,11 +82,9 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     source = state.get("source") or "terminal"
     catalogue = ctx.registry.catalogue_for_llm()
     system = brain_system_prompt(catalogue)
-    try:
-        if getattr(getattr(ctx, "settings", None).agent, "use_specialists", False):
-            system = system + "\n12b. If the task needs several browser steps that depend on what the page shows (searching, opening a result, reading a page, playing a video), return request_type 'browse' with a goal and no actions. Simple single actions stay 'action'."
-    except Exception:
-        pass
+    agent_settings = getattr(getattr(ctx, "settings", None), "agent", None)
+    if getattr(agent_settings, "use_specialists", False):
+        system = system + "\n12b. If the task needs several browser steps that depend on what the page shows (searching, opening a result, reading a page, playing a video), return request_type 'browse' with a goal and no actions. Simple single actions stay 'action'."
     session_block = _session_reference_block(state, ctx)
     sites_block = render_site_catalogue(sites_from_settings(ctx.settings))
     # build referent summary
@@ -107,7 +105,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
                 referent_summary = "\n".join(parts)
                 if len(referent_summary) > 1200:
                     referent_summary = referent_summary[:1200]
-    except Exception:
+    except Exception:  # noqa: BLE001 - referent context must never block a task
         referent_summary = None
     user = brain_user_prompt(
         state.get("user_input") or "",
@@ -240,24 +238,22 @@ def _project(decision: BrainDecision, state: dict[str, Any], usage: Any, ctx: Ap
         }
 
     if decision.request_type == "browse":
-        try:
-            c = ctx
-            if c is None:
-                # try to get from closure not possible; fall back
-                raise Exception()
-            if getattr(getattr(c, "settings", None).agent, "use_specialists", False):
-                return {
-                    **update,
-                    "plan": None,
-                    "request_kind": RequestKind.BROWSE.value if hasattr(RequestKind, "BROWSE") else "browse",
-                    "specialist_goal": decision.goal or decision.response_text or state.get("user_input") or "",
-                    "specialist_phase": "decide",
-                    "specialist_calls": 0,
-                    "specialist_history": [],
-                    "error": None,
-                }
-        except Exception:
-            pass
+        # Fail closed: with no context or the flag off, no specialist loop can
+        # run, so the browse request is an honest unsupported halt.
+        agent_settings = getattr(getattr(ctx, "settings", None), "agent", None)
+        if getattr(agent_settings, "use_specialists", False):
+            return {
+                **update,
+                "plan": None,
+                "request_kind": RequestKind.BROWSE.value,
+                "specialist_goal": (
+                    decision.goal or decision.response_text or state.get("user_input") or ""
+                ),
+                "specialist_phase": "decide",
+                "specialist_calls": 0,
+                "specialist_history": [],
+                "error": None,
+            }
         return {
             **update,
             "plan": None,
