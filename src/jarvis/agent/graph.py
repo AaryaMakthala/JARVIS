@@ -4,13 +4,16 @@ Topology (docs/02_ARCHITECTURE.md sec. 4):
 
     START -> intake -> memory_retrieve -> brain
                                              |
-                 +---------------------------+--------------------------+
-                 | (conversation)           | (action)                 | (clarification)
-                 v                           v                         v
-              respond                    validate                   clarify
-                                             |  ^        (answer)        |
-                                             v  +- replan<-...           +----> brain
-                       policy_gate <--------+      (validate rejected)
+                 +---------------------------+--------------------------+------------------+
+                 | (conversation)           | (action)                 | (clarification)  | (browse, flagged)
+                 v                           v                         v                  v
+              respond                    validate                   clarify        specialist_decide
+                                             |  ^        (answer)        |                |
+                                             v  +- replan<-...           +----> brain     (act)->validate
+                       policy_gate <--------+      (validate rejected)                |
+                                                                                      observe<-verify
+                                                                                         |
+                                                                                      act/decide
 
                        policy_gate -> act -> verify -> policy_gate (next step) | respond
 
@@ -57,6 +60,9 @@ from jarvis.agent.nodes import (
     validate,
     verify,
     wrap,
+    specialist,
+    route_after_specialist_decide,
+    route_after_specialist_observe,
 )
 from jarvis.agent.state import AgentState
 
@@ -133,6 +139,10 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
     g.add_node("replan", wrap(replan, ctx, cancel))
     g.add_node("respond", wrap(respond, ctx, cancel))
     g.add_node("memory_save", wrap(memory_save, ctx, cancel))
+    use_sp = getattr(getattr(ctx, "settings", None), "agent", None)
+    if use_sp is not None and getattr(use_sp, "use_specialists", False):
+        g.add_node("specialist_decide", wrap(specialist.decide, ctx, cancel))
+        g.add_node("specialist_observe", wrap(specialist.observe, ctx, cancel))
 
     g.add_edge(START, "intake")
     g.add_conditional_edges(
@@ -140,11 +150,25 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
     )
     g.add_edge("context_resolve", "memory_retrieve")
     g.add_edge("memory_retrieve", "brain")
-    g.add_conditional_edges(
-        "brain",
-        route_after_brain,
-        {"clarify": "clarify", "validate": "validate", "respond": "respond"},
-    )
+    use_sp = getattr(getattr(ctx, "settings", None), "agent", None)
+    if use_sp is not None and getattr(use_sp, "use_specialists", False):
+        g.add_conditional_edges(
+            "brain",
+            route_after_brain,
+            {"clarify": "clarify", "validate": "validate", "respond": "respond", "specialist_decide": "specialist_decide"},
+        )
+        g.add_conditional_edges(
+            "specialist_decide", route_after_specialist_decide, {"validate": "validate", "respond": "respond"}
+        )
+        g.add_conditional_edges(
+            "specialist_observe", route_after_specialist_observe, {"act": "act", "decide": "specialist_decide"}
+        )
+    else:
+        g.add_conditional_edges(
+            "brain",
+            route_after_brain,
+            {"clarify": "clarify", "validate": "validate", "respond": "respond"},
+        )
     g.add_conditional_edges(
         "clarify", route_after_clarify, {"brain": "brain", "respond": "respond"}
     )
@@ -164,11 +188,18 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
         "policy_gate", route_after_policy_gate, {"act": "act", "respond": "respond"}
     )
     g.add_conditional_edges("act", route_after_act, {"verify": "verify", "respond": "respond"})
-    g.add_conditional_edges(
-        "verify",
-        route_after_verify,
-        {"act": "act", "replan": "replan", "policy_gate": "policy_gate", "respond": "respond"},
-    )
+    if use_sp is not None and getattr(use_sp, "use_specialists", False):
+        g.add_conditional_edges(
+            "verify",
+            route_after_verify,
+            {"act": "act", "replan": "replan", "policy_gate": "policy_gate", "respond": "respond", "specialist_observe": "specialist_observe"},
+        )
+    else:
+        g.add_conditional_edges(
+            "verify",
+            route_after_verify,
+            {"act": "act", "replan": "replan", "policy_gate": "policy_gate", "respond": "respond"},
+        )
     g.add_conditional_edges(
         "replan", route_after_replan, {"validate": "validate", "respond": "respond"}
     )

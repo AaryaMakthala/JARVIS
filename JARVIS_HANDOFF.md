@@ -241,3 +241,16 @@ WhatsApp: send a message to mom saying running late (T032) - make_send_whatsapp_
 | browser_forward | 1 | Invalidates result set, records PageRef |
 | browser_tabs | 1 | list/switch/close_extra; bounds checked |
 | browser_screenshot | 1 | Saves to pictures/JARVIS with screenshot- prefix, returns artifact |
+
+
+## Phase 3 results
+
+- Step 0: graph diff was context_resolve wiring -> committed (883fc31). Catalogue: 47 tools, JSON size ~23479. tests/unit/test_tools_registry.py not present; ran daemon_browser_wiring (unrelated failure). Fixture browser test command: pytest tests/integration/test_browser_fixture.py -m browser (not run).
+- Step 1: Added browse to BrainDecision, SpecialistDecision (flat), AgentState keys (specialist_goal/calls/history/phase), AgentSettings use_specialists/specialist_max_calls/specialist_call_timeout_s. SpecialistDecision not added to serde allowlist (transient). Commit 7984e45/7cb3d07.
+- Step 2: Added agent/nodes/specialist.py (decide with LLM planner role, timeout capped, max_retries 0; observe builds browser_read; guards: call cap, repeat guard, non-browser rejected). Page digest <=2500 wrapped as untrusted. Outputs one-step Plan to reuse validate/policy_gate/act/verify. Routing added when flag true; graph topology updated. Commit 95c4e72.
+- Step 3: Brain routes browse to specialist when flag true (sets specialist_goal/phase/clears history); adds prompt rule only if flag true. Commit included in 95c4e72.
+- Step 4: tests/unit/test_specialist.py (fakes) - validators, digest bounds/wrapping, call cap, repeat guard, non-browser rejection, flag-off routing unchanged. PASSED.
+- How to enable: in config.toml [agent] use_specialists = true (and specialist_max_calls/specialist_call_timeout_s optional).
+- Known limit: each Tier 1 browser step still asks for confirmation until browsing grant exists.
+- NEXT STEP: "Phase 4 design spec (browsing grant, policy change)"
+

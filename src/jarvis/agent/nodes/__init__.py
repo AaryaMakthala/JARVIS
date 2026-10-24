@@ -37,6 +37,7 @@ from jarvis.agent.nodes.replan import replan
 from jarvis.agent.nodes.respond import respond
 from jarvis.agent.nodes.validate import validate
 from jarvis.agent.nodes.verify import verify
+from jarvis.agent.nodes import specialist
 from jarvis.tools.base import CancelToken
 
 __all__ = [
@@ -60,6 +61,7 @@ __all__ = [
     "route_after_verify",
     "validate",
     "verify",
+    "specialist",
     "wrap",
 ]
 
@@ -98,21 +100,17 @@ def route_after_intake(state: dict[str, Any]) -> str:
 
 
 def route_after_brain(state: dict[str, Any]) -> str:
-    """brain -> (clarify | validate | respond).
-
-    The human-facing routes are decided here, in code, from the *projected*
-    Plan produced by the brain node: clarification goes to the ``clarify``
-    interrupt, conversation straight to ``respond``, anything else through the
-    deterministic validate / policy_gate / act pipeline.
-    """
+    """brain -> (clarify | validate | respond)."""
     if state.get("halted_reason"):
         return "respond"
+    if state.get("specialist_phase") == "decide" and (state.get("specialist_goal") or state.get("request_kind") == "browse"):
+        return "specialist_decide"
     plan_obj = state.get("plan")
     if plan_obj is None:
         return "respond"
-    if plan_obj.needs_clarification:
+    if getattr(plan_obj, "needs_clarification", False):
         return "clarify"
-    if plan_obj.kind == "conversation":
+    if getattr(plan_obj, "kind", None) == "conversation":
         return "respond"
     return "validate"
 
@@ -159,12 +157,22 @@ def route_after_verify(state: dict[str, Any]) -> str:
     results = state.get("results") or []
     plan_obj = state.get("plan")
     if not plan_obj or not plan_obj.steps:
+        # check if in specialist flow
+        if state.get("specialist_phase") == "observe":
+            return "specialist_observe"
         return "respond"
     if (not results) or (not results[-1].ok) or results[-1].verified is False:
+        if state.get("specialist_phase") == "observe":
+            return "specialist_observe"
         return "respond"  # fail closed inside verify
     idx = int(state.get("step_index") or 0)
     if idx >= len(plan_obj.steps):
+        if state.get("specialist_phase") == "observe":
+            return "specialist_observe"
         return "respond"
+    # if specialist active and we just finished a step, go to observe
+    if state.get("specialist_phase") == "observe":
+        return "specialist_observe"
     return "policy_gate"
 
 
@@ -173,3 +181,23 @@ def route_after_replan(state: dict[str, Any]) -> str:
     if state.get("halted_reason"):
         return "respond"
     return "validate"
+
+
+def route_after_specialist_decide(state: dict[str, Any]) -> str:
+    if state.get("plan") is None:
+        if state.get("halted_reason") or state.get("final_answer") is not None:
+            return "respond"
+        return "respond"
+    plan_obj = state.get("plan")
+    if plan_obj is not None and getattr(plan_obj, "steps", None):
+        return "validate"
+    if state.get("halted_reason") or state.get("final_answer") is not None:
+        return "respond"
+    return "respond"
+
+
+def route_after_specialist_observe(state: dict[str, Any]) -> str:
+    plan_obj = state.get("plan")
+    if plan_obj is not None and getattr(plan_obj, "steps", None):
+        return "act"
+    return "decide"

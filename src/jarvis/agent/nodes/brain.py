@@ -31,7 +31,7 @@ from jarvis.agent.session_context import (
     SESSION_THREAD,
     render_resolution,
 )
-from jarvis.agent.state import Plan, Step
+from jarvis.agent.state import Plan, RequestKind, Step
 from jarvis.browser.sites import render_site_catalogue, sites_from_settings
 
 #: Deterministic, user-facing halt reasons.  The LLM output never reaches the
@@ -82,6 +82,11 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     source = state.get("source") or "terminal"
     catalogue = ctx.registry.catalogue_for_llm()
     system = brain_system_prompt(catalogue)
+    try:
+        if getattr(getattr(ctx, "settings", None).agent, "use_specialists", False):
+            system = system + "\n12b. If the task needs several browser steps that depend on what the page shows (searching, opening a result, reading a page, playing a video), return request_type 'browse' with a goal and no actions. Simple single actions stay 'action'."
+    except Exception:
+        pass
     session_block = _session_reference_block(state, ctx)
     sites_block = render_site_catalogue(sites_from_settings(ctx.settings))
     # build referent summary
@@ -232,6 +237,29 @@ def _project(decision: BrainDecision, state: dict[str, Any], usage: Any) -> dict
             **update,
             "request_kind": "unsupported",
             "halted_reason": reason or "I can't do that.",
+        }
+
+    if decision.request_type == "browse":
+        try:
+            if getattr(getattr(ctx, "settings", None).agent, "use_specialists", False):
+                return {
+                    **update,
+                    "plan": None,
+                "request_kind": RequestKind.BROWSE.value if hasattr(RequestKind, "BROWSE") else "browse",
+                "specialist_goal": decision.goal or "",
+                "specialist_phase": "decide",
+                "specialist_calls": 0,
+                "specialist_history": [],
+                "error": None,
+                }
+        except Exception:
+            pass
+        # if flag off, fall through to normal handling? but browse has no actions; better treat as clarify/unsupported
+        return {
+            **update,
+            "plan": None,
+            "request_kind": "unsupported",
+            "halted_reason": "Browser specialist is disabled.",
         }
 
     if decision.missing and not (decision.assumption or "").strip():
