@@ -682,6 +682,13 @@ class BrowserSettings(BaseModel):
     allowed_domains: list[str] = []
     task_scope_max_actions: int = 8
     scope_expiry_s: float = 120.0
+    #: Task-scoped browsing grant (Phase 4), separate from the scope grant
+    #: above.  One approval covers Tier 1 browser steps on a single host for
+    #: this task; it binds no plan hash and has its own (larger) ceilings, which
+    #: the registry clamps to a hard maximum of 30 actions / 600 s.
+    task_grant_enabled: bool = True
+    task_grant_max_actions: int = 30
+    task_grant_ttl_s: float = 600.0
 
     @field_validator("allowed_domains")
     @classmethod

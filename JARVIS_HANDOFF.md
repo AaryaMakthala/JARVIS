@@ -282,3 +282,14 @@ WhatsApp: send a message to mom saying running late (T032) - make_send_whatsapp_
   trailers or AI attribution are allowed.
 - NEXT STEP: "Phase 4: specialist gap fixes, then browsing grant".
 
+
+## Phase 4 grant — mid-wiring note
+
+- `src/jarvis/policy/browse_grant.py` (BrowseGrant / BrowseGrantRegistry / pure coverage) and
+  `tests/unit/test_browse_grant.py` (15 tests) are committed as 0f78c4e. Settings added to
+  BrowserSettings: task_grant_enabled / task_grant_max_actions (30) / task_grant_ttl_s (600).
+- ScopeRegistry, the policy engine and the tiers table are untouched.
+- Decision: `browser_search` is covered by resolving the model-supplied site name to a host in
+  code (SiteDirectory: defaults + config), in BOTH policy_gate and act. Unknown site = not covered.
+  The tool itself is not changed.
+- Wiring into policy_gate / act / daemon _end_task_runtime is in progress.
