@@ -10,11 +10,29 @@ is checkpointed to SQLite in plaintext.
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
 
 Source = Literal["terminal", "voice", "benchmark"]
+
+
+class RequestKind(StrEnum):
+    TOOL = "tool"
+    CONVERSATION = "conversation"
+    CLARIFICATION = "clarification"
+    UNSUPPORTED = "unsupported"
+
+
+class FailureCode(StrEnum):
+    NONE = "none"
+    HALTED = "halted"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    PARTIAL = "partial"
+    UNSUPPORTED = "unsupported"
+    CLARIFICATION = "clarification"
 
 
 class Step(BaseModel):
@@ -110,6 +128,7 @@ class AgentState(TypedDict, total=False):
     task_id: str
     source: Source
     user_input: str
+    conversation_id: str
     memory_context: list[dict]  # retrieved skills/failures/preferences (examples only)
     plan: Plan | None
     step_index: int
@@ -123,6 +142,7 @@ class AgentState(TypedDict, total=False):
     cancelled: bool
     final_answer: str | None
     error: str | None
+    resolved_refs: dict[str, Any]
     # operational (Phase 1)
     validate_attempts: int
     gated_resolved_paths: dict[str, list[str]]  # step_id -> pre-interrupt resolved paths (TOCTOU)

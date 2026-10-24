@@ -32,6 +32,7 @@ def intake(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         task_id = state.get("task_id") or new_task_id()
         update: dict[str, Any] = {
             "task_id": task_id,
+            "conversation_id": state.get("conversation_id") or "local",
             "source": source if source in ("terminal", "voice", "benchmark") else "terminal",
             "user_input": "",
             "cancelled": False,
@@ -68,6 +69,7 @@ def intake(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         task_id = state.get("task_id") or new_task_id()
         update = {
             "task_id": task_id,
+            "conversation_id": state.get("conversation_id") or "local",
             "source": source if source in ("terminal", "voice", "benchmark") else "terminal",
             "user_input": user_input,
             "cancelled": False,
@@ -99,6 +101,7 @@ def intake(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     update = {
         "task_id": state.get("task_id") or new_task_id(),
+        "conversation_id": state.get("conversation_id") or "local",
         "source": request.source,
         "user_input": request.text,
         "cancelled": cancelled,

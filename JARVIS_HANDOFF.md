@@ -85,7 +85,17 @@ Not touched: `src/` logic, `tests/`, `pyproject.toml`, lock/config TOML files, `
 
 ## 6. Next step
 
-Phase 1 design spec
+Phase 2 design spec (browser primitives)
+
+## Phase 1 results
+- Step 0: Conftest guard allows subprocess in test_daemon_single_instance, test_tools_dictation, test_tools_open_in_app, test_tools_apps, and test_memory::test_embed_is_process_stable (5+ files in allowlist noted). Benchmarks YAML total 59, no expect.tool entries found (schema uses expected.type); missing from registry: [] (static). Git status clean at phase start of commits.
+- Step 1: Blank input now reaches "No input received" branch without validation exception (intake fixed). Test tests/unit/test_intake_blank.py passes.
+- Step 2: Added src/jarvis/agent/referents.py (ReferentStore, TTL 600s, one per kind, thread-safe, in-memory). Wired into act.py - browser_find/open_result/goto/open_site set referents; take_photo/create_file set FileRef; page referent not cleared on unrelated steps (only on nav to different origin/explicit/TTL). SessionContext API preserved. Tests tests/unit/test_referents.py and tests/unit/test_session_context.py pass.
+- Step 3: Added referent summary block to brain prompt (<1200 chars) with rule line in system prompt; brain passes resolved_refs summary.
+- Step 4: Added context_resolve node (no LLM), wired between intake and memory_retrieve in graph; extended fastpath for referent-aware "open the first/second/third result|link|one" (browser_open_result position) and "open the picture/photo" (open_path). Routing updated in nodes/__init__ and graph.
+- Step 5: Added RequestKind and FailureCode enums to state.py; added conversation_id and resolved_refs keys to AgentState. Kept request_kind, replan_decision, Profile. Dead/live table (summary): request_kind written by intake/fastpath/brain/replan paths (live), read by graph routing/respond/telemetry (live). replan_decision written by replan node (live), read by respond/graph (live). Profile defined in state.py and used in benchmark/profiles codebase (separate from AgentState; not stored as AgentState key - largely live in its own domain).
+- Decisions: guarded generic final click incl. opt-in voice approval; whole-profile folders; full-screen screenshot Tier 1; generic not site-specific; browsing grant yes.
+
 
 ## Redesign plan
 
