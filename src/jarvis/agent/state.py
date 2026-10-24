@@ -23,6 +23,7 @@ class RequestKind(StrEnum):
     CONVERSATION = "conversation"
     CLARIFICATION = "clarification"
     UNSUPPORTED = "unsupported"
+    BROWSE = "browse"
 
 
 class FailureCode(StrEnum):
@@ -159,6 +160,10 @@ class AgentState(TypedDict, total=False):
     pending_replan: bool
     replan_now: bool | None
     replan_decision: Any | None  # jarvis.agent.schemas.ReplanDecision (allowlisted)
+    specialist_goal: str | None = None
+    specialist_calls: int = 0
+    specialist_history: list[dict[str, Any]] = Field(default_factory=list)
+    specialist_phase: str = "idle"
     # operational (brain -> clarify loop)
     clarification_question: str | None
     clarification_answer: str | None

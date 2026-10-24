@@ -349,6 +349,9 @@ class AgentSettings(BaseModel):
     step_timeout_seconds: int = 30
     verify_enabled: bool = True
     replan_enabled: bool = True
+    use_specialists: bool = False
+    specialist_max_calls: int = 12
+    specialist_call_timeout_s: float = 12.0
 
 
 class PolicySettings(BaseModel):

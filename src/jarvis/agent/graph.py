@@ -35,28 +35,29 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from jarvis.agent.context import AppContext
-    from jarvis.agent.nodes import (
-        act,
-        brain,
-        clarify,
-        context_resolve,
-        intake,
-        memory_retrieve,
-        memory_save,
-        policy_gate,
-        replan,
-        respond,
-        route_after_act,
-        route_after_brain,
-        route_after_clarify,
-        route_after_intake,
-        route_after_policy_gate,
-        route_after_replan,
-        route_after_validate,
-        route_after_verify,
-        validate,
-        verify,
-    )
+from jarvis.agent.nodes import (
+    act,
+    brain,
+    clarify,
+    context_resolve,
+    intake,
+    memory_retrieve,
+    memory_save,
+    policy_gate,
+    replan,
+    respond,
+    route_after_act,
+    route_after_brain,
+    route_after_clarify,
+    route_after_intake,
+    route_after_policy_gate,
+    route_after_replan,
+    route_after_validate,
+    route_after_verify,
+    validate,
+    verify,
+    wrap,
+)
 from jarvis.agent.state import AgentState
 
 __all__ = ["build_graph", "build_secure_serde", "open_sqlite_checkpointer"]

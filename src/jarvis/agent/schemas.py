@@ -35,6 +35,7 @@ __all__ = [
     "PlanStep",
     "PolicyDecision",
     "ReplanDecision",
+    "SpecialistDecision",
     "ToolCall",
     "UserRequest",
 ]
@@ -134,7 +135,7 @@ class BrainDecision(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    request_type: Literal["conversation", "action", "clarification", "unsupported"]
+    request_type: Literal["conversation", "action", "clarification", "unsupported", "browse"]
     goal: str = ""
     actions: list[ActionIntent] = Field(default_factory=list)
     response_text: str = ""
@@ -172,6 +173,10 @@ class BrainDecision(BaseModel):
             )
         if self.request_type == "action" and not self.actions:
             raise ValueError("request_type='action' requires at least one action")
+        if self.request_type == "browse" and not (self.goal or "").strip():
+            raise ValueError("request_type='browse' requires a non-blank goal")
+        if self.request_type == "browse" and self.actions:
+            raise ValueError("request_type='browse' requires empty actions")
         return self
 
 
@@ -262,3 +267,27 @@ class AgentResponse(BaseModel):
     kind: RequestKind = "tool"
     interrupted: bool = False
     text: str
+
+
+class SpecialistDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["act", "done", "give_up"]
+    tool: str = ""
+    args: dict = Field(default_factory=dict)
+    rationale: str = ""
+    expect: str = ""
+    summary: str = ""
+
+    @model_validator(mode="after")
+    def _validate_kind(self) -> SpecialistDecision:
+        if self.kind == "act":
+            if not (self.tool or "").strip():
+                raise ValueError("act requires a tool")
+        if self.kind == "done":
+            if not (self.summary or "").strip():
+                raise ValueError("done requires a summary")
+        if self.kind == "give_up":
+            if not (self.summary or "").strip():
+                raise ValueError("give_up requires a reason in summary")
+        return self
