@@ -1,6 +1,6 @@
 """Onset-triggered bare-cancel detection for the *speaking* state (D22).
 
-Owner decision **D22** overrides ``ROADMAP_V2.1_AMENDMENTS.md.md`` section E: a
+Owner decision **D22** overrides ``docs/ROADMAP.md`` (Stage 1): a
 bare ``"stop"``, with **no wake word**, must cancel while JARVIS is THINKING and
 while it is SPEAKING.  Section E had barge-in respond to the wake word only.
 

@@ -140,7 +140,7 @@ The **summary shown to the user is generated from the validated args**, not from
 
 #### 7.2.1 Bare "stop" while busy (owner decision D22)
 
-**D22 supersedes `ROADMAP_V2.1_AMENDMENTS.md.md` section E**, which specified that barge-in responds to the wake word only. A bare `"stop"` — spoken with **no wake word** — now cancels in both busy states:
+**D22 supersedes `docs/ROADMAP.md` (Stage 1)**, which specified that barge-in responds to the wake word only. A bare `"stop"` — spoken with **no wake word** — now cancels in both busy states:
 
 | State | Trigger | Bound | Effect |
 |-------|---------|-------|--------|

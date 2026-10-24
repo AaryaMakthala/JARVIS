@@ -26,7 +26,7 @@ Optional: probe with a real photo instead of the generated 1x1 PNG:
 
     .venv\Scripts\python.exe scripts\whatsapp_attach_probe.py --file "C:\path\to\photo.jpg"
 
-WhatsApp ToS: your own test number only (ROADMAP_V2.1, risk I9).
+WhatsApp ToS: your own test number only (docs/ROADMAP.md, risk I9).
 """
 
 from __future__ import annotations

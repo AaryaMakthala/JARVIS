@@ -150,7 +150,7 @@ auto_idle_timeout_s = 300.0
 # wake word, and a timeout is a refusal (fail closed).
 confirm_window_s = 8.0
 
-# D22 (overrides ROADMAP_V2.1_AMENDMENTS section E): a bare "stop", with no
+# D22 (overrides docs/ROADMAP.md Stage 1): a bare "stop", with no
 # wake word, also cuts JARVIS off while it is SPEAKING.  Gates only that new
 # speaking-state capability; the in-flight watch already accepted a bare cancel.
 bare_stop_while_busy = true
@@ -493,7 +493,7 @@ class VoiceSettings(BaseModel):
     #: value and by the trailing-silence end in ``_read_command``.  No wake word
     #: is required inside it (docs/03 §7.8), and silence/timeout is a refusal.
     confirm_window_s: float = 8.0
-    #: Owner decision **D22** (overrides ROADMAP_V2.1_AMENDMENTS section E): a
+    #: Owner decision **D22** (overrides docs/ROADMAP.md Stage 1): a
     #: bare ``"stop"`` with no wake word must also cut JARVIS off **while it is
     #: speaking**, not only while a task is in flight.  This flag gates only
     #: that new speaking-state capability; the in-flight (THINKING) watch

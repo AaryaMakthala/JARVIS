@@ -2743,7 +2743,7 @@ class TestBargeIn:
 class TestBareStopWhileSpeaking:
     """D22: a bare ``"stop"`` - no wake word - also cuts the answer short.
 
-    Overrides ``ROADMAP_V2.1_AMENDMENTS.md.md`` section E, which made barge-in
+    Overrides ``docs/ROADMAP.md`` (Stage 1), which made barge-in
     respond to the wake word only.  ``voice.bare_stop_while_busy`` gates this
     speaking-state capability; the in-flight (THINKING) watch accepted a bare
     cancel before the flag existed and is covered by
