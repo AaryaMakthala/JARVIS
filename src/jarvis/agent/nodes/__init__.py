@@ -123,21 +123,29 @@ def route_after_clarify(state: dict[str, Any]) -> str:
 
 
 def route_after_validate(state: dict[str, Any]) -> str:
-    """validate -> (brain | replan | policy_gate | respond)."""
+    """validate -> (brain | replan | specialist_decide | policy_gate | respond)."""
     if state.get("halted_reason"):
         return "respond"
     plan_obj = state.get("plan")
     if plan_obj is not None and plan_obj.needs_clarification:
         return "respond"
     if state.get("error"):
+        # A rejected specialist plan is the specialist's to correct; every other
+        # task keeps the original brain/replan repair path.
+        if state.get("specialist_phase") == "decide":
+            return "specialist_decide"
         return "replan" if state.get("pending_replan") else "brain"
     return "policy_gate"
 
 
 def route_after_policy_gate(state: dict[str, Any]) -> str:
-    """policy_gate -> (act | respond)."""
+    """policy_gate -> (act | specialist_decide | respond)."""
     if state.get("halted_reason"):
         return "respond"
+    # A recoverable specialist refusal records why and hands back to decide;
+    # an ordinary step keeps the unchanged path to act.
+    if state.get("specialist_phase") == "decide":
+        return "specialist_decide"
     return "act"
 
 

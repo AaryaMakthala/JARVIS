@@ -173,20 +173,37 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
         "clarify", route_after_clarify, {"brain": "brain", "respond": "respond"}
     )
 
-    g.add_conditional_edges(
-        "validate",
-        route_after_validate,
-        {
-            "brain": "brain",
-            "replan": "replan",
-            "policy_gate": "policy_gate",
-            "respond": "respond",
-        },
-    )
-
-    g.add_conditional_edges(
-        "policy_gate", route_after_policy_gate, {"act": "act", "respond": "respond"}
-    )
+    if use_sp is not None and getattr(use_sp, "use_specialists", False):
+        g.add_conditional_edges(
+            "validate",
+            route_after_validate,
+            {
+                "brain": "brain",
+                "replan": "replan",
+                "policy_gate": "policy_gate",
+                "respond": "respond",
+                "specialist_decide": "specialist_decide",
+            },
+        )
+        g.add_conditional_edges(
+            "policy_gate",
+            route_after_policy_gate,
+            {"act": "act", "respond": "respond", "specialist_decide": "specialist_decide"},
+        )
+    else:
+        g.add_conditional_edges(
+            "validate",
+            route_after_validate,
+            {
+                "brain": "brain",
+                "replan": "replan",
+                "policy_gate": "policy_gate",
+                "respond": "respond",
+            },
+        )
+        g.add_conditional_edges(
+            "policy_gate", route_after_policy_gate, {"act": "act", "respond": "respond"}
+        )
     g.add_conditional_edges("act", route_after_act, {"verify": "verify", "respond": "respond"})
     if use_sp is not None and getattr(use_sp, "use_specialists", False):
         g.add_conditional_edges(

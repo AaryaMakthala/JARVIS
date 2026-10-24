@@ -3,10 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from tests.support import approve
+from tests.support import approve, deny
 
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import open_sqlite_checkpointer
+from jarvis.agent.nodes.telemetry import task_status
 from jarvis.agent.runner import resume_task, run_task
 from jarvis.agent.schemas import BrainDecision, SpecialistDecision
 from jarvis.browser.context import ElementRef, Observation
@@ -197,6 +198,108 @@ def test_specialist_loop_adapts_after_a_failed_step(tmp_path: Path) -> None:
         assert [entry.get("ok") for entry in history] == [False, True], history
         assert "unknown site" in str(history[0].get("note", ""))
         assert out.final_answer == "Recovered."
+    finally:
+        saver.conn.close()
+
+
+def test_specialist_loop_recovers_from_a_gate_refusal(tmp_path: Path) -> None:
+    """An unobservable target is recorded in history, not a task halt."""
+    session = _FakeSession()
+    decisions = [
+        BrainDecision(request_type="browse", goal="open the first result", actions=[]),
+        # No result set exists yet, so the gate cannot resolve the target.
+        SpecialistDecision(
+            kind="act", tool="browser_open_result", args={"position": 1}, rationale="open"
+        ),
+        _search("test"),
+        SpecialistDecision(kind="done", summary="Recovered from refusal."),
+    ]
+    ctx = make_app_context(
+        _settings(specialist_max_calls=10),
+        llm=FakeLLM(decisions),
+        registry=_browser_registry(),
+        browser=session,
+    )
+    saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
+    try:
+        out = _run_to_completion(ctx, saver, "open the first result")
+        assert out.interrupted is False
+        assert out.halted_reason is None
+        history = out.state.get("specialist_history") or []
+        assert len(history) == 2, history
+        assert history[0]["tool"] == "browser_open_result"
+        assert history[0]["ok"] is False
+        assert "could not be reliably observed" in history[0]["note"]
+        ids = [getattr(r, "step_id", None) for r in (out.state.get("results") or [])]
+        assert ids == ["s1"], ids
+        assert out.final_answer == "Recovered from refusal."
+        # The refusal carries the synthetic TIER_BLOCKED resolution marker, yet
+        # telemetry reports the task as completed: it derives the status from
+        # results/halted_reason and never reads decision tiers.
+        assert task_status(out.state) in ("completed", "partial")
+    finally:
+        saver.conn.close()
+
+
+def test_specialist_loop_recovers_from_a_validate_rejection(tmp_path: Path) -> None:
+    """A bad-args plan goes back to decide, capped and recorded."""
+    session = _FakeSession()
+    decisions = [
+        BrainDecision(request_type="browse", goal="search broken then fixed", actions=[]),
+        SpecialistDecision(
+            kind="act", tool="browser_search", args={"site": "Google"}, rationale="broken"
+        ),
+        _search("test"),
+        SpecialistDecision(kind="done", summary="Fixed the plan."),
+    ]
+    ctx = make_app_context(
+        _settings(specialist_max_calls=10),
+        llm=FakeLLM(decisions),
+        registry=_browser_registry(),
+        browser=session,
+    )
+    saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
+    try:
+        out = _run_to_completion(ctx, saver, "search broken then fixed")
+        assert out.interrupted is False
+        assert out.halted_reason is None
+        history = out.state.get("specialist_history") or []
+        assert len(history) == 2, history
+        assert history[0]["tool"] == "validate"
+        assert history[0]["ok"] is False
+        assert "invalid args" in history[0]["note"], history[0]
+        ids = [getattr(r, "step_id", None) for r in (out.state.get("results") or [])]
+        assert ids == ["s1"], ids
+        assert out.final_answer == "Fixed the plan."
+    finally:
+        saver.conn.close()
+
+
+def test_specialist_user_no_still_halts(tmp_path: Path) -> None:
+    """A refused confirmation must stop the task, not feed the loop."""
+    session = _FakeSession()
+    decisions = [
+        BrainDecision(request_type="browse", goal="search example", actions=[]),
+        _search("test"),
+        SpecialistDecision(kind="done", summary="Should never run."),
+    ]
+    ctx = make_app_context(
+        _settings(specialist_max_calls=10),
+        llm=FakeLLM(decisions),
+        registry=_browser_registry(),
+        browser=session,
+    )
+    saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
+    try:
+        out = run_task(ctx, saver, "search example", thread_id="t1")
+        assert out.interrupted is True and out.confirmation is not None
+        out = resume_task(ctx, saver, out.task_id, deny(out.confirmation))
+        assert out.interrupted is False
+        assert out.halted_reason
+        assert out.halted_reason.startswith("Refused"), out.halted_reason
+        assert not (out.state.get("results") or [])
+        assert out.state.get("specialist_phase") == "observe"
+        assert not (out.state.get("specialist_history") or [])
     finally:
         saver.conn.close()
 

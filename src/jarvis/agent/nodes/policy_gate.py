@@ -45,7 +45,9 @@ from jarvis.agent.nodes.util import (
     active_scope_cid,
     plan_hash_for,
     policy_context_for,
+    record_specialist_note,
     resolve_step_target,
+    specialist_active,
 )
 from jarvis.agent.precheck import (
     blocked_precheck_steps,
@@ -95,7 +97,11 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         decision = precheck_refusal(step, precheck_error)
         decisions = dict(state.get("decisions") or {})
         decisions[step.id] = decision
-        return {"decisions": decisions, "halted_reason": refusal_text(decision, decision.step_id)}
+        refusal = refusal_text(decision, decision.step_id)
+        recovered = _specialist_refusal(state, step, refusal)
+        if recovered is not None:
+            return {**recovered, "decisions": decisions}
+        return {"decisions": decisions, "halted_reason": refusal}
 
     plan_hash_v = plan_hash_for(plan, base_pctx, ctx.engine)
 
@@ -224,6 +230,42 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     )
 
 
+# ── specialist loop: recoverable refusals ────────────────────────────────
+
+
+def _specialist_refusal(
+    state: dict[str, Any], step: Any, refusal: str, *, hard: bool = False
+) -> dict[str, Any] | None:
+    """Turn a recoverable gate refusal into a new specialist decision.
+
+    A specialist iteration proposes one step at a time from untrusted page
+    text, so an ordinary refusal (unknown precondition, unobservable target, a
+    browser action outside the approved scope) must inform the next decision
+    instead of ending the task.  ``None`` is returned when this is not a
+    specialist task or the refusal is a hard stop, and the caller keeps its
+    original halt.
+
+    Hard stops are never routed here: a Tier 3 block, a typed-confirmation or
+    action-hash mismatch, a TOCTOU path change, a user "no", a confirmation
+    timeout, a scope grant that could not be issued, and cancellation.  The
+    engine's tier is the authority; this helper can only *not halt* on a
+    refusal the user could have corrected, never lower or skip a check.
+    """
+    if hard or not specialist_active(state):
+        return None
+    return {
+        "plan": None,
+        "specialist_phase": "decide",
+        "specialist_history": record_specialist_note(
+            state,
+            tool=str(getattr(step, "tool", "") or ""),
+            note=refusal,
+            args_summary="gate refusal",
+        ),
+        "halted_reason": None,
+    }
+
+
 # ── Stage 7 (Slice 8): scope front end ────────────────────────────────────
 
 
@@ -264,8 +306,20 @@ def _blocked_or_scope(
             # reason from the hypothetical approved-scope decision (payment /
             # password / ambiguous target) instead of the less specific scope one.
             decisions = {**decisions, step.id: trial}
-            return {"decisions": decisions, "halted_reason": refusal_text(trial, step.id)}
-    return {"decisions": decisions, "halted_reason": refusal_text(decision, step.id)}
+            refusal = refusal_text(trial, step.id)
+            recovered = _specialist_refusal(
+                state, step, refusal, hard=trial.tier >= tiers.TIER_BLOCKED
+            )
+            if recovered is not None:
+                return {**recovered, "decisions": decisions}
+            return {"decisions": decisions, "halted_reason": refusal}
+    refusal = refusal_text(decision, step.id)
+    recovered = _specialist_refusal(
+        state, step, refusal, hard=decision.tier >= tiers.TIER_BLOCKED
+    )
+    if recovered is not None:
+        return {**recovered, "decisions": decisions}
+    return {"decisions": decisions, "halted_reason": refusal}
 
 
 def _scope_missing_tier(
@@ -333,7 +387,14 @@ def _scope_confirm(
     decision = ctx.engine.decide(step, scoped)
     decisions = {**decisions, step.id: decision}
     if not decision.allowed:
-        return {"decisions": decisions, "halted_reason": refusal_text(decision, step.id)}
+        refusal = refusal_text(decision, step.id)
+        recovered = _specialist_refusal(
+            state, step, refusal, hard=decision.tier >= tiers.TIER_BLOCKED
+        )
+        if recovered is not None:
+            ctx.scope_registry.revoke(task_id)
+            return {**recovered, "decisions": decisions}
+        return {"decisions": decisions, "halted_reason": refusal}
 
     gated = dict(state.get("gated_resolved_paths") or {})
     prior_paths = gated.get(step.id)
@@ -661,7 +722,17 @@ def _approve_single_step(
 
 
 def _resolution_refusal(state: dict[str, Any], step: Any, reason: str) -> dict[str, Any]:
-    """Refuse a step whose interaction target could not be reliably observed."""
+    """Refuse a step whose interaction target could not be reliably observed.
+
+    The ``TIER_BLOCKED`` below is a *resolution marker* ("the target could not
+    be observed, so this step can never pass"), NOT a Tier 3 policy block.  It
+    is deliberately not routed through the engine, and telemetry never records
+    it as a policy refusal: ``telemetry.task_status`` is derived from
+    ``StepResult`` records and ``halted_reason``, and the task_log row stores
+    status/counters only - ``AgentState.decisions`` (where this Decision lands)
+    is never read by either.  A specialist iteration may therefore recover from
+    it; every other task halts here exactly as before.
+    """
     decision = Decision(
         step_id=str(getattr(step, "id", "") or ""),
         tier=tiers.TIER_BLOCKED,
@@ -676,7 +747,13 @@ def _resolution_refusal(state: dict[str, Any], step: Any, reason: str) -> dict[s
     )
     decisions = dict(state.get("decisions") or {})
     decisions[decision.step_id] = decision
-    return {"decisions": decisions, "halted_reason": refusal_text(decision, decision.step_id)}
+    refusal = refusal_text(decision, decision.step_id)
+    # The synthetic TIER_BLOCKED above marks "cannot observe the target", not a
+    # Tier 3 policy block, so a specialist iteration may recover from it.
+    recovered = _specialist_refusal(state, step, refusal)
+    if recovered is not None:
+        return {**recovered, "decisions": decisions}
+    return {"decisions": decisions, "halted_reason": refusal}
 
 
 def _voice_tier2_ok(

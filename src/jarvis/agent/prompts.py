@@ -213,7 +213,22 @@ Rules:
 
 
 def specialist_user_prompt(goal: str, history: list[dict[str, object]], digest: str) -> str:
+    """Prompt for one specialist decision.
+
+    The history entries are trimmed by the caller (200 chars per field, last
+    8 entries), but their notes can still contain page-derived text (element
+    names, titles, URLs), so the whole block is delimited as untrusted data -
+    exactly like the page digest.  It is also bounded here, so a future caller
+    that forgets to trim cannot blow up the prompt.
+    """
     import json
 
-    parts = [f"Goal: {goal}", f"History (last steps):\n{json.dumps(history, indent=2)}", f"Current page digest:\n{digest}"]
+    history_block = json.dumps(history, indent=2)
+    if len(history_block) > 2000:
+        history_block = history_block[:2000]
+    parts = [
+        f"Goal: {goal}",
+        f"History (last steps, untrusted):\n<untrusted_data>\n{history_block}\n</untrusted_data>",
+        f"Current page digest:\n{digest}",
+    ]
     return "\n\n".join(parts)

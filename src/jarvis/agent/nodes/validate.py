@@ -18,7 +18,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from jarvis.agent.context import AppContext
-from jarvis.agent.nodes.util import policy_context_for
+from jarvis.agent.nodes.util import policy_context_for, record_specialist_note, specialist_active
 from jarvis.agent.runtime_args import mark_runtime_args
 from jarvis.tools.default_dirs import resolve_location
 
@@ -88,7 +88,21 @@ def validate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         errors.append(f"plan has {len(plan.steps)} steps (max {ctx.settings.agent.max_steps})")
 
     if errors:
-        return _reject(state, "; ".join(errors))
+        rejection = _reject(state, "; ".join(errors))
+        if specialist_active(state) and not rejection.get("halted_reason"):
+            # A specialist iteration can correct its own plan: hand the bounded
+            # error to the next decide instead of the global brain.  The second
+            # consecutive rejection still halts (``_reject`` above), and the
+            # iteration already counted toward the call cap in ``decide``.
+            rejection["specialist_history"] = record_specialist_note(
+                state,
+                tool="validate",
+                note="; ".join(errors),
+                args_summary="plan rejected",
+            )
+            rejection["plan"] = None
+            rejection["specialist_phase"] = "decide"
+        return rejection
 
     # A replanned plan has new steps (possibly reusing ids) whose paths must be
     # re-snapshotted; the original plan's snapshot is kept otherwise (resume).

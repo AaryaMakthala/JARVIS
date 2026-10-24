@@ -136,6 +136,43 @@ def resolve_step_target(
     return StepTarget(context=augmented, target=target, host=host)
 
 
+def specialist_active(state: dict[str, Any]) -> bool:
+    """Whether this task is inside the (flagged) browser specialist loop.
+
+    ``"idle"`` is the resting phase, so only "decide" and "observe" count.
+    Every other task keeps the ordinary graph behaviour.
+    """
+    return str(state.get("specialist_phase") or "idle") not in ("", "idle")
+
+
+def record_specialist_note(
+    state: dict[str, Any],
+    *,
+    tool: str,
+    note: str,
+    ok: bool = False,
+    args_summary: str = "",
+) -> list[dict[str, Any]]:
+    """Append one bounded entry to ``specialist_history`` and return the list.
+
+    The shape matches what :mod:`jarvis.agent.nodes.specialist` writes, so the
+    next decision sees a refusal exactly like a failed step: ``tool``,
+    ``args-summary``, ``ok`` and a note trimmed to 200 characters.  The repeat
+    guard compares ``(tool, args-summary)``, so the same refused action twice in
+    a row still stops the loop.
+    """
+    history = list(state.get("specialist_history") or [])
+    history.append(
+        {
+            "tool": str(tool or "")[:200],
+            "args-summary": str(args_summary or "")[:200],
+            "ok": bool(ok),
+            "note": str(note or "")[:200],
+        }
+    )
+    return history
+
+
 def active_scope_cid(scope_registry: ScopeRegistry | None, task_id: str) -> str:
     """The current valid grant's confirmation id for ``task_id``, else ``""``.
 
