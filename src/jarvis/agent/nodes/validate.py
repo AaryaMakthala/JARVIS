@@ -92,7 +92,11 @@ def validate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     # A replanned plan has new steps (possibly reusing ids) whose paths must be
     # re-snapshotted; the original plan's snapshot is kept otherwise (resume).
-    replaying = bool(state.get("pending_replan"))
+    # A specialist iteration presents a fresh one-step plan for the same task,
+    # so the results and approvals already earned must survive it too - resetting
+    # them would re-ask for every approval and forget completed work.
+    specialist_iteration = str(state.get("specialist_phase") or "") not in ("", "idle")
+    replaying = bool(state.get("pending_replan")) or specialist_iteration
     gated = {} if replaying else state.get("gated_resolved_paths")
 
     if gated is None:

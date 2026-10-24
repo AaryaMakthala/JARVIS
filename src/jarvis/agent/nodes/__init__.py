@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from jarvis.agent.nodes import specialist
 from jarvis.agent.nodes.act import act
 from jarvis.agent.nodes.brain import brain
 from jarvis.agent.nodes.clarify import clarify
@@ -37,7 +38,6 @@ from jarvis.agent.nodes.replan import replan
 from jarvis.agent.nodes.respond import respond
 from jarvis.agent.nodes.validate import validate
 from jarvis.agent.nodes.verify import verify
-from jarvis.agent.nodes import specialist
 from jarvis.tools.base import CancelToken
 
 __all__ = [
@@ -59,9 +59,9 @@ __all__ = [
     "route_after_replan",
     "route_after_validate",
     "route_after_verify",
+    "specialist",
     "validate",
     "verify",
-    "specialist",
     "wrap",
 ]
 
@@ -150,11 +150,20 @@ def route_after_act(state: dict[str, Any]) -> str:
 
 def route_after_verify(state: dict[str, Any]) -> str:
     """verify -> (act | replan | policy_gate | respond)."""
+    results = state.get("results") or []
+    if state.get("specialist_phase") == "observe" and (
+        not results or not results[-1].ok or results[-1].verified is False
+    ):
+        # The specialist loop owns its own recovery: observe records the failure
+        # in specialist_history and the next decide adapts to it.  A failed step
+        # never falls into the generic replan node, and a blind retry of the
+        # same failing step is not taken either (the LLM decides what to do).
+        # Non-specialist runs never see phase "observe", so they are unchanged.
+        return "specialist_observe"
     if state.get("replan_now"):
         return "replan"
     if state.get("retry_now"):
         return "act"
-    results = state.get("results") or []
     plan_obj = state.get("plan")
     if not plan_obj or not plan_obj.steps:
         # check if in specialist flow
@@ -184,20 +193,28 @@ def route_after_replan(state: dict[str, Any]) -> str:
 
 
 def route_after_specialist_decide(state: dict[str, Any]) -> str:
-    if state.get("plan") is None:
-        if state.get("halted_reason") or state.get("final_answer") is not None:
-            return "respond"
+    """specialist_decide -> (validate | respond).
+
+    ``done`` / ``give_up`` / the call catch all leave the previous iteration's
+    plan in state; the terminal answer must win over that stale plan, or the
+    run would validate (and reset the bookkeeping of) a plan that is finished.
+    """
+    if state.get("halted_reason") or state.get("final_answer") is not None:
         return "respond"
     plan_obj = state.get("plan")
     if plan_obj is not None and getattr(plan_obj, "steps", None):
         return "validate"
-    if state.get("halted_reason") or state.get("final_answer") is not None:
-        return "respond"
     return "respond"
 
 
 def route_after_specialist_observe(state: dict[str, Any]) -> str:
-    plan_obj = state.get("plan")
-    if plan_obj is not None and getattr(plan_obj, "steps", None):
+    """specialist_observe -> (act | specialist_decide).
+
+    ``observe`` sets the phase back to "observe" only when it built the page-
+    refresh step act must execute; otherwise it hands straight back to decide.
+    The previous plan is still in state, so the phase (not the plan) is what
+    says what just happened.
+    """
+    if state.get("specialist_phase") == "observe":
         return "act"
     return "decide"

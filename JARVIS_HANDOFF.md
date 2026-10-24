@@ -254,3 +254,31 @@ WhatsApp: send a message to mom saying running late (T032) - make_send_whatsapp_
 - Known limit: each Tier 1 browser step still asks for confirmation until browsing grant exists.
 - NEXT STEP: "Phase 4 design spec (browsing grant, policy change)"
 
+
+## Phase 4 results (in progress)
+
+- Task 1 (root cause, not guessed): `specialist.decide` called `ctx.llm.structured(..., role="planner")`;
+  the client protocol only accepts `model_role`, so the call raised `TypeError` before the fake recorded it.
+  The specialist's `except` handed it to `_llm_halted_reason`, which reported the coding error as
+  "I couldn't reach the AI service.". Fixed in ebd5607 (also unpacks the `(model, usage)` tuple, which
+  would have raised `AttributeError` next).
+- Task 2 (loop fixes, 62824d9): unique step ids `s<specialist_calls>` (plus `r<calls>` for the injected
+  read step); `validate` preserves results/approved_hashes for a specialist iteration; `observe` reads
+  `Step.tool` correctly (the old `A or B if C else None` expression always yielded `None` and looped
+  forever); `observe` records each outcome in `specialist_history`; failed/unverified steps route to
+  `specialist_observe`, not the generic replan node; `route_after_specialist_decide` lets `done`/call-cap
+  beat the stale plan; `route_after_specialist_observe` routes on the phase, not the leftover plan.
+  3 e2e tests pass (three steps once, failure then adaptation, call cap).
+- Cleanup/style: a36aac8 (browse projection simplified, no bare except), 4338863 (ruff clean on
+  specialist.py and brain.py).
+- Decision: the task-scoped browsing grant lives in a **separate** `src/jarvis/policy/browse_grant.py`
+  (`BrowseGrant` / `BrowseGrantRegistry`). `ScopeRegistry` is not edited: its grant requires a plan hash
+  and its hard cap is 8 actions, neither of which fits a task-scoped browse grant (30 actions, no plan
+  hash). The engine, tiers table and Tier 3 blocking stay untouched.
+- Authorship fix: 34 commits in `backup-before-cleanup..HEAD` were rewritten to
+  `Aarya Makthala <aaryamakthala@gmail.com>` (author and committer); trees are byte-identical. Safety
+  branch `backup-pre-author-fix` kept. Rule: commit emails must never be masked (no `***` placeholder).
+- Repository identity (global and repo-local) is `Aarya Makthala <aaryamakthala@gmail.com>`; no commit
+  trailers or AI attribution are allowed.
+- NEXT STEP: "Phase 4: specialist gap fixes, then browsing grant".
+

@@ -168,8 +168,10 @@ def decide(state: AgentState, ctx: AppContext) -> dict[str, Any]:
         if tool not in BROWSER_TOOL_NAMES:
             return {"halted_reason": "Specialist proposed non-browser tool.", "final_answer": "I can only use browser tools for this task.", "specialist_phase": "idle"}
         args = decision.args or {}
-        # build single-step plan
-        step = Step(id="s1", tool=tool, args=args, rationale=(decision.rationale or "")[:200], expect=(decision.expect or "")[:200])
+        # One step id per executed decision: ids must stay unique for the whole
+        # task, because act's exactly-once guard skips a step whose id already
+        # has a successful result.  ``calls`` increments once per act decision.
+        step = Step(id=f"s{calls}", tool=tool, args=args, rationale=(decision.rationale or "")[:200], expect=(decision.expect or "")[:200])
         plan = Plan(kind="tool", goal=goal or decision.rationale or "Browse", steps=[step])
         return {
             "plan": plan,
@@ -181,23 +183,71 @@ def decide(state: AgentState, ctx: AppContext) -> dict[str, Any]:
     return {"halted_reason": "Invalid specialist decision.", "final_answer": "I couldn't proceed.", "specialist_phase": "idle"}
 
 
+def _record_history(state: AgentState) -> list[dict[str, Any]]:
+    """Append the just-finished step's outcome to ``specialist_history``.
+
+    The next decision must see whether the previous step worked (and why not),
+    so a failed or unverified step is recorded here rather than being retried
+    blindly.  Only a result that belongs to the plan's last step is recorded,
+    so re-entering observe twice never duplicates an entry.
+    """
+    history = list(state.get("specialist_history") or [])
+    plan = state.get("plan")
+    results = list(state.get("results") or [])
+    steps = list(getattr(plan, "steps", None) or [])
+    if not steps or not results:
+        return history
+    step = steps[-1]
+    result = results[-1]
+    if str(getattr(result, "step_id", "")) != str(getattr(step, "id", "")):
+        return history
+    note = str(result.verify_note or result.error or "")
+    if not result.ok and not note:
+        note = "the step did not succeed"
+    if result.ok and result.verified is False and not note:
+        note = "the step could not be verified"
+    history.append(
+        {
+            "tool": str(getattr(step, "tool", "") or ""),
+            "args-summary": _args_summary(getattr(step, "args", None) or {}),
+            "ok": bool(result.ok and result.verified is not False),
+            "note": note[:200],
+        }
+    )
+    return history
+
+
 def observe(state: AgentState, ctx: AppContext) -> dict[str, Any]:
+    """Record the finished step, then either refresh the page or hand back."""
+    history = _record_history(state)
+    calls = int(state.get("specialist_calls") or 0)
     plan = state.get("plan")
     if plan is None:
-        return {"specialist_phase": "decide"}
+        return {"specialist_phase": "decide", "specialist_history": history}
     # check last step
     try:
         steps = plan.steps if hasattr(plan, "steps") else plan.get("steps", [])
         if steps:
-            last_tool = getattr(steps[-1], "tool", None) or steps[-1].get("tool") if isinstance(steps[-1], dict) else None
+            last = steps[-1]
+            last_tool = (
+                last.get("tool") if isinstance(last, dict) else getattr(last, "tool", None)
+            )
             if last_tool in {"browser_read", "browser_find", "browser_search"}:
-                return {"specialist_phase": "decide"}
+                return {"specialist_phase": "decide", "specialist_history": history}
     except Exception:  # a malformed plan must not break the loop
         logger.debug("specialist observe: could not inspect the last step", exc_info=True)
-    # build plan to read
-    step = Step(id="s1", tool="browser_read", args={}, rationale="Refresh page", expect="See current page")
+    # Build a page-refresh step for act.  The phase deliberately stays
+    # "observe" so verify routes the refresh back here; ``r<calls>`` keeps the
+    # id out of the decision ids (``s<calls>``) and unique per iteration.
+    step = Step(id=f"r{calls}", tool="browser_read", args={}, rationale="Refresh page", expect="See current page")
     new_plan = Plan(kind="tool", goal=state.get("specialist_goal") or state.get("goal") or "Browse", steps=[step])
-    return {"plan": new_plan, "step_index": 0, "decisions": {}, "specialist_phase": "decide"}
+    return {
+        "plan": new_plan,
+        "step_index": 0,
+        "decisions": {},
+        "specialist_phase": "observe",
+        "specialist_history": history,
+    }
 
 
 __all__ = ["BROWSER_TOOL_NAMES", "decide", "observe"]
