@@ -28,13 +28,76 @@ def intake(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     """Prepare the state for one task run."""
     user_input = (state.get("user_input") or "").strip()
     source = state.get("source", "terminal")
-    request = UserRequest(
-        text=user_input,
-        source=source if source in ("terminal", "voice", "benchmark") else "terminal",
-    )
+    if not user_input:
+        task_id = state.get("task_id") or new_task_id()
+        update: dict[str, Any] = {
+            "task_id": task_id,
+            "source": source if source in ("terminal", "voice", "benchmark") else "terminal",
+            "user_input": "",
+            "cancelled": False,
+            "request_kind": "",
+            "clarification_question": None,
+            "clarification_answer": None,
+            "clarification_count": 0,
+            "clarification_history": [],
+            "step_index": 0,
+            "retry_count": 0,
+            "retry_now": False,
+            "replan_now": False,
+            "replan_count": 0,
+            "pending_replan": False,
+            "replan_decision": None,
+            "validate_attempts": 0,
+            "api_calls": 0,
+            "tokens": 0,
+            "plan": None,
+            "decisions": {},
+            "approved_hashes": [],
+            "results": [],
+            "memory_context": [],
+            "halted_reason": "No input received. Tell me what to do.",
+        }
+        record_started(update, ctx)
+        return update
+    try:
+        request = UserRequest(
+            text=user_input,
+            source=source if source in ("terminal", "voice", "benchmark") else "terminal",
+        )
+    except Exception:
+        task_id = state.get("task_id") or new_task_id()
+        update = {
+            "task_id": task_id,
+            "source": source if source in ("terminal", "voice", "benchmark") else "terminal",
+            "user_input": user_input,
+            "cancelled": False,
+            "request_kind": "",
+            "clarification_question": None,
+            "clarification_answer": None,
+            "clarification_count": 0,
+            "clarification_history": [],
+            "step_index": 0,
+            "retry_count": 0,
+            "retry_now": False,
+            "replan_now": False,
+            "replan_count": 0,
+            "pending_replan": False,
+            "replan_decision": None,
+            "validate_attempts": 0,
+            "api_calls": 0,
+            "tokens": 0,
+            "plan": None,
+            "decisions": {},
+            "approved_hashes": [],
+            "results": [],
+            "memory_context": [],
+            "halted_reason": "No input received. Tell me what to do.",
+        }
+        record_started(update, ctx)
+        return update
     cancelled = bool(_CANCEL_RE.match(request.text))
 
-    update: dict[str, Any] = {
+    update = {
         "task_id": state.get("task_id") or new_task_id(),
         "source": request.source,
         "user_input": request.text,
@@ -60,9 +123,7 @@ def intake(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         "results": [],
         "memory_context": [],
     }
-    if not request.text:
-        update["halted_reason"] = "No input received. Tell me what to do."
-    elif cancelled:
+    if cancelled:
         update["halted_reason"] = "Cancelled by the user."
     else:
         update["halted_reason"] = None
