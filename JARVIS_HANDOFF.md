@@ -342,6 +342,23 @@ to the deadline; cancel-between-attempts was skipped (6 `ctx.llm` call sites);
 single-provider installs bypass the composite client and therefore the overall
 deadline; "sir" is only used when a `user_name` preference already exists.
 
+### Memory pass (M0a-M6)
+
+All implementation-only and **UNTESTED** (ruff + py_compile + read-only scripts
+only; no tests written, pytest not run). `act.py`, `policy_gate.py` and
+`tests/unit/test_browse_grant_wiring.py` remain untouched and uncommitted.
+
+| Step | Commit | Content | Status |
+|---|---|---|---|
+| M0a | `3db20b0` | Node path stored as short codes (`in`, `cr`, `mr`, `br`, `va`, `pg`, `ac`, `ve`, `rp`, `cl`, `co`, `re`, `ms`, `sd`, `so`) joined by `>`, repeats as `ac x3`, so the whole run fits the 300-char `tools_used` column. One documented map (`NODE_CODES`); `get_trace` still returns full names. | UNTESTED |
+| M0b | `b20a2c1` | Retry backoff clipped to the request deadline: `multi._deadline()` computes one absolute deadline and hands it to every provider as `deadline_at`; `sleep_within_deadline` sleeps `min(backoff, remaining)` and raises the timeout category when it is gone. Groq, OpenRouter/NVIDIA and Gemini all use it. | UNTESTED |
+| M1 | (no commit) | Read-only memory audit (stores, caps, retrieval, save policy, failure behaviour, preferences, CLI). Findings drove M4/M5/M6; the M2/M3 hardening items were not implemented in this pass. | audited |
+| M2 | - | **Not implemented** (bounded retrieval: `retrieve_k`, 300/1200-char caps, `min_score`, dedupe, secret/age filters, retrieval timeout). `docs/MEMORY.md` lists them as planned. | NOT DONE |
+| M3 | - | **Not implemented** (strict save policy/retention keys, `max_records`, `max_failure_records`, explicit `skipped_sensitive`). Existing gate documented in `docs/MEMORY.md`. | NOT DONE |
+| M4 | `b1f997c` | Name learning in `memory_save` (`detect_name_statement`): four explicit phrasings only, 1-2 letter/apostrophe/hyphen words, 2-40 chars, stop words/verbs/credential words refused, secret check, conversation turns only, `memory.learn_name` (default true), weak phrasings cannot replace an existing name, `memory_saved_reason="name_saved"`. Applied from the **next** turn (compose runs before memory_save). | UNTESTED |
+| M5 | `3cc4cea` | `src/jarvis/memory_cli.py` + registration: `jarvis memory list|forget|clear|prefs` over the agent's own stores; 50-row cap, 60-char text, 40-char values, secrets hidden, `CLEAR` confirmation, `--kind` disambiguates ids; `FailureStore.delete` added. | UNTESTED |
+| M6 | this commit | `docs/MEMORY.md`, updated `docs/STATE_CONTRACT.md` memory keys, this section. | UNTESTED |
+
 OPEN: cross-host test question
 (test_step_on_another_host_interrupts + the 3 uncommitted files) must be
 resolved before the test phase.

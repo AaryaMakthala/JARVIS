@@ -81,19 +81,22 @@ Writers/readers below are per module (`agent/nodes/*` unless stated).
 | `screen_answer` | `compose` | `respond`, `runner`, `cli` | **New.** The full answer the terminal shows; built from `respond.base_answer`, so it equals the pre-compose text. Plain `str`, nothing new in the serializer. |
 | `spoken_answer` | `compose` | `runner`, `daemon/server.py` (voice) | **New.** At most two sentences, cut at a sentence boundary. Failures/refusals are the factual text shortened, never a template. Plain `str`. |
 
-## Dead keys
+## Memory outcome keys
 
-Written by `memory_save` after `respond`, and **read by no one** (the
-architecture doc names them, so they are kept rather than removed silently):
+Written by `memory_save`, which runs after `respond`. They now carry real
+values; no node reads them yet (the reader would belong in the runner's
+outcome, since `respond` runs *before* `memory_save`), which is why they are
+listed here rather than in the answers table.
 
-| Key | Written by | Read by |
-|---|---|---|
-| `memory_saved` | `memory_save` | - |
-| `memory_saved_reason` | `memory_save` | - |
-| `memory_failure_logged` | `memory_save` | - |
+| Key | Written by | Read by | Values |
+|---|---|---|---|
+| `memory_saved` | `memory_save` | - | `True` only when a **skill** was stored; a failure record does not count. |
+| `memory_saved_reason` | `memory_save` | - | `"name_saved"` when an explicitly stated name was stored as the `user_name` preference; otherwise why nothing was stored (`"cancelled by the user"`, `"task halted: ..."`, `"not a tool plan"`, `"at least one step failed"`, `"dry-run: nothing is written"`, `"memory write failed"`, ...) or `None`. |
+| `memory_failure_logged` | `memory_save` | - | `True` when a failure example was appended to the failure log instead of a skill. |
 
-If a later phase needs them, the reader belongs in `respond` (it runs *before*
-`memory_save`) or in the runner's outcome - not in a new node.
+Name learning writes only the preference store: the turn that states the name
+is already answered, so the name applies from the **next** turn (`compose`
+reads `user_name` before `memory_save` runs). See `docs/MEMORY.md`.
 
 ## What may never be added here
 
