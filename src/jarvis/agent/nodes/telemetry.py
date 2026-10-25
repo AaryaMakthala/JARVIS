@@ -26,17 +26,140 @@ logged as a success.  The vocabulary is closed
 **Nothing here may raise.**  Telemetry is not the product; a locked or corrupt
 ``memory.db`` must degrade to "no metrics" and leave the task's actual answer
 untouched.  ``--dry-run`` writes nothing at all, exactly like the other nodes.
+
+A third, cheap signal rides along: the **node path** of the run.  :func:`wrap`
+appends the node's *name* to an in-memory trace keyed by ``task_id``; at
+``respond`` the trace is folded into one compact string (``brain x3 > respond``)
+and stored in the task-log row's free-form ``tools_used`` column, then dropped.
+Only node names are recorded - never user text, tool arguments or results - so
+the trace cannot leak anything the state did not already store, and the writer
+is bounded twice (200 entries per task, a 600-character path).
 """
 
 from __future__ import annotations
 
+import re
+import threading
+from collections import OrderedDict
 from typing import Any
 
 from jarvis.agent.context import AppContext
 from jarvis.agent.state import Plan, StepResult
 from jarvis.memory.tasklog import STATUSES
 
-__all__ = ["record_finished", "record_started", "task_status"]
+__all__ = [
+    "MAX_PATH_CHARS",
+    "MAX_TRACED_TASKS",
+    "MAX_TRACE_ENTRIES",
+    "discard_trace",
+    "format_trace",
+    "get_trace",
+    "record_finished",
+    "record_started",
+    "task_status",
+    "trace_node",
+]
+
+#: Most tasks whose path is held in memory at once (oldest evicted first).
+MAX_TRACED_TASKS = 200
+
+#: Most node entries recorded for one task (oldest dropped first).
+MAX_TRACE_ENTRIES = 200
+
+#: Longest compact path string written to the task-log field.
+MAX_PATH_CHARS = 600
+
+#: A recorded name is a function's ``__name__``; anything else is normalised
+#: down to this shape before it is kept.
+_NAME_RE = re.compile(r"[^A-Za-z0-9_]")
+_MAX_NAME_CHARS = 40
+
+
+class _NodeTraces:
+    """Bounded, thread-safe map of ``task_id`` -> recorded node names.
+
+    Held by this module rather than in ``AgentState`` on purpose: the path is
+    observability, not graph state, so it needs no checkpoint key and no
+    serializer allowlist entry.  It is process-local and dropped as soon as
+    the task's row is written.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_task: OrderedDict[str, list[str]] = OrderedDict()
+
+    def append(self, task_id: str, name: str) -> None:
+        with self._lock:
+            names = self._by_task.get(task_id)
+            if names is None:
+                names = []
+                self._by_task[task_id] = names
+                while len(self._by_task) > MAX_TRACED_TASKS:
+                    self._by_task.popitem(last=False)
+            names.append(name)
+            if len(names) > MAX_TRACE_ENTRIES:
+                del names[0 : len(names) - MAX_TRACE_ENTRIES]
+
+    def names(self, task_id: str) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._by_task.get(task_id) or ())
+
+    def discard(self, task_id: str) -> None:
+        with self._lock:
+            self._by_task.pop(task_id, None)
+
+
+#: The process-wide trace store.  Private: callers use the functions below so
+#: the bounded dict itself is never handed out.
+_TRACES = _NodeTraces()
+
+
+def trace_node(task_id: str, name: str) -> None:
+    """Record that ``name`` is being entered for ``task_id`` (called by :func:`wrap`).
+
+    Best effort by construction: an empty id or a name with no usable
+    characters records nothing, and nothing here can raise into the graph.
+    """
+    task_id = (task_id or "").strip()
+    clean = _NAME_RE.sub("", str(name or ""))[:_MAX_NAME_CHARS]
+    if not task_id or not clean:
+        return
+    _TRACES.append(task_id, clean)
+
+
+def get_trace(task_id: str) -> tuple[str, ...]:
+    """The node names recorded so far for ``task_id`` (oldest first)."""
+    return _TRACES.names((task_id or "").strip())
+
+
+def discard_trace(task_id: str) -> None:
+    """Forget ``task_id``'s path (called once its row is written)."""
+    _TRACES.discard((task_id or "").strip())
+
+
+def format_trace(names: tuple[str, ...] | list[str]) -> str:
+    """One compact, bounded string for the recorded node names.
+
+    Consecutive repeats collapse to ``name x3`` (a routed loop such as
+    ``policy_gate > act > verify`` reads as one pass, not as noise).  The
+    result is cut at a separator boundary so it never ends mid-name.
+    """
+    runs: list[tuple[str, int]] = []
+    for name in names:
+        label = str(name or "")
+        if not label:
+            continue
+        if runs and runs[-1][0] == label:
+            runs[-1] = (label, runs[-1][1] + 1)
+        else:
+            runs.append((label, 1))
+    path = " > ".join(f"{label} x{count}" if count > 1 else label for label, count in runs)
+    if len(path) <= MAX_PATH_CHARS:
+        return path
+    cut = path.rfind(" > ", 0, MAX_PATH_CHARS - 2)
+    if cut <= 0:
+        return path[: MAX_PATH_CHARS - 1] + "…"
+    return path[:cut] + " > …"
 
 
 def record_started(state: dict[str, Any], ctx: AppContext) -> None:
@@ -53,17 +176,29 @@ def record_started(state: dict[str, Any], ctx: AppContext) -> None:
 
 
 def record_finished(state: dict[str, Any], ctx: AppContext) -> None:
-    """Close the row with the task's final counters and status (``respond``)."""
+    """Close the row with the task's final counters and status (``respond``).
+
+    Also writes the run's node path (see :func:`format_trace`) into the row's
+    free-form ``tools_used`` field and then frees the in-memory trace, whether
+    or not the write succeeded - a finished task must not leak memory.
+    """
     plan: Plan | None = state.get("plan")
-    _write(
-        state,
-        ctx,
-        status=task_status(state),
-        api_calls=int(state.get("api_calls") or 0),
-        tokens=int(state.get("tokens") or 0),
-        steps=len(plan.steps) if plan is not None else 0,
-        replans=int(state.get("replan_count") or 0),
-    )
+    task_id = str(state.get("task_id") or "")
+    path = format_trace(get_trace(task_id)) if task_id else ""
+    try:
+        _write(
+            state,
+            ctx,
+            status=task_status(state),
+            api_calls=int(state.get("api_calls") or 0),
+            tokens=int(state.get("tokens") or 0),
+            steps=len(plan.steps) if plan is not None else 0,
+            replans=int(state.get("replan_count") or 0),
+            tools_used=path or None,
+        )
+    finally:
+        if task_id:
+            discard_trace(task_id)
 
 
 def task_status(state: dict[str, Any]) -> str:
@@ -119,6 +254,7 @@ def _write(
     tokens: int,
     steps: int,
     replans: int,
+    tools_used: str | None = None,
 ) -> None:
     """Hand the row to the memory backend, tolerating every backend shape.
 
@@ -134,6 +270,7 @@ def _write(
     task_id = str(state.get("task_id") or "")
     if not task_id or bool(getattr(ctx, "dry_run", False)):
         return
+    extra = {"tools_used": tools_used} if tools_used else {}
     try:
         sink(
             task_id,
@@ -144,6 +281,7 @@ def _write(
             tokens=tokens,
             steps=steps,
             replans=replans,
+            **extra,
         )
     except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
         ctx.logger.warning("task telemetry not recorded: %s", exc)

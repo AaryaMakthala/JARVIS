@@ -36,6 +36,7 @@ from jarvis.agent.nodes.memory_save import memory_save
 from jarvis.agent.nodes.policy_gate import policy_gate
 from jarvis.agent.nodes.replan import replan
 from jarvis.agent.nodes.respond import respond
+from jarvis.agent.nodes.telemetry import trace_node
 from jarvis.agent.nodes.validate import validate
 from jarvis.agent.nodes.verify import verify
 from jarvis.tools.base import CancelToken
@@ -76,17 +77,31 @@ def wrap(
     ``cancel`` (optional) is the **per-task** token: when the user cancels a
     run, the next node to be entered raises :class:`~jarvis.tools.base.Cancelled`
     instead of executing, so the remaining steps of the plan are never planned
-    or acted on.  The check belongs here because ``wrap`` is the single choke
+    or acted on.    The check belongs here because ``wrap`` is the single choke
     point every node passes through.  The token is bound per *graph* rather than
     on the shared :class:`~jarvis.agent.context.AppContext` on purpose: a
     cancelled run can still be unwinding while the next task starts, and a
     shared field would let the new task's token mask the old task's cancel.
+
+    The same choke point records the run's **node path**: after the cancel
+    check, the node's name is appended to the in-memory trace for
+    ``state["task_id"]`` (:func:`jarvis.agent.nodes.telemetry.trace_node`).
+    Node names only - never user text, tool arguments or results - and the
+    trace is written once and freed by ``respond``.
     """
+    name = getattr(node, "__name__", "node")
+
     if cancel is None:
-        return lambda state: node(state, ctx)
+
+        def _plain(state: dict[str, Any]) -> dict[str, Any]:
+            trace_node(str(state.get("task_id") or ""), name)
+            return node(state, ctx)
+
+        return _plain
 
     def _gated(state: dict[str, Any]) -> dict[str, Any]:
         cancel.check()
+        trace_node(str(state.get("task_id") or ""), name)
         return node(state, ctx)
 
     return _gated

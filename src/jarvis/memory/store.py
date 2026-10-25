@@ -126,6 +126,7 @@ class SqliteMemory:
         tokens: int = 0,
         steps: int = 0,
         replans: int = 0,
+        tools_used: str | None = None,
     ) -> None:
         """Upsert this task's telemetry row; a failure never fails a task.
 
@@ -150,6 +151,7 @@ class SqliteMemory:
                         tokens=tokens,
                         steps=steps,
                         replans=replans,
+                        tools_used=tools_used,
                     )
             except sqlite3.Error as exc:
                 self._log.warning("task telemetry not recorded: %s", exc)

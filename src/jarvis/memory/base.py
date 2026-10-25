@@ -50,6 +50,7 @@ class MemoryBackend(Protocol):
         tokens: int = 0,
         steps: int = 0,
         replans: int = 0,
+        tools_used: str | None = None,
     ) -> None:
         """Store per-task telemetry counters (no-op for read-only backends).
 
@@ -85,6 +86,7 @@ class NullMemory:
         tokens: int = 0,
         steps: int = 0,
         replans: int = 0,
+        tools_used: str | None = None,
     ) -> None:
         """No-op: with no store there is nowhere to record telemetry."""
-        del task_id, status, source, user_input, api_calls, tokens, steps, replans
+        del task_id, status, source, user_input, api_calls, tokens, steps, replans, tools_used
