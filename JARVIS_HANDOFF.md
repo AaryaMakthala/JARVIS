@@ -317,3 +317,33 @@ WhatsApp: send a message to mom saying running late (T032) - make_send_whatsapp_
   payment/purchase controls are Tier 3-blocked rather than re-confirmed; browser_search coverage
   needs a known site.
 - NEXT STEP: "Phase 5 design spec (compose, persona, guarded final click)".
+
+## Backbone (docs/BACKBONE_PLAN.md)
+
+Implementation-only pass over the prompt -> LLM -> plan -> run -> answer
+backbone. **Every step below is UNTESTED**: no tests were written and pytest was
+not run (per the plan's rules: `ruff check` + `py_compile` + read-only scripts
+only). `act.py`, `policy_gate.py` and `tests/unit/test_browse_grant_wiring.py`
+were not touched and remain uncommitted WIP.
+
+| Step | Commit | Content | Status |
+|---|---|---|---|
+| A0 | `e28b2b8` | `docs/BACKBONE_PLAN.md` (the step list + rules) | UNTESTED |
+| A1 | `a4ec8bc` | Node trace: `wrap()` appends the node *name* per `task_id` to a bounded in-memory trace in `agent/nodes/telemetry.py`; `record_finished` writes the compact path (`brain x2 > respond`) into the existing free-form `tools_used` column and frees the trace. | UNTESTED |
+| A2 | `4cfc3d1` | `agent/routing.py`: `route_for_brain_result` with the route table; `route_after_brain` delegates; `unsupported` explicit (no tools, answer = brain text or "I can't do that with the tools I have."); `BrainDecision` gained the missing consistency validators (conversation/unsupported -> no actions). | UNTESTED |
+| A4 | `06ed825` | `llm.total_deadline_seconds` (30 s) / `llm.voice_deadline_seconds` (12 s); the composite client sets one monotonic deadline per call, clips every attempt's timeout to the time left and raises the timeout-category error when it is gone. Brain voice path uses the voice budget. | UNTESTED |
+| A3 | `f1fc83a` | `agent/tool_groups.py` + `agent.prompt_trim_enabled` (default **false**): the brain describes only the groups the request plausibly needs and a trimmed site catalogue; unassigned tool or no match = full catalogue (fail open); off = byte-identical prompt. Measured: 47 tools, full prompt 35,390 B (catalogue 30,923 B); "open notepad" trimmed 11,502 B / 13 tools. | UNTESTED |
+| A5 | `a59b380` | `compose` node + `agent/compose_rules.py`: routers still return `"respond"`, the edge maps translate it to `compose`, `compose -> respond`; writes only `spoken_answer` (<=2 sentences) and `screen_answer` (the pre-existing answer); failures/refusals are never reworded; the address appears only with a stored `user_name`. Voice reads `spoken_answer` (`runner`, `daemon/server.py`), terminal reads `screen_answer` (`cli._print_outcome`). `compose.enabled` default true. | UNTESTED |
+| A6 | this commit | `docs/STATE_CONTRACT.md`, `docs/GRAPH.md`, this section. | UNTESTED |
+
+Deviations recorded during the pass: the `tools_used` column truncates at 300
+chars (no migration); backoff sleeps inside the provider clients are not clipped
+to the deadline; cancel-between-attempts was skipped (6 `ctx.llm` call sites);
+single-provider installs bypass the composite client and therefore the overall
+deadline; "sir" is only used when a `user_name` preference already exists.
+
+OPEN: cross-host test question
+(test_step_on_another_host_interrupts + the 3 uncommitted files) must be
+resolved before the test phase.
+
+Next: the test phase (golden-path S1-S10) per `docs/BACKBONE_PLAN.md`.
