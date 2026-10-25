@@ -17,7 +17,13 @@ Topology (docs/02_ARCHITECTURE.md sec. 4):
 
                        policy_gate -> act -> verify -> policy_gate (next step) | respond
 
-                       respond -> memory_save -> END   (Phase 8, exactly one write)
+                       compose -> respond -> memory_save -> END
+
+Every router still returns the route key ``"respond"``; the conditional-edge
+maps translate that key to the **compose** node, which writes the short spoken
+answer and the screen answer and then hands over to ``respond`` (the single
+sanitizer and task-log writer).  With ``compose.enabled = false`` compose writes
+nothing and ``respond`` produces exactly its old text.
 
 Confirmations suspend inside ``policy_gate`` via ``interrupt`` and
 clarifications suspend inside ``clarify``; resume re-enters that node
@@ -42,6 +48,7 @@ from jarvis.agent.nodes import (
     act,
     brain,
     clarify,
+    compose,
     context_resolve,
     intake,
     memory_retrieve,
@@ -55,14 +62,14 @@ from jarvis.agent.nodes import (
     route_after_intake,
     route_after_policy_gate,
     route_after_replan,
+    route_after_specialist_decide,
+    route_after_specialist_observe,
     route_after_validate,
     route_after_verify,
+    specialist,
     validate,
     verify,
     wrap,
-    specialist,
-    route_after_specialist_decide,
-    route_after_specialist_observe,
 )
 from jarvis.agent.state import AgentState
 
@@ -137,6 +144,7 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
     g.add_node("act", wrap(act, ctx, cancel))
     g.add_node("verify", wrap(verify, ctx, cancel))
     g.add_node("replan", wrap(replan, ctx, cancel))
+    g.add_node("compose", wrap(compose, ctx, cancel))
     g.add_node("respond", wrap(respond, ctx, cancel))
     g.add_node("memory_save", wrap(memory_save, ctx, cancel))
     use_sp = getattr(getattr(ctx, "settings", None), "agent", None)
@@ -146,7 +154,7 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
 
     g.add_edge(START, "intake")
     g.add_conditional_edges(
-        "intake", route_after_intake, {"memory_retrieve": "context_resolve", "respond": "respond"}
+        "intake", route_after_intake, {"memory_retrieve": "context_resolve", "respond": "compose"}
     )
     g.add_edge("context_resolve", "memory_retrieve")
     g.add_edge("memory_retrieve", "brain")
@@ -155,10 +163,10 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
         g.add_conditional_edges(
             "brain",
             route_after_brain,
-            {"clarify": "clarify", "validate": "validate", "respond": "respond", "specialist_decide": "specialist_decide"},
+            {"clarify": "clarify", "validate": "validate", "respond": "compose", "specialist_decide": "specialist_decide"},
         )
         g.add_conditional_edges(
-            "specialist_decide", route_after_specialist_decide, {"validate": "validate", "respond": "respond"}
+            "specialist_decide", route_after_specialist_decide, {"validate": "validate", "respond": "compose"}
         )
         g.add_conditional_edges(
             "specialist_observe", route_after_specialist_observe, {"act": "act", "decide": "specialist_decide"}
@@ -167,10 +175,10 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
         g.add_conditional_edges(
             "brain",
             route_after_brain,
-            {"clarify": "clarify", "validate": "validate", "respond": "respond"},
+            {"clarify": "clarify", "validate": "validate", "respond": "compose"},
         )
     g.add_conditional_edges(
-        "clarify", route_after_clarify, {"brain": "brain", "respond": "respond"}
+        "clarify", route_after_clarify, {"brain": "brain", "respond": "compose"}
     )
 
     if use_sp is not None and getattr(use_sp, "use_specialists", False):
@@ -181,14 +189,14 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
                 "brain": "brain",
                 "replan": "replan",
                 "policy_gate": "policy_gate",
-                "respond": "respond",
+                "respond": "compose",
                 "specialist_decide": "specialist_decide",
             },
         )
         g.add_conditional_edges(
             "policy_gate",
             route_after_policy_gate,
-            {"act": "act", "respond": "respond", "specialist_decide": "specialist_decide"},
+            {"act": "act", "respond": "compose", "specialist_decide": "specialist_decide"},
         )
     else:
         g.add_conditional_edges(
@@ -198,28 +206,29 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
                 "brain": "brain",
                 "replan": "replan",
                 "policy_gate": "policy_gate",
-                "respond": "respond",
+                "respond": "compose",
             },
         )
         g.add_conditional_edges(
-            "policy_gate", route_after_policy_gate, {"act": "act", "respond": "respond"}
+            "policy_gate", route_after_policy_gate, {"act": "act", "respond": "compose"}
         )
-    g.add_conditional_edges("act", route_after_act, {"verify": "verify", "respond": "respond"})
+    g.add_conditional_edges("act", route_after_act, {"verify": "verify", "respond": "compose"})
     if use_sp is not None and getattr(use_sp, "use_specialists", False):
         g.add_conditional_edges(
             "verify",
             route_after_verify,
-            {"act": "act", "replan": "replan", "policy_gate": "policy_gate", "respond": "respond", "specialist_observe": "specialist_observe"},
+            {"act": "act", "replan": "replan", "policy_gate": "policy_gate", "respond": "compose", "specialist_observe": "specialist_observe"},
         )
     else:
         g.add_conditional_edges(
             "verify",
             route_after_verify,
-            {"act": "act", "replan": "replan", "policy_gate": "policy_gate", "respond": "respond"},
+            {"act": "act", "replan": "replan", "policy_gate": "policy_gate", "respond": "compose"},
         )
     g.add_conditional_edges(
-        "replan", route_after_replan, {"validate": "validate", "respond": "respond"}
+        "replan", route_after_replan, {"validate": "validate", "respond": "compose"}
     )
+    g.add_edge("compose", "respond")
     g.add_edge("respond", "memory_save")
     g.add_edge("memory_save", END)
 

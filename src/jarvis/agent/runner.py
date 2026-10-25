@@ -34,6 +34,12 @@ class TaskOutcome:
     halted_reason: str | None
     decisions: dict[str, Decision]
     results: list[StepResult]
+    #: Written by the ``compose`` node.  ``screen_answer`` is what the terminal
+    #: shows, ``spoken_answer`` what the voice channel says; both are ``None``
+    #: when compose is disabled or fell back, and every reader then uses
+    #: :attr:`final_answer` as before.
+    spoken_answer: str | None = None
+    screen_answer: str | None = None
     state: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -154,5 +160,7 @@ def _outcome(
         halted_reason=persisted.get("halted_reason"),
         decisions=decision_map,
         results=results,
+        spoken_answer=persisted.get("spoken_answer"),
+        screen_answer=persisted.get("screen_answer"),
         state=persisted,
     )

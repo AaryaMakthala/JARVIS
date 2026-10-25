@@ -142,6 +142,13 @@ class AgentState(TypedDict, total=False):
     tokens: int
     cancelled: bool
     final_answer: str | None
+    #: Written by the ``compose`` node on every terminal path (plain strings, no
+    #: new serialised type).  ``screen_answer`` is the full answer the terminal
+    #: shows; ``spoken_answer`` is the same outcome in at most two sentences for
+    #: the voice channel.  Both are optional: with ``compose.enabled = false``
+    #: neither exists and ``respond`` builds ``final_answer`` exactly as before.
+    spoken_answer: str | None
+    screen_answer: str | None
     error: str | None
     resolved_refs: dict[str, Any]
     # operational (Phase 1)

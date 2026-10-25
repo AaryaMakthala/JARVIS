@@ -30,6 +30,7 @@ from jarvis.agent.nodes import specialist
 from jarvis.agent.nodes.act import act
 from jarvis.agent.nodes.brain import brain
 from jarvis.agent.nodes.clarify import clarify
+from jarvis.agent.nodes.compose import compose
 from jarvis.agent.nodes.context_resolve import context_resolve
 from jarvis.agent.nodes.intake import intake
 from jarvis.agent.nodes.memory_retrieve import memory_retrieve
@@ -47,6 +48,7 @@ __all__ = [
     "act",
     "brain",
     "clarify",
+    "compose",
     "context_resolve",
     "intake",
     "memory_retrieve",

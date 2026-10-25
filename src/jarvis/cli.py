@@ -1263,11 +1263,16 @@ def resolve_interrupts(outcome: Any, ctx: AppContext, saver: SqliteSaver) -> Any
 
 
 def _print_outcome(outcome: Any) -> None:
-    """Print a finished task result (shared by ``chat`` and ``run``)."""
+    """Print a finished task result (shared by ``chat`` and ``run``).
+
+    The terminal shows ``screen_answer`` when the ``compose`` node produced one
+    and falls back to ``final_answer`` otherwise (the pre-compose behaviour).
+    """
+    answer = getattr(outcome, "screen_answer", None) or outcome.final_answer
     if outcome.error:
         console.print(f"[red]{outcome.error}[/red]")
-    elif outcome.final_answer:
-        console.print(f"[green]{outcome.final_answer}[/green]")
+    elif answer:
+        console.print(f"[green]{answer}[/green]")
     else:
         console.print("[dim](no answer)[/dim]")
 

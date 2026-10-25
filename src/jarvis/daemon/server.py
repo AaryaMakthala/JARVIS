@@ -1593,8 +1593,12 @@ class DaemonServer:
                         slot.event.set()
                     return
 
-                if outcome.final_answer and not outcome.confirmation:
-                    slot.result_text = outcome.final_answer
+                # The voice channel speaks the composed short answer when the
+                # `compose` node produced one; otherwise it keeps the full
+                # final answer (the pre-compose behaviour).
+                spoken = getattr(outcome, "spoken_answer", None) or outcome.final_answer
+                if spoken and not outcome.confirmation:
+                    slot.result_text = spoken
                     slot.done = True
                     self._wake_dispatch()
                     if slot.owner_id == VOICE_OWNER:

@@ -102,6 +102,11 @@ step_timeout_seconds = 30
 # registry, tiers and policy are untouched.  Off until it has been verified.
 prompt_trim_enabled = false
 
+[compose]
+# Write a short spoken answer and a screen answer before respond.  false falls
+# back to the single pre-compose answer.
+enabled = true
+
 [policy]
 unlock_ttl_seconds = 300
 password_max_failures = 5
@@ -380,6 +385,18 @@ class AgentSettings(BaseModel):
     specialist_max_calls: int = 12
     specialist_call_timeout_s: float = 12.0
     prompt_trim_enabled: bool = False
+
+
+class ComposeSettings(BaseModel):
+    """The ``compose`` node's answer shaping.
+
+    ``enabled`` (default true) lets the node write a short ``spoken_answer`` and
+    the ``screen_answer`` before ``respond``.  With it false - or if the node
+    raises - ``respond`` builds its original single answer, so the flag is a
+    pure fallback switch, never a safety switch.
+    """
+
+    enabled: bool = True
 
 
 class PolicySettings(BaseModel):
@@ -801,6 +818,7 @@ class Settings(BaseSettings):
 
     llm: LLMSettings = LLMSettings()
     agent: AgentSettings = AgentSettings()
+    compose: ComposeSettings = ComposeSettings()
     policy: PolicySettings = PolicySettings()
     paths: PathSettings = PathSettings()
     apps: AppSettings = AppSettings()

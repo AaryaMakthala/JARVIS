@@ -40,9 +40,32 @@ def respond(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     are final here.  ``telemetry.record_finished`` cannot raise and cannot
     change the answer.
     """
-    update = _answer_for(state)
+    update = _composed(state) or _answer_for(state)
     record_finished(state, ctx)
     return update
+
+
+def _composed(state: dict[str, Any]) -> dict[str, str] | None:
+    """``screen_answer`` as the answer, or ``None`` to use the built-in path.
+
+    ``respond`` stays the single sanitizer: the composed text passes through
+    :func:`_answer` like every other answer, so a leaked routing document can
+    never reach the terminal even if ``compose`` produced it.
+    """
+    screen = state.get("screen_answer")
+    if isinstance(screen, str) and screen.strip():
+        return _answer(screen)
+    return None
+
+
+def base_answer(state: dict[str, Any]) -> str:
+    """The sanitized answer ``respond`` builds for this state.
+
+    Public so the ``compose`` node can use the *existing* answer as its screen
+    answer instead of re-deriving one (same assumption prefix, same step lines,
+    same failure text).
+    """
+    return _answer_for(state)["final_answer"]
 
 
 def _answer(text: str) -> dict[str, str]:
