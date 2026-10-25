@@ -20,6 +20,7 @@ from typing import Any
 from jarvis.agent.answer import safe_final_answer
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.telemetry import record_finished
+from jarvis.agent.routing import unsupported_answer
 from jarvis.agent.state import StepResult
 
 #: Longest single tool output line shown as a final answer.  A tool's raw
@@ -64,6 +65,11 @@ def _answer_for(state: dict[str, Any]) -> dict[str, str]:
     if plan is not None and plan.needs_clarification:
         question = plan.clarification_question or "Could you rephrase that?"
         return _answer(f"Clarification needed: {question}")
+
+    # An unsupported request is answered, not executed: the brain's dialog
+    # answer when it gave one, else the fixed refusal (route contract).
+    if state.get("request_kind") == "unsupported":
+        return _answer(unsupported_answer(state))
 
     if state.get("halted_reason"):
         return _answer(str(state["halted_reason"]))

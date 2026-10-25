@@ -26,6 +26,7 @@ from jarvis.agent import fastpath
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.clarify import MAX_CLARIFICATIONS
 from jarvis.agent.prompts import brain_system_prompt, brain_user_prompt
+from jarvis.agent.routing import UNSUPPORTED_ANSWER
 from jarvis.agent.schemas import BrainDecision
 from jarvis.agent.session_context import (
     SESSION_THREAD,
@@ -230,11 +231,13 @@ def _project(decision: BrainDecision, state: dict[str, Any], usage: Any, ctx: Ap
         }
 
     if decision.request_type == "unsupported":
-        reason = (decision.response_text or "").strip()
+        # The brain's own words when it gave them; otherwise the fixed refusal
+        # from the route contract.  Never a tool step (see jarvis.agent.routing).
+        reason = (decision.response_text or "").strip() or UNSUPPORTED_ANSWER
         return {
             **update,
             "request_kind": "unsupported",
-            "halted_reason": reason or "I can't do that.",
+            "halted_reason": reason,
         }
 
     if decision.request_type == "browse":

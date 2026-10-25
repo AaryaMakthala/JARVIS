@@ -177,6 +177,13 @@ class BrainDecision(BaseModel):
             raise ValueError("request_type='browse' requires a non-blank goal")
         if self.request_type == "browse" and self.actions:
             raise ValueError("request_type='browse' requires empty actions")
+        # Consistency (route contract, jarvis.agent.routing): a request that is
+        # answered or refused must not carry tool steps - nothing would run
+        # them, and a stale action list could otherwise be projected into a
+        # plan the policy gate would judge.  Rejected here so the clients'
+        # existing single repair round re-asks the model instead of crashing.
+        if self.request_type in ("conversation", "unsupported") and self.actions:
+            raise ValueError(f"request_type='{self.request_type}' requires empty actions")
         return self
 
 

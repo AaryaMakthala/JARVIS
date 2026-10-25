@@ -7,7 +7,8 @@ pure functions directly with a fake context.
 Routers (all deterministic, no LLM):
 
 * ``route_after_intake``  -> memory_retrieve | respond
-* ``route_after_brain``   -> clarify | validate | respond   (BrainDecision)
+* ``route_after_brain``   -> clarify | validate | respond   (BrainDecision;
+  the table lives in :mod:`jarvis.agent.routing`)
 * ``route_after_clarify`` -> brain | respond               (answer or cancel)
 * ``route_after_validate``-> brain | replan | policy_gate | respond
 * ``route_after_policy_gate`` -> act | respond
@@ -39,6 +40,7 @@ from jarvis.agent.nodes.respond import respond
 from jarvis.agent.nodes.telemetry import trace_node
 from jarvis.agent.nodes.validate import validate
 from jarvis.agent.nodes.verify import verify
+from jarvis.agent.routing import route_for_brain_result
 from jarvis.tools.base import CancelToken
 
 __all__ = [
@@ -115,19 +117,14 @@ def route_after_intake(state: dict[str, Any]) -> str:
 
 
 def route_after_brain(state: dict[str, Any]) -> str:
-    """brain -> (clarify | validate | respond)."""
-    if state.get("halted_reason"):
-        return "respond"
-    if state.get("specialist_phase") == "decide" and (state.get("specialist_goal") or state.get("request_kind") == "browse"):
-        return "specialist_decide"
-    plan_obj = state.get("plan")
-    if plan_obj is None:
-        return "respond"
-    if getattr(plan_obj, "needs_clarification", False):
-        return "clarify"
-    if getattr(plan_obj, "kind", None) == "conversation":
-        return "respond"
-    return "validate"
+    """brain -> (clarify | validate | respond | specialist_decide).
+
+    The route table itself lives in :mod:`jarvis.agent.routing`
+    (:func:`~jarvis.agent.routing.route_for_brain_result`), so the graph's edges
+    and the contract are defined in one place.  This function stays as the name
+    ``graph.py`` and the tests already use.
+    """
+    return route_for_brain_result(state)
 
 
 def route_after_clarify(state: dict[str, Any]) -> str:
