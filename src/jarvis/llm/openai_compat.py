@@ -15,7 +15,6 @@ Error messages name the provider/model and status, never request bodies.
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 
 import httpx
@@ -28,7 +27,9 @@ from jarvis.llm.client import (
     LLMModelError,
     LLMTransientError,
     Usage,
+    sleep_within_deadline,
 )
+from jarvis.llm.failures import FailureCategory
 
 _MODEL_ROLES = ("planner", "fast")
 
@@ -117,6 +118,7 @@ class OpenAICompatClient:
         *,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[str, int, int]:
         """One completion with bounded transient retries.
 
@@ -124,7 +126,9 @@ class OpenAICompatClient:
         exponential backoff.  Auth and model-availability failures are never
         retried.  ``max_retries`` / ``timeout_s`` override the configured
         budget and timeout for this call only; ``None`` keeps the configured
-        default.  Returns ``(content, prompt_tokens, completion_tokens)``.
+        default.  ``deadline_at`` is the overall request deadline from the
+        composite client, so a backoff sleep can never outlive the request.
+        Returns ``(content, prompt_tokens, completion_tokens)``.
         """
         retry_budget = self._max_retries if max_retries is None else max_retries
         request_timeout = self._timeout if timeout_s is None else timeout_s
@@ -151,7 +155,12 @@ class OpenAICompatClient:
                 self._logger.warning(
                     "%s transport error; retrying in %.1fs", self._provider, backoff
                 )
-                time.sleep(backoff)
+                sleep_within_deadline(
+                    backoff,
+                    deadline_at,
+                    provider=self._provider,
+                    category=FailureCategory.CONNECTION,
+                )
                 backoff *= 2
                 continue
             if resp.status_code == 429 or resp.status_code >= 500:
@@ -164,7 +173,12 @@ class OpenAICompatClient:
                 self._logger.warning(
                     "%s HTTP %d; retrying in %.1fs", self._provider, resp.status_code, backoff
                 )
-                time.sleep(backoff)
+                sleep_within_deadline(
+                    backoff,
+                    deadline_at,
+                    provider=self._provider,
+                    category=FailureCategory.SERVER_ERROR,
+                )
                 backoff *= 2
                 continue
             if resp.status_code != 200:
@@ -203,6 +217,7 @@ class OpenAICompatClient:
         temperature: float = 0.0,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[BaseModel, Usage]:
         model = self._model_for(model_role)
         messages = [
@@ -224,6 +239,7 @@ class OpenAICompatClient:
             temperature=temperature,
             max_retries=max_retries,
             timeout_s=timeout_s,
+            deadline_at=deadline_at,
         )
         try:
             parsed = schema.model_validate_json(self._strip_json_fence(raw))
@@ -248,6 +264,7 @@ class OpenAICompatClient:
                 temperature=temperature,
                 max_retries=max_retries,
                 timeout_s=timeout_s,
+                deadline_at=deadline_at,
             )
             try:
                 parsed = schema.model_validate_json(self._strip_json_fence(raw2))
@@ -267,6 +284,7 @@ class OpenAICompatClient:
         max_tokens: int | None = None,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[str, Usage]:
         model = self._model_for(model_role)
         messages = [
@@ -281,6 +299,7 @@ class OpenAICompatClient:
             max_tokens=max_tokens,
             max_retries=max_retries,
             timeout_s=timeout_s,
+            deadline_at=deadline_at,
         )
         return content, self._snapshot_usage()
 

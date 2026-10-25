@@ -123,6 +123,7 @@ class LLMClient(Protocol):
         temperature: float = 0.0,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[BaseModel, Usage]: ...
 
     def text(
@@ -135,6 +136,7 @@ class LLMClient(Protocol):
         max_tokens: int | None = None,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[str, Usage]: ...
 
 
@@ -173,6 +175,40 @@ def _is_schema_rejection(exc: BaseException) -> bool:
         return int(status) in (400, 422) if status is not None else False
     except (TypeError, ValueError):
         return False
+
+
+def sleep_within_deadline(
+    backoff: float,
+    deadline_at: float | None,
+    *,
+    provider: str,
+    category: FailureCategory,
+) -> None:
+    """Sleep before a retry, clipped to the request's overall deadline.
+
+    ``deadline_at`` is the absolute ``time.monotonic()`` deadline that
+    :class:`~jarvis.llm.multi.MultiProviderClient` computes once per request
+    (the same value it uses to clip each attempt's timeout).  Reusing that one
+    value - rather than a second, local budget - is what keeps a retry loop
+    from sleeping past the time the caller already spent falling through other
+    providers.
+
+    When the time is already gone, the retry is abandoned instead of slept on:
+    the timeout-category :class:`LLMTransientError` is raised, so the composite
+    walk records the same kind of failure it would for a provider timeout.
+    ``None`` means "no overall deadline" and sleeps the full backoff.
+    """
+    if deadline_at is None:
+        time.sleep(backoff)
+        return
+    remaining = deadline_at - time.monotonic()
+    if remaining <= 0:
+        raise LLMTransientError(
+            f"{provider} request timed out: the overall deadline was reached "
+            f"before a {category.value} retry",
+            category=FailureCategory.TIMEOUT,
+        )
+    time.sleep(min(backoff, remaining))
 
 
 def _as_llm_error(category: FailureCategory, message: str, exc: BaseException) -> LLMError:
@@ -301,6 +337,7 @@ class GroqClient(_MetaMixin):
         role: str = "planner",
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[str, int, int]:
         """Run one completion; bounded retry for genuinely transient failures.
 
@@ -315,7 +352,10 @@ class GroqClient(_MetaMixin):
 
         ``max_retries`` / ``timeout_s`` override the configured retry budget
         and timeout for this call only; ``None`` keeps the configured default,
-        so existing callers behave identically.
+        so existing callers behave identically.  ``deadline_at`` is the overall
+        request deadline from the composite client: a backoff sleep is clipped
+        to it, and once it has passed the retry is abandoned with the timeout
+        category instead of sleeping on (see :func:`sleep_within_deadline`).
         """
         retry_budget = self._settings.llm.max_retries if max_retries is None else max_retries
         request_timeout = self._settings.llm.timeout_seconds if timeout_s is None else timeout_s
@@ -340,7 +380,9 @@ class GroqClient(_MetaMixin):
                     ) from exc
                 if should_retry_same_provider(category) and attempts <= retry_budget:
                     self._logger.warning("groq %s; retrying in %.1fs", category.value, backoff)
-                    time.sleep(backoff)
+                    sleep_within_deadline(
+                        backoff, deadline_at, provider="Groq", category=category
+                    )
                     backoff *= 2
                     continue
                 elapsed = int((time.perf_counter() - started) * 1000)
@@ -381,6 +423,7 @@ class GroqClient(_MetaMixin):
         temperature: float = 0.0,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[BaseModel, Usage]:
         model = self._model_for(model_role)
         messages = [
@@ -399,6 +442,7 @@ class GroqClient(_MetaMixin):
                 model_role,
                 max_retries=max_retries,
                 timeout_s=timeout_s,
+                deadline_at=deadline_at,
             )
 
         try:
@@ -418,6 +462,7 @@ class GroqClient(_MetaMixin):
                 model_role,
                 max_retries=max_retries,
                 timeout_s=timeout_s,
+                deadline_at=deadline_at,
             )
         except Exception as exc:
             if not _is_schema_rejection(exc):
@@ -442,6 +487,7 @@ class GroqClient(_MetaMixin):
                 model_role,
                 max_retries=max_retries,
                 timeout_s=timeout_s,
+                deadline_at=deadline_at,
             )
 
         self._schema_modes[model] = True
@@ -458,6 +504,7 @@ class GroqClient(_MetaMixin):
         role: str = "planner",
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[BaseModel, Usage]:
         """Ask the model for JSON, validate it, and repair it once if invalid.
 
@@ -476,6 +523,7 @@ class GroqClient(_MetaMixin):
             role=role,
             max_retries=max_retries,
             timeout_s=timeout_s,
+            deadline_at=deadline_at,
         )
         try:
             parsed = schema.model_validate_json(self._strip_json_fence(raw))
@@ -501,6 +549,7 @@ class GroqClient(_MetaMixin):
                 role=role,
                 max_retries=max_retries,
                 timeout_s=timeout_s,
+                deadline_at=deadline_at,
             )
             try:
                 parsed = schema.model_validate_json(self._strip_json_fence(raw2))
@@ -521,6 +570,7 @@ class GroqClient(_MetaMixin):
         max_tokens: int | None = None,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[str, Usage]:
         model = self._model_for(model_role)
         messages = [
@@ -536,6 +586,7 @@ class GroqClient(_MetaMixin):
                 role=model_role,
                 max_retries=max_retries,
                 timeout_s=timeout_s,
+                deadline_at=deadline_at,
             )
         except LLMError:
             raise

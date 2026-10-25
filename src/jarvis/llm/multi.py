@@ -58,6 +58,7 @@ provider is asked again, no model name or credential is echoed.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -207,7 +208,7 @@ class MultiProviderClient:
     ) -> tuple[BaseModel, Usage]:
         """First provider that can produce ``schema`` for ``model_role`` wins."""
         failures: list[str] = []
-        deadline_at = self._clock() + self._budget_seconds(timeout_s)
+        deadline_at, handed_deadline = self._deadline(timeout_s)
         for group in self._groups(model_role):
             for info, _spec, client in group:
                 remaining = self._remaining(deadline_at, model_role)
@@ -228,6 +229,7 @@ class MultiProviderClient:
                         temperature=temperature,
                         max_retries=max_retries,
                         timeout_s=self._attempt_timeout(timeout_s, remaining),
+                        deadline_at=handed_deadline,
                     )
                 except LLMError as exc:
                     failure = self._note_failure(
@@ -255,7 +257,7 @@ class MultiProviderClient:
     ) -> tuple[str, Usage]:
         """First healthy provider that can answer plain text for ``model_role``."""
         failures: list[str] = []
-        deadline_at = self._clock() + self._budget_seconds(timeout_s)
+        deadline_at, handed_deadline = self._deadline(timeout_s)
         for group in self._groups(model_role):
             for info, _spec, client in group:
                 remaining = self._remaining(deadline_at, model_role)
@@ -268,6 +270,7 @@ class MultiProviderClient:
                         max_tokens=max_tokens,
                         max_retries=max_retries,
                         timeout_s=self._attempt_timeout(timeout_s, remaining),
+                        deadline_at=handed_deadline,
                     )
                 except LLMError as exc:
                     failure = self._note_failure(
@@ -375,6 +378,19 @@ class MultiProviderClient:
         if timeout_s is not None and 0 < timeout_s <= self._voice_deadline_seconds:
             return min(total, self._voice_deadline_seconds)
         return total
+
+    def _deadline(self, timeout_s: float | None) -> tuple[float, float | None]:
+        """``(absolute deadline for this walk, value handed to a provider)``.
+
+        The absolute value is compared with this client's clock (fake in tests);
+        the handed value is the same instant, or ``None`` when the deadline is
+        disabled, which tells a provider client not to clip anything.  One
+        deadline, computed once, is what both :meth:`_remaining` and every
+        provider's retry backoff measure against.
+        """
+        deadline_at = self._clock() + self._budget_seconds(timeout_s)
+        handed = None if math.isinf(deadline_at) else deadline_at
+        return deadline_at, handed
 
     def _remaining(self, deadline_at: float, role: str) -> float:
         """Seconds left before ``deadline_at``; raises the timeout error at zero.

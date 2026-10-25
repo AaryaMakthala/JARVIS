@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import base64
 import logging
-import time
 from typing import Any
 
 import httpx
@@ -32,7 +31,9 @@ from jarvis.llm.client import (
     LLMModelError,
     LLMTransientError,
     Usage,
+    sleep_within_deadline,
 )
+from jarvis.llm.failures import FailureCategory
 
 _MODEL_ROLES = ("planner", "fast", "vision")
 _GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -117,6 +118,7 @@ class GeminiClient:
         *,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[str, int, int]:
         """One generateContent call with bounded transient retries.
 
@@ -124,6 +126,8 @@ class GeminiClient:
         are best-effort (Gemini reports usage metadata when available).
         ``max_retries`` / ``timeout_s`` override the configured budget and
         timeout for this call only; ``None`` keeps the configured default.
+        ``deadline_at`` is the overall request deadline from the composite
+        client, so a backoff sleep can never outlive the request.
         """
         retry_budget = self._max_retries if max_retries is None else max_retries
         request_timeout = self._timeout if timeout_s is None else timeout_s
@@ -144,7 +148,9 @@ class GeminiClient:
                         f"Gemini request failed after {attempts} attempts"
                     ) from exc
                 self._logger.warning("Gemini transport error; retrying in %.1fs", backoff)
-                time.sleep(backoff)
+                sleep_within_deadline(
+                    backoff, deadline_at, provider="Gemini", category=FailureCategory.CONNECTION
+                )
                 backoff *= 2
                 continue
             if resp.status_code == 429 or resp.status_code >= 500:
@@ -155,7 +161,12 @@ class GeminiClient:
                         f"persisted after {attempts} attempts"
                     )
                 self._logger.warning("Gemini HTTP %d; retrying in %.1fs", resp.status_code, backoff)
-                time.sleep(backoff)
+                sleep_within_deadline(
+                    backoff,
+                    deadline_at,
+                    provider="Gemini",
+                    category=FailureCategory.SERVER_ERROR,
+                )
                 backoff *= 2
                 continue
             if resp.status_code != 200:
@@ -212,10 +223,13 @@ class GeminiClient:
         temperature: float = 0.0,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[BaseModel, Usage]:
         model = self._model_for(model_role)
         body = self._body(system, user, temperature, schema.model_json_schema())
-        raw, _, _ = self._generate(model, body, max_retries=max_retries, timeout_s=timeout_s)
+        raw, _, _ = self._generate(
+            model, body, max_retries=max_retries, timeout_s=timeout_s, deadline_at=deadline_at
+        )
         try:
             parsed = schema.model_validate_json(self._strip_json_fence(raw))
         except ValidationError as first_error:
@@ -238,7 +252,11 @@ class GeminiClient:
                 },
             ]
             raw2, _, _ = self._generate(
-                model, repair_body, max_retries=max_retries, timeout_s=timeout_s
+                model,
+                repair_body,
+                max_retries=max_retries,
+                timeout_s=timeout_s,
+                deadline_at=deadline_at,
             )
             try:
                 parsed = schema.model_validate_json(self._strip_json_fence(raw2))
@@ -258,12 +276,15 @@ class GeminiClient:
         max_tokens: int | None = None,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[str, Usage]:
         model = self._model_for(model_role)
         body = self._body(system, user, temperature, None)
         if max_tokens is not None:
             body["generationConfig"]["maxOutputTokens"] = max_tokens
-        content, _, _ = self._generate(model, body, max_retries=max_retries, timeout_s=timeout_s)
+        content, _, _ = self._generate(
+            model, body, max_retries=max_retries, timeout_s=timeout_s, deadline_at=deadline_at
+        )
         return content, self._snapshot_usage()
 
     def describe_image(
