@@ -55,6 +55,7 @@ from jarvis.llm.provider import (
     provider_has_credential,
 )
 from jarvis.memory import open_memory
+from jarvis.memory_cli import memory_app
 from jarvis.ml.risk import build_classifier
 from jarvis.platform_guard import is_64bit, is_python_supported, is_windows
 from jarvis.policy import tiers
@@ -2119,6 +2120,9 @@ def skills_list_command(store: Any, limit: int = 20) -> list[str]:
 
 skills_app = typer.Typer(help="Learned skills and preferences.", no_args_is_help=True)
 app.add_typer(skills_app, name="skills")
+# `jarvis memory list|forget|clear|prefs` lives in jarvis.memory_cli: the same
+# stores the agent uses, read and written without an LLM or a network call.
+app.add_typer(memory_app, name="memory")
 
 
 @skills_app.command("list")

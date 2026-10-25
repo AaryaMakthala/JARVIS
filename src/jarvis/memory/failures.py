@@ -255,6 +255,15 @@ class FailureStore:
                 break
         return seen
 
+    def delete(self, failure_id: int) -> bool:
+        """Delete one stored failure by id; ``True`` when a row was removed.
+
+        Backs ``jarvis memory forget``.  Includes a quarantined row: the user
+        asked to forget that exact id, so withholding it would be dishonest.
+        """
+        cur = self._conn.execute("DELETE FROM failures WHERE id = ?", (int(failure_id),))
+        return bool(cur.rowcount)
+
     def clear(self) -> int:
         """Delete every failure (used by ``jarvis reset --memory``).
 
