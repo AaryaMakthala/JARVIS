@@ -403,6 +403,9 @@ def build_llm_client(
             candidates,
             logger=logger,
             rotate_on_rate_limit=settings.llm.rotate_on_rate_limit,
+            deadline_seconds=settings.llm.total_deadline_seconds,
+            voice_deadline_seconds=settings.llm.voice_deadline_seconds,
+            call_timeout_seconds=settings.llm.timeout_seconds,
         )
     return ProviderSelection(client=client, info=info, reasons=reasons)
 

@@ -41,6 +41,18 @@ to call anything would fail the interaction outright.
 The loop is bounded by the number of eligible providers, so fallback can never
 spin forever and never reaches a paid model (ineligible providers never enter
 this client).
+
+OVERALL DEADLINE
+----------------
+A walk across several providers, each with its own retry budget, could
+otherwise take minutes.  Every ``structured()`` / ``text()`` call therefore
+records one monotonic deadline at its start (``llm.total_deadline_seconds``,
+or ``llm.voice_deadline_seconds`` for a latency-sensitive request that asks for
+a short per-call timeout) and, before **every** attempt, computes the time left
+and calls the provider with ``min(per-call timeout, remaining)``.  When the
+time is gone the call stops with the ordinary timeout-category
+:class:`~jarvis.llm.client.LLMError`, whose message is safe to show: no
+provider is asked again, no model name or credential is echoed.
 """
 
 from __future__ import annotations
@@ -54,7 +66,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from jarvis.llm import models as llm_models
-from jarvis.llm.client import CallMeta, LLMError, Usage
+from jarvis.llm.client import CallMeta, LLMError, LLMTransientError, Usage
 from jarvis.llm.failures import (
     MODEL_SCOPED_CATEGORIES,
     ROTATION_CATEGORIES,
@@ -123,13 +135,20 @@ class MultiProviderClient:
         health: ProviderHealth | None = None,
         clock: Callable[[], float] = time.monotonic,
         rotate_on_rate_limit: bool = False,
+        deadline_seconds: float = 30.0,
+        voice_deadline_seconds: float = 12.0,
+        call_timeout_seconds: float = 30.0,
     ) -> None:
         if not candidates:
             raise ValueError("MultiProviderClient needs at least one candidate")
         self._candidates = list(candidates)
         self._logger = logger or logging.getLogger("llm.multi")
+        self._clock = clock
         self._health = health if health is not None else ProviderHealth(clock=clock)
         self._rotate_on_rate_limit = rotate_on_rate_limit
+        self._deadline_seconds = float(deadline_seconds)
+        self._voice_deadline_seconds = float(voice_deadline_seconds)
+        self._call_timeout_seconds = float(call_timeout_seconds)
         self._last_call = CallMeta(provider="", model="", role="")
 
     # ── observability ────────────────────────────────────────────────────
@@ -188,8 +207,10 @@ class MultiProviderClient:
     ) -> tuple[BaseModel, Usage]:
         """First provider that can produce ``schema`` for ``model_role`` wins."""
         failures: list[str] = []
+        deadline_at = self._clock() + self._budget_seconds(timeout_s)
         for group in self._groups(model_role):
             for info, _spec, client in group:
+                remaining = self._remaining(deadline_at, model_role)
                 spec = _spec_for_role(info.name, _spec, client, model_role)
                 caps = spec.capabilities
                 if not (caps.supports_structured_output and caps.supports_tools):
@@ -206,7 +227,7 @@ class MultiProviderClient:
                         model_role=model_role,
                         temperature=temperature,
                         max_retries=max_retries,
-                        timeout_s=timeout_s,
+                        timeout_s=self._attempt_timeout(timeout_s, remaining),
                     )
                 except LLMError as exc:
                     failure = self._note_failure(
@@ -234,8 +255,10 @@ class MultiProviderClient:
     ) -> tuple[str, Usage]:
         """First healthy provider that can answer plain text for ``model_role``."""
         failures: list[str] = []
+        deadline_at = self._clock() + self._budget_seconds(timeout_s)
         for group in self._groups(model_role):
             for info, _spec, client in group:
+                remaining = self._remaining(deadline_at, model_role)
                 try:
                     result = client.text(
                         system=system,
@@ -244,7 +267,7 @@ class MultiProviderClient:
                         temperature=temperature,
                         max_tokens=max_tokens,
                         max_retries=max_retries,
-                        timeout_s=timeout_s,
+                        timeout_s=self._attempt_timeout(timeout_s, remaining),
                     )
                 except LLMError as exc:
                     failure = self._note_failure(
@@ -337,6 +360,41 @@ class MultiProviderClient:
         for members in groups.values():
             members.sort(key=lambda item: item[0].slot)
         return list(groups.values())
+
+    def _budget_seconds(self, timeout_s: float | None) -> float:
+        """Overall wall-clock budget for one request, in seconds.
+
+        ``llm.total_deadline_seconds`` normally, unless the caller asked for a
+        per-call timeout already inside ``llm.voice_deadline_seconds`` - that
+        is the latency-sensitive (voice) path, which gets the shorter overall
+        budget.  ``<= 0`` means "no deadline" (documented config escape).
+        """
+        total = self._deadline_seconds
+        if total <= 0:
+            return float("inf")
+        if timeout_s is not None and 0 < timeout_s <= self._voice_deadline_seconds:
+            return min(total, self._voice_deadline_seconds)
+        return total
+
+    def _remaining(self, deadline_at: float, role: str) -> float:
+        """Seconds left before ``deadline_at``; raises the timeout error at zero.
+
+        The message names the role and nothing else: no provider, model,
+        credential or prompt text (brain maps it to its own timeout message).
+        """
+        remaining = deadline_at - self._clock()
+        if remaining <= 0:
+            raise LLMTransientError(
+                "LLM request timed out: the overall deadline was reached before "
+                f"any provider answered the {role} request",
+                category=FailureCategory.TIMEOUT,
+            )
+        return remaining
+
+    def _attempt_timeout(self, timeout_s: float | None, remaining: float) -> float:
+        """The per-attempt timeout handed to the provider: never past the deadline."""
+        base = self._call_timeout_seconds if timeout_s is None else float(timeout_s)
+        return max(min(base, remaining), 0.001)
 
     def _advance_after_failure(self, failure: LLMCallFailure) -> bool:
         """B8: whether the walk may try this provider's *next key slot*.

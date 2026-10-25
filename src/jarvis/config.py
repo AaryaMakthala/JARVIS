@@ -62,6 +62,11 @@ free_only = true
 strict_zero_cost = true
 timeout_seconds = 30.0
 max_retries = 1
+# Overall wall-clock budget for ONE LLM call, including retries and every
+# provider fallback.  0 disables the deadline.  The voice path uses the
+# shorter voice_deadline_seconds instead so a slow provider cannot stall it.
+total_deadline_seconds = 30.0
+voice_deadline_seconds = 12.0
 # Ordered keyring names per provider for key failover (Stage 5a).  Every name
 # must already exist in the credential store: `jarvis keys set groq --slot 2`
 # stores groq_2_api_key and prints the exact line to add here.  Omit the key
@@ -296,6 +301,14 @@ class LLMSettings(BaseModel):
     dict means one key per provider.  ``rotate_on_rate_limit`` (default false)
     additionally allows a 429 on one key to hand over to the next key of the
     same provider; otherwise failover stays availability-only.
+
+    ``total_deadline_seconds`` (default 30) is the **overall** wall-clock budget
+    for one ``structured()``/``text()`` call *including* per-provider retries and
+    every fallback attempt: once it is used up no further provider is tried.
+    ``voice_deadline_seconds`` (default 12) is the same budget for a latency-
+    sensitive request (the voice path), which always asks for a short per-call
+    timeout.  Both default to values that keep an old ``config.toml`` - which
+    has neither key - behaving exactly as before.
     """
 
     planner_model: str = ""
@@ -310,6 +323,8 @@ class LLMSettings(BaseModel):
     models: dict[str, ProviderModels] = {}
     key_slots: dict[str, list[str]] = {}
     rotate_on_rate_limit: bool = False
+    total_deadline_seconds: float = 30.0
+    voice_deadline_seconds: float = 12.0
 
     def model_for(self, provider: str, role: str) -> str:
         """Resolve the effective model name for a provider/role.

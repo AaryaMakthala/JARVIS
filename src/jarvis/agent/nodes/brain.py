@@ -126,9 +126,16 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     llm_budget: dict[str, Any] = {}
     if source == "voice":
+        # No retry, and a per-call timeout the composite client recognises as
+        # latency-sensitive: it then bounds the WHOLE walk by
+        # llm.voice_deadline_seconds instead of the total deadline.
+        voice_deadline = float(
+            getattr(ctx.settings.llm, "voice_deadline_seconds", 12.0)
+            or 12.0
+        )
         llm_budget = {
             "max_retries": 0,
-            "timeout_s": min(float(ctx.settings.llm.timeout_seconds), 10.0),
+            "timeout_s": min(float(ctx.settings.llm.timeout_seconds), voice_deadline, 10.0),
         }
 
     try:
