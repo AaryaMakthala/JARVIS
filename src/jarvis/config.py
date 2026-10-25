@@ -194,6 +194,9 @@ max_file_bytes = 16777216
 retrieval_limit = 3
 enabled = true
 save_skills = true
+# Learn "my name is ..." / "call me ..." from a plain conversation turn and
+# store it as the user_name preference (no LLM involved).
+learn_name = true
 similarity_threshold = 0.75
 max_skills = 500
 max_failures = 200
@@ -614,11 +617,18 @@ class MemorySettings(BaseModel):
     ``max_task_log`` bounds the per-task telemetry rows (the Observability
     requirement in docs/01 section "Targets"), which are written even when
     ``save_skills`` is off because they are counters, not learned examples.
+
+    ``learn_name`` (default true) lets ``memory_save`` store an explicitly stated
+    name ("my name is Ada", "call me Ada") as the ``user_name`` preference, so
+    the butler can address the user from the next turn on.  The statement is
+    matched by a deterministic rule set - no LLM, no inference from behaviour -
+    and the write reuses :class:`~jarvis.memory.prefs.PreferenceStore`.
     """
 
     retrieval_limit: int = 3
     enabled: bool = True
     save_skills: bool = True
+    learn_name: bool = True
     similarity_threshold: float = 0.75
     failure_similarity_threshold: float = 0.45
     max_skills: int = 500
