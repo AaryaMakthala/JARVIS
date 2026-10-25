@@ -408,42 +408,64 @@ def open_db(path: str | Path) -> sqlite3.Connection:
     return init_schema(connect(path))
 
 
-def prune_skills(conn: sqlite3.Connection, max_rows: int) -> int:
+#: Most rows one prune call may delete.  A save is a user-facing write made
+#: while the answer is being delivered, so the work it does must stay bounded:
+#: lowering ``max_*`` takes a few saves instead of one long transaction, and a
+#: save can never stall on a table that grew while the cap was smaller.
+MAX_PRUNE_DELETIONS = 50
+
+
+def prune_skills(
+    conn: sqlite3.Connection, max_rows: int, *, max_deletions: int = MAX_PRUNE_DELETIONS
+) -> int:
     """Drop the least recently used skills above ``max_rows``.
 
-    Returns the number of rows deleted.  Never runs when ``max_rows <= 0`` (a
-    caller that wants "no pruning" passes 0).
+    Returns the number of rows deleted, at most ``max_deletions`` per call.
+    Never runs when ``max_rows <= 0`` (a caller that wants "no pruning" passes
+    0).  Order is oldest ``last_used_at`` first, so the rows that are pruned are
+    the ones nothing has needed for longest.
     """
     if max_rows <= 0:
         return 0
     total = int(conn.execute("SELECT COUNT(*) FROM skills").fetchone()[0])
     if total <= max_rows:
         return 0
+    wanted = total - max_rows
+    limit = wanted if max_deletions <= 0 else min(wanted, max_deletions)
     cur = conn.execute(
         """
         DELETE FROM skills WHERE id IN (
           SELECT id FROM skills ORDER BY last_used_at ASC, id ASC LIMIT ?
         )
         """,
-        (total - max_rows,),
+        (limit,),
     )
     return int(cur.rowcount or 0)
 
 
-def prune_failures(conn: sqlite3.Connection, max_rows: int) -> int:
-    """Drop the oldest failures above ``max_rows``; returns rows deleted."""
+def prune_failures(
+    conn: sqlite3.Connection, max_rows: int, *, max_deletions: int = MAX_PRUNE_DELETIONS
+) -> int:
+    """Drop the oldest failures above ``max_rows``; at most ``max_deletions``.
+
+    Oldest ``created_at`` first: a remembered failure loses its value as it
+    ages (the world moves on), so age is both the prune order and, in
+    ``memory_retrieve``, the read-time filter.
+    """
     if max_rows <= 0:
         return 0
     total = int(conn.execute("SELECT COUNT(*) FROM failures").fetchone()[0])
     if total <= max_rows:
         return 0
+    wanted = total - max_rows
+    limit = wanted if max_deletions <= 0 else min(wanted, max_deletions)
     cur = conn.execute(
         """
         DELETE FROM failures WHERE id IN (
           SELECT id FROM failures ORDER BY created_at ASC, id ASC LIMIT ?
         )
         """,
-        (total - max_rows,),
+        (limit,),
     )
     return int(cur.rowcount or 0)
 

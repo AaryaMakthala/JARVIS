@@ -40,7 +40,36 @@ from jarvis.memory.db import (
 )
 from jarvis.memory.embeddings import cosine, embed_text
 
-__all__ = ["FAILURE_SIMILARITY", "MAX_ERROR_CHARS", "Failure", "FailureStore"]
+__all__ = [
+    "FAILURE_CATEGORIES",
+    "FAILURE_SIMILARITY",
+    "MAX_ERROR_CHARS",
+    "Failure",
+    "FailureStore",
+    "failure_category",
+]
+
+#: Closed vocabulary for *what kind of* failure a row records.  It replaces the
+#: raw tool error text: a remembered failure needs to say "open_app failed", not
+#: to archive whatever a tool or a page printed.
+FAILURE_CATEGORIES = ("tool_failed", "verify_failed", "untrusted_output", "unknown")
+
+
+def failure_category(state: dict[str, Any] | None) -> str:
+    """The category label for one failed step, from its recorded provenance.
+
+    Deterministic, and deliberately coarse: the value is stored in the row and
+    compared for dedupe, so it must not carry anything the caller could vary
+    (a message, a path, a page title).
+    """
+    data = _clean_state(state)
+    if data.get("ok") is False:
+        return "tool_failed"
+    if data.get("verified") is False:
+        return "verify_failed"
+    if data.get("tainted"):
+        return "untrusted_output"
+    return "unknown"
 
 #: Failures come from tool error strings, which can be arbitrarily long.  A
 #: remembered failure is a hint, not an archive.
@@ -118,16 +147,24 @@ class FailureStore:
         error: str = "",
         state: dict[str, Any] | None = None,
     ) -> Failure | None:
-        """Append one failure; ``None`` when the entry is skipped.
+        """Append one failure, or refresh an identical one; ``None`` when skipped.
 
         ``state`` is the failing step's outcome (``ok``/``verified``/``tainted``).
         It is stored as the row's provenance so the planner sees an honest
         sentence and a later reader can tell a real failure from a bug artefact.
+        After `M3` the row's ``error`` text is a short **category label**
+        (:data:`FAILURE_CATEGORIES`), not the tool's own error string: a failure
+        example is a hint about which approach failed, never an archive of tool
+        output or page text.
 
-        Two entries are refused, both returning ``None``:
+        An entry is refused (returning ``None``) when it is empty/secret-only or
+        when its outcome says the step actually *succeeded* - see below.
 
-        * an empty or secret-only message, and
-        * a step whose outcome says it *succeeded* - see below.
+        Repeats are folded: the same goal, tool and category refresh the existing
+        row's ``created_at`` instead of adding a duplicate.  The table has no
+        repeat counter, and adding one would need a schema migration that this
+        pass deliberately does not do - so "how many times" is not recorded (see
+        ``docs/MEMORY.md``).
         """
         # Truncate first (the text is unbounded), then redact.  A tool error is
         # untrusted third-party text: "login failed for hunter2, password
@@ -144,11 +181,20 @@ class FailureStore:
             # *failed* verification keeps its row - that is a real failure.
             return None
 
+        category = failure_category(state)
         safe_step = safe_plan(step or {})
+        safe_step.setdefault("category", category)
         goal = (goal_text or "").strip()[:200]
         if looks_secret(goal):
             goal = "[redacted goal]"
         now = now_iso()
+        duplicate = self._matching_id(goal, str(safe_step.get("tool") or ""), category)
+        if duplicate is not None:
+            self._conn.execute("UPDATE failures SET created_at = ? WHERE id = ?", (now, duplicate))
+            refreshed = self._to_failure(
+                self._conn.execute("SELECT * FROM failures WHERE id = ?", (duplicate,)).fetchone()
+            )
+            return refreshed
         cursor = self._conn.execute(
             "INSERT INTO failures (goal_text, step_json, error, created_at, step_state)"
             " VALUES (?, ?, ?, ?, ?)",
@@ -169,6 +215,27 @@ class FailureStore:
             created_at=now,
             state=_clean_state(state),
         )
+
+    def _matching_id(self, goal: str, tool: str, category: str) -> int | None:
+        """Id of an identical remembered failure, or ``None``.
+
+        Identical means the same goal text, the same tool and the same category.
+        The table is capped at a few hundred rows, so a linear scan on a save is
+        cheap and needs no JSON index (which would be a migration).
+        """
+        if not goal:
+            return None
+        for row in self._conn.execute(
+            "SELECT * FROM failures WHERE goal_text = ?", (goal,)
+        ):
+            stored = _loads(row["step_json"])
+            if str(stored.get("tool") or "") != tool:
+                continue
+            stored_category = str(stored.get("category") or "")
+            if stored_category and stored_category != category:
+                continue
+            return int(row["id"])
+        return None
 
     def count(self) -> int:
         """Failures the planner can still see (quarantined rows excluded)."""

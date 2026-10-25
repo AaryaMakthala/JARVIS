@@ -47,10 +47,36 @@ from jarvis.agent.context import AppContext
 from jarvis.agent.state import Plan, StepResult
 from jarvis.memory.base import MemoryRecord
 from jarvis.memory.db import looks_secret, safe_value
+from jarvis.memory.failures import failure_category
 
-__all__ = ["detect_name_statement", "memory_save"]
+__all__ = ["REASONS", "detect_name_statement", "memory_save"]
 
 _LOG = logging.getLogger("memory")
+
+#: Closed vocabulary for ``memory_saved_reason``.  A code, not prose: callers
+#: compare it, and the human detail (which check failed, which tool) lives in
+#: the log line and in the failure row itself.
+SAVED = "saved"
+SKIPPED_CANCELLED = "skipped_cancelled"
+SKIPPED_HALTED = "skipped_halted"
+SKIPPED_UNVERIFIED = "skipped_unverified"
+SKIPPED_SENSITIVE = "skipped_sensitive"
+SKIPPED_CONVERSATION = "skipped_conversation"
+NAME_SAVED = "name_saved"
+#: Nothing was recorded for a reason outside the task itself: no backend (or a
+#: disabled memory), ``--dry-run``, ``save_skills`` off, or a write that raised.
+ERROR = "error"
+
+REASONS = (
+    SAVED,
+    SKIPPED_CANCELLED,
+    SKIPPED_HALTED,
+    SKIPPED_UNVERIFIED,
+    SKIPPED_SENSITIVE,
+    SKIPPED_CONVERSATION,
+    NAME_SAVED,
+    ERROR,
+)
 
 #: ``meta`` key that marks a record as a *failure* rather than a skill, so the
 #: backend routes it to the failure log (shared with
@@ -105,20 +131,26 @@ def memory_save(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     never change the answer to the turn it learned from: the name is used from
     the *next* turn on, when ``compose`` reads the ``user_name`` preference.
 
-    Returns three state keys so a caller can report honestly:
+    Returns three state keys, and **every** return path sets all three:
 
     * ``memory_saved`` - a **skill** was stored (a failure record does not
       count: learning from a failure is not the same as learning a skill);
-    * ``memory_saved_reason`` - why not, in words, or ``None``;
-    * ``memory_failure_logged`` - a failure was appended to the log instead.
+    * ``memory_saved_reason`` - one of :data:`REASONS` (``"saved"``,
+      ``"skipped_cancelled"``, ``"skipped_halted"``, ``"skipped_unverified"``,
+      ``"skipped_sensitive"``, ``"skipped_conversation"``, ``"error"``,
+      ``"name_saved"``), never ``None``;
+    * ``memory_failure_logged`` - a failure example was written instead.
     """
     outcome = _outcome(state, ctx)
-    if outcome.reason:
+    if outcome.reason != SAVED:
         ctx.logger.debug("memory: %s", outcome.reason)
     name_saved = _learn_name(state, ctx)
+    reason = SAVED if outcome.record is not None and not outcome.is_failure else outcome.reason
+    if name_saved and reason != SAVED:
+        reason = NAME_SAVED
     return {
         "memory_saved": outcome.record is not None and not outcome.is_failure,
-        "memory_saved_reason": "name_saved" if name_saved else (outcome.reason or None),
+        "memory_saved_reason": reason,
         "memory_failure_logged": outcome.is_failure,
     }
 
@@ -132,7 +164,7 @@ class _Outcome:
     __slots__ = ("is_failure", "reason", "record")
 
     def __init__(
-        self, reason: str = "", record: MemoryRecord | None = None, *, is_failure: bool = False
+        self, reason: str = SAVED, record: MemoryRecord | None = None, *, is_failure: bool = False
     ) -> None:
         self.reason = reason
         self.record = record
@@ -143,50 +175,71 @@ def _outcome(state: dict[str, Any], ctx: AppContext) -> _Outcome:
     """Decide the single record (if any) this task contributes to memory."""
     backend = ctx.memory
     if backend is None:
-        return _Outcome("no memory backend")
+        return _Outcome(ERROR)
     if ctx.dry_run:
-        return _Outcome("dry-run: nothing is written")
+        return _Outcome(ERROR)
+    if _sensitive(state):
+        # A credential (or credential-looking value) is anywhere in this turn:
+        # store nothing at all rather than a scrubbed half-example.
+        return _Outcome(SKIPPED_SENSITIVE)
 
-    blocked = _skill_gate(state, ctx)
-    if not blocked:
-        return _write(backend, _skill_record(state), "")
+    gate = _skill_gate(state, ctx)
+    if gate == SAVED:
+        return _write(backend, _skill_record(state), SAVED)
 
-    failure = _failure_record(state)
+    failure = _failure_record(state, ctx)
     if failure is None:
-        return _Outcome(blocked)
-    return _write(backend, failure, f"{blocked}; recorded as a failure", is_failure=True)
+        return _Outcome(gate)
+    return _write(backend, failure, gate, is_failure=True)
+
+
+def _sensitive(state: dict[str, Any]) -> bool:
+    """True when the user's text or any planned argument looks like a credential.
+
+    Reuses :func:`jarvis.memory.db.looks_secret` - the same guard the stores
+    apply - so nothing is stored for a turn that carries a secret, and the
+    reason says exactly that.
+    """
+    if looks_secret(str(state.get("user_input") or "")):
+        return True
+    plan: Plan | None = state.get("plan")
+    for step in plan.steps if plan is not None else []:
+        for value in step.args.values():
+            if looks_secret(str(value)):
+                return True
+    return False
 
 
 def _skill_gate(state: dict[str, Any], ctx: AppContext) -> str:
-    """Return the reason this task must **not** become a skill ("" if it may)."""
+    """The reason this task must **not** become a skill (``SAVED`` if it may)."""
     if state.get("cancelled"):
-        return "cancelled by the user"
+        return SKIPPED_CANCELLED
     if state.get("halted_reason"):
-        return f"task halted: {state['halted_reason']}"
+        return SKIPPED_HALTED
 
     plan: Plan | None = state.get("plan")
     if plan is None or plan.kind != "tool" or not plan.steps:
-        return "not a tool plan"
+        return SKIPPED_CONVERSATION
 
     results: list[StepResult] = list(state.get("results") or [])
     if not results:
-        return "no step results"
+        return SKIPPED_UNVERIFIED
     if len(results) != len(plan.steps):
-        return "plan and results disagree on step count"
+        return SKIPPED_UNVERIFIED
     if any(not result.ok for result in results):
-        return "at least one step failed"
+        return SKIPPED_UNVERIFIED
     if any(result.verified is False for result in results):
-        return "at least one step failed verification"
+        return SKIPPED_UNVERIFIED
     if any(result.verified is None for result in results):
-        return "a step's completion could not be independently verified"
+        return SKIPPED_UNVERIFIED
     if any(result.tainted for result in results):
-        return "a step returned untrusted external text"
+        return SKIPPED_UNVERIFIED
     if any(step.depends_on_untrusted for step in plan.steps):
-        return "a step's arguments came from untrusted text"
+        return SKIPPED_UNVERIFIED
 
     if not bool(getattr(ctx.settings.memory, "save_skills", True)):
-        return "skill saving disabled by settings"
-    return ""
+        return ERROR
+    return SAVED
 
 
 # ------------------------------------------------------------------ records
@@ -206,7 +259,7 @@ def _skill_record(state: dict[str, Any]) -> MemoryRecord:
     )
 
 
-def _failure_record(state: dict[str, Any]) -> MemoryRecord | None:
+def _failure_record(state: dict[str, Any], ctx: AppContext) -> MemoryRecord | None:
     """The first bad step to remember, if the task did not fully succeed.
 
     "Bad" means failed, failed-verification **or tainted**: a step whose
@@ -223,31 +276,59 @@ def _failure_record(state: dict[str, Any]) -> MemoryRecord | None:
     tell a genuine failure from an artefact of an older build.  Rows written
     before this existed are handled by
     :func:`jarvis.memory.db.migrate_failures`.
+
+    The stored text is the **tool name plus a short category** (M3), never the
+    tool's own error string, a page title or any file content: a failure example
+    is a hint about which approach failed, and the raw text is exactly the
+    untrusted, unbounded part.  Only a terminal failure is recorded - the run has
+    already ended (``memory_save`` is the post-answer node) and the replan budget
+    is spent or the task halted, so a retry still in flight is never archived as
+    a dead end.
     """
     results: list[StepResult] = list(state.get("results") or [])
     bad = next(
         (r for r in results if not r.ok or r.verified is False or r.tainted),
         None,
     )
-    if bad is None:
+    if bad is None or not _failure_is_terminal(state, ctx):
         return None
     plan: Plan | None = state.get("plan")
     step = next((s for s in (plan.steps if plan else []) if s.id == bad.step_id), None)
     goal = plan.goal if plan else ""
+    outcome = {"ok": bad.ok, "verified": bad.verified, "tainted": bad.tainted}
+    category = failure_category(outcome)
+    tool = step.tool if step else ""
     return MemoryRecord(
         kind="episodic",
-        text=(bad.error or f"step {bad.step_id} did not complete")[:300],
+        text=f"{tool or 'tool'} failed ({category})",
         meta={
             _FAILURE_META: True,  # routes this record to the failure log
             "goal_text": goal,
             "step": {
-                "tool": step.tool if step else "",
+                "tool": tool,
                 "id": bad.step_id,
                 "tainted": bad.tainted,
+                "category": category,
             },
-            "step_state": {"ok": bad.ok, "verified": bad.verified, "tainted": bad.tainted},
+            "step_state": outcome,
         },
     )
+
+
+def _failure_is_terminal(state: dict[str, Any], ctx: AppContext) -> bool:
+    """True when this failure ended the task (not a retry still in flight).
+
+    ``memory_save`` runs after ``respond``, so in practice every path here is
+    terminal.  The check is explicit anyway: a halted run is terminal, an
+    exhausted replan budget is terminal, and so is a result with no retry or
+    replan requested - while a run that is still asking to retry is not.
+    """
+    if state.get("halted_reason"):
+        return True
+    budget = int(getattr(ctx.settings.agent, "max_replans", 2) or 0)
+    if int(state.get("replan_count") or 0) >= budget:
+        return True
+    return not (state.get("retry_now") or state.get("replan_now"))
 
 
 def _safe_plan(plan: Plan) -> dict:
@@ -273,12 +354,12 @@ def _write(
 ) -> _Outcome:
     """Hand the record to the backend; a memory error never fails the task."""
     if record is None:
-        return _Outcome(reason or "nothing to record")
+        return _Outcome(reason or ERROR)
     try:
         backend.remember(record)
     except Exception as exc:  # noqa: BLE001 - memory must never break a task
         _LOG.warning("memory write failed: %s", exc)
-        return _Outcome("memory write failed")
+        return _Outcome(ERROR)
     return _Outcome(reason, record=record, is_failure=is_failure)
 
 
