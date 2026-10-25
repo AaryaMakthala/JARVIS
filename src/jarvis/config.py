@@ -97,6 +97,10 @@ max_steps = 12
 max_retries_per_step = 2
 max_replans = 2
 step_timeout_seconds = 30
+# Send only the tool groups a request plausibly needs (and a trimmed site
+# catalogue) instead of the whole tool catalogue.  Prompt shaping only: the
+# registry, tiers and policy are untouched.  Off until it has been verified.
+prompt_trim_enabled = false
 
 [policy]
 unlock_ttl_seconds = 300
@@ -356,6 +360,14 @@ class AgentSettings(BaseModel):
     quietly advancing.  The policy engine, confirmation and Tier 3 blocks are
     untouched by either flag, so an ablated run is still safe to execute
     (docs/07 section 3.4 keeps the policy engine on in every profile).
+
+    ``prompt_trim_enabled`` (default **false**) switches the brain prompt to the
+    tool-group selector (:mod:`jarvis.agent.tool_groups`): only the groups the
+    request plausibly needs are described, and the site catalogue is trimmed to
+    the sites that were named plus a short default list.  It is prompt shaping
+    only - the registry stays closed and every step is still judged by
+    ``validate`` / ``policy_gate`` / ``act``.  Off by default so the prompt is
+    byte-identical to the untrimmed one until it has been verified.
     """
 
     max_steps: int = 12
@@ -367,6 +379,7 @@ class AgentSettings(BaseModel):
     use_specialists: bool = False
     specialist_max_calls: int = 12
     specialist_call_timeout_s: float = 12.0
+    prompt_trim_enabled: bool = False
 
 
 class PolicySettings(BaseModel):

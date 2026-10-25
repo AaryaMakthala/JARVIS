@@ -33,6 +33,7 @@ from jarvis.agent.session_context import (
     render_resolution,
 )
 from jarvis.agent.state import Plan, RequestKind, Step
+from jarvis.agent.tool_groups import select_catalogue, trim_site_catalogue
 from jarvis.browser.sites import render_site_catalogue, sites_from_settings
 
 #: Deterministic, user-facing halt reasons.  The LLM output never reaches the
@@ -81,13 +82,26 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     previous_error = state.get("error") if int(state.get("validate_attempts") or 0) > 0 else None
     source = state.get("source") or "terminal"
-    catalogue = ctx.registry.catalogue_for_llm()
-    system = brain_system_prompt(catalogue)
     agent_settings = getattr(getattr(ctx, "settings", None), "agent", None)
+    # Prompt trimming is opt-in (agent.prompt_trim_enabled, default false).  It
+    # only decides which tools/sites are *described*; the registry stays closed
+    # and validate/policy_gate/act judge every step exactly as before.  With the
+    # flag off the catalogue and site block are byte-identical to before.
+    prompt_trim = bool(getattr(agent_settings, "prompt_trim_enabled", False))
+    if prompt_trim:
+        catalogue = select_catalogue(ctx.registry, state)
+    else:
+        catalogue = ctx.registry.catalogue_for_llm()
+    system = brain_system_prompt(catalogue)
     if getattr(agent_settings, "use_specialists", False):
         system = system + "\n12b. If the task needs several browser steps that depend on what the page shows (searching, opening a result, reading a page, playing a video), return request_type 'browse' with a goal and no actions. Simple single actions stay 'action'."
     session_block = _session_reference_block(state, ctx)
-    sites_block = render_site_catalogue(sites_from_settings(ctx.settings))
+    site_directory = sites_from_settings(ctx.settings)
+    sites_block = (
+        trim_site_catalogue(site_directory, state)
+        if prompt_trim
+        else render_site_catalogue(site_directory)
+    )
     # build referent summary
     referent_summary = None
     try:
