@@ -198,6 +198,12 @@ save_skills = true
 # store it as the user_name preference (no LLM involved).
 learn_name = true
 similarity_threshold = 0.75
+# Retrieval safety caps: one example, the whole injected block, stale failures,
+# and how long the store call may take before the task continues without it.
+item_max_chars = 300
+context_max_chars = 1200
+failure_max_age_days = 30
+retrieve_timeout_seconds = 2.0
 max_skills = 500
 max_failures = 200
 max_preferences = 50
@@ -623,6 +629,13 @@ class MemorySettings(BaseModel):
     the butler can address the user from the next turn on.  The statement is
     matched by a deterministic rule set - no LLM, no inference from behaviour -
     and the write reuses :class:`~jarvis.memory.prefs.PreferenceStore`.
+
+    Retrieval safety caps (M2): ``item_max_chars`` (300) bounds one example,
+    ``context_max_chars`` (1200) bounds the whole injected block,
+    ``failure_max_age_days`` (30) drops stale failure examples (0 disables the
+    filter) and ``retrieve_timeout_seconds`` (2.0) bounds the store call - a
+    slower or broken backend yields an empty context instead of stalling the
+    answer (0 disables the timeout).
     """
 
     retrieval_limit: int = 3
@@ -631,6 +644,10 @@ class MemorySettings(BaseModel):
     learn_name: bool = True
     similarity_threshold: float = 0.75
     failure_similarity_threshold: float = 0.45
+    item_max_chars: int = 300
+    context_max_chars: int = 1200
+    failure_max_age_days: int = 30
+    retrieve_timeout_seconds: float = 2.0
     max_skills: int = 500
     max_failures: int = 200
     max_preferences: int = 50

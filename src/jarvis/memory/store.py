@@ -219,7 +219,14 @@ class SqliteMemory:
             MemoryRecord(
                 kind="episodic",
                 text=failure.as_memory_text(),
-                meta={"failure_id": failure.id, "tool": failure.step.get("tool", "")},
+                meta={
+                    "failure_id": failure.id,
+                    "tool": failure.step.get("tool", ""),
+                    # Age is part of the example's usefulness: memory_retrieve
+                    # drops examples older than memory.failure_max_age_days, and
+                    # it can only do that if the row's timestamp travels with it.
+                    "created_at": failure.created_at,
+                },
             )
             for failure in related
         ]
