@@ -51,9 +51,11 @@ __all__ = [
     "MAX_PATH_CHARS",
     "MAX_TRACED_TASKS",
     "MAX_TRACE_ENTRIES",
+    "NODE_CODES",
     "discard_trace",
     "format_trace",
     "get_trace",
+    "node_code",
     "record_finished",
     "record_started",
     "task_status",
@@ -73,6 +75,33 @@ MAX_PATH_CHARS = 600
 #: down to this shape before it is kept.
 _NAME_RE = re.compile(r"[^A-Za-z0-9_]")
 _MAX_NAME_CHARS = 40
+
+#: Short codes for the stored path.  The `task_log.tools_used` column is
+#: truncated at 300 characters by the store, and a long specialist run in full
+#: node names (``context_resolve > memory_retrieve > brain > validate >
+#: policy_gate > act > verify``) reached that limit, losing the *end* of the
+#: path - the part that says how the task terminated.  Codes keep a whole run
+#: in ~3 characters per visit.  This is the ONE place the mapping lives; the
+#: in-memory trace and :func:`get_trace` keep the full names, so debugging in a
+#: running process is unaffected.  A node with no code is stored by its own
+#: (sanitised) name rather than dropped.
+NODE_CODES: dict[str, str] = {
+    "intake": "in",
+    "context_resolve": "cr",
+    "memory_retrieve": "mr",
+    "brain": "br",
+    "validate": "va",
+    "policy_gate": "pg",
+    "act": "ac",
+    "verify": "ve",
+    "replan": "rp",
+    "clarify": "cl",
+    "compose": "co",
+    "respond": "re",
+    "memory_save": "ms",
+    "specialist_decide": "sd",
+    "specialist_observe": "so",
+}
 
 
 class _NodeTraces:
@@ -137,12 +166,24 @@ def discard_trace(task_id: str) -> None:
     _TRACES.discard((task_id or "").strip())
 
 
+def node_code(name: str) -> str:
+    """The short, stored code for a node name (see :data:`NODE_CODES`).
+
+    Unknown nodes keep their sanitised name: a new node must still show up in
+    the path, just longer than three characters.
+    """
+    label = _NAME_RE.sub("", str(name or ""))[:_MAX_NAME_CHARS]
+    return NODE_CODES.get(label, label)
+
+
 def format_trace(names: tuple[str, ...] | list[str]) -> str:
     """One compact, bounded string for the recorded node names.
 
-    Consecutive repeats collapse to ``name x3`` (a routed loop such as
-    ``policy_gate > act > verify`` reads as one pass, not as noise).  The
-    result is cut at a separator boundary so it never ends mid-name.
+    Consecutive repeats collapse to ``ac x3`` (a routed loop such as
+    ``policy_gate > act > verify`` reads as one pass, not as noise) and each
+    name becomes its short :data:`NODE_CODES` code, joined by ``>`` without
+    spaces, so the whole run fits the task-log column.  The result is still cut
+    at a separator boundary so it never ends mid-code.
     """
     runs: list[tuple[str, int]] = []
     for name in names:
@@ -153,13 +194,16 @@ def format_trace(names: tuple[str, ...] | list[str]) -> str:
             runs[-1] = (label, runs[-1][1] + 1)
         else:
             runs.append((label, 1))
-    path = " > ".join(f"{label} x{count}" if count > 1 else label for label, count in runs)
+    path = ">".join(
+        f"{node_code(label)} x{count}" if count > 1 else node_code(label)
+        for label, count in runs
+    )
     if len(path) <= MAX_PATH_CHARS:
         return path
-    cut = path.rfind(" > ", 0, MAX_PATH_CHARS - 2)
+    cut = path.rfind(">", 0, MAX_PATH_CHARS - 4)
     if cut <= 0:
         return path[: MAX_PATH_CHARS - 1] + "…"
-    return path[:cut] + " > …"
+    return path[: cut + 1] + "…"
 
 
 def record_started(state: dict[str, Any], ctx: AppContext) -> None:
@@ -178,9 +222,10 @@ def record_started(state: dict[str, Any], ctx: AppContext) -> None:
 def record_finished(state: dict[str, Any], ctx: AppContext) -> None:
     """Close the row with the task's final counters and status (``respond``).
 
-    Also writes the run's node path (see :func:`format_trace`) into the row's
-    free-form ``tools_used`` field and then frees the in-memory trace, whether
-    or not the write succeeded - a finished task must not leak memory.
+    Also writes the run's node path (see :func:`format_trace`, short node
+    codes so the whole run fits the column) into the row's free-form
+    ``tools_used`` field and then frees the in-memory trace, whether or not the
+    write succeeded - a finished task must not leak memory.
     """
     plan: Plan | None = state.get("plan")
     task_id = str(state.get("task_id") or "")
