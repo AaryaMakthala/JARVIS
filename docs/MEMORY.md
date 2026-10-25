@@ -33,20 +33,37 @@ offline lexical embedding (`jarvis.memory.embeddings`):
   purpose, because missing a real failure is worse than showing a loose one and
   unrelated goals score below 0.2.
 
-Hard caps: `memory.retrieval_limit` (3) records per task; each item is truncated
-to 4000 chars by `nodes/util.truncate` before it enters state.
+Bounded retrieval (`memory_retrieve`, M2):
+
+* `memory.retrieval_limit` (3) records per task - the hard count cap;
+* each item's text is cut to `memory.item_max_chars` (300) and the whole
+  injected block to `memory.context_max_chars` (1200), so a single prompt can
+  never be flooded by a large plan or goal;
+* an item near-identical to one already kept is dropped (normalised-text
+  comparison plus the lexical embedding's cosine), so three paraphrases of the
+  same skill cost one slot, not three;
+* an item that trips the shared secret check (`memory.db.looks_secret`) is
+  skipped, and the fact is logged without the text;
+* a failure example older than `memory.failure_max_age_days` (30) is skipped -
+  stale advice about a world that has moved on. Preferences and skills are not
+  age-filtered. `0` disables the age filter.
+
+The store call runs in a worker thread and is given
+`memory.retrieve_timeout_seconds` (2.0) via `future.result(timeout)`; on
+timeout the task continues immediately. The SQLite connection is opened per
+`SqliteMemory` and only ever touched by one thread at a time (`check_same_thread`
+stays on, `_lock` covers writes), so the worker borrows the store, does one read
+and returns - it never writes and is never shared with a second caller.
 
 The records are injected into the brain prompt as `memory_context` (a
 `list[dict]` of plain primitives: `kind`, `text`, optional `meta`), serialised
-as JSON under "Relevant past examples". They are reference data only - the
-brain system prompt treats stored text as untrusted, never as instructions.
+as JSON inside a delimited block (see `agent/prompts.py`) that is labelled
+"past tasks, reference only": never instructions, never replayed, and anything
+inside it is untrusted data.
 
-**Failure behaviour:** any exception during retrieval is swallowed, logged as
-one line without content, and the task continues with an empty
-`memory_context` (fail **open** for retrieval). There is no timeout today: a
-slow SQLite call would block the task, and the retrieval is small enough that
-this has not been hit - a bounded timeout is tracked as a follow-up, not
-implemented.
+**Failure behaviour:** any exception during retrieval, and a timeout, are
+swallowed, logged as one line without content, and the task continues with an
+empty `memory_context` (fail **open** for retrieval).
 
 ## Save policy (`memory_save`, after `respond`)
 
@@ -61,20 +78,45 @@ Text stored: the plan goal; args pass through `safe_value`; the row is refused
 if it still looks like it carries a credential.
 
 A **failure** is stored for the first *bad* step (failed, failed-verification or
-tainted) of a task that could not become a skill. Text stored: the step error,
-redacted to 300 chars; a tainted step's output is dropped. `FailureStore`
-additionally refuses any row whose provenance says the step actually succeeded.
-No page text, tool output, file contents or plan args are stored for failures.
+tainted) of a task that could not become a skill, and only once the task is
+terminal (halted, replan budget spent, or no retry/replan pending) - a retry
+still in flight is never archived as a dead end. Text stored: the **tool name
+plus a short category** (`tool_failed`, `verify_failed`, `untrusted_output`,
+`unknown`), never the tool's own error string, page text, tool output, file
+contents or plan args. `FailureStore` additionally refuses any row whose
+provenance says the step actually succeeded, and redacts a goal that carries a
+credential.
 
 Dedupe: `SkillStore.save` folds a near-identical goal into the existing row
-(incrementing `success_count`, updating `last_used_at`); failures append.
-Retention: each save prunes its own table back to the cap, oldest/least-used
-rows first, in the same call.
+(incrementing `success_count`, updating `last_used_at`); a failure with the
+same goal, tool and category refreshes the existing row's `created_at` instead
+of inserting a duplicate (`failures` has no repeat counter - that would need a
+schema migration, which this pass does not do - so "how many times" is not
+recorded).
+
+Retention: each save prunes its own table back to the cap in the same call,
+oldest/least-used rows first, deleting **at most 50 rows per call**
+(`memory.db.MAX_PRUNE_DELETIONS`). Lowering a cap therefore takes a few saves
+instead of one long transaction, and a save can never stall on a table that
+grew while the cap was smaller.
 
 The node never raises and never blocks the answer; a memory error is a one-line
-warning. It sets the three state keys (`memory_saved`,
-`memory_saved_reason`, `memory_failure_logged`) - see
-`docs/STATE_CONTRACT.md`.
+warning. Every return path sets all three state keys, and
+`memory_saved_reason` is one of the codes in `memory_save.REASONS`:
+
+| `memory_saved_reason` | Meaning |
+|---|---|
+| `saved` | A skill was stored (`memory_saved` is true). |
+| `skipped_cancelled` | The user cancelled the task. |
+| `skipped_halted` | The task halted (`halted_reason` set). |
+| `skipped_unverified` | Not provably good: a step failed, failed verification, was unverifiable, or was tainted. |
+| `skipped_sensitive` | The turn carried a credential-looking value; nothing was stored at all. |
+| `skipped_conversation` | Not a tool plan (no steps to remember). |
+| `name_saved` | A stated name was written to `user_name` (see below). |
+| `error` | Nothing recorded for a reason outside the task: no backend/disabled memory, `--dry-run`, `save_skills` off, or a write that raised. |
+
+`memory_failure_logged` is true only when a failure row was written. See
+`docs/STATE_CONTRACT.md` for the state keys themselves.
 
 ## Preferences and the user's name
 
@@ -124,13 +166,20 @@ name other than this one statement detector (and the raw `preferences` table).
 | `memory.max_failures` | `200` | Failure rows retained. |
 | `memory.max_preferences` | `50` | Preference keys retained. |
 | `memory.max_task_log` | `500` | Task-log rows retained. |
+| `memory.item_max_chars` | `300` | Char cap for one retrieved item. |
+| `memory.context_max_chars` | `1200` | Char cap for the whole `memory_context` block. |
+| `memory.failure_max_age_days` | `30` | Failure examples older than this are not retrieved (`0` = no age filter). |
+| `memory.retrieve_timeout_seconds` | `2.0` | Hard timeout for one retrieval call; on expiry the task continues with no memory. |
 
-## Not implemented yet (planned, do not assume)
+Old config files keep loading: the four keys above are new fields with
+defaults, so a `config.toml` written before this pass is still valid.
 
-Bounded retrieval hardening is **not** in the code today: per-item char cap
-(300), total prompt cap (1200), `memory.min_score`, dedupe of near-identical
-items, excluding secret-looking records and stale failures (older than 30 days)
-at read time, and a hard retrieval timeout. `retrieval_limit` is the only
-retrieval cap; the item truncation is 4000 chars from `nodes/util.truncate`.
-The save side likewise has no `memory.max_records` /
-`memory.max_failure_records` keys - retention uses the `max_*` keys above.
+## Known limits (deliberate, not bugs)
+
+* A failure row records *that* the approach failed, not how many times: no
+  repeat counter (would be a migration).
+* Pruning is bounded, so a table can sit above its cap for a few saves after
+  `max_*` is lowered.
+* The name takes effect from the next turn (see above).
+* Retrieval scores with the offline lexical encoder, not a semantic model:
+  synonyms that share no words can be missed.
