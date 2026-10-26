@@ -12,8 +12,7 @@ reaches the internet.
 from __future__ import annotations
 
 import os
-import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -38,19 +37,6 @@ def _element(elements, *, role: str, name: str):
             return element
     seen = [(element.role, element.name) for element in elements]
     raise AssertionError(f"no {role} named {name!r}; observed {seen}")
-
-
-def _wait_for_path(browser, path: str, *, timeout: float = 10.0) -> None:
-    """Wait until the browser is on ``path`` and its DOM is ready."""
-    deadline = time.monotonic() + timeout
-    last = ""
-    while time.monotonic() < deadline:
-        last = browser.current_url()
-        if urlsplit(last).path == path:
-            browser.wait(seconds=5, load_state="domcontentloaded")
-            return
-        time.sleep(0.1)
-    raise AssertionError(f"page did not navigate to {path!r}; current URL was {last!r}")
 
 
 @pytest.fixture(scope="module")
@@ -94,7 +80,10 @@ def test_browser_read_fixture(browser, fixture_server):
 
     browser.type_text(search.ref, "jarvis")
     browser.press_key("Enter")
-    _wait_for_path(browser, "/results")
+
+    current = urlsplit(browser.current_url())
+    assert current.path == "/results"
+    assert parse_qs(current.query) == {"q": ["jarvis"]}
 
     observation = browser.read()
     assert observation.title == "Results"
@@ -111,7 +100,7 @@ def test_browser_find_open_result_fixture(browser, fixture_server):
     assert urlsplit(external.url).hostname == "example.invalid"
 
     browser.click(result.ref)
-    _wait_for_path(browser, "/result1")
+    assert urlsplit(browser.current_url()).path == "/result1"
 
     final = browser.read()
     assert final.title == "Result One"

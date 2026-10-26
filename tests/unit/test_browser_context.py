@@ -10,6 +10,7 @@ transient references, identity re-validation and credential refusal).
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -46,6 +47,7 @@ class _FakeElement:
         self.aria_label = aria_label
         self.clicks = 0
         self.filled: str | None = None
+        self.click_url: str | None = None
 
     def live_role(self) -> str:
         if self.role:
@@ -65,8 +67,9 @@ class _FakeHandle:
 
 
 class _FakeLocator:
-    def __init__(self, element: _FakeElement) -> None:
+    def __init__(self, element: _FakeElement, page: _FakePage | None = None) -> None:
         self._element = element
+        self._page = page
 
     def is_visible(self) -> bool:
         return self._element.visible
@@ -89,6 +92,8 @@ class _FakeLocator:
     def click(self, timeout: int | None = None) -> None:
         del timeout
         self._element.clicks += 1
+        if self._page is not None and self._element.click_url is not None:
+            self._page.url = self._element.click_url
 
     def fill(self, text: str, timeout: int | None = None) -> None:
         del timeout
@@ -116,6 +121,36 @@ class _FakeGroupLocator:
         return self._locators[index]
 
 
+class _FakeKeyboard:
+    def __init__(self, page: _FakePage) -> None:
+        self._page = page
+
+    def press(self, key: str) -> None:
+        self._page.key_calls.append(key)
+        if self._page.expect_depth and key == self._page.navigate_on_key:
+            self._page.url = self._page.navigation_url
+            self._page.navigation_waited = True
+
+
+class _FakeExpectNavigation:
+    def __init__(self, page: _FakePage) -> None:
+        self._page = page
+
+    def __enter__(self) -> None:
+        self._page.expect_depth += 1
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self._page.expect_depth -= 1
+
+
+class _FakeMouse:
+    def __init__(self) -> None:
+        self.wheel_calls: list[tuple[int, int]] = []
+
+    def wheel(self, dx: int, dy: int) -> None:
+        self.wheel_calls.append((dx, dy))
+
+
 class _FakePage:
     def __init__(
         self,
@@ -129,6 +164,24 @@ class _FakePage:
         self._title = title
         self.redirect_to: str | None = None
         self.goto_calls: list[str] = []
+        self.keyboard = _FakeKeyboard(self)
+        self.key_calls: list[str] = []
+        self.mouse = _FakeMouse()
+        self.title_calls = 0
+        self.screenshot_calls: list[str | None] = []
+        self.screenshot_result = b"\x89PNG\r\n\x1a\nfake"
+        self.screenshot_navigation_url: str | None = None
+        self.wait_calls: list[tuple[str, int | None]] = []
+        self.go_back_calls = 0
+        self.go_forward_calls = 0
+        self.bring_to_front_calls = 0
+        self.close_calls = 0
+        self.enter_can_navigate = False
+        self.navigate_on_key = ""
+        self.navigation_url = url
+        self.navigation_waited = False
+        self.expect_navigation_calls = 0
+        self.expect_depth = 0
 
     def goto(self, url: str, wait_until: str | None = None, timeout: int | None = None) -> None:
         del wait_until, timeout
@@ -136,10 +189,46 @@ class _FakePage:
         self.url = self.redirect_to or url
 
     def title(self) -> str:
+        self.title_calls += 1
         return self._title
 
+    def screenshot(self, path: str | None = None) -> bytes:
+        self.screenshot_calls.append(path)
+        if self.screenshot_navigation_url is not None:
+            self.url = self.screenshot_navigation_url
+        return self.screenshot_result
+
+    def wait_for_load_state(self, state: str, timeout: int | None = None) -> None:
+        self.wait_calls.append((state, timeout))
+
+    def go_back(self, wait_until: str | None = None, timeout: int | None = None) -> None:
+        del wait_until, timeout
+        self.go_back_calls += 1
+
+    def go_forward(self, wait_until: str | None = None, timeout: int | None = None) -> None:
+        del wait_until, timeout
+        self.go_forward_calls += 1
+
+    def bring_to_front(self) -> None:
+        self.bring_to_front_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    def evaluate(self, script: str) -> bool:
+        if "document.activeElement" in script:
+            return self.enter_can_navigate
+        raise AssertionError(f"unexpected script: {script}")
+
+    def expect_navigation(
+        self, *, wait_until: str | None = None, timeout: int | None = None
+    ) -> _FakeExpectNavigation:
+        del wait_until, timeout
+        self.expect_navigation_calls += 1
+        return _FakeExpectNavigation(self)
+
     def locator(self, _selector: str) -> _FakeListLocator:
-        return _FakeListLocator([_FakeLocator(e) for e in self._elements])
+        return _FakeListLocator([_FakeLocator(e, self) for e in self._elements])
 
     def get_by_role(
         self, role: str, name: str | None = None, exact: bool = False
@@ -151,7 +240,7 @@ class _FakePage:
                 continue
             if name is not None and e.live_name() != name:
                 continue
-            matches.append(_FakeLocator(e))
+            matches.append(_FakeLocator(e, self))
         return _FakeGroupLocator(matches)
 
 
@@ -535,6 +624,200 @@ def test_click_after_page_navigation_refused(monkeypatch: pytest.MonkeyPatch) ->
         browser.close()
 
 
+def test_click_cross_origin_blocks_follow_up_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    element = _FakeElement("button", "Send")
+    element.click_url = "https://evil.example.net/landing"
+    page = _FakePage([element])
+    driver = _FakeDriver(page)
+    _install(monkeypatch, driver)
+    browser = PlaywrightBrowser(settings=Settings())
+    browser.start()
+    browser.read()
+    try:
+        with pytest.raises(BrowserError, match="disallowed domain"):
+            browser.click("e1")
+        assert browser._redirect_blocked is True
+        with pytest.raises(BrowserError, match="blocked"):
+            browser.read()
+        with pytest.raises(BrowserError, match="blocked"):
+            browser.press_key("Tab")
+        assert page.key_calls == []
+    finally:
+        browser.close()
+
+
+def test_blocked_session_refuses_reads_and_actions_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _FakePage([_FakeElement("button", "Send")])
+    browser, _ = _started(monkeypatch, page)
+    browser.read()
+    browser._redirect_blocked = True
+    operations = [
+        ("scroll", lambda: browser.scroll("down")),
+        ("wait", lambda: browser.wait(1, load_state="load")),
+        ("back", browser.back),
+        ("forward", browser.forward),
+        ("switch_tab", lambda: browser.switch_tab(0)),
+        ("close_extra_tab", browser.close_extra_tab),
+        ("resolve", lambda: browser.resolve("e1")),
+        ("current_url", browser.current_url),
+    ]
+    try:
+        for _name, operation in operations:
+            with pytest.raises(BrowserError, match="blocked"):
+                operation()
+        assert page.mouse.wheel_calls == []
+        assert page.wait_calls == []
+        assert page.go_back_calls == 0
+        assert page.go_forward_calls == 0
+        assert page.bring_to_front_calls == 0
+        assert page.close_calls == 0
+    finally:
+        browser.close()
+
+
+def test_blocked_session_refuses_to_list_tabs(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage(title="Secret tab")
+    browser, _ = _started(monkeypatch, page)
+    browser._redirect_blocked = True
+    try:
+        with pytest.raises(BrowserError, match="blocked"):
+            browser.list_tabs()
+        assert page.title_calls == 0
+    finally:
+        browser.close()
+
+
+def test_blocked_session_refuses_screenshot_before_file_creation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    page = _FakePage()
+    browser, _ = _started(monkeypatch, page)
+    browser._redirect_blocked = True
+    target = tmp_path / "nested" / "shot.png"
+    try:
+        with pytest.raises(BrowserError, match="blocked"):
+            browser.screenshot(str(target))
+        assert page.screenshot_calls == []
+        assert not target.exists()
+        assert not target.parent.exists()
+    finally:
+        browser.close()
+
+
+def test_screenshot_refuses_disallowed_origin_before_capture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings()
+    settings.browser.allowed_domains = ["example.com"]
+    page = _FakePage(url="https://evil.example.net/landing")
+    driver = _FakeDriver(page)
+    _install(monkeypatch, driver)
+    browser = PlaywrightBrowser(settings=settings)
+    browser.start()
+    target = tmp_path / "nested" / "shot.png"
+    try:
+        with pytest.raises(BrowserError, match="disallowed domain"):
+            browser.screenshot(str(target))
+        assert browser._redirect_blocked is True
+        assert page.screenshot_calls == []
+        assert not target.parent.exists()
+    finally:
+        browser.close()
+
+
+def test_screenshot_refuses_publication_when_origin_changes_during_capture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings()
+    settings.browser.allowed_domains = ["example.com"]
+    page = _FakePage()
+    page.screenshot_navigation_url = "https://evil.example.net/landing"
+    driver = _FakeDriver(page)
+    _install(monkeypatch, driver)
+    browser = PlaywrightBrowser(settings=settings)
+    browser.start()
+    target = tmp_path / "nested" / "shot.png"
+    try:
+        with pytest.raises(BrowserError, match="disallowed domain"):
+            browser.screenshot(str(target))
+        assert page.screenshot_calls == [None]
+        assert browser._redirect_blocked is True
+        assert not target.exists()
+        assert not target.parent.exists()
+        with pytest.raises(BrowserError, match="blocked"):
+            browser.read()
+    finally:
+        browser.close()
+
+
+def test_screenshot_allowed_origin_captures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings()
+    settings.browser.allowed_domains = ["example.com"]
+    page = _FakePage()
+    driver = _FakeDriver(page)
+    _install(monkeypatch, driver)
+    browser = PlaywrightBrowser(settings=settings)
+    browser.start()
+    target = tmp_path / "shot.png"
+    try:
+        data = browser.screenshot(str(target))
+        assert data["path"] == str(target)
+        assert page.screenshot_calls == [None]
+        assert target.read_bytes() == page.screenshot_result
+        assert browser._redirect_blocked is False
+    finally:
+        browser.close()
+
+
+# ── keyboard navigation ────────────────────────────────────────────────────
+
+
+def test_press_enter_waits_for_navigation(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage(url="https://example.com/search")
+    page.enter_can_navigate = True
+    page.navigate_on_key = "Enter"
+    page.navigation_url = "https://example.com/results?q=jarvis"
+    browser, _ = _started(monkeypatch, page)
+    try:
+        data = browser.press_key("Enter")
+        assert data == {"key": "Enter"}
+        assert page.expect_navigation_calls == 1
+        assert page.navigation_waited is True
+        assert browser.current_url() == "https://example.com/results?q=jarvis"
+    finally:
+        browser.close()
+
+
+def test_press_enter_without_navigable_control_does_not_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _FakePage(url="https://example.com/search")
+    page.enter_can_navigate = False
+    browser, _ = _started(monkeypatch, page)
+    try:
+        browser.press_key("Enter")
+        assert page.key_calls == ["Enter"]
+        assert page.expect_navigation_calls == 0
+    finally:
+        browser.close()
+
+
+def test_press_non_navigation_key_does_not_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage(url="https://example.com/search")
+    page.enter_can_navigate = True
+    browser, _ = _started(monkeypatch, page)
+    try:
+        browser.press_key("Tab")
+        assert page.key_calls == ["Tab"]
+        assert page.expect_navigation_calls == 0
+    finally:
+        browser.close()
+
+
 # ── find / open_match (Stage 8.6, slice 8.6.2) ───────────────────────────
 
 
@@ -721,6 +1004,18 @@ def test_whatsapp_page_requires_a_started_session(monkeypatch: pytest.MonkeyPatc
     browser = PlaywrightBrowser(settings=Settings(), profile="whatsapp")
     with pytest.raises(BrowserError, match="not started"):
         browser.whatsapp_page()
+
+
+def test_blocked_whatsapp_session_refuses_page_accessor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser, _ = _started_whatsapp(monkeypatch)
+    browser._redirect_blocked = True
+    try:
+        with pytest.raises(BrowserError, match="blocked"):
+            browser.whatsapp_page()
+    finally:
+        browser.close()
 
 
 def test_whatsapp_page_returns_the_narrow_adapter(monkeypatch: pytest.MonkeyPatch) -> None:

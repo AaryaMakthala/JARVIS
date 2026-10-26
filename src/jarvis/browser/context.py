@@ -65,6 +65,10 @@ _MAX_ELEMENT_NAME_CHARS = 120
 _NAV_TIMEOUT_MS = 30_000
 _CLICK_TIMEOUT_MS = 10_000
 _TYPE_TIMEOUT_MS = 10_000
+_BLOCKED_MESSAGE = (
+    "interactions are blocked after an unauthorized redirect; "
+    "authorize a valid navigation first"
+)
 
 #: Compact locator covering common interactive controls plus explicit roles.
 _INTERACTIVE_SELECTOR = "button, a[href], input, textarea, select, [role], [tabindex]"
@@ -350,6 +354,11 @@ class PlaywrightBrowser:
             raise BrowserError("the managed browser session is not started")
         return self._page
 
+    def _require_not_blocked(self) -> None:
+        """Refuse page reads and actions until an authorized goto clears the block."""
+        if self._redirect_blocked:
+            raise BrowserError(_BLOCKED_MESSAGE)
+
     # ── tools ──────────────────────────────────────────────────────────────
 
     def goto(self, url: str) -> dict[str, Any]:
@@ -384,11 +393,7 @@ class PlaywrightBrowser:
     def read(self, max_elements: int = _MAX_OBSERVED_ELEMENTS) -> Observation:
         """Take a bounded accessibility observation of the current page."""
         page = self._require_page()
-        if self._redirect_blocked:
-            raise BrowserError(
-                "interactions are blocked after an unauthorized redirect; "
-                "authorize a valid navigation first"
-            )
+        self._require_not_blocked()
         url = str(page.url)
         origin = url_origin(url) or ""
 
@@ -415,11 +420,7 @@ class PlaywrightBrowser:
         invalidates the refs of the previous one.
         """
         page = self._require_page()
-        if self._redirect_blocked:
-            raise BrowserError(
-                "interactions are blocked after an unauthorized redirect; "
-                "authorize a valid navigation first"
-            )
+        self._require_not_blocked()
         origin = url_origin(str(page.url)) or ""
         candidates, groups = self._collect_candidates(page, _MAX_FIND_ELEMENTS)
         pairs = [(item.role, item.name) for item in candidates]
@@ -453,8 +454,7 @@ class PlaywrightBrowser:
         is **not** performed and an error is raised.
         """
         page = self._require_page()
-        if self._redirect_blocked:
-            raise BrowserError("interactions are blocked after an unauthorized redirect")
+        self._require_not_blocked()
         origin = url_origin(str(page.url)) or ""
         candidates, groups = self._collect_candidates(page, _MAX_FIND_ELEMENTS)
         pairs = [(item.role, item.name) for item in candidates]
@@ -565,6 +565,7 @@ class PlaywrightBrowser:
 
     def resolve(self, ref: str) -> ElementRef | None:
         """Return the transient observed identity for ``ref``, else ``None``."""
+        self._require_not_blocked()
         snap = self._snapshots.get(ref)
         if snap is None:
             return None
@@ -579,20 +580,24 @@ class PlaywrightBrowser:
         )
 
     def current_url(self) -> str:
-        """The URL of the page the managed browser is on (may be empty)."""
+        """The URL of the current page; raises while the redirect block is set."""
         try:
             page = self._require_page()
         except BrowserError:
             return ""
+        self._require_not_blocked()
         return str(getattr(page, "url", "") or "")
 
     def click(self, ref: str) -> dict[str, Any]:
         """Re-validate then click ``ref``; never falls back to coordinates."""
         page = self._require_page()
-        if self._redirect_blocked:
-            raise BrowserError("interactions are blocked after an unauthorized redirect")
+        self._require_not_blocked()
         snap, loc, live = self._relocate(page, ref)
+        before = str(getattr(page, "url", "") or "")
         loc.click(timeout=_CLICK_TIMEOUT_MS)
+        if str(getattr(page, "url", "") or "") != before:
+            self._snapshots.clear()
+        _recheck_origin_after_action(self, before)
         return {
             "ref": snap.ref,
             "role": live.role,
@@ -603,8 +608,7 @@ class PlaywrightBrowser:
     def type_text(self, ref: str, text: str) -> dict[str, Any]:
         """Re-validate then type into ``ref``, confined to the managed page."""
         page = self._require_page()
-        if self._redirect_blocked:
-            raise BrowserError("interactions are blocked after an unauthorized redirect")
+        self._require_not_blocked()
         if not text or len(text) > 4096:
             raise BrowserError("refusing to type an empty or oversized value")
         snap, loc, live = self._relocate(page, ref)
@@ -631,15 +635,26 @@ class PlaywrightBrowser:
         if key not in KEY_ALLOWLIST:
             raise BrowserError(f"key {key!r} not allowed")
         page = self._require_page()
+        self._require_not_blocked()
+        before = str(getattr(page, "url", "") or "")
         try:
-            page.keyboard.press(key)
+            if key == "Enter" and _enter_may_navigate(page):
+                with page.expect_navigation(
+                    wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
+                ):
+                    page.keyboard.press(key)
+            else:
+                page.keyboard.press(key)
         except Exception as exc:
             raise BrowserError(str(exc)) from exc
-        _recheck_origin_after_action(self)
+        if str(getattr(page, "url", "") or "") != before:
+            self._snapshots.clear()
+        _recheck_origin_after_action(self, before)
         return {"key": key}
 
     def scroll(self, direction: str, amount: int = 1) -> dict[str, Any]:
         page = self._require_page()
+        self._require_not_blocked()
         amt = max(1, min(int(amount), 10))
         if direction == "up":
             try:
@@ -658,6 +673,7 @@ class PlaywrightBrowser:
 
     def wait(self, seconds: float = 1.0, *, load_state: str | None = None) -> dict[str, Any]:
         page = self._require_page()
+        self._require_not_blocked()
         secs = max(0.0, min(float(seconds), 10.0))
         import time
 
@@ -673,6 +689,7 @@ class PlaywrightBrowser:
 
     def back(self) -> dict[str, Any]:
         page = self._require_page()
+        self._require_not_blocked()
         try:
             page.go_back(wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
         except Exception as exc:
@@ -683,6 +700,7 @@ class PlaywrightBrowser:
 
     def forward(self) -> dict[str, Any]:
         page = self._require_page()
+        self._require_not_blocked()
         try:
             page.go_forward(wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
         except Exception as exc:
@@ -694,6 +712,7 @@ class PlaywrightBrowser:
     def list_tabs(self) -> list[dict[str, Any]]:
         if not self._started or self._context is None:
             raise BrowserError("the managed browser session is not started")
+        self._require_not_blocked()
         tabs = []
         for i, p in enumerate(self._context.pages):
             try:
@@ -705,6 +724,7 @@ class PlaywrightBrowser:
     def switch_tab(self, index: int) -> dict[str, Any]:
         if not self._started or self._context is None:
             raise BrowserError("the managed browser session is not started")
+        self._require_not_blocked()
         pages = list(self._context.pages)
         if index < 0 or index >= len(pages):
             raise BrowserError("tab index out of range")
@@ -719,6 +739,7 @@ class PlaywrightBrowser:
     def close_extra_tab(self) -> dict[str, Any]:
         if not self._started or self._context is None:
             raise BrowserError("the managed browser session is not started")
+        self._require_not_blocked()
         pages = list(self._context.pages)
         if len(pages) <= 1:
             return {"closed": 0}
@@ -737,11 +758,12 @@ class PlaywrightBrowser:
 
     def screenshot(self, path: str | None = None) -> dict[str, Any]:
         page = self._require_page()
+        self._require_not_blocked()
+        _recheck_origin_after_action(self)
         from pathlib import Path
         import time
 
         out_dir = photo_dir(self._settings)
-        out_dir.mkdir(parents=True, exist_ok=True)
         if path is None:
             ts = time.strftime("%Y%m%d-%H%M%S")
             fname = f"screenshot-{ts}.png"
@@ -750,12 +772,16 @@ class PlaywrightBrowser:
             out_path = Path(path)
             if not out_path.is_absolute():
                 out_path = out_dir / out_path.name
-            out_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            page.screenshot(path=str(out_path))
+            image = page.screenshot()
         except Exception as exc:
             raise BrowserError(str(exc)) from exc
         _recheck_origin_after_action(self)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            out_path.write_bytes(image)
+        except Exception as exc:
+            raise BrowserError(str(exc)) from exc
         return {"path": str(out_path)}
 
 
@@ -776,6 +802,7 @@ class PlaywrightBrowser:
             raise BrowserError(
                 "the WhatsApp page accessor is only available on the whatsapp profile"
             )
+        self._require_not_blocked()
         page = self._require_page()
         from jarvis.browser.whatsapp_page import PlaywrightWhatsAppPage
 
@@ -885,7 +912,27 @@ class PlaywrightBrowser:
 #: Allowlist for press_key (no modifiers)
 KEY_ALLOWLIST = {"Enter", "Tab", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Backspace"}
 
-def _recheck_origin_after_action(browser: "PlaywrightBrowser") -> None:
+
+def _enter_may_navigate(page: Any) -> bool:
+    """Whether Enter on the focused control may submit or navigate."""
+    try:
+        return bool(
+            page.evaluate(
+                "() => {"
+                " const el = document.activeElement;"
+                " if (!el) return false;"
+                " const tag = el.tagName.toLowerCase();"
+                " if (tag === 'a') return Boolean(el.getAttribute('href'));"
+                " if (tag === 'button') return true;"
+                " return Boolean(el.form);"
+                " }"
+            )
+        )
+    except Exception:  # noqa: BLE001 - best-effort pre-action hint
+        return False
+
+
+def _recheck_origin_after_action(browser: PlaywrightBrowser, previous_url: str = "") -> None:
     """Re-validate the origin after an action and refuse if ended on disallowed domain."""
     try:
         page = getattr(browser, "_page", None)
@@ -895,10 +942,13 @@ def _recheck_origin_after_action(browser: "PlaywrightBrowser") -> None:
         final_origin = url_origin(final_url)
         allowed = browser._settings.browser.allowed_domains
         if final_origin is None:
+            browser._redirect_blocked = True
             raise BrowserError("invalid origin after action")
-        if allowed and final_origin not in allowed and not domain_allowed(final_url, allowed):
-            raise BrowserError(f"action ended on disallowed domain {final_origin!r}")
-        if getattr(browser, "_redirect_blocked", False) and allowed and final_origin not in allowed:
+        browser._require_not_blocked()
+        changed_origin = bool(previous_url) and final_origin != url_origin(previous_url)
+        unauthorized = changed_origin or bool(allowed)
+        if unauthorized and not domain_allowed(final_url, allowed):
+            browser._redirect_blocked = True
             raise BrowserError(f"action ended on disallowed domain {final_origin!r}")
     except BrowserError:
         raise

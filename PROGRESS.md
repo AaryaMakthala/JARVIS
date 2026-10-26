@@ -53,3 +53,5 @@ Maintained by the coding agent. Condensed from historical log.
 - **Stage 8**: Camera/WhatsApp/referents work in progress; not complete.
 - **D22**: Bare 'stop' barge-in enabled (voice).
 - **P3**: Browser page referent invalidation added (2026-10-23).
+- **L4**: Enter now synchronizes on Playwright navigation; click rechecks the post-action origin; unauthorized cross-origin actions set the redirect block. Narrow fixture checks pass (2026-10-26).
+- **L5**: Redirect-block enforcement now covers reads/actions/side effects (`resolve`, `current_url`, `scroll`, `wait`, `back`, `forward`, tabs, screenshot, WhatsApp accessor); screenshot revalidates its origin before capture. Targeted browser-context tests pass; live checks not run (2026-10-26).

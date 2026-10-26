@@ -15,12 +15,14 @@ import os
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from jarvis.browser.context import BrowserError, PlaywrightBrowser
 from jarvis.config import BrowserSettings, Settings
 
 SITE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "site"
+SEARCH_TEXT = "jarvis"
+EXPECTED_PATH = "/results"
 
 
 class _Handler(http.server.SimpleHTTPRequestHandler):
@@ -37,6 +39,26 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def log_message(self, *args):
         return
+
+
+def _matches_expected_navigation(url: str, base: str) -> bool:
+    actual = urlsplit(url)
+    expected = urlsplit(f"{base}{EXPECTED_PATH}")
+    return (
+        actual.scheme == expected.scheme
+        and actual.netloc == expected.netloc
+        and actual.path == expected.path
+        and parse_qs(actual.query, keep_blank_values=True) == {"q": [SEARCH_TEXT]}
+    )
+
+
+def _navigation_detail(url: str) -> str:
+    parts = urlsplit(url)
+    query = parse_qs(parts.query, keep_blank_values=True)
+    return (
+        f"scheme={parts.scheme!r} netloc={parts.netloc!r} "
+        f"path={parts.path!r} query={query!r}"
+    )
 
 
 def _active(page) -> str:
@@ -101,7 +123,7 @@ def main() -> int:
         )
         print(f"form={form}")
 
-        session.type_text(search.ref, "jarvis")
+        session.type_text(search.ref, SEARCH_TEXT)
         _show("type", session, page)
 
         events: list[str] = []
@@ -143,14 +165,18 @@ def main() -> int:
 
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if urlsplit(session.current_url()).path == "/results":
+            if _matches_expected_navigation(session.current_url(), base):
                 break
             page.wait_for_timeout(100)
         _show("after-wait", session, page)
-        if urlsplit(session.current_url()).path != "/results":
-            print("RESULT: Enter did not reach /results")
+        actual_url = session.current_url()
+        if not _matches_expected_navigation(actual_url, base):
+            expected_url = f"{base}{EXPECTED_PATH}?q={SEARCH_TEXT}"
+            print("RESULT: Enter did not reach the expected navigation")
+            print(f"  expected: {_navigation_detail(expected_url)}")
+            print(f"  actual:   {_navigation_detail(actual_url)}")
             return 1
-        print("RESULT: Enter reached /results")
+        print(f"RESULT: Enter reached the expected navigation: {actual_url}")
         return 0
     except BrowserError as exc:
         print(f"browser error: {exc}")
