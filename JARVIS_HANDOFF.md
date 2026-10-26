@@ -312,10 +312,9 @@ WhatsApp: send a message to mom saying running late (T032) - make_send_whatsapp_
   tests/unit/test_invariants.py passes (37).
 - Commits: 0f78c4e (module + rules), f369f2f (wiring), 99c2fe4 (target binding + wiring tests),
   a70b622 (pre-wiring note).
-- Known limits: browser_press_key Enter is never covered in the wired path (the previous step's
-  role is not retained in specialist_history, so the rule fails closed; the pure rule supports it);
-  payment/purchase controls are Tier 3-blocked rather than re-confirmed; browser_search coverage
-  needs a known site.
+- Known limits: payment/purchase controls are Tier 3-blocked rather than re-confirmed;
+  browser_search coverage needs a known site.  (Enter after a search was a limit here; it is covered
+  from B3 on - see the browser hardening section below.)
 - NEXT STEP: "Phase 5 design spec (compose, persona, guarded final click)".
 
 ## Backbone (docs/BACKBONE_PLAN.md)
@@ -324,7 +323,8 @@ Implementation-only pass over the prompt -> LLM -> plan -> run -> answer
 backbone. **Every step below is UNTESTED**: no tests were written and pytest was
 not run (per the plan's rules: `ruff check` + `py_compile` + read-only scripts
 only). `act.py`, `policy_gate.py` and `tests/unit/test_browse_grant_wiring.py`
-were not touched and remain uncommitted WIP.
+were not touched by that pass; they were WIP then and are committed now in the
+browser hardening pass (B2, `9e88856`).
 
 | Step | Commit | Content | Status |
 |---|---|---|---|
@@ -346,7 +346,8 @@ deadline; "sir" is only used when a `user_name` preference already exists.
 
 All implementation-only and **UNTESTED** (ruff + py_compile + read-only scripts
 only; no tests written, pytest not run). `act.py`, `policy_gate.py` and
-`tests/unit/test_browse_grant_wiring.py` remain untouched and uncommitted.
+`tests/unit/test_browse_grant_wiring.py` were left untouched by that pass; they
+are committed now in the browser hardening pass (B2, `9e88856`).
 
 | Step | Commit | Content | Status |
 |---|---|---|---|
@@ -360,8 +361,28 @@ only; no tests written, pytest not run). `act.py`, `policy_gate.py` and
 | M6 | `07305af` | `docs/MEMORY.md`, updated `docs/STATE_CONTRACT.md` memory keys, this section. | UNTESTED |
 | M7 | this commit | Docs for the hardening: `docs/MEMORY.md` retrieval caps/timeout, failure content and dedupe, bounded prune, the `memory_saved_reason` code table, the four new config keys; this table. | UNTESTED |
 
-OPEN: cross-host test question
-(test_step_on_another_host_interrupts + the 3 uncommitted files) must be
-resolved before the test phase.
+Cross-host item: **RESOLVED-IN-CODE / UNTESTED** (B1-B3 below).
+
+### Browser hardening pass (B1-B4)
+
+Implementation + design docs only, **UNTESTED**: no pytest run (the test phase is
+later); checks were `ruff check` on the changed files, `py_compile` with
+`.venv\Scripts\python.exe`, and read-only probe scripts with a `FakeLLM` (no
+network). `PolicyEngine`, `tiers`, Tier 3 blocking, the target-binding hash
+algorithm, `llm/models.py`, `free_only` and `strict_zero_cost` are untouched.
+
+| Step | Commit | Content | Status |
+|---|---|---|---|
+| B1 | (no commit) | Read-only trace of the cross-host sequence. Conclusion **(Y)**: host B already gets its OWN independent authorization - a task-scope confirmation for B (`scope_confirm=True`, summary names B, `browse_grant` absent) minted by `_scope_confirm` -> `_issue_scope_grant` (`policy_gate.py:463,636`), with the target binding recorded under that grant's `confirmation_id` (`:534`) and consumed by act with the same id (`act.py:276`). Traced ids: A's browse grant `b550c3f1...` put/consumed at both ends; B's scope cid `67793dd1...` put/consumed at both ends; s1 ran (`ok=True verified=True`), A's grant untouched, browse `consumed=1`. No cross-host code fix was needed. The real defect was the *other* direction: a browse-covered step while a ScopeGrant is active. | traced |
+| B2 | `9e88856` | One authorization id per step, at both ends: a browse-covered step records its binding under the grant's own id (`policy_gate.py:287-293,326-332`) and act consumes it with the id its own fresh coverage check derives (`act.py:276-278`); a step the gate did not cover binds under the active ScopeGrant's confirmation id (now the only path into `_approve_single_step`, dead `grant_id` branch removed). Tests in `test_browse_grant_wiring.py`: host B's prompt names B and is B's own authorization, approving it lets the step RUN (result + navigation asserted), refusing it runs nothing and leaves A's grant intact, `_VanishingGrantRegistry` proves act refuses when coverage is removed between gate and act, plus the simultaneous-ScopeGrant regression. | UNTESTED |
+| B3 | `5687447` | Enter after a search is covered: `_record_history` keeps a compact marker of a successful type into a `searchbox`/`combobox` (role + host only, never the element's name/label/ref or the typed text) (`specialist.py:187-262`); `browse_grant_check` looks back over passive `browser_read` refresh steps only, passes the pressed key and the previous role, and takes the host from the marker for `browser_press_key` (`util.py:171-198,200-246`). Fail closed: a textbox, a password/submit role, an intervening click/navigation, or a host mismatch all leave Enter uncovered. act re-runs the same rule independently. | UNTESTED |
+| B4 | `9ed011f` | `docs/FINAL_CLICK_DESIGN.md`: `browser_final_click` design - payment classified FIRST (Tier 3, unreachable), irreversible non-payment verbs only, never browse-grant/batch covered, exact identity + fresh evidence + host + typed-confirmation hash, single-use binding, re-verify immediately before dispatch, `reserved -> dispatched -> confirmed \| indeterminate` journal written before dispatch, never retried when indeterminate, `final_click_max_total` 0 and voice approval off by default, owner decisions listed. Design only, no code. | design |
+
+Known limit after B3: the marker deliberately survives only passive page reads, so any
+other action between the type and Enter (a click, a navigation, another key press, a
+scroll) means Enter asks again. That is the intended fail-closed side of the rule, not
+a bug: only a read is known not to move focus.
+
+`docs/GRAPH.md` is unchanged: B2-B3 changed no node, edge or route.
 
 Next: the test phase (golden-path S1-S10) per `docs/BACKBONE_PLAN.md`.
