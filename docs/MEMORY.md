@@ -50,10 +50,13 @@ Bounded retrieval (`memory_retrieve`, M2):
 
 The store call runs in a worker thread and is given
 `memory.retrieve_timeout_seconds` (2.0) via `future.result(timeout)`; on
-timeout the task continues immediately. The SQLite connection is opened per
-`SqliteMemory` and only ever touched by one thread at a time (`check_same_thread`
-stays on, `_lock` covers writes), so the worker borrows the store, does one read
-and returns - it never writes and is never shared with a second caller.
+timeout the task continues immediately. The SQLite connection is opened with
+`check_same_thread=False` (the daemon shares one connection across its threads;
+see `memory/db.py`) and `SqliteMemory.retrieve` holds the store's `RLock` for the
+whole read, so the worker borrows the store, does one read and returns - it never
+writes. A worker abandoned after a timeout can still hold that lock for the rest
+of its one query, which is why the next task gets its own timeout rather than
+waiting forever.
 
 The records are injected into the brain prompt as `memory_context` (a
 `list[dict]` of plain primitives: `kind`, `text`, optional `meta`), serialised

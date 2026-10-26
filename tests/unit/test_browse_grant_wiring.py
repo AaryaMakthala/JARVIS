@@ -6,6 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from tests.support import approve, deny
+from tests.unit.test_specialist_loop_e2e import _FakeSession
+
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import open_sqlite_checkpointer
 from jarvis.agent.runner import resume_task, run_task
@@ -14,9 +17,8 @@ from jarvis.browser.context import ElementRef, Observation
 from jarvis.config import AgentSettings, BrowserSettings, Settings
 from jarvis.daemon.server import DaemonServer
 from jarvis.llm.client import FakeLLM
+from jarvis.policy.browse_grant import BrowseGrantRegistry
 from jarvis.tools.registry import build_default_registry
-from tests.support import approve, deny
-from tests.unit.test_specialist_loop_e2e import _FakeSession
 
 BROWSE_PROMPT = "Allow JARVIS to browse example.com for this task?"
 
@@ -143,16 +145,93 @@ def test_risky_click_on_the_approved_host_still_interrupts(tmp_path: Path) -> No
 
 
 def test_step_on_another_host_interrupts(tmp_path: Path) -> None:
-    ctx = _ctx(_FakeSession())
+    """Host B gets its own authorization, and approving it lets the step run.
+
+    A grant for host A never covers host B: the gate raises host B's own
+    task-scope confirmation, names B, and approving it authorizes exactly that
+    step.  Gate and act must agree on the authorization id, so the *result* is
+    the contract here - if they disagreed, act would refuse and the step would
+    not run.
+    """
+    session = _FakeSession()
+    ctx = _ctx(session)
     saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
     try:
         out, payloads = _run(
-            ctx, saver, [_browse(), _goto(), _goto("https://other.example/page"), _done()]
+            ctx, saver, [_browse(), _goto(), _goto("https://other.example/page"), _done("B.")]
         )
-        assert len(payloads) >= 2, payloads
+        assert len(payloads) == 2, payloads
         assert payloads[0]["summary"] == BROWSE_PROMPT
+        # Host B's own authorization: a scope confirmation naming B, never a
+        # reuse of host A's browsing grant.
         assert "other.example" in payloads[1]["summary"]
-        assert out.halted_reason is None
+        assert payloads[1].get("scope_confirm") is True
+        assert "browse_grant" not in payloads[1]
+        assert out.halted_reason is None, out.halted_reason
+        # The step ran on host B under that authorization.
+        assert ("goto", "https://other.example/page") in session.calls
+        results = {r.step_id: r for r in out.state.get("results") or []}
+        assert results["s1"].ok is True and results["s1"].error is None
+        # Host A's grant was neither reused nor charged for B's step.
+        grant_a = ctx.browse_grants.active_for_task("t1")
+        assert grant_a is not None and grant_a.host == "example.com"
+        assert ctx.browse_grants.consumed("t1") == 1
+    finally:
+        saver.conn.close()
+
+
+def test_refusing_the_second_host_runs_nothing_there(tmp_path: Path) -> None:
+    """Refusing host B leaves B untouched and host A's grant in force."""
+    session = _FakeSession()
+    ctx = _ctx(session)
+    ctx.llm = FakeLLM([_browse(), _goto(), _goto("https://other.example/page"), _done()])
+    saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
+    try:
+        out = run_task(ctx, saver, "browse example", thread_id="t1")
+        assert out.interrupted is True and out.confirmation is not None
+        first = dict(out.confirmation)
+        assert first["summary"] == BROWSE_PROMPT
+        out = resume_task(ctx, saver, out.task_id, approve(first))
+        assert out.interrupted is True and out.confirmation is not None
+        second = dict(out.confirmation)
+        assert "other.example" in second["summary"]
+        out = resume_task(ctx, saver, out.task_id, deny(second))
+        assert out.interrupted is False
+        assert out.halted_reason
+        # Nothing reached host B, and A's authorization is unaffected.
+        assert ("goto", "https://other.example/page") not in session.calls
+        assert all(not (r.step_id == "s1" and r.ok) for r in out.state.get("results") or [])
+        assert ctx.browse_grants.consumed("t1") == 1
+    finally:
+        saver.conn.close()
+
+
+class _VanishingGrantRegistry(BrowseGrantRegistry):
+    """A registry whose grant is revoked the instant it is issued.
+
+    Models the gate -> act window closing: the gate approves and records the
+    target binding under the grant id, then the coverage is gone before act
+    re-checks it.
+    """
+
+    def issue(self, *args: Any, **kwargs: Any) -> Any:
+        grant = super().issue(*args, **kwargs)
+        self.revoke(grant.task_id)
+        return grant
+
+
+def test_act_refuses_when_coverage_vanishes_after_the_gate(tmp_path: Path) -> None:
+    """Act re-checks coverage itself: losing it after the gate refuses the step."""
+    session = _FakeSession()
+    ctx = _ctx(session)
+    ctx.browse_grants = _VanishingGrantRegistry()
+    saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
+    try:
+        out, payloads = _run(ctx, saver, [_browse(), _goto(), _done()])
+        assert payloads and payloads[0]["summary"] == BROWSE_PROMPT
+        results = {r.step_id: r for r in out.state.get("results") or []}
+        assert "s0" in results and results["s0"].ok is False
+        assert ("goto", "https://example.com/page") not in session.calls
     finally:
         saver.conn.close()
 
@@ -186,6 +265,37 @@ def test_grant_disabled_keeps_the_normal_prompt(tmp_path: Path) -> None:
         assert "browse_grant" not in payloads[0]
         assert ctx.browse_grants.active_for_task("t1") is None
         assert out.final_answer
+    finally:
+        saver.conn.close()
+
+
+def test_covered_step_survives_a_simultaneous_scope_grant(tmp_path: Path) -> None:
+    """A browse-covered step must still pass act while a ScopeGrant is active.
+
+    Regression for a suspected binding mismatch: the gate records a browse-grant
+    target binding with an empty scope id, while act consumes it with the active
+    ScopeGrant's confirmation id.  Both grants are real registries and the real
+    gate/act nodes run - only the browser is faked.
+    """
+    ctx = _ctx(_FakeSession())
+    # A task-scope grant for the same task, as if an earlier scope prompt had
+    # been approved (its plan hash may be stale; only its id matters here).
+    ctx.scope_registry.issue(
+        "t1",
+        plan_hash="scope-plan-hash",
+        confirmation_id="scope-cid-1",
+        allowed_domains=["example.com"],
+        max_actions=1,
+    )
+    assert ctx.scope_registry.active_grant("t1") is not None
+    saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
+    try:
+        out, payloads = _run(ctx, saver, [_browse(), _goto(), _done("Browsed.")])
+        assert len(payloads) == 1, payloads
+        assert payloads[0]["summary"] == BROWSE_PROMPT
+        assert out.halted_reason is None, out.halted_reason
+        assert out.final_answer == "Browsed."
+        assert ctx.browse_grants.consumed("t1") == 1
     finally:
         saver.conn.close()
 

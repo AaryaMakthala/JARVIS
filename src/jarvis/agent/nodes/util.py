@@ -158,6 +158,45 @@ def browse_step_host(step: Any, settings: Settings) -> str:
     return site.host if site is not None else ""
 
 
+#: Tools that only read the page.  They cannot move focus, so the loop's own
+#: refresh step between a type and the next decision does not break the chain.
+_PASSIVE_HISTORY_TOOLS = frozenset({"browser_read"})
+#: Roles a preceding typing step must have had for Enter to be coverable
+#: (mirrors the pure rule's ``_ENTER_ROLES``; a password field is never here).
+_SEARCH_ROLES = frozenset({"searchbox", "combobox"})
+#: How far back the typed-target marker is looked for (history is bounded anyway).
+_HISTORY_LOOKBACK = 12
+
+
+def _previous_typed_target(state: dict[str, Any]) -> tuple[str, str, str]:
+    """``(tool, role, host)`` of the last step that typed into a search field.
+
+    Walks back over passive page reads only: the loop's automatic refresh
+    cannot move focus, so it does not break the chain, while any real action
+    (click, navigation, search, another key press) does.  The marker is written
+    by ``specialist._record_history`` and is ordinary state, so it is treated as
+    untrusted input: unknown or malformed values yield an empty marker and the
+    Enter rule then fails closed.
+    """
+    history = state.get("specialist_history")
+    if not isinstance(history, list):
+        return "", "", ""
+    for entry in reversed(history[-_HISTORY_LOOKBACK:]):
+        if not isinstance(entry, dict):
+            return "", "", ""
+        tool = str(entry.get("tool") or "").strip()
+        if tool in _PASSIVE_HISTORY_TOOLS:
+            continue
+        if tool != "browser_type" or entry.get("ok") is not True:
+            return "", "", ""
+        role = str(entry.get("role") or "").casefold()
+        host = str(entry.get("host") or "").casefold().rstrip(".")
+        if role not in _SEARCH_ROLES or not host:
+            return "", "", ""
+        return "browser_type", role, host
+    return "", "", ""
+
+
 def browse_grant_check(
     state: dict[str, Any], ctx: Any, *, step: Any, decision: Any, resolved: Any
 ) -> tuple[Any | None, str, str]:
@@ -175,10 +214,19 @@ def browse_grant_check(
         return None, "", "tool_not_allowed"
     task_id = str(state.get("task_id") or "")
     grant = registry.active_for_task(task_id)
-    host = str(getattr(resolved, "host", "") or "") or browse_step_host(step, ctx.settings)
     target = getattr(resolved, "target", None)
-    history = list(state.get("specialist_history") or [])
-    previous_tool = str(history[-1].get("tool") or "") if history else ""
+    previous_tool, previous_role, previous_host = _previous_typed_target(state)
+    host = str(getattr(resolved, "host", "") or "") or browse_step_host(step, ctx.settings)
+    if not host and tool == "browser_press_key":
+        # Enter acts on whatever holds focus, so there is no target to resolve and
+        # no URL in the step.  The host comes from the marker of the last typing
+        # step instead - and coverage() still requires the task's grant to cover
+        # exactly that host, so this never widens the approved scope.
+        host = previous_host
+    if tool == "browser_press_key" and previous_host != host:
+        previous_tool, previous_role = "", ""
+    args = getattr(step, "args", None)
+    key = str(args.get("key") or "") if isinstance(args, dict) else ""
     ok, reason = coverage(
         grant,
         task_id=task_id,
@@ -188,11 +236,12 @@ def browse_grant_check(
         label=str(getattr(target, "name", "") or "") if target is not None else "",
         role=str(getattr(target, "role", "") or "") if target is not None else "",
         is_password=bool(getattr(target, "is_password", False)) if target is not None else False,
+        key=key,
         actions_used=registry.consumed(task_id),
         needs_unlock=bool(getattr(decision, "needs_unlock", False)),
         needs_typed_confirmation=bool(getattr(decision, "needs_typed_confirmation", False)),
         previous_tool=previous_tool,
-        previous_role="",
+        previous_role=previous_role,
     )
     return (grant if ok else None), host, reason
 

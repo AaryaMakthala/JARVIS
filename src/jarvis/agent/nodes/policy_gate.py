@@ -141,6 +141,10 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         return {"decisions": decisions}
 
     # Phase 4: a specialist browser task may hold a task-scoped browsing grant.
+    # A browse-covered step RETURNS here: `_browse_grant_gate` records its target
+    # binding under that grant's own id, and act re-runs the same coverage rule
+    # and consumes the binding with the same id.  So a browse approval never
+    # reaches the scope-id path below - the two identifiers cannot be mixed.
     grant_update = _browse_grant_gate(state, ctx, step, resolved, decision, decisions, plan_hash_v)
     if grant_update is not None:
         return grant_update
@@ -225,6 +229,10 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     # Content-hash binding (Stage 8.4d) happens inside ``_approve_single_step``,
     # after every approval check has passed: a denied/timed-out/locked
     # confirmation must not leave a recorded content binding behind.
+    #
+    # This path means the step was NOT browse-covered (a covered step returned
+    # above), so its binding belongs to the task's ScopeGrant - and act, which
+    # re-derives the same value, consumes it with that confirmation id.
     return _approve_single_step(
         state,
         ctx,
@@ -273,9 +281,17 @@ def _browse_grant_gate(
         covered = decision.model_copy(
             update={"reasons": [*decision.reasons, f"browse grant {grant.grant_id}"]}
         )
-        # act still requires the transient target binding the gate issues; a
-        # browsing grant is not a ScopeGrant, so its scope id is empty.
-        _record_binding_for(ctx, state, step, decision, getattr(resolved, "target", None), "")
+        # No scope id: a browsing grant is not a ScopeGrant, and no ScopeGrant
+        # is active for this task, so a later act re-verification must bind the
+        # freshly-observed target under this grant's own identifier.
+        _record_binding_for(
+            ctx,
+            state,
+            step,
+            decision,
+            getattr(resolved, "target", None),
+            grant.grant_id,
+        )
         logger.info("browse grant %s covers step %s", grant.grant_id, step.id)
         return {"decisions": {**decisions, step.id: covered}}
     if not host:
@@ -307,7 +323,14 @@ def _browse_grant_gate(
     covered = decision.model_copy(
         update={"reasons": [*decision.reasons, f"browse grant {grant.grant_id}"]}
     )
-    _record_binding_for(ctx, state, step, decision, getattr(resolved, "target", None), "")
+    _record_binding_for(
+        ctx,
+        state,
+        step,
+        decision,
+        getattr(resolved, "target", None),
+        grant.grant_id,
+    )
     return {"decisions": {**decisions, step.id: covered}}
 
 

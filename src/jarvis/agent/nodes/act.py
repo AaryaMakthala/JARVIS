@@ -103,6 +103,7 @@ def _consume_target_binding(
     decision: Any,
     target: Any,
     task_id: str,
+    scope_confirmation_id: str,
 ) -> str | None:
     """Re-verify the gate's one-shot target binding for this action.
 
@@ -126,7 +127,7 @@ def _consume_target_binding(
         action_hash=str(getattr(decision, "action_hash", "")),
         fingerprint=str(fingerprint),
         origin=str(getattr(target, "origin", "") or ""),
-        scope_confirmation_id=active_scope_cid(ctx.scope_registry, task_id),
+        scope_confirmation_id=scope_confirmation_id,
     )
     if not result.ok:
         return f"target binding {result.reason}"
@@ -262,8 +263,19 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     # changed, missing, expired or unauthorized target fails closed.  Dry runs
     # execute nothing, so they neither consume the one-shot binding nor budget.
     if resolved.target is not None and not ctx.dry_run:
+        # One identifier per step, derived here from act's own state (never
+        # copied from the gate's decision):
+        # * browse-covered - the gate recorded the binding under the browse
+        #   grant's id (policy_gate.py `_browse_grant_gate`), and `grant_id`
+        #   above is the same grant, re-derived from the fresh coverage check;
+        # * otherwise - the active ScopeGrant's confirmation id, or "" when the
+        #   task has no scope grant, which is what the gate recorded for a plain
+        #   confirmed step.
+        # A stale, expired or superseded authorization therefore mismatches and
+        # is refused below; a host-B step can never present host A's grant.
+        observed_id = grant_id if grant_id else active_scope_cid(ctx.scope_registry, task_id)
         binding_error = _consume_target_binding(
-            ctx, state, step, decision, resolved.target, task_id
+            ctx, state, step, decision, resolved.target, task_id, observed_id
         )
         if binding_error is not None:
             return _refuse(

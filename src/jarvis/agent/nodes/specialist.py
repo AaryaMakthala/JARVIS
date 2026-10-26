@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.brain import _llm_halted_reason
@@ -206,15 +207,58 @@ def _record_history(state: AgentState) -> list[dict[str, Any]]:
         note = "the step did not succeed"
     if result.ok and result.verified is False and not note:
         note = "the step could not be verified"
+    role, host = _typed_target_marker(step, result)
     history.append(
         {
             "tool": str(getattr(step, "tool", "") or ""),
             "args-summary": _args_summary(getattr(step, "args", None) or {}),
             "ok": bool(result.ok and result.verified is not False),
             "note": note[:200],
+            # Compact, non-sensitive marker of the element this step typed into
+            # (empty for everything else).  ``browse_grant_check`` needs it to
+            # decide whether a following Enter may be covered by the grant: the
+            # role used to be lost here, so Enter always forced a prompt.  Only
+            # a two-value role and a host are kept - never the element's name,
+            # label, ref or the typed text.  Plain strings: no new state type.
+            "role": role,
+            "host": host,
         }
     )
     return history
+
+
+#: Roles a typing step must have had for a following Enter to be coverable.
+#: Mirrors the pure rule's ``_ENTER_ROLES``; a password field is never here.
+_SEARCH_ROLES = frozenset({"searchbox", "combobox"})
+
+
+def _typed_target_marker(step: Any, result: Any) -> tuple[str, str]:
+    """``(role, host)`` for a successful type into a search field, else ``("", "")``.
+
+    The element's role and origin are all that survives from the browser's
+    answer: the tool's own ``data`` also carries page-controlled text (its name
+    and label), which must never be copied into state.  Anything unexpected -
+    a failed type, a field that is not a searchbox/combobox (so never a password
+    or submit control), an unparseable origin - yields an empty marker, which
+    makes the Enter rule fail closed.
+    """
+    if str(getattr(step, "tool", "") or "") != "browser_type":
+        return "", ""
+    if not bool(getattr(result, "ok", False)):
+        return "", ""
+    data = getattr(result, "data", None)
+    if not isinstance(data, dict):
+        return "", ""
+    role = " ".join(str(data.get("role") or "").casefold().split())
+    if role not in _SEARCH_ROLES:
+        return "", ""
+    try:
+        host = (urlsplit(str(data.get("origin") or "")).hostname or "").lower().rstrip(".")
+    except ValueError:  # fail closed: an unparseable origin is no host
+        return "", ""
+    if not host or len(host) > 253:
+        return "", ""
+    return role, host
 
 
 def observe(state: AgentState, ctx: AppContext) -> dict[str, Any]:
