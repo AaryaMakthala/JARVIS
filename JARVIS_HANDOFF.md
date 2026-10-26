@@ -869,9 +869,8 @@ vision role is configured, and `health` WARN because the daemon is not running).
 
 ### Remaining items after batch H
 
-- **Browser fixture**: still stubs. Implement the test bodies (and the real `BrowserManager` import
-  path), mark them `live`/`windows_only` as appropriate, then run the H0b commands. Do not weaken the
-  autouse hazardous-call guard to make them pass.
+- **Browser fixture**: implemented in batch I (`cd26e6a`), still **UNTESTED**; the owner runs it with
+  the Batch I commands below. The autouse hazardous-call guard was not weakened.
 - **Prompt trim**: left off by default. H4 proves the trim path is safe for the 11 fake scenarios;
   the owner still needs to review the G5/H4 sizes before enabling `agent.prompt_trim_enabled`.
 - **Optional extras**: `pycaw`, `mss` and `rapidocr-onnxruntime` are now installed on this PC and
@@ -883,3 +882,80 @@ vision role is configured, and `health` WARN because the daemon is not running).
 - `browser_final_click` is still design-only (`docs/FINAL_CLICK_DESIGN.md`) pending the eight owner
   decisions.
 - Orchestrator (route/dispatch/compose split) and voice-latency tuning remain.
+
+## Batch I (I0-I2)
+
+| Step | Commit | Message | Status |
+|---|---|---|---|
+| I0 | none (read-only) | fixture inventory | n/a |
+| I1 | `cd26e6a` | `test: implement browser fixture tests` | **UNTESTED** (no pytest run, per rules) |
+| I2 | this commit | `docs: fixture run instructions` | n/a |
+
+### I0 - what existed before I1
+
+- H1 exists: `1de4140` (`build: declare optional libs in pyproject and verify_env`, 2 files, +5).
+  H2 has **no commit** - it changed no file (probe only); report it as MISSING, not lost.
+- The fixture test had `pytestmark = [pytest.mark.browser]` and three bodies that only
+  `pytest.skip("browser not executed in low-resource mode")`; the import skipped on the nonexistent
+  `jarvis.browser.manager.BrowserManager`.
+- Fixture site files (names/sizes before I1): `__init__.py` 0, `cart.html` 108, `checkout.html` 125,
+  `form.html` 133, `result1.html` 139, `results.html` 146, `search.html` 458, `shop.html` 189,
+  `video.html` 352, `video1.html` 139 bytes. There was no `index.html`, and the links were
+  extensionless (`/results`, `/result1`) while files are `*.html`.
+
+### I1 - implemented tests (not run here)
+
+`tests/integration/test_browser_fixture.py` now uses the real wrapper
+`jarvis.browser.context.PlaywrightBrowser` (the only live `BrowserSession` implementation; there is
+no `BrowserManager`). It is opt-in and Windows-only:
+
+- module markers: `browser`, `live`; skip unless `JARVIS_BROWSER_TESTS=1`; skip off Windows. The skip
+  reason names the exact env var. A missing import or `BrowserError` on start is still a skip.
+- `fixture_server` serves `tests/fixtures/site` from `http.server.ThreadingHTTPServer` bound to
+  `127.0.0.1` on port 0 (free), runs it in a daemon thread, and calls `shutdown()` in teardown.
+- `translate_path` maps `/name` to `name.html` when the exact file is absent, matching the fixture's
+  extensionless links.
+- Test 1 opens `/` (`index.html`), asserts title/link text and host `127.0.0.1`.
+- Test 2 opens `/search`, types into the labelled search box with `browser_type` semantics, presses
+  Enter, and asserts the `/results` page/title/link.
+- Test 3 opens `/results`, asserts the result link is local and the added `example.invalid` link is
+  external, clicks **Result One**, and asserts `/result1` plus host `127.0.0.1` (the external link is
+  not followed).
+
+Fixture edits were required for the real wrapper: new `index.html`, `aria-label="Search"` on the
+search input, an external link on `results.html`, and the `.html` fallback in `serve.py`.
+
+`ruff check` and `py_compile` on `tests/integration/test_browser_fixture.py` and
+`tests/fixtures/serve.py` were clean. **pytest was not run** (per the rules).
+
+### I2 - exact owner commands (Windows PowerShell, repo root)
+
+```powershell
+# one-time (if not already installed)
+pip install -e ".[browser,vision]"
+.venv\Scripts\python.exe -m playwright install chromium
+# the wrapper launches channel="chrome"; if Google Chrome is not installed:
+.venv\Scripts\python.exe -m playwright install chrome
+
+# every run
+$env:JARVIS_BROWSER_TESTS = "1"
+.venv\Scripts\python.exe -m pytest tests/integration/test_browser_fixture.py -m browser
+Remove-Item Env:JARVIS_BROWSER_TESTS
+```
+
+For `cmd.exe`, use `set JARVIS_BROWSER_TESTS=1` and `set JARVIS_BROWSER_TESTS=` instead. The test
+opens a visible Chrome window and uses the `general` JARVIS profile; close any other JARVIS browser
+window first so the profile lock is free.
+
+A pass looks like:
+
+```
+...                                                                      [100%]
+3 passed
+```
+
+(exit code 0). The three names are `test_browser_goto_fixture`,
+`test_browser_read_fixture` and `test_browser_find_open_result_fixture`. Without the env var the
+same command reports 3 skipped with a reason naming `JARVIS_BROWSER_TESTS=1`; a missing Playwright /
+Chrome installation skips with "browser deps missing or browser unavailable". Any wrong title, host,
+path or navigation timeout is a **failure**, not a skip.
