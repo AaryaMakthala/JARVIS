@@ -150,6 +150,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_append_file_spec,
         make_create_file_spec,
         make_delete_path_spec,
+        make_file_search_spec,
         make_list_dir_spec,
         make_read_file_spec,
         make_undo_last_delete_spec,
@@ -161,7 +162,9 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     from jarvis.tools.system import (
         make_lock_computer_spec,
         make_lock_jarvis_spec,
+        make_process_list_spec,
         make_system_info_spec,
+        make_volume_control_spec,
     )
     from jarvis.tools.web import make_google_search_spec, make_open_url_spec, make_web_answer_spec
     from jarvis.tools.whatsapp import make_whatsapp_send_spec
@@ -187,6 +190,8 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_show_file_spec(),
         make_lock_jarvis_spec(),
         make_lock_computer_spec(),
+        make_process_list_spec(),
+        make_volume_control_spec(),
         make_audit_run_spec(),
         make_defender_status_spec(),
         make_defender_quick_scan_spec(),
@@ -194,6 +199,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_append_file_spec(),
         make_list_dir_spec(),
         make_read_file_spec(),
+        make_file_search_spec(),
         make_delete_path_spec(),
         make_undo_last_delete_spec(),
         make_take_photo_spec(),

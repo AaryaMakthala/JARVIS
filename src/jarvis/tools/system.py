@@ -18,13 +18,31 @@ from __future__ import annotations
 import os
 import platform
 import time
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
 
 _INFO_KINDS = ("ram", "cpu", "disk", "battery", "uptime", "top_processes")
+
+
+class _BackendUnavailable(RuntimeError):
+    """An optional third-party backend is missing or cannot start."""
+
+
+try:
+    from comtypes import COMError as _ComError
+except ImportError:  # pragma: no cover - comtypes is a Windows-only extra
+    _ComError = OSError
+
+#: Errors opening the COM audio endpoint through pycaw/comtypes.
+_VOLUME_ENDPOINT_ERRORS: tuple[type[BaseException], ...] = (
+    _ComError,
+    OSError,
+    ImportError,
+    AttributeError,
+)
 
 
 class SystemInfoArgs(BaseModel):
@@ -147,6 +165,155 @@ def make_system_info_spec() -> ToolSpec:
         run=_run_system_info,
         verify=_verify_system_info,
         describe=_describe_system_info,
+    )
+
+
+class ProcessListArgs(BaseModel):
+    """List running process names and pids (no command lines or users)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def _load_psutil() -> Any:
+    """Import psutil lazily so the module imports on every OS."""
+    try:
+        import psutil
+    except ImportError as exc:
+        raise _BackendUnavailable("process listing needs the optional 'psutil' package") from exc
+    return psutil
+
+
+def _run_process_list(args: ProcessListArgs, ctx: ToolContext) -> ToolResult:
+    del args, ctx
+    try:
+        psutil = _load_psutil()
+        rows: list[dict[str, Any]] = []
+        for proc in psutil.process_iter(["pid", "name"]):
+            info = proc.info
+            name = info.get("name")
+            pid = info.get("pid")
+            if name is None or pid is None:
+                continue
+            rows.append({"name": str(name), "pid": int(pid)})
+            if len(rows) >= 40:
+                break
+    except _BackendUnavailable as exc:
+        return ToolResult(ok=False, error=str(exc))
+    except Exception as exc:  # noqa: BLE001 - psutil raises platform-specific errors
+        return ToolResult(ok=False, error=f"could not list processes: {exc}")
+    output = "\n".join(f"{row['name']} ({row['pid']})" for row in rows) or "No processes found."
+    return ToolResult(ok=True, output=output, data={"processes": rows, "count": len(rows)})
+
+
+def _verify_process_list(
+    args: ProcessListArgs, result: ToolResult, ctx: ToolContext
+) -> ToolResult:
+    del args, ctx
+    return result.model_copy(update={"verified": None})
+
+
+def make_process_list_spec() -> ToolSpec:
+    """Build ``process_list`` (Tier 1; read-only process names)."""
+    return ToolSpec(
+        name="process_list",
+        description=(
+            "List up to 40 running process names with their pids. Read-only: "
+            "no command lines, usernames or environment values."
+        ),
+        args_model=ProcessListArgs,
+        base_tier=1,
+        timeout_s=15,
+        run=_run_process_list,
+        verify=_verify_process_list,
+        describe=lambda args: "List running processes",
+    )
+
+
+class VolumeControlArgs(BaseModel):
+    """Read or change the Windows master volume."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["get", "set", "mute", "unmute"]
+    level: int | None = Field(default=None, ge=0, le=100, description="Volume percent for 'set'.")
+
+    @model_validator(mode="after")
+    def _level_required_for_set(self) -> VolumeControlArgs:
+        if self.action == "set" and self.level is None:
+            raise ValueError("level is required when action is 'set'")
+        return self
+
+
+def _load_volume_endpoint() -> Any:
+    """Open the Windows master-volume endpoint through optional pycaw."""
+    try:
+        from pycaw.pycaw import AudioUtilities
+    except ImportError as exc:
+        raise _BackendUnavailable(
+            "volume control needs the optional 'pycaw' package"
+        ) from exc
+    try:
+        speakers = AudioUtilities.GetSpeakers()
+        endpoint = getattr(speakers, "EndpointVolume", None)
+        if endpoint is not None:
+            return endpoint
+        from ctypes import POINTER, cast
+
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import IAudioEndpointVolume
+
+        interface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        return cast(interface, POINTER(IAudioEndpointVolume))
+    except _VOLUME_ENDPOINT_ERRORS as exc:
+        raise _BackendUnavailable(f"could not open the Windows audio endpoint: {exc}") from exc
+
+
+def _run_volume_control(args: VolumeControlArgs, ctx: ToolContext) -> ToolResult:
+    del ctx
+    try:
+        endpoint = _load_volume_endpoint()
+        if args.action == "set":
+            endpoint.SetMasterVolumeLevelScalar(float(args.level or 0) / 100.0, None)
+        elif args.action == "mute":
+            endpoint.SetMute(1, None)
+        elif args.action == "unmute":
+            endpoint.SetMute(0, None)
+        percent = round(float(endpoint.GetMasterVolumeLevelScalar()) * 100)
+        muted = bool(endpoint.GetMute())
+    except _BackendUnavailable as exc:
+        return ToolResult(ok=False, error=str(exc))
+    except Exception as exc:  # noqa: BLE001 - pycaw/COM errors are platform-specific
+        return ToolResult(ok=False, error=f"volume control failed: {exc}")
+    state = "muted" if muted else "on"
+    return ToolResult(
+        ok=True,
+        output=f"Volume: {percent}% ({state})",
+        data={"level": percent, "muted": muted},
+    )
+
+
+def _verify_volume_control(
+    args: VolumeControlArgs, result: ToolResult, ctx: ToolContext
+) -> ToolResult:
+    del args, ctx
+    return result.model_copy(update={"verified": None})
+
+
+def make_volume_control_spec() -> ToolSpec:
+    """Build ``volume_control`` (Tier 1; changes the master volume)."""
+    return ToolSpec(
+        name="volume_control",
+        description=(
+            "Read or change the Windows master volume: get, set a 0-100 level, "
+            "mute or unmute."
+        ),
+        args_model=VolumeControlArgs,
+        base_tier=1,
+        timeout_s=15,
+        run=_run_volume_control,
+        verify=_verify_volume_control,
+        describe=lambda args: f"Volume control: {args.action}",
+        windows_only=True,
     )
 
 

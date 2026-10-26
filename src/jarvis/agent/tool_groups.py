@@ -60,6 +60,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "append_file",
         "create_file",
         "delete_path",
+        "file_search",
         "list_dir",
         "read_file",
         "undo_last_delete",
@@ -113,6 +114,10 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "take_screenshot",
         "show_file",
     ),
+    "system": (
+        "process_list",
+        "volume_control",
+    ),
     "memory": (),
 }
 
@@ -134,6 +139,7 @@ _GROUP_KEYWORDS: dict[str, tuple[str, ...]] = {
         "save as",
         "delete",
         "rename",
+        "find",
         "path",
     ),
     "apps_windows": (
@@ -210,6 +216,17 @@ _GROUP_KEYWORDS: dict[str, tuple[str, ...]] = {
         "show ",
         "display ",
         "view ",
+    ),
+    "system": (
+        "volume",
+        "mute",
+        "unmute",
+        "sound",
+        "process",
+        "processes",
+        "task manager",
+        "cpu",
+        "memory",
     ),
 }
 

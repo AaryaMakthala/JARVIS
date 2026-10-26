@@ -25,12 +25,14 @@ import json
 import os
 import shutil
 import tempfile
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from send2trash import send2trash
 
 from jarvis import config
@@ -103,6 +105,44 @@ class ReadFileArgs(BaseModel):
     max_bytes: int = Field(
         default=1_048_576, ge=1, le=1_048_576, description="Max bytes to read (1 MiB cap)."
     )
+
+
+class FileSearchArgs(BaseModel):
+    """Find files by name inside the allowed roots (paths only)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(
+        min_length=2,
+        max_length=80,
+        description="Case-insensitive substring of the file name.",
+    )
+    extension: str | None = Field(
+        default=None,
+        max_length=16,
+        description="Optional extension filter, with or without the leading dot.",
+    )
+    max_results: int = Field(default=20, ge=1, le=20, description="Maximum paths to return.")
+
+    @field_validator("query")
+    @classmethod
+    def _query_non_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) < 2:
+            raise ValueError("query must contain at least 2 non-space characters")
+        return stripped
+
+    @field_validator("extension")
+    @classmethod
+    def _normalise_extension(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalised = value.strip().casefold().lstrip(".")
+        if not normalised:
+            return None
+        if any(separator in normalised for separator in ("/", "\\")):
+            raise ValueError("extension must not contain a path separator")
+        return normalised
 
 
 class DeletePathArgs(BaseModel):
@@ -710,6 +750,122 @@ def make_read_file_spec() -> ToolSpec:
         path_args=("path",),
         run=_run_read_file,
         describe=lambda args: f"Read file {args.path}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# file_search (Tier 1, bounded read-only walk)
+# ---------------------------------------------------------------------------
+
+_FILE_SEARCH_SECONDS = 3.0
+_FILE_SEARCH_MAX_DEPTH = 6
+_FILE_SEARCH_MAX_ENTRIES = 5000
+
+
+def _ignore_walk_error(_exc: OSError) -> None:
+    """Ignore one unreadable directory during a bounded search."""
+
+
+def _skip_search_dir(path: Path, settings: config.Settings) -> bool:
+    """Skip links and profile deny-listed folders before descending."""
+    return path.is_symlink() or paths.is_profile_denied(path, settings)
+
+
+def _walk_files(
+    roots: list[Path], settings: config.Settings, deadline: float
+) -> Iterator[Path]:
+    """Yield candidate files from ``roots`` until the depth/entry/time caps."""
+    seen = 0
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(
+            root, topdown=True, onerror=_ignore_walk_error, followlinks=False
+        ):
+            if time.monotonic() >= deadline:
+                return
+            here = Path(dirpath)
+            try:
+                depth = len(here.relative_to(root).parts)
+            except ValueError:
+                depth = _FILE_SEARCH_MAX_DEPTH
+            if depth >= _FILE_SEARCH_MAX_DEPTH:
+                dirnames.clear()
+            else:
+                dirnames[:] = [
+                    name
+                    for name in dirnames
+                    if not _skip_search_dir(here / name, settings)
+                ]
+            for name in filenames:
+                if time.monotonic() >= deadline:
+                    return
+                seen += 1
+                if seen > _FILE_SEARCH_MAX_ENTRIES:
+                    return
+                yield here / name
+
+
+def _run_file_search(args: FileSearchArgs, ctx: ToolContext) -> ToolResult:
+    try:
+        roots = paths.roots_from_settings(ctx.settings)
+    except paths.PathError as exc:
+        return ToolResult(ok=False, error=str(exc))
+    deadline = time.monotonic() + _FILE_SEARCH_SECONDS
+    matches: list[str] = []
+    seen_paths: set[str] = set()
+    for candidate in _walk_files(roots, ctx.settings, deadline):
+        try:
+            resolved = paths.resolve_safe(str(candidate))
+        except paths.PathError:
+            continue
+        if not paths.within_any_root(resolved, roots):
+            continue
+        if paths.is_profile_denied(resolved, ctx.settings):
+            continue
+        if args.query.casefold() not in resolved.name.casefold():
+            continue
+        if args.extension and resolved.suffix.casefold().lstrip(".") != args.extension:
+            continue
+        key = paths.normalise_key(resolved)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        matches.append(str(resolved))
+        if len(matches) >= args.max_results:
+            break
+    if not matches:
+        return ToolResult(ok=True, output="No files found.", data={"paths": [], "count": 0})
+    return ToolResult(
+        ok=True,
+        output="\n".join(matches),
+        data={"paths": matches, "count": len(matches)},
+        tainted=True,
+    )
+
+
+def _verify_file_search(
+    args: FileSearchArgs, result: ToolResult, ctx: ToolContext
+) -> ToolResult:
+    del args, ctx
+    return result.model_copy(update={"verified": None})
+
+
+def make_file_search_spec() -> ToolSpec:
+    """Build ``file_search`` (Tier 1; bounded read-only name search)."""
+    return ToolSpec(
+        name="file_search",
+        description=(
+            "Find files by name inside the allowed roots. Returns paths only, "
+            "never file contents. Read-only and bounded to 3 seconds, depth 6 "
+            "and 5000 entries."
+        ),
+        args_model=FileSearchArgs,
+        base_tier=1,
+        timeout_s=5,
+        run=_run_file_search,
+        verify=_verify_file_search,
+        describe=lambda args: f"Search files for {args.query!r}",
     )
 
 

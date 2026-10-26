@@ -197,11 +197,20 @@ def _profile_wide(settings: config.Settings | None) -> bool:
 
 
 def _profile_denied(path: Path) -> bool:
-    """Return ``True`` when a resolved profile path is on the deny list."""
-    parts = [part.casefold() for part in path.parts]
+    """Return ``True`` when a resolved path below home is on the deny list."""
+    try:
+        relative = path.relative_to(Path.home().resolve(strict=False))
+    except (OSError, ValueError):
+        relative = path
+    parts = [part.casefold() for part in relative.parts]
     if any(part in _PROFILE_DENY_NAMES for part in parts):
         return True
     return any((parts[i], parts[i + 1]) in _PROFILE_DENY_PAIRS for i in range(len(parts) - 1))
+
+
+def is_profile_denied(path: Path, settings: config.Settings | None = None) -> bool:
+    """Return ``True`` when ``path`` is denied by ``files.profile_wide``."""
+    return _profile_wide(settings) and _profile_denied(path)
 
 
 def roots_from_settings(settings: config.Settings) -> list[Path]:
@@ -386,7 +395,7 @@ def is_protected(
     if key == normalise_key(path.anchor):
         return True  # a drive root itself is always protected
 
-    if _profile_wide(settings) and _profile_denied(path):
+    if is_profile_denied(path, settings):
         return True
 
     if _pattern_region_hit(key, path, patterns):

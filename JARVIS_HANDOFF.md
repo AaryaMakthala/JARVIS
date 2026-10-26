@@ -558,8 +558,8 @@ that moved an LLM call into an executor would silently lose the hook (a
 
 - `browser_final_click` code: designed (`docs/FINAL_CLICK_DESIGN.md`, B4) but blocked
   on the eight owner decisions listed there - nothing implemented.
-- Screenshot and `show_file` tools: not written.
-- Wider system tools: not written.
+- Screenshot and `show_file` tools: written in G1 (`b7687ca`).
+- Wider system tools: `file_search`, `process_list`, `volume_control` written in G4 (`8d3cd6e`).
 - `agent.prompt_trim_enabled` (tool-group prompt trimming, A3) is still **off** by default.
 - The test phase has started: the files in "Test phase results" below were run; areas
   without a passing file there remain UNTESTED.
@@ -619,3 +619,121 @@ not listed here remains **UNTESTED**.
 | LLM rotation, overall deadline, Gemini client | VERIFIED | `test_llm_rotation.py`, `test_gemini.py` |
 | Daemon server, daemon browser wiring, approval words | VERIFIED | `test_daemon_server.py`, `test_daemon_browser_wiring.py`, `test_approval_words.py` |
 | Memory retrieval/CLI, messaging resolver, live browser, voice, camera, OCR, benchmark, packaging | UNTESTED | not run in this pass |
+
+## Batch G (G1-G6)
+
+Scope: screenshot/`show_file`, OCR confidence, optional whole-profile roots, three wider system
+tools, a prompt-trim verifier and this handoff. G1-G3 were committed before this session; G4 was
+uncommitted WIP and was reviewed/fixed here; G5-G6 were created here. PolicyEngine, tiers, Tier 3,
+the target-binding hash, `llm/models.py`, `free_only` and `strict_zero_cost` were not changed.
+
+| Step | Commit | Content | Status |
+|---|---|---|---|
+| G1 | `b7687ca` | `feat(tools): take_screenshot and show_file` | committed |
+| G2 | `f6eff96` | `feat(perception): ocr confidence passthrough` | committed |
+| G3 | `8350148` | `feat(files): optional whole-profile roots with protected folders` | committed |
+| G4 | `8d3cd6e` | `feat(tools): file_search, process_list, volume_control` | committed this session |
+| G5 | `c517bf8` | `chore: prompt trim verification script` (`scripts/verify_trim.py`) | committed this session |
+| G6 | this commit | `docs: batch G handoff` | docs |
+
+### G4 review (R1) before commit
+
+- Registry: **52 tools**, no duplicate names. Imports and registrations for `file_search`,
+  `process_list`, `volume_control`, `take_screenshot` and `show_file` appear exactly once.
+- `agent/tool_groups.py`: every registered tool is in exactly one group; no unassigned or
+  duplicated tool. New assignments: `file_search` -> `files`; `process_list` and
+  `volume_control` -> `system`.
+- `system.py`: the broad `except Exception` around the pycaw/comtypes endpoint lookup was replaced
+  with `COMError` (when importable), `OSError`, `ImportError` and `AttributeError`. The run function
+  still converts unexpected backend failures into `ToolResult(ok=False, ...)`; nothing is silent.
+- `policy/paths.py`: the deny list is now checked against the path **relative to home**, so a home
+  folder whose own ancestors contain a deny name (for example a temp profile under `AppData`) is
+  not over-denied, while paths outside home fall back to the full parts. Read-only probe with a
+  throwaway home: `.ssh`, `.aws`, `.gnupg`, `AppData`, `.git`, `.venv`, `Documents/Wallets` and a
+  `..` escape with a deny name are all DENIED; a plain `..` escape is DENIED by the root check; a
+  normal `Documents` file is ALLOWED; with `profile_wide=false` the raw result and `is_protected`
+  are byte-for-byte the same as `HEAD`.
+- `ruff check` and `py_compile` were clean on all six changed files.
+
+### Tests run this session (one named file per run, 90 s, `-q -x -p no:cacheprovider`)
+
+| File | Result |
+|---|---|
+| `tests/unit/test_system_tools_new.py` | 14 passed |
+| `tests/unit/test_profile_roots.py` | 22 passed, 1 skipped (symlink unavailable) |
+| `tests/unit/test_screenshot_tools.py` | 13 passed |
+| `tests/unit/test_ocr_confidence.py` | 7 passed |
+| `tests/unit/test_invariants.py` | 37 passed |
+| `tests/unit/test_agent.py` | 14 passed |
+
+### G5 output (`python scripts/verify_trim.py`, exit 0)
+
+```
+registry tools: 52
+full catalogue: 25003 bytes
+
+PASS | 'open notepad'
+     needs: open_app
+     selected (13): audit_run, defender_quick_scan, defender_status, get_time, list_windows, lock_computer, lock_jarvis, open_app, open_in_app, open_path, system_info, type_text, web_answer
+     bytes: 5604 (full 25003)  fallback=False
+PASS | 'search youtube for lofi and open the first video'
+     needs: browser_search, browser_open_result
+     selected (30): audit_run, browser_back, browser_click, browser_find, browser_forward, browser_goto, browser_open_result, browser_open_site, browser_press_key, browser_read, browser_screenshot, browser_scroll, browser_search, browser_tabs, browser_type, browser_wait, defender_quick_scan, defender_status, get_time, google_search, list_windows, lock_computer, lock_jarvis, open_app, open_in_app, open_path, open_url, system_info, type_text, web_answer
+     bytes: 13239 (full 25003)  fallback=False
+PASS | 'send a whatsapp message to Papa'
+     needs: whatsapp_send
+     selected (16): audit_run, defender_quick_scan, defender_status, get_time, list_windows, lock_computer, lock_jarvis, open_app, open_in_app, open_path, system_info, type_text, web_answer, whatsapp_open_chat, whatsapp_send, whatsapp_send_file
+     bytes: 7670 (full 25003)  fallback=False
+PASS | 'take a screenshot and show it'
+     needs: take_screenshot, show_file
+     selected (12): audit_run, defender_quick_scan, defender_status, describe_screen, get_time, read_screen, show_file, system_info, take_screenshot, ui_click, ui_list_controls, web_answer
+     bytes: 5373 (full 25003)  fallback=False
+PASS | 'what is 2+2'
+     needs: (none)
+     selected (52): full catalogue
+     bytes: 25003 (full 25003)  fallback=True
+PASS | 'find my resume file'
+     needs: file_search
+     selected (13): append_file, audit_run, create_file, defender_quick_scan, defender_status, delete_path, file_search, get_time, list_dir, read_file, system_info, undo_last_delete, web_answer
+     bytes: 6642 (full 25003)  fallback=False
+PASS | 'set volume to 30'
+     needs: volume_control
+     selected (8): audit_run, defender_quick_scan, defender_status, get_time, process_list, system_info, volume_control, web_answer
+     bytes: 3177 (full 25003)  fallback=False
+PASS | 'read the file notes.txt'
+     needs: read_file
+     selected (13): append_file, audit_run, create_file, defender_quick_scan, defender_status, delete_path, file_search, get_time, list_dir, read_file, system_info, undo_last_delete, web_answer
+     bytes: 6642 (full 25003)  fallback=False
+PASS | "what's on my screen"
+     needs: read_screen
+     selected (10): audit_run, defender_quick_scan, defender_status, describe_screen, get_time, read_screen, system_info, ui_click, ui_list_controls, web_answer
+     bytes: 4316 (full 25003)  fallback=False
+PASS | 'take a picture of me'
+     needs: take_photo
+     selected (10): audit_run, defender_quick_scan, defender_status, get_time, save_dictation, start_dictation, stop_dictation, system_info, take_photo, web_answer
+     bytes: 3686 (full 25003)  fallback=False
+
+full-catalogue fallback rate: 1/10 = 10%
+result: 10/10 PASS
+```
+
+`agent.prompt_trim_enabled` was **not** changed (still false by default). No trigger keyword needed
+fixing; the script was not edited after its first run.
+
+### Remaining items after batch G
+
+- `browser_final_click`: still design-only (`docs/FINAL_CLICK_DESIGN.md`); needs the owner to approve
+  the eight decisions there before any code.
+- Enable `agent.prompt_trim_enabled` only after the owner reviews the G5 output (saves ~5-20 KB per
+  request; fallback stays the full catalogue).
+- Optional libraries: `psutil` and `Pillow` are already installed; `pycaw`, `mss` and
+  `rapidocr-onnxruntime` are **not** installed. `pycaw` (for `volume_control`) is not yet declared in
+  `pyproject.toml`/`scripts/verify_env.py`; add it to the optional extra and verifier before shipping.
+- `contacts.json` still does not exist; WhatsApp paths refuse until the user adds contacts.
+- Browser fixture test is written but must be run by the user on the PC
+  (`pytest tests/integration/test_browser_fixture.py -m browser`).
+- One real specialist task (live browser) has not been run.
+- No vision role is configured; the vision model decision is still open.
+- Orchestrator (route/dispatch/compose split) and voice-latency tuning remain.
+
+Next: owner review of G5 and the final-click decisions before enabling anything.
