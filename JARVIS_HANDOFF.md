@@ -737,3 +737,149 @@ fixing; the script was not edited after its first run.
 - Orchestrator (route/dispatch/compose split) and voice-latency tuning remain.
 
 Next: owner review of G5 and the final-click decisions before enabling anything.
+
+## Batch H (H0-H6)
+
+| Step | Commit | Message | Files |
+|---|---|---|---|
+| H0 | none (read-only) | browser-fixture investigation | none |
+| H1 | `1de4140` | `build: declare optional libs in pyproject and verify_env` | `pyproject.toml`, `scripts/verify_env.py` |
+| H2 | none (no file changed) | runtime backend probe | scratch probe only |
+| H3 | `f12496b` | `feat(agent): specialist smoke script with fakes` | `scripts/smoke_flow.py` |
+| H4 | `7bc20a1` | `feat(agent): trim-on smoke run` | `scripts/smoke_flow.py` |
+| H5 | `54cd843` | `feat(agent): jarvis doctor read-only health check` | `src/jarvis/doctor.py`, `src/jarvis/cli.py`, `tests/unit/test_doctor_backends.py` |
+| H6 | this commit | `docs: batch H handoff` | `JARVIS_HANDOFF.md` |
+
+### H0 - why the browser fixture always skips
+
+- `tests/integration/test_browser_fixture.py:6` marks the module `browser`.
+- Lines 12-15 say "browser deps missing": they import `BrowserManager` from
+  `jarvis.browser.manager`, a module that **does not exist** and a symbol that appears nowhere in
+  `src/`. The real browser package has `context.py`, `find.py`, `lazy.py`, `results.py`, `sites.py`,
+  `tools.py`, `whatsapp_page.py` and `whatsapp_web.py`.
+- Lines 17, 21 and 25 are unconditional `pytest.skip("browser not executed in low-resource mode")`
+  calls. There is no environment variable, config flag or conftest condition behind them; the
+  `browser` marker is the only selector.
+- `tests/conftest.py:71-76,110-112` blocks subprocess/os/webbrowser/pyautogui/pywinauto/cv2/sounddevice
+  in autouse for every test except `live` and `windows_only`, so a real browser launch would also
+  need one of those markers.
+- `fixture_server` is the local server in `tests/fixtures/serve.py:10`, re-exported by
+  `tests/integration/conftest.py`.
+
+H0b (owner, on the Windows PC) once the fixture bodies exist and are marked `live` (or the guard is
+deliberately extended):
+
+```powershell
+pip install -e ".[browser,vision]"
+.venv\Scripts\python.exe -m playwright install chromium
+.venv\Scripts\python.exe -m pytest tests/integration/test_browser_fixture.py -m browser
+```
+
+### H1 - optional libraries are declared and verified
+
+- `pyproject.toml` gains `tools-extra = ["pycaw; sys_platform == 'win32'", "mss",
+  "rapidocr-onnxruntime"]` (the existing `vision` extra keeps its own `mss`/Pillow/RapidOCR entries).
+- `scripts/verify_env.py` gains `("pycaw", "pycaw", 7, True)` and `"pycaw"` in `OPTIONAL`, so a
+  missing package is a WARN, not a FAIL, and Windows-only probing is explicit.
+- `scripts/verify_env.py --all` exit 0: **57 PASS, 1 WARN, 0 FAIL**. The warning is the Recycle Bin
+  OLE probe (`WinError -2144927705` on this machine), not a dependency. `pycaw` resolved as
+  `20260927`; `ruff` and `py_compile` were clean.
+
+### H2 - runtime backends behave cleanly when present
+
+Probe (`C:\Users\aarya\AppData\Local\Temp\opencode_jarvis\h2_probe.py`, temp roots under
+`C:\Users\Public`) found: `mss True`, `PIL True`, `rapidocr_onnxruntime True`, `rapidocr False`,
+`pycaw True`, `comtypes True`; OCR `backend_name() = rapidocr_onnxruntime`.
+
+With the backends installed, the tools still fail cleanly rather than raising:
+
+| Probe | Result |
+|---|---|
+| `take_screenshot` with the capture backend unavailable | `ok=False`, `"screenshot backend not installed"` |
+| `read_screen` with OCR unavailable | `ok=True`, note `"Local OCR is not installed."` (UIA text is kept) |
+| `volume_control` with `pycaw` unavailable | `ok=False`, `"volume control needs the optional 'pycaw' package"` |
+
+Tests: `test_screenshot_tools.py` 13 passed, `test_ocr_confidence.py` 7 passed,
+`test_system_tools_new.py` 14 passed. No source file needed changing, so H2 has no commit.
+
+### H3 - S10/S11 in the smoke script
+
+`scripts/smoke_flow.py` now imports the existing `_FakeSession` and adds two specialist scenarios on
+top of S1-S9, still with fakes only:
+
+- **S10** - a browse task with `use_specialists=True`: the first special step raises the host prompt,
+  approval is given, the next two steps on the same host run without a second prompt, and the run
+  ends with the specialist's answer. Asserts one prompt only, `final_answer == "Browsed."`, and two
+  consumed grant uses.
+- **S11** - the third step targets a second host: the next prompt is a scope confirmation naming
+  `other.example` (no `browse_grant`), refusing it runs nothing on that host, and only the first
+  host's one use is consumed.
+
+`python scripts/smoke_flow.py` printed **11/11 passed** (exit 0). S10 path:
+`in>cr>mr>br>decide>va>pg x2>ac>ve>observe>...>decide>co>re>ms`. S11 ends
+`...>decide>va>pg x2>co>re>ms` with the refusal message.
+
+### H4 - `--trim` smoke run
+
+`--trim` is parsed by the script and sets **only this script's** `AgentSettings.prompt_trim_enabled`;
+the application default in `config.py` is untouched. A `FakeLLM` subclass records the UTF-8 byte
+size of every `system`/`user` prompt without changing it, and each scenario prints per-call sizes.
+
+`python scripts/smoke_flow.py --trim` printed **11/11 passed** (exit 0), 19 LLM calls, **163,012
+bytes** total:
+
+| Scenario | Calls | Prompt bytes |
+|---|---:|---:|
+| S1 conversation answer | 1 | 4,359 |
+| S2 one safe action | 1 | 4,359 |
+| S3 all providers fail | 1 | 4,359 |
+| S4 clarify, answer, act | 2 | 9,318 |
+| S5 invalid plan, repair | 2 | 8,861 |
+| S6 confirmation yes | 1 | 4,351 |
+| S7 confirmation no | 1 | 4,351 |
+| S8 tool fails, replans | 2 | 7,350 |
+| S9 cancelled before acting | 1 | 4,351 |
+| S10 specialist grant | 4 | 71,286 |
+| S11 second host refused | 3 | 40,067 |
+
+S10's first planner call is large (39,186 bytes) because the specialist prompt carries the fake
+page text; the two covered steps reuse the grant and add no prompt beyond the specialist's own
+decisions. Trim remains **off by default**.
+
+### H5 - `jarvis doctor` reports optional backends
+
+New `src/jarvis/doctor.py` exposes `optional_backend_checks()`. Every probe is
+`importlib.util.find_spec` (or `jarvis.perception.ocr.backend_name`), so doctor never imports a
+heavy backend, opens a device, touches the network or reads user data. Missing extras are WARN,
+never FAIL. `cli.run_doctor` appends the rows after the existing `vision` check; the command's
+rendering and exit code are unchanged.
+
+On this PC `jarvis doctor` exited 0 and printed:
+
+```
+ PASS  screenshot          ready (mss + Pillow)
+ PASS  ocr                 ready (rapidocr_onnxruntime)
+ PASS  volume              ready (pycaw)
+ PASS  playwright          package installed (run `playwright install chromium` if needed)
+```
+
+Existing rows stayed as before (all PASS except `strict_zero_cost` WARN, `vision` WARN because no
+vision role is configured, and `health` WARN because the daemon is not running).
+`tests/unit/test_doctor_backends.py` 3 passed.
+
+### Remaining items after batch H
+
+- **Browser fixture**: still stubs. Implement the test bodies (and the real `BrowserManager` import
+  path), mark them `live`/`windows_only` as appropriate, then run the H0b commands. Do not weaken the
+  autouse hazardous-call guard to make them pass.
+- **Prompt trim**: left off by default. H4 proves the trim path is safe for the 11 fake scenarios;
+  the owner still needs to review the G5/H4 sizes before enabling `agent.prompt_trim_enabled`.
+- **Optional extras**: `pycaw`, `mss` and `rapidocr-onnxruntime` are now installed on this PC and
+  declared in `[tools-extra]`, so the old G bullet saying they were undeclared/missing is superseded.
+  The clean-failure paths remain intentional for machines without the extras.
+- `contacts.json` still does not exist; WhatsApp paths refuse until the owner adds contacts.
+- One real specialist task (live browser) has not been run; S10/S11 are fakes only.
+- No vision role is configured; the vision model decision is still open.
+- `browser_final_click` is still design-only (`docs/FINAL_CLICK_DESIGN.md`) pending the eight owner
+  decisions.
+- Orchestrator (route/dispatch/compose split) and voice-latency tuning remain.

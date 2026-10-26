@@ -41,6 +41,7 @@ from jarvis.agent import (
 )
 from jarvis.apps_scan import append_apps_entries, list_entries, scan_command, validate_add
 from jarvis.checks import Check, _check
+from jarvis.doctor import optional_backend_checks
 from jarvis.llm import models as llm_models
 from jarvis.llm.client import (
     LLMAuthError,
@@ -694,6 +695,7 @@ def run_doctor(
         checks.append(_check("llm_provider", "FAIL", "No free LLM provider configured"))
 
     checks.append(_vision_check(settings, store, providers))
+    checks.extend(optional_backend_checks())
     checks.extend(_health_checks(_daemon_llm_health()))
 
     if live:

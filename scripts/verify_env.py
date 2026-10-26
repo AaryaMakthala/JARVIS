@@ -94,6 +94,9 @@ PACKAGES: list[tuple[str, str, int, bool]] = [
     ("rapidocr-onnxruntime", "rapidocr_onnxruntime", 6, False),
     # Stage 7 owns the browser (Playwright); it is not needed for Stage 6.
     ("playwright", "playwright", 7, False),
+    # Stage 7 wider system tools (optional [tools-extra] extra).  Missing is WARN -
+    # volume_control then reports that pycaw is unavailable and changes nothing.
+    ("pycaw", "pycaw", 7, True),
     # Stage 8 camera capture (optional [camera] extra).  Missing is WARN - the
     # take_photo tool then reports that OpenCV is unavailable and takes no shot.
     ("opencv-python", "cv2", 8, False),
@@ -116,6 +119,7 @@ OPTIONAL = {
     "Pillow",
     "rapidocr-onnxruntime",
     "opencv-python",
+    "pycaw",
 }
 
 

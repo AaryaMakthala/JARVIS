@@ -10,13 +10,15 @@ SQLite checkpointer.  Nothing here reaches a model, a browser or the network.
 Scenarios: S1 a conversation answer, S2 one safe action that runs, S3 every LLM
 provider failing, S4 a clarification then the action, S5 an invalid plan that is
 repaired, S6 a confirmation that is approved, S7 a confirmation that is refused,
-S8 a failing tool that is replanned, S9 a cancel before the approved step.  Each
-prints the node path (the A1 trace), the final answer, the halted reason and
-PASS/FAIL; exit code 1 if any scenario fails.
+S8 a failing tool that is replanned, S9 a cancel before the approved step, S10 a
+specialist browse task covered by one host grant, S11 a second host whose scope
+prompt is refused.  Each prints the node path (the A1 trace), the final answer,
+the halted reason and PASS/FAIL; exit code 1 if any scenario fails.
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -29,14 +31,18 @@ for _path in (_ROOT, _ROOT / "src", _ROOT / "tests"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+from tests.unit.test_specialist_loop_e2e import _FakeSession
+
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import open_sqlite_checkpointer
 from jarvis.agent.nodes import telemetry
 from jarvis.agent.runner import TaskOutcome, resume_task, run_task
+from jarvis.agent.schemas import BrainDecision, SpecialistDecision
 from jarvis.agent.state import Plan, Step
-from jarvis.config import Settings
-from jarvis.llm.client import FakeLLM
+from jarvis.config import AgentSettings, BrowserSettings, Settings
+from jarvis.llm.client import FakeLLM as _BaseFakeLLM
 from jarvis.tools.base import Cancelled, CancelToken
+from jarvis.tools.registry import build_default_registry
 from support import (
     approve,
     brain_action,
@@ -50,8 +56,34 @@ from support import (
 
 CONVERSATION_ANSWER = "Here is your answer."
 CLARIFY_QUESTION = "Which file did you mean?"
+BROWSE_PROMPT = "Allow JARVIS to browse example.com for this task?"
 """Scenario result: (outcome or ``None`` when the run raised, passed, note)."""
 Scenario = tuple[TaskOutcome | None, bool, str]
+
+TRIM = False
+_PROMPTS: list[tuple[str, str, int, int]] = []
+
+
+class FakeLLM(_BaseFakeLLM):
+    """FakeLLM that records prompt byte sizes without changing the prompts."""
+
+    def _remember(self, method: str, kwargs: dict[str, Any]) -> None:
+        system = str(kwargs.get("system", "")).encode("utf-8")
+        user = str(kwargs.get("user", "")).encode("utf-8")
+        _PROMPTS.append((method, str(kwargs.get("model_role", "")), len(system), len(user)))
+
+    def structured(self, **kwargs: Any) -> Any:
+        self._remember("structured", kwargs)
+        return super().structured(**kwargs)
+
+    def text(self, **kwargs: Any) -> Any:
+        self._remember("text", kwargs)
+        return super().text(**kwargs)
+
+
+def _agent_settings(**overrides: Any) -> AgentSettings:
+    """Agent settings for this run; only this script honours ``--trim``."""
+    return AgentSettings(prompt_trim_enabled=TRIM, **overrides)
 
 
 def _keep_trace_after_respond(task_id: str) -> None:
@@ -68,7 +100,9 @@ def _keep_trace_after_respond(task_id: str) -> None:
 @contextmanager
 def _session(llm: FakeLLM, *specs: Any) -> Iterator[tuple[Any, Any]]:
     """Yield one (context, checkpointer) pair on a temporary database."""
-    ctx = make_app_context(Settings(), llm=llm, registry=registry_with(*specs))
+    ctx = make_app_context(
+        Settings(agent=_agent_settings()), llm=llm, registry=registry_with(*specs)
+    )
     with tempfile.TemporaryDirectory() as tmp:
         saver = open_sqlite_checkpointer(str(Path(tmp) / "checkpoints.db"))
         try:
@@ -238,6 +272,111 @@ def _scenario_cancelled() -> Scenario:
     return None, passed, note or "no cancel was observed"
 
 
+def _browse_settings() -> Settings:
+    """Specialist browsing enabled against one fake host."""
+    return Settings(
+        agent=_agent_settings(use_specialists=True, specialist_max_calls=10),
+        browser=BrowserSettings(allowed_domains=["example.com"], task_grant_enabled=True),
+    )
+
+
+def _browse(goal: str = "browse example") -> BrainDecision:
+    """A brain decision that hands the task to the browser specialist."""
+    return BrainDecision(request_type="browse", goal=goal, actions=[])
+
+
+def _goto(url: str = "https://example.com/page") -> SpecialistDecision:
+    """A specialist step that navigates the fake browser."""
+    return SpecialistDecision(kind="act", tool="browser_goto", args={"url": url}, rationale="go")
+
+
+def _done(text: str = "Done.") -> SpecialistDecision:
+    """A specialist decision that finishes the browse task."""
+    return SpecialistDecision(kind="done", summary=text)
+
+
+def _browse_context(session: _FakeSession, decisions: list[Any]) -> Any:
+    """Build an app context whose browser is the shared fake session."""
+    settings = _browse_settings()
+    return make_app_context(
+        settings,
+        llm=FakeLLM(decisions),
+        registry=build_default_registry(settings),
+        browser=session,
+    )
+
+
+def _scenario_specialist_grant() -> Scenario:
+    """S10: one host prompt, then two covered steps and the final answer."""
+    session = _FakeSession()
+    ctx = _browse_context(
+        session,
+        [_browse(), _goto(), _goto(), _done("Browsed.")],
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        saver = open_sqlite_checkpointer(str(Path(tmp) / "c.db"))
+        try:
+            first = run_task(ctx, saver, "browse example", thread_id="t1")
+            first_ok = bool(
+                first.interrupted
+                and first.confirmation
+                and first.confirmation.get("summary") == BROWSE_PROMPT
+                and first.confirmation.get("browse_grant") is True
+            )
+            out = resume_task(ctx, saver, first.task_id, approve(first.confirmation or {}))
+            second_prompt = out.interrupted
+        finally:
+            saver.conn.close()
+    passed = bool(
+        first_ok
+        and not second_prompt
+        and out.interrupted is False
+        and out.halted_reason is None
+        and out.final_answer == "Browsed."
+        and ctx.browse_grants.consumed("t1") == 2
+    )
+    return out, passed, f"first prompt ok: {first_ok}; second prompt: {second_prompt}"
+
+
+def _scenario_second_host_refused() -> Scenario:
+    """S11: a step on a second host asks its own scope question; refusing runs it nothing."""
+    session = _FakeSession()
+    other = "https://other.example/page"
+    ctx = _browse_context(
+        session,
+        [_browse(), _goto(), _goto(other), _done()],
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        saver = open_sqlite_checkpointer(str(Path(tmp) / "c.db"))
+        try:
+            first = run_task(ctx, saver, "browse example", thread_id="t1")
+            first_ok = bool(
+                first.interrupted
+                and first.confirmation
+                and first.confirmation.get("summary") == BROWSE_PROMPT
+            )
+            second = resume_task(ctx, saver, first.task_id, approve(first.confirmation or {}))
+            payload = dict(second.confirmation or {})
+            second_ok = bool(
+                second.interrupted
+                and "other.example" in str(payload.get("summary") or "")
+                and payload.get("scope_confirm") is True
+                and "browse_grant" not in payload
+            )
+            out = resume_task(ctx, saver, second.task_id, deny(payload))
+        finally:
+            saver.conn.close()
+    passed = bool(
+        first_ok
+        and second_ok
+        and out.interrupted is False
+        and out.halted_reason
+        and ("goto", other) not in session.calls
+        and ctx.browse_grants.consumed("t1") == 1
+    )
+    return out, passed, f"first prompt ok: {first_ok}; second names other host: {second_ok}"
+
+
 SCENARIOS = (
     ("S1 conversation answer", _scenario_conversation),
     ("S2 one safe action", _scenario_safe_action),
@@ -248,19 +387,51 @@ SCENARIOS = (
     ("S7 confirmation no", _scenario_confirm_no),
     ("S8 tool fails, then replans", _scenario_tool_fails),
     ("S9 cancelled before acting", _scenario_cancelled),
+    ("S10 specialist browse grant covers later steps", _scenario_specialist_grant),
+    ("S11 second host refused runs nothing", _scenario_second_host_refused),
 )
 
 
-def main() -> int:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    """Parse the script's optional flags."""
+    parser = argparse.ArgumentParser(description="Run the offline smoke scenarios.")
+    parser.add_argument(
+        "--trim",
+        action="store_true",
+        help="enable agent.prompt_trim_enabled for this run",
+    )
+    return parser.parse_args(argv)
+
+
+def _print_prompts() -> None:
+    """Print the byte size of every prompt this scenario sent to the LLM."""
+    if not _PROMPTS:
+        print("   llm prompts: (none)")
+        return
+    total = sum(system + user for _, _, system, user in _PROMPTS)
+    print(f"   llm prompts: {len(_PROMPTS)} calls, {total} bytes")
+    for method, role, system, user in _PROMPTS:
+        print(
+            f"      {method} role={role or '-'} "
+            f"system={system}B user={user}B total={system + user}B"
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
     """Run every scenario; return 0 when all pass, 1 otherwise."""
+    global TRIM
+    TRIM = _parse_args(argv).trim
+    print(f"prompt trim: {'on' if TRIM else 'off'}")
     telemetry.discard_trace = _keep_trace_after_respond
     failed = 0
     for name, scenario in SCENARIOS:
         print(f"[{name}]")
+        _PROMPTS.clear()
         try:
             out, passed, note = scenario()
         except Exception as exc:  # noqa: BLE001 - a crash is a failed scenario here
             print(f"   error: {type(exc).__name__}: {exc}")
+            _print_prompts()
             print("   FAIL")
             failed += 1
             continue
@@ -274,6 +445,7 @@ def main() -> int:
             print(f"   final answer: {out.final_answer!r}")
             print(f"   halted_reason: {out.halted_reason!r}")
             print(f"   results: {[(r.step_id, r.ok) for r in out.results]}")
+        _print_prompts()
         print("   PASS" if passed else "   FAIL")
         if not passed:
             failed += 1
