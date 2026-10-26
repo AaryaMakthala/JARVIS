@@ -39,6 +39,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.util import (
@@ -94,6 +95,31 @@ def _refuse(state: dict[str, Any], step_id: str, error: str, halted: str) -> dic
         StepResult(step_id=step_id, ok=False, error=error, verified=False),
         halted=halted,
     )
+
+
+def _live_page_host(ctx: AppContext) -> str:
+    """Host of the managed browser's live active page, or ``""``.
+
+    ``browser_press_key`` has no target to resolve, so the gate derives its
+    host from the typed-target history marker.  That marker records where a
+    previous step *was*, not where the browser is now (a redirect, another tab
+    or an intervening navigation can move it), so act reads the live URL here
+    and compares it with the grant host before pressing the key.
+    """
+    session = getattr(ctx, "browser", None)
+    getter = getattr(session, "current_url", None)
+    if getter is None:
+        return ""
+    try:
+        url = str(getter() or "").strip()
+    except Exception:  # noqa: BLE001 - a session that cannot report it has none
+        return ""
+    if not url:
+        return ""
+    try:
+        return (urlsplit(url).hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return ""
 
 
 def _consume_target_binding(
@@ -208,6 +234,16 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             state, ctx, step=step, decision=decision, resolved=resolved
         )
         if grant is not None:
+            if str(getattr(step, "tool", "") or "") == "browser_press_key":
+                live_host = _live_page_host(ctx)
+                if not live_host or not grant.covers_host(live_host):
+                    return _refuse(
+                        state,
+                        step.id,
+                        "live page host does not match the browsing grant",
+                        "Refused: the page changed since you approved browsing - "
+                        "not pressing the key.",
+                    )
             grant_id = grant.grant_id
             decision = decision.model_copy(
                 update={"reasons": [*decision.reasons, f"browse grant {grant_id}"]}

@@ -124,7 +124,8 @@ def test_domain_allowed_localhost() -> None:
         ("Payment", "button", rules.CONTROL_PAYMENT),
         ("Make Payment", "button", rules.CONTROL_PAYMENT),
         ("Payments", "link", rules.CONTROL_PAYMENT),
-        ("Checkout", "button", None),
+        ("Checkout", "button", rules.CONTROL_FRESH_CONFIRM),
+        ("Login", "button", rules.CONTROL_FRESH_CONFIRM),
     ],
 )
 def test_risky_control_classification(name: str, role: str, expected: str | None) -> None:
@@ -143,7 +144,6 @@ def test_risky_control_classification(name: str, role: str, expected: str | None
         ("Repayment", ""),
         ("Payload", ""),
         ("Payer", "button"),
-        ("Login", "button"),
         ("", ""),
     ],
 )
