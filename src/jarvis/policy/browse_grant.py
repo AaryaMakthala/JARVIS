@@ -45,6 +45,7 @@ __all__ = [
     "BrowseGrantRegistry",
     "GrantCheck",
     "coverage",
+    "prospective_coverage",
     "risky_label",
 ]
 
@@ -381,7 +382,7 @@ def coverage(
         return False, "cross_domain"
 
     role_folded = _fold(role)
-    if tool_name == "browser_click":
+    if tool_name in ("browser_click", "browser_open_result"):
         if is_password or role_folded in _FORBIDDEN_CLICK_ROLES:
             return False, "target_not_allowed"
         if not _fold(label):
@@ -403,3 +404,57 @@ def coverage(
         ):
             return False, "enter_after_non_search_type"
     return True, ""
+
+
+def prospective_coverage(
+    *,
+    task_id: str,
+    tool: str,
+    tier: int,
+    host: str = "",
+    label: str = "",
+    role: str = "",
+    is_password: bool = False,
+    key: str = "",
+    needs_unlock: bool = False,
+    needs_typed_confirmation: bool = False,
+    previous_tool: str = "",
+    previous_role: str = "",
+    now: float | None = None,
+) -> tuple[bool, str]:
+    """Whether a *fresh* grant for ``host`` would cover this exact step.
+
+    Pure and side-effect free: it mints no grant and changes no budget.  The
+    gate uses it *before* asking for a host grant, so an ineligible action (for
+    example a risky first click) keeps its ordinary per-action confirmation
+    instead of triggering a browsing prompt.
+    """
+    task = str(task_id or "").strip()
+    if not task:
+        return False, "task_missing"
+    current = time.monotonic() if now is None else float(now)
+    preview = BrowseGrant(
+        task_id=task,
+        grant_id="",
+        host=_fold(host),
+        max_actions=BrowseGrantRegistry.HARD_MAX_ACTIONS,
+        issued_at=current,
+        expires_at=current + BrowseGrantRegistry.HARD_MAX_TTL_S,
+    )
+    return coverage(
+        preview,
+        task_id=task,
+        tool=tool,
+        tier=tier,
+        host=host,
+        label=label,
+        role=role,
+        is_password=is_password,
+        key=key,
+        actions_used=0,
+        needs_unlock=needs_unlock,
+        needs_typed_confirmation=needs_typed_confirmation,
+        previous_tool=previous_tool,
+        previous_role=previous_role,
+        now=current,
+    )

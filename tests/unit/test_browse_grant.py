@@ -104,6 +104,27 @@ def test_risky_click_labels_are_not_covered() -> None:
     )
 
 
+def test_risky_open_result_target_is_not_covered() -> None:
+    registry = _registry()
+    grant = registry.issue(TASK, host=HOST)
+    for label in ("Delete note", "Sign in", "Download file"):
+        covered, reason = _covered(
+            grant, tool="browser_open_result", label=label, role="link"
+        )
+        assert covered is False, label
+        assert reason.startswith("risky_label:"), (label, reason)
+    assert _covered(
+        grant, tool="browser_open_result", label="Continue", role="submit"
+    ) == (False, "target_not_allowed")
+    assert _covered(grant, tool="browser_open_result", role="link") == (
+        False,
+        "unobserved_target",
+    )
+    assert _covered(
+        grant, tool="browser_open_result", label="Read result", role="link"
+    ) == (True, "")
+
+
 def test_password_field_is_not_covered() -> None:
     registry = _registry()
     grant = registry.issue(TASK, host=HOST)
@@ -173,7 +194,9 @@ def test_a_plan_change_does_not_invalidate_the_grant() -> None:
     """There is no plan hash to invalidate: a new one-step plan stays covered."""
     registry = _registry()
     grant = registry.issue(TASK, host=HOST)
-    assert _covered(grant, tool="browser_open_result") == (True, "")
+    assert _covered(
+        grant, tool="browser_open_result", label="Read result", role="link"
+    ) == (True, "")
     # The specialist builds a brand-new one-step plan next iteration; nothing
     # about the grant changed, so the same host is still covered.
     assert _covered(grant, tool="browser_goto", host=HOST) == (True, "")

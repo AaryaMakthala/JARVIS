@@ -144,6 +144,26 @@ def test_risky_click_on_the_approved_host_still_interrupts(tmp_path: Path) -> No
         saver.conn.close()
 
 
+def test_first_risky_click_gets_no_browse_prompt(tmp_path: Path) -> None:
+    """An ineligible first step keeps its ordinary confirmation, no grant."""
+    session = _RiskySession()
+    ctx = _ctx(session)
+    saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
+    try:
+        click = SpecialistDecision(
+            kind="act", tool="browser_click", args={"ref": "e2"}, rationale="delete"
+        )
+        out, payloads = _run(ctx, saver, [_browse(), click, _done("Clicked.")])
+        assert payloads, "expected the ordinary action confirmation"
+        assert payloads[0]["summary"] != BROWSE_PROMPT
+        assert "browse_grant" not in payloads[0]
+        assert ctx.browse_grants.active_for_task("t1") is None
+        assert ("click", "e2") in session.calls
+        assert out.final_answer == "Clicked."
+    finally:
+        saver.conn.close()
+
+
 def test_step_on_another_host_interrupts(tmp_path: Path) -> None:
     """Host B gets its own authorization, and approving it lets the step run.
 

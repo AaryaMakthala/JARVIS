@@ -44,6 +44,7 @@ from jarvis.agent.nodes.util import (
     StepTarget,
     active_scope_cid,
     browse_grant_check,
+    browse_grant_eligible,
     plan_hash_for,
     policy_context_for,
     record_specialist_note,
@@ -298,6 +299,15 @@ def _browse_grant_gate(
         return None  # not even one host to ask about; ordinary confirmation
     if registry.active_for_task(str(state.get("task_id") or "")) is not None:
         return None  # a grant exists but does not cover this step
+    eligible, reason = browse_grant_eligible(
+        state, ctx, step=step, decision=decision, resolved=resolved
+    )
+    if not eligible:
+        # Do not offer a host grant for a step it could never cover (a risky
+        # first click, a password field, ...).  That step keeps its ordinary
+        # action confirmation; the first *eligible* step will ask for the grant.
+        logger.info("browse grant not offered for step %s: %s", step.id, reason)
+        return None
 
     answer = interrupt(_browse_payload(step, host, decision, plan_hash_v))
     if not _answer_matches(answer, plan_hash_v):

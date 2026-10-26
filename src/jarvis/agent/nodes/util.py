@@ -13,7 +13,7 @@ from jarvis.browser.sites import sites_from_settings
 from jarvis.config import Settings
 from jarvis.platform_guard import is_windows
 from jarvis.policy import rules
-from jarvis.policy.browse_grant import BROWSE_TOOLS, coverage
+from jarvis.policy.browse_grant import BROWSE_TOOLS, coverage, prospective_coverage
 from jarvis.policy.scope import ScopeRegistry
 from jarvis.policy.targets import ResolvedTarget
 from jarvis.tools.base import resolve_target
@@ -197,23 +197,11 @@ def _previous_typed_target(state: dict[str, Any]) -> tuple[str, str, str]:
     return "", "", ""
 
 
-def browse_grant_check(
-    state: dict[str, Any], ctx: Any, *, step: Any, decision: Any, resolved: Any
-) -> tuple[Any | None, str, str]:
-    """``(grant, host, reason)`` when ``coverage`` covers this exact step.
-
-    Shared by the policy gate and act so both run the identical pure rules
-    (act re-observes the target first, so a changed element is refused).  The
-    grant is returned only on success; any doubt yields ``None``.
-    """
-    registry = getattr(ctx, "browse_grants", None)
-    if registry is None or not getattr(registry, "enabled", False):
-        return None, "", "disabled"
+def _browse_grant_fields(
+    state: dict[str, Any], ctx: Any, *, step: Any, resolved: Any
+) -> dict[str, Any]:
+    """The exact coverage inputs for one step, shared by every caller."""
     tool = str(getattr(step, "tool", "") or "")
-    if tool not in BROWSE_TOOLS:
-        return None, "", "tool_not_allowed"
-    task_id = str(state.get("task_id") or "")
-    grant = registry.active_for_task(task_id)
     target = getattr(resolved, "target", None)
     previous_tool, previous_role, previous_host = _previous_typed_target(state)
     host = str(getattr(resolved, "host", "") or "") or browse_step_host(step, ctx.settings)
@@ -226,24 +214,68 @@ def browse_grant_check(
     if tool == "browser_press_key" and previous_host != host:
         previous_tool, previous_role = "", ""
     args = getattr(step, "args", None)
-    key = str(args.get("key") or "") if isinstance(args, dict) else ""
+    return {
+        "tool": tool,
+        "host": host,
+        "label": str(getattr(target, "name", "") or "") if target is not None else "",
+        "role": str(getattr(target, "role", "") or "") if target is not None else "",
+        "is_password": bool(getattr(target, "is_password", False))
+        if target is not None
+        else False,
+        "key": str(args.get("key") or "") if isinstance(args, dict) else "",
+        "previous_tool": previous_tool,
+        "previous_role": previous_role,
+    }
+
+
+def browse_grant_check(
+    state: dict[str, Any], ctx: Any, *, step: Any, decision: Any, resolved: Any
+) -> tuple[Any | None, str, str]:
+    """``(grant, host, reason)`` when ``coverage`` covers this exact step.
+
+    Shared by the policy gate and act so both run the identical pure rules
+    (act re-observes the target first, so a changed element is refused).  The
+    grant is returned only on success; any doubt yields ``None``.
+    """
+    registry = getattr(ctx, "browse_grants", None)
+    if registry is None or not getattr(registry, "enabled", False):
+        return None, "", "disabled"
+    task_id = str(state.get("task_id") or "")
+    if str(getattr(step, "tool", "") or "") not in BROWSE_TOOLS:
+        return None, "", "tool_not_allowed"
+    fields = _browse_grant_fields(state, ctx, step=step, resolved=resolved)
     ok, reason = coverage(
-        grant,
+        registry.active_for_task(task_id),
         task_id=task_id,
-        tool=tool,
         tier=int(getattr(decision, "tier", 0)),
-        host=host,
-        label=str(getattr(target, "name", "") or "") if target is not None else "",
-        role=str(getattr(target, "role", "") or "") if target is not None else "",
-        is_password=bool(getattr(target, "is_password", False)) if target is not None else False,
-        key=key,
         actions_used=registry.consumed(task_id),
         needs_unlock=bool(getattr(decision, "needs_unlock", False)),
         needs_typed_confirmation=bool(getattr(decision, "needs_typed_confirmation", False)),
-        previous_tool=previous_tool,
-        previous_role=previous_role,
+        **fields,
     )
-    return (grant if ok else None), host, reason
+    return (registry.active_for_task(task_id) if ok else None), str(fields["host"]), reason
+
+
+def browse_grant_eligible(
+    state: dict[str, Any], ctx: Any, *, step: Any, decision: Any, resolved: Any
+) -> tuple[bool, str]:
+    """Whether a fresh browsing grant for this step's host would cover it.
+
+    Pure preview for the gate's *before asking* decision: it issues no grant and
+    records no binding.  If this is false the step keeps its ordinary action
+    confirmation and never causes a browsing prompt.
+    """
+    registry = getattr(ctx, "browse_grants", None)
+    if registry is None or not getattr(registry, "enabled", False):
+        return False, "disabled"
+    fields = _browse_grant_fields(state, ctx, step=step, resolved=resolved)
+    return prospective_coverage(
+        task_id=str(state.get("task_id") or ""),
+        tier=int(getattr(decision, "tier", 0)),
+        needs_unlock=bool(getattr(decision, "needs_unlock", False)),
+        needs_typed_confirmation=bool(getattr(decision, "needs_typed_confirmation", False)),
+        **fields,
+    )
 
 
 def specialist_active(state: dict[str, Any]) -> bool:
