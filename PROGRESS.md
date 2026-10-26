@@ -11,7 +11,7 @@ Maintained by the coding agent. Condensed from historical log.
 - **Voice**: Wake word/stt/tts present; barge-in supports bare 'stop' per D22 (overrides old Stage 1 note).
 - **Browser**: Managed Playwright browser + UIA tools; session referents exist but page referent cleared by unrelated actions (P3 added).
 - **WhatsApp**: WhatsApp Web via isolated profile; content-hash binding, recipient precheck, rate limiting.
-- **Memory**: SQLite memory store (skills/failures/preferences/task_log), retrieval capped.
+- **Memory**: SQLite memory store (skills/failures/preferences/task_log), retrieval capped; explicit preferred-name capture persists (`user_name`), with targeted CLI deletion (`memory forget-pref`).
 - **Benchmark**: Harness exists in benchmarks/; full runs not completed in condensed form.
 
 ## Safety invariants and non-negotiable decisions
@@ -55,3 +55,4 @@ Maintained by the coding agent. Condensed from historical log.
 - **P3**: Browser page referent invalidation added (2026-10-23).
 - **L4**: Enter now synchronizes on Playwright navigation; click rechecks the post-action origin; unauthorized cross-origin actions set the redirect block. Narrow fixture checks pass (2026-10-26).
 - **L5**: Redirect-block enforcement now covers reads/actions/side effects (`resolve`, `current_url`, `scroll`, `wait`, `back`, `forward`, tabs, screenshot, WhatsApp accessor); screenshot revalidates its origin before capture. Targeted browser-context tests pass; live checks not run (2026-10-26).
+- **5B**: Preferred-name capture hardened against quoted/reported/hypothetical/negated text, contextual/time phrases, three-word truncation, command-shaped suffixes, and punctuation-separated continuations; imperative statements require every candidate word to carry name-shape evidence, and an ambiguous candidate is rejected whole rather than trimmed to a prefix. Overlapping statements resolve by sentence position. Compose tests exercise the real preference-read path, and `memory forget-pref <key>` distinguishes invalid keys/storage errors from a missing preference. A fail-closed guard now prevents name learning and preference writes when the turn is classified `skipped_sensitive`; regression coverage added. Tests updated but not run in this pass (2026-10-26).

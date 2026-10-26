@@ -134,10 +134,44 @@ credential-ish words are refused; the value must pass the secret check. It only
 runs on a plain conversation turn (no tool steps, no halt, not cancelled) and
 only when `memory.learn_name` is on.
 
+The parser is deliberately conservative. Text inside matched quotes, reported
+speech (`"he said my name is Bob"`), hypothetical/uncertain wording (`"if"`,
+`"suppose"`, `"maybe"`) and a directly negated phrase (`"don't call me Bob"`)
+are ignored.
+
+Except for the unambiguous declarative `my name is`, every candidate word must
+also look like a proper name: it needs a capital letter, an apostrophe/hyphen,
+or a caseless script. That structural boundary stops ordinary requests such as
+`call me again`, `call me quickly`, and `call me like Alice` from becoming
+names. Only `my name is` accepts an unmarked lowercase name, so `my name is
+arya` can still be learned. A closed list of stop, context and command words
+remains as a backstop; it is not a claim of exhaustive semantic understanding.
+
+Only a short, closed trailing discourse phrase is dropped (`"call me Aarya
+instead"`). Every remaining word is checked, and an invalid or ambiguous
+candidate is rejected whole, never trimmed to a shorter prefix: `"call me Bob
+again"` and `"call me Bob quickly"` save nothing. Three or more name words are
+rejected rather than truncated, so a three-part name is never silently saved as
+its first two words. When the input contains several statements, the earliest
+valid one wins; pattern specificity and strength only break ties at the same
+position.
+
+Punctuation cannot hide extra context inside the statement. The candidate may be
+followed by terminal punctuation or closing wrappers, by the closed discourse
+list after a comma (`"call me Bob, please"`), or by a coordinating clause that
+contains another valid name statement (`"you can call me Bob, but my name is
+Alice"`). Separators that introduce more context reject the whole candidate:
+`"call me Bob, again"`, `"call me Bob; quickly"`, `"call me Bob - again"`,
+`"call me Bob (again)"`, and `"call me Bob, promptly"` save nothing. A full stop
+followed by whitespace starts a separate sentence, so it ends the candidate's
+statement rather than continuing it.
+
 The name is stored as the `user_name` preference through the *existing*
 `PreferenceStore`. An existing name is replaced only by the explicit "my name is"
 / "call me" phrasings; "you can call me" / "I'm called" only fill an empty slot.
-`memory_saved_reason` becomes `"name_saved"` when a name is written.
+`memory_saved_reason` becomes `"name_saved"` when a name is written. To forget
+only the name (and keep every other preference), run
+`jarvis memory forget-pref user_name`.
 
 **The name takes effect from the next turn**: `memory_save` runs after
 `respond`, and `compose` reads `user_name` before it, so the turn that teaches
@@ -150,8 +184,13 @@ name other than this one statement detector (and the raw `preferences` table).
 |---|---|
 | `jarvis memory list [--limit N]` | Up to 50 rows: kind, id, date, 60-char text. Failures held back by the unverifiable-success fix are marked `!`. |
 | `jarvis memory forget <id> [--kind auto\|skill\|failure]` | Deletes one row. `auto` refuses an id that exists in both tables. |
+| `jarvis memory forget-pref <key>` | Deletes one preference, e.g. `user_name`, without touching skills, failures or other preferences. |
 | `jarvis memory clear [CLEAR]` | Deletes every skill, failure and preference (asks first, or requires the word `CLEAR`). `task_log` is kept. |
 | `jarvis memory prefs` | Preference keys; values truncated to 40 chars, credential-looking ones shown as `[hidden]`. |
+
+`forget-pref` validates the key before touching the store: an invalid key is
+reported as invalid input, not as a missing preference, and a storage error
+exits 1 without claiming a deletion.
 
 `jarvis skills list|show|delete|clear` remains the richer view of learned plans.
 
@@ -184,5 +223,10 @@ defaults, so a `config.toml` written before this pass is still valid.
 * Pruning is bounded, so a table can sit above its cap for a few saves after
   `max_*` is lowered.
 * The name takes effect from the next turn (see above).
+* The name detector is lexical, not semantic. An all-lowercase name outside
+  `my name is` is rejected as ambiguous (use `my name is ...` instead).
+  Conversely, a capitalised two-word phrase is accepted even though it cannot be
+  proven not to be a name. The parser is conservative about lowercase
+  command-shaped candidates, not a semantic name authority.
 * Retrieval scores with the offline lexical encoder, not a semantic model:
   synonyms that share no words can be missed.

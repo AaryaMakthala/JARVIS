@@ -17,8 +17,8 @@ Rules this module keeps:
 * **Bounded output.** ``list`` shows at most :data:`MAX_LIST_ROWS` rows and one
   short line each, so it stays usable on a small terminal.
 * **Explicit deletion.** ``clear`` needs the word ``CLEAR`` (or an interactive
-  yes), and ``forget`` refuses an id that exists in both tables unless a kind is
-  named.
+  yes), ``forget`` refuses an id that exists in both tables unless a kind is
+  named, and ``forget-pref`` deletes one preference by key only.
 
 Task-log rows (per-task counters) are deliberately *not* touched: they are
 telemetry for the benchmark, not learned memory.
@@ -36,6 +36,7 @@ from rich.console import Console
 
 from jarvis import config
 from jarvis.memory.db import looks_secret
+from jarvis.memory.prefs import normalise_key
 from jarvis.memory.store import open_memory
 
 __all__ = [
@@ -44,6 +45,7 @@ __all__ = [
     "MAX_VALUE_CHARS",
     "clear_memory",
     "forget_memory",
+    "forget_preference",
     "format_list_rows",
     "format_pref_rows",
     "memory_app",
@@ -133,6 +135,36 @@ def forget_memory(memory: Any, row_id: int, kind: str = "auto") -> tuple[bool, s
     )
 
 
+def forget_preference(memory: Any, key: str) -> tuple[bool, str]:
+    """Delete one preference; returns ``(deleted, message)``.
+
+    Targeted deletion is intentionally separate from ``clear``: forgetting a
+    single ``user_name`` must not wipe skills, failures or every other
+    preference.  The key is validated before the store call so an unusable key
+    is reported as invalid input rather than as a missing preference, and a
+    storage error becomes a controlled failure instead of escaping the CLI.
+    """
+    wanted = (key or "").strip()
+    try:
+        normalised = normalise_key(wanted)
+    except ValueError as exc:
+        return False, f"invalid preference key {wanted!r}: {exc}"
+    store = getattr(memory, "preferences", None)
+    delete = getattr(store, "delete", None)
+    if not callable(delete):
+        return False, "this memory store has no preferences"
+    try:
+        deleted = bool(delete(normalised))
+    except Exception as exc:  # noqa: BLE001 - a store error must not escape the CLI
+        logging.getLogger("jarvis.memory_cli").warning(
+            "forget preference failed: %s", type(exc).__name__
+        )
+        return False, f"could not delete preference {normalised!r}; memory store error"
+    if not deleted:
+        return False, f"no preference with key {normalised!r}"
+    return True, f"deleted preference {normalised!r}"
+
+
 def clear_memory(memory: Any) -> int:
     """Delete every learned skill, failure and preference; returns the count."""
     return int(memory.skills.clear() or 0) + int(memory.failures.clear() or 0) + int(
@@ -189,6 +221,18 @@ def memory_forget(
     """Delete one stored skill or failure."""
     with _open_store() as memory:
         deleted, message = forget_memory(memory, row_id, kind)
+        console.print(message, markup=False)
+        if not deleted:
+            raise typer.Exit(code=1)
+
+
+@memory_app.command("forget-pref")
+def memory_forget_pref(
+    key: Annotated[str, typer.Argument(help="Preference key from `jarvis memory prefs`.")],
+) -> None:
+    """Delete one stored preference, such as the learned ``user_name``."""
+    with _open_store() as memory:
+        deleted, message = forget_preference(memory, key)
         console.print(message, markup=False)
         if not deleted:
             raise typer.Exit(code=1)

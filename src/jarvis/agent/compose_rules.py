@@ -78,9 +78,9 @@ _ADDRESSABLE = frozenset({"success", "partial", "cancelled", "clarify"})
 _TEMPLATES: dict[str, tuple[str, ...]] = {
     "success": (
         "Done.",
-        "That's done.",
-        "It's done.",
-        "All set.",
+        "That's done{address}.",
+        "It's done{address}.",
+        "All set{address}.",
     ),
     "partial": (
         "That's done, but I could not verify it{address}.",

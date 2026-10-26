@@ -83,22 +83,89 @@ REASONS = (
 #: :class:`jarvis.memory.store.SqliteMemory`).
 _FAILURE_META = "failure_id"
 
-#: Explicit name statements, strongest phrasing first.  ``strong`` phrasings may
-#: replace a name already on file; the softer ones only fill an empty slot, so a
-#: passing "you can call me Bob" cannot silently rename the owner.
-_NAME_STATEMENTS: tuple[tuple[str, bool], ...] = (
-    # Longest / softest first: "call me" is a substring of "you can call me".
-    (r"\byou can call me\s+", False),
-    (r"\bi'?m called\s+", False),
-    (r"\bmy name is\s+", True),
-    (r"\bcall me\s+", True),
+#: Explicit name statements: the phrasing, whether it may replace a name already
+#: on file, and whether every candidate word must carry name-shape evidence.
+#: Softer phrasing only fills an empty slot, so a passing "you can call me Bob"
+#: cannot silently rename the owner.  Only the unambiguous declarative "my name
+#: is" can accept an all-lowercase candidate; "call me" is also a normal request
+#: ("call me again"), so the other phrasings need proper-name evidence.
+_NAME_STATEMENTS: tuple[tuple[str, bool, bool], ...] = (
+    # Longer alternatives precede the "call me" substring inside them.  Match
+    # selection is by input position; this order only breaks an exact tie.
+    (r"\byou can call me\b", False, True),
+    (r"\bi['\u2019]?m called\b", False, True),
+    (r"\bmy name is\b", True, False),
+    (r"\bcall me\b", True, True),
 )
-_NAME_AFTER_PHRASE = re.compile(
-    r"(?P<name>[^\W\d_]+(?:['\u2019-][^\W\d_]+)?(?:\s+[^\W\d_]+(?:['\u2019-][^\W\d_]+)?)?)",
+#: Read the whole word run after the phrase.  The run is capped later: taking
+#: only two words would silently turn "Mary Jane Watson" into "Mary Jane".
+_NAME_RUN = re.compile(
+    r"(?P<run>[^\W\d_]+(?:['\u2019-][^\W\d_]+)?"
+    r"(?:\s+[^\W\d_]+(?:['\u2019-][^\W\d_]+)?)*)",
     re.UNICODE,
 )
+_DISCOURSE_WORDS = (
+    r"(?:please|thanks|thank\s+you|instead|actually|really|too|also|"
+    r"just|though|however|anyway|now|for\s+short)"
+)
+#: A short, closed list of discourse words that can follow a valid name.
+#: Applied only to the end of the local run, never used to shorten a longer
+#: contextual phrase ("call me after lunch" must stay invalid).
+_TRAILING_DISCOURSE = re.compile(rf"(?:\s+{_DISCOURSE_WORDS})+$", re.IGNORECASE)
+#: The same closed list after a comma: "Call me Bob, please."  Requiring the
+#: whole tail keeps "Call me Bob, please stop." invalid.
+_SEPARATED_DISCOURSE = re.compile(
+    rf"^\s*,\s*{_DISCOURSE_WORDS}(?:\s*[.!?]+)?\s*$", re.IGNORECASE
+)
+#: A comma may continue into a clause only when that clause contains another
+#: supported name statement.  This preserves the documented earliest-statement
+#: rule for "You can call me Bob, but my name is Alice."
+_COORDINATING_CLAUSE = re.compile(
+    r"^\s*,\s*(?:but|and|while|whereas)\b", re.IGNORECASE
+)
+_NAME_TERMINAL = ".!?\u2026"
+_NAME_CLOSING_WRAPPERS = "\"'\u201d\u2019`)]}>"
 _MAX_NAME_CHARS = 40
 _MIN_NAME_CHARS = 2
+_MAX_PREFIX_CHARS = 120
+
+#: Text inside these spans is quoted or reported speech, not a declaration.
+#: The single-quote patterns require a non-word character on each side so an
+#: apostrophe (``I'm``, ``O'Brien``) never opens a span.
+_QUOTE_PATTERNS = (
+    re.compile(r'"[^"\n]*"'),
+    re.compile(r"\u201c[^\u201d\n]*\u201d"),
+    re.compile(r"`[^`\n]*`"),
+    re.compile(r"(?<![\w'\u2019])'[^'\n]*'(?![\w'\u2019])"),
+    re.compile(r"(?<![\w'\u2019])\u2018[^\u2019\n]*\u2019(?![\w'\u2019])"),
+)
+
+#: Phrases immediately before a name that make it reported, hypothetical,
+#: uncertain or an example rather than a declaration.  Kept deliberately
+#: conservative: a missed learning can be retried, a wrong name is persistent.
+_NON_DECLARATION = re.compile(
+    r"(?:"
+    r"\bwhat\s+if\b|\bif\b|\bsuppose\b|\bsupposing\b|\bimagine\b|\bimagining\b|"
+    r"\bpretend\b|\bpretending\b|\bhypothetical(?:ly)?\b|\bfor\s+example\b|"
+    r"\bmaybe\b|\bperhaps\b|\bprobably\b|\bpossibly\b|\bwhether\b|"
+    r"\baccording\s+to\b|"
+    r"\b(?:said|says|saying|asked|asks|told|tells|telling|wrote|writes|written|"
+    r"texted|reported|claims?|claimed|mentioned|mentions)\b|"
+    r"\b(?:read|reads|heard|hears)\b[^.!?]{0,40}\bthat\b"
+    r")",
+    re.IGNORECASE,
+)
+
+#: A negation directly before the phrase: "don't call me Bob".  The short word
+#: tail allows "I do not want you to call me Bob" while a comma ("Do not forget,
+#: my name is Bob") ends the guard.
+_NEGATED_DECLARATION = re.compile(
+    r"\b(?:do\s+not|don['\u2019]?t|never|stop|not)\b(?:\s+\w+){0,4}\s*$",
+    re.IGNORECASE,
+)
+
+#: Punctuation allowed between a statement phrase and the name.
+_NAME_LEADING_JUNK = " \t\r\n.,;:!?\"'\u201c\u201d\u2018\u2019`()[]{}<>-\u2013\u2014"
 
 #: Words that are never a name: command verbs, pronouns, fillers and the
 #: everyday nouns a mis-parse would grab ("call me a taxi every morning").
@@ -106,9 +173,20 @@ _MIN_NAME_CHARS = 2
 _NOT_A_NAME_WORDS = """
     a an the and or but if then than that this these those it its is are am was were be been
     i me my you your we us our he she they them his her theirs
+    all any both each either neither every few many more most much other some such
+    what whatever which whichever who whom whose why how
     jarvis sir madam boss mate dude man woman
-    please thanks thank ok okay yes no not never now later tomorrow today
+    please thanks thank ok okay yes no not never now later tomorrow today yesterday
     back
+    about above across after against along amid among around at before behind below beneath
+    beside besides between beyond by despite down during except inside into near off on onto
+    out outside over past per since through throughout till toward towards under underneath
+    until up upon via within
+    tonight soon morning afternoon evening night noon midnight lunch dinner breakfast
+    meeting appointment week weekend weekday monday tuesday wednesday thursday friday
+    saturday sunday minute minutes hour hours day days first second third fourth fifth
+    next last previous coming asap immediately anytime sometime whenever away right
+    work home school office cell mobile landline
     open close start stop run send play pause search find look show tell say
     delete remove create make write read save set get go go to wait click type press
     call lock unlock load move copy paste cut undo redo scroll
@@ -119,6 +197,8 @@ _NOT_A_NAME_WORDS = """
     one two three four five six seven eight nine ten
     http https www url
     password passwd passphrase pin token secret key apikey login credential credentials
+    actually really instead too also just maybe perhaps though however anyway again quickly
+    for from as to of with without because when whether while like
     """
 _NOT_A_NAME = frozenset(_NOT_A_NAME_WORDS.split())
 
@@ -375,39 +455,137 @@ def detect_name_statement(user_input: str) -> tuple[str, bool] | None:
     dots/slashes (so no URLs), stop words and command verbs are refused, and the
     candidate must pass the same secret check the preference store applies.
 
+    Except for the unambiguous declarative "my name is", every candidate word
+    must look like a proper name (a capital letter, name punctuation, or a
+    caseless script).  That keeps an ordinary request such as "call me again"
+    from being read as the name "again", while "my name is arya" can still be
+    learned without title case.
+
     Returns ``(name, strong)`` where  ``strong`` is true for "my name is" / "call
     me" - the phrasings allowed to replace a name already on file - or ``None``
     when the input states no usable name.
 
-    The longer, softer phrasings are tested first: "you can call me Bob" must be
-    read as the weak statement it is, not as the strong "call me" inside it (a
-    later phrase in a sentence never wins over an earlier one).
+    Matches are resolved by their position in the input, not by the order of
+    :data:`_NAME_STATEMENTS`: an earlier valid statement wins over a later one,
+    while pattern length and strength only break ties at the same position.
+    A phrase inside quotes, or preceded by reported/hypothetical/uncertain
+    wording, is ignored.
     """
     text = " ".join(str(user_input or "").split())
     if not text:
         return None
-    for phrase, strong in _NAME_STATEMENTS:
+    quoted = _quoted_spans(text)
+    candidates: list[tuple[int, int, bool, str]] = []
+    for phrase, strong, require_name_shape in _NAME_STATEMENTS:
         for match in re.finditer(phrase, text, re.IGNORECASE):
-            name = _clean_name(text[match.end() :])
+            if _inside_quotes(match.start(), quoted):
+                continue
+            prefix = text[max(0, match.start() - _MAX_PREFIX_CHARS) : match.start()]
+            if _NON_DECLARATION.search(prefix) or _NEGATED_DECLARATION.search(prefix):
+                continue
+            name = _clean_name(
+                text[match.end() :], require_name_shape=require_name_shape
+            )
             if name is not None:
-                return name, strong
-    return None
+                candidates.append(
+                    (match.start(), match.end() - match.start(), strong, name)
+                )
+    if not candidates:
+        return None
+    _, _, strong, name = min(
+        candidates, key=lambda item: (item[0], -item[1], not item[2])
+    )
+    return name, strong
 
 
-def _clean_name(rest: str) -> str | None:
-    """Validate the candidate name at the start of ``rest`` (or ``None``)."""
-    found = _NAME_AFTER_PHRASE.match(rest.lstrip())
+def _quoted_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans covered by paired quotes, in any supported style."""
+    return [
+        (match.start(), match.end())
+        for pattern in _QUOTE_PATTERNS
+        for match in pattern.finditer(text)
+    ]
+
+
+def _inside_quotes(position: int, spans: list[tuple[int, int]]) -> bool:
+    """True when ``position`` sits inside one of ``spans``."""
+    return any(start < position < end for start, end in spans)
+
+
+def _has_name_shape(word: str) -> bool:
+    """True when a candidate word looks like a name, not ordinary command text.
+
+    A capital letter, apostrophe/hyphen, or a caseless script is positive
+    evidence.  An all-lowercase Latin word is ambiguous outside "my name is"
+    ("call me again"), so it is not accepted there without other evidence.
+    """
+    if any(char.isupper() for char in word):
+        return True
+    if any(char in "'\u2019-" for char in word):
+        return True
+    return not any(char.islower() for char in word)
+
+
+def _valid_name_boundary(tail: str) -> bool:
+    """True when the text after the candidate cannot hide a longer utterance.
+
+    Terminal punctuation and closing wrappers may end the name; terminal
+    punctuation followed by whitespace starts a separate sentence.  A comma may
+    introduce only the closed discourse list or a coordinating clause that
+    itself contains another supported name statement.  Every other separator is
+    part of the candidate's context, so the whole candidate is rejected.
+    """
+    cleaned = tail.strip()
+    if not cleaned:
+        return True
+    end = 0
+    saw_terminal = False
+    while end < len(cleaned) and (
+        cleaned[end] in _NAME_TERMINAL or cleaned[end] in _NAME_CLOSING_WRAPPERS
+    ):
+        saw_terminal = saw_terminal or cleaned[end] in _NAME_TERMINAL
+        end += 1
+    if end == len(cleaned):
+        return True
+    if saw_terminal and cleaned[end].isspace():
+        return True
+    remaining = cleaned[end:]
+    if _SEPARATED_DISCOURSE.fullmatch(remaining):
+        return True
+    if _COORDINATING_CLAUSE.match(remaining):
+        return detect_name_statement(remaining) is not None
+    return False
+
+
+def _clean_name(rest: str, *, require_name_shape: bool = False) -> str | None:
+    """Validate the candidate name at the start of ``rest`` (or ``None``).
+
+    Only a short, closed trailing discourse phrase is dropped ("Call me Aarya
+    instead" -> "Aarya").  Every remaining word must pass the non-name word
+    guard.  When name-shape evidence is required (every phrasing except "my name
+    is"), every word must also look like a proper name: this rejects an ordinary
+    request such as "call me quickly" or "call me Bob again" as a whole, never
+    by trimming it to a shorter prefix.  A third word rejects rather than
+    truncates ("Mary Jane Watson" is not saved as "Mary Jane").
+    """
+    cleaned = rest.lstrip(_NAME_LEADING_JUNK)
+    found = _NAME_RUN.match(cleaned)
     if found is None:
         return None
-    name = found.group("name").strip()
+    if not _valid_name_boundary(cleaned[found.end() :]):
+        return None
+    remaining = _TRAILING_DISCOURSE.sub("", found.group("run")).strip()
+    words = remaining.split()
+    if not 1 <= len(words) <= 2:
+        return None
+    if any(word.casefold().strip("'-\u2019") in _NOT_A_NAME for word in words):
+        return None
+    if require_name_shape and not all(_has_name_shape(word) for word in words):
+        return None
+    name = " ".join(words)
     if not (_MIN_NAME_CHARS <= len(name) <= _MAX_NAME_CHARS):
         return None
     if any(char.isdigit() for char in name):
-        return None
-    words = name.split()
-    if len(words) > 2:
-        return None
-    if any(word.casefold().strip("'-\u2019") in _NOT_A_NAME for word in words):
         return None
     if looks_secret(name):
         return None
@@ -419,11 +597,14 @@ def _learn_name(state: dict[str, Any], ctx: AppContext) -> bool:
 
     Only a plain conversation turn counts: an action turn already ran tools,
     and a halted or cancelled turn is not a statement the user meant to keep.
+    A sensitive turn writes nothing, even when it also contains a valid name.
     The write goes through the existing :class:`PreferenceStore` (same
     validation, same secret guard); there is no second profile store and no
     tool, so nothing here can act.  Never raises.
     """
     try:
+        if _sensitive(state):
+            return False
         if not bool(getattr(ctx.settings.memory, "learn_name", True)):
             return False
         if ctx.dry_run or state.get("cancelled") or state.get("halted_reason"):
