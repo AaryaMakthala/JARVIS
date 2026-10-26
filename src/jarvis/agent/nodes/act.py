@@ -393,9 +393,14 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             tool_name = str(getattr(step, "tool", "") or "")
             # record action
             try:
-                REFERENT_STORE.set_action(cid, ActionRef(tool=tool_name, ok=True, created_at=referents.now_ts()))
-            except Exception:
-                pass
+                REFERENT_STORE.set_action(
+                    cid, ActionRef(tool=tool_name, ok=True, created_at=referents.now_ts())
+                )
+            except (TypeError, ValueError):
+                # Unreachable in practice: the store only takes a lock and
+                # assigns, and the ref model was just constructed.  Kept
+                # defensive; the message carries no tool or page content.
+                logger.debug("referent action not recorded")
             # browser navigation -> set/update page; clear only if different origin? spec says clear only on nav to different origin or explicit/TTL
             if tool_name in ("browser_goto", "browser_open_site", "browser_open_result") and isinstance(page_url, str) and page_url.strip():
                 prev = REFERENT_STORE.get(cid).page
@@ -442,8 +447,14 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
                     p = artifact.get("path") or result.data.get("path")
                 if isinstance(p, str) and p:
                     REFERENT_STORE.set_file(cid, FileRef(path=p, kind="file", created_at=referents.now_ts()))
-        except Exception:
-            pass
+        except (ImportError, TypeError, ValueError):
+            # Exactly what this block can raise: the optional import, a
+            # page-supplied position that is not a number (``int(...)``), or a
+            # ref model that fails validation (``ValidationError`` IS a
+            # ``ValueError``).  Referent bookkeeping is convenience only - it can
+            # never fail the step - and nothing is logged in detail because the
+            # values are page and tool content.
+            logger.debug("referent bookkeeping skipped")
         # For non-browser unrelated steps, do NOT clear page referent (Phase 1 fix)
 
     step_result = StepResult(

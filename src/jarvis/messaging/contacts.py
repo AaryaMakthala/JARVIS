@@ -251,19 +251,37 @@ def resolve_single(store: ContactStore, query: str) -> tuple[Contact | None, str
     """Return exactly one contact, or the error text listing the options.
 
     Shared by every channel adapter and by the WhatsApp tools so that contact
-    resolution has exactly one implementation.
+    resolution has exactly one implementation.  The decision itself is
+    :func:`jarvis.messaging.resolver.resolve_contact`: an exact name (or an
+    exact alias) is the only outcome that selects a contact.  ``near`` and
+    ``ambiguous`` come back as an error naming the candidates, so a send
+    refuses and the human picks - nothing is ever guessed.
     """
-    matches = store.resolve(query)
-    if len(matches) == 1:
-        return matches[0], None
-    if not matches:
-        known = ", ".join(c.name for c in store.load()) or "(no contacts yet)"
+    from jarvis.messaging.resolver import STATUS_ALIAS, STATUS_EXACT, resolve_contact
+
+    contacts = store.load()
+    resolution = resolve_contact(query, contacts)
+    if resolution.status in (STATUS_EXACT, STATUS_ALIAS):
+        chosen = resolution.selected
+        for contact in contacts:
+            if contact.name == chosen:
+                return contact, None
+        # The resolver saw a name the store no longer returns (a reload race).
+        return None, f"no contact matches {query!r}. Add one with `jarvis contacts add`."
+    known = ", ".join(c.name for c in contacts) or "(no contacts yet)"
+    if resolution.status == "ambiguous":
+        names = ", ".join(resolution.matches)
+        return None, f"multiple contacts match {query!r}: {names} — be more specific"
+    if resolution.status == "near":
+        suggestion = resolution.matches[0] if resolution.matches else ""
         return None, (
-            f"no contact matches {query!r}. Known contacts: {known}. "
-            "Add one with `jarvis contacts add`."
+            f"no exact match for {query!r}: did you mean {suggestion!r}? "
+            f"Known contacts: {known}. Add one with `jarvis contacts add`."
         )
-    names = ", ".join(c.name for c in matches)
-    return None, f"multiple contacts match {query!r}: {names} — be more specific"
+    return None, (
+        f"no contact matches {query!r}. Known contacts: {known}. "
+        "Add one with `jarvis contacts add`."
+    )
 
 
 def recipient_error(store: ContactStore, query: str) -> str | None:

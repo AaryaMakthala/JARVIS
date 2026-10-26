@@ -393,20 +393,23 @@ def build_llm_client(
     if not candidates:
         return ProviderSelection(client=None, info=None, reasons=reasons)
 
-    info, _spec, single = candidates[0]
-    if len(candidates) == 1:
-        client: Any = single
-    else:
-        from jarvis.llm.multi import MultiProviderClient
+    info, _spec, _single = candidates[0]
+    # Even a one-provider install goes through the composite client: it owns the
+    # one overall deadline (``llm.total_deadline_seconds``, or
+    # ``llm.voice_deadline_seconds`` for a latency-sensitive call) that every
+    # attempt and every backoff sleep is measured against, and with a single
+    # candidate its fallthrough walk has nowhere else to go.  Reusing the same
+    # class keeps exactly one deadline mechanism.
+    from jarvis.llm.multi import MultiProviderClient
 
-        client = MultiProviderClient(
-            candidates,
-            logger=logger,
-            rotate_on_rate_limit=settings.llm.rotate_on_rate_limit,
-            deadline_seconds=settings.llm.total_deadline_seconds,
-            voice_deadline_seconds=settings.llm.voice_deadline_seconds,
-            call_timeout_seconds=settings.llm.timeout_seconds,
-        )
+    client = MultiProviderClient(
+        candidates,
+        logger=logger,
+        rotate_on_rate_limit=settings.llm.rotate_on_rate_limit,
+        deadline_seconds=settings.llm.total_deadline_seconds,
+        voice_deadline_seconds=settings.llm.voice_deadline_seconds,
+        call_timeout_seconds=settings.llm.timeout_seconds,
+    )
     return ProviderSelection(client=client, info=info, reasons=reasons)
 
 

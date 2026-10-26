@@ -67,6 +67,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from jarvis.llm import models as llm_models
+from jarvis.llm.abort import abort_if_cancelled
 from jarvis.llm.client import CallMeta, LLMError, LLMTransientError, Usage
 from jarvis.llm.failures import (
     MODEL_SCOPED_CATEGORIES,
@@ -211,6 +212,9 @@ class MultiProviderClient:
         deadline_at, handed_deadline = self._deadline(timeout_s)
         for group in self._groups(model_role):
             for info, _spec, client in group:
+                # Between attempts, before any provider is called: a cancelled
+                # task stops here instead of starting one more request.
+                abort_if_cancelled()
                 remaining = self._remaining(deadline_at, model_role)
                 spec = _spec_for_role(info.name, _spec, client, model_role)
                 caps = spec.capabilities
@@ -260,6 +264,9 @@ class MultiProviderClient:
         deadline_at, handed_deadline = self._deadline(timeout_s)
         for group in self._groups(model_role):
             for info, _spec, client in group:
+                # Between attempts, before any provider is called: a cancelled
+                # task stops here instead of starting one more request.
+                abort_if_cancelled()
                 remaining = self._remaining(deadline_at, model_role)
                 try:
                     result = client.text(
@@ -303,6 +310,7 @@ class MultiProviderClient:
         failures: list[str] = []
         for group in self._groups(model_role):
             for info, _spec, client in group:
+                abort_if_cancelled()
                 spec = _spec_for_role(info.name, _spec, client, model_role)
                 if not spec.capabilities.supports_vision:
                     failures.append(f"{info.name}: skipped ({spec.model} lacks vision support)")

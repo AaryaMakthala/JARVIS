@@ -19,6 +19,7 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel, ValidationError
 
 from jarvis import config
+from jarvis.llm.abort import abort_if_cancelled
 from jarvis.llm.failures import (
     FailureCategory,
     classify,
@@ -363,6 +364,9 @@ class GroqClient(_MetaMixin):
         attempts = 0
         started = time.perf_counter()
         while True:
+            # A cancelled task stops before the next attempt: the retry budget
+            # must never be spent on a request nobody is waiting for any more.
+            abort_if_cancelled()
             try:
                 resp = self._completer(
                     model=model,
@@ -379,6 +383,9 @@ class GroqClient(_MetaMixin):
                         f"Groq model {model!r} context window exceeded ({category.value})"
                     ) from exc
                 if should_retry_same_provider(category) and attempts <= retry_budget:
+                    # Also before the backoff sleep: cancelling during it should
+                    # not wait out the delay first.
+                    abort_if_cancelled()
                     self._logger.warning("groq %s; retrying in %.1fs", category.value, backoff)
                     sleep_within_deadline(
                         backoff, deadline_at, provider="Groq", category=category

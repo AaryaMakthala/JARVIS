@@ -42,6 +42,7 @@ from jarvis.agent.nodes.telemetry import trace_node
 from jarvis.agent.nodes.validate import validate
 from jarvis.agent.nodes.verify import verify
 from jarvis.agent.routing import route_for_brain_result
+from jarvis.llm.abort import cancelled_by
 from jarvis.tools.base import CancelToken
 
 __all__ = [
@@ -92,21 +93,29 @@ def wrap(
     ``state["task_id"]`` (:func:`jarvis.agent.nodes.telemetry.trace_node`).
     Node names only - never user text, tool arguments or results - and the
     trace is written once and freed by ``respond``.
+
+    It also *publishes* the token's ``cancelled`` flag to the LLM layer for the
+    duration of the node (:func:`jarvis.llm.abort.cancelled_by`), so a long
+    provider retry walk stops between attempts without any call site passing
+    the token down.  The hook is reset in a ``finally``, so it cannot outlive
+    the node it was installed for.
     """
     name = getattr(node, "__name__", "node")
 
     if cancel is None:
 
         def _plain(state: dict[str, Any]) -> dict[str, Any]:
-            trace_node(str(state.get("task_id") or ""), name)
-            return node(state, ctx)
+            with cancelled_by(None):
+                trace_node(str(state.get("task_id") or ""), name)
+                return node(state, ctx)
 
         return _plain
 
     def _gated(state: dict[str, Any]) -> dict[str, Any]:
         cancel.check()
-        trace_node(str(state.get("task_id") or ""), name)
-        return node(state, ctx)
+        with cancelled_by(lambda: cancel.cancelled):
+            trace_node(str(state.get("task_id") or ""), name)
+            return node(state, ctx)
 
     return _gated
 
