@@ -202,7 +202,38 @@ CONTROL_FRESH_CONFIRM = "confirm"
 CONTROL_PAYMENT = "payment"
 
 _RISKY_PAYMENT_TOKENS = frozenset({"buy", "purchase", "pay", "payment", "payments"})
-_RISKY_CONFIRM_TOKENS = frozenset({"send", "submit", "delete", "confirm", "allow"})
+
+#: Words that always need their own fresh confirmation, even inside an approved
+#: scope grant or browsing grant.  This only *adds* prompts (it never lowers a
+#: tier); payment words are checked first and stay Tier 3.
+FRESH_CONFIRM_TOKENS = frozenset(
+    {
+        "send",
+        "submit",
+        "delete",
+        "confirm",
+        "allow",
+        "login",
+        "post",
+        "publish",
+        "subscribe",
+        "donate",
+        "download",
+        "upload",
+        "install",
+        "book",
+        "reserve",
+        "checkout",
+        "place",
+        "order",
+        "transfer",
+        "withdraw",
+    }
+)
+
+#: Multi-word phrasings with the same meaning (token matching cannot see them).
+#: ``jarvis.policy.browse_grant`` refuses these too (it imports this set).
+FRESH_CONFIRM_PHRASES = ("log in", "sign in", "sign up")
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -213,14 +244,27 @@ def risky_control(name: str, role: str = "") -> str | None:
     :data:`CONTROL_FRESH_CONFIRM` for controls that must re-gate individually
     even inside an approved scope, and ``None`` when the control is not risky.
     Matching is token-based (case/whitespace/punctuation insensitive) so it
-    does not fire on words that merely contain a risky fragment.
+    does not fire on words that merely contain a risky fragment; the few
+    multi-word phrasings in :data:`FRESH_CONFIRM_PHRASES` are matched as whole
+    phrases.  Payment is tested first, so a payment control is never downgraded
+    to a plain confirmation.
     """
-    tokens = set(_TOKEN_RE.findall(f"{name or ''} {role or ''}".lower()))
+    text = f"{name or ''} {role or ''}".lower()
+    tokens = set(_TOKEN_RE.findall(text))
     if tokens & _RISKY_PAYMENT_TOKENS:
         return CONTROL_PAYMENT
-    if tokens & _RISKY_CONFIRM_TOKENS:
+    if tokens & FRESH_CONFIRM_TOKENS or _has_phrase(text):
         return CONTROL_FRESH_CONFIRM
     return None
+
+
+def _has_phrase(text: str) -> bool:
+    """Whether ``text`` contains one of :data:`FRESH_CONFIRM_PHRASES`.
+
+    Works on a whitespace-collapsed copy so "Log\n  in" still matches "log in".
+    """
+    padded = f" {' '.join(text.split())} "
+    return any(f" {phrase} " in padded for phrase in FRESH_CONFIRM_PHRASES)
 
 
 def _field_getter(target: Any) -> Any:

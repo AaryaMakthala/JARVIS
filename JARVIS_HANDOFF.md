@@ -385,4 +385,182 @@ a bug: only a read is known not to move focus.
 
 `docs/GRAPH.md` is unchanged: B2-B3 changed no node, edge or route.
 
+### Batch C (C1-C4)
+
+Implementation only, **UNTESTED** except the C1 smoke run (raw result below).
+No pytest, no new test files; checks were `ruff check` on the changed files,
+`py_compile` with `.venv\Scripts\python.exe`, and read-only probe scripts with
+fakes (no LLM, no network, no browser). `PolicyEngine`, `tiers`, Tier 3, the
+target-binding hash, `llm/models.py`, `free_only`, `strict_zero_cost` and the
+provider order are untouched.
+
+| Step | Commit | Content | Status |
+|---|---|---|---|
+| C1 | `9f52a6b` | `scripts/smoke_flow.py`: runs the real graph with fakes only (scripted `FakeLLM`, the `tests/support.py` fake tool, a temp SQLite checkpointer) for S1 conversation, S2 one safe action, S3 every LLM provider failing; prints scenario, node path from the A1 trace, final answer, `halted_reason`, PASS/FAIL, and exits 1 on any FAIL. The trace is kept readable by replacing `telemetry.discard_trace` with a no-op *inside the script* (the graph is untouched). | smoke 3/3 PASS |
+| C2 | `f183bbf` | `act.py`: both referent-bookkeeping `except Exception: pass` blocks replaced with the narrow set that block can actually raise (`ImportError` for the optional import, `TypeError`/`ValueError` - and `ValidationError` *is* a `ValueError` - for a page-supplied `position` or a failing ref model) plus a content-free `logger.debug`. No authorization, binding or tier logic touched. `ruff check act.py` is now clean (it had 4 carried-over S110/BLE001 findings). | UNTESTED |
+| C3 | `f0ee622` | (a) `llm/abort.py`: a `ContextVar` holding an optional zero-argument `is_cancelled`; `wrap()` installs the task token's `cancelled` flag for the node and resets it in a `finally`; the composite client checks it before every attempt (all three operations) and the provider retry loop before every attempt and every backoff sleep, raising the existing `Cancelled`. No hook set = behaviour unchanged. (b) `build_llm_client` now routes a single provider through `MultiProviderClient` too, so one-provider installs get the same `llm.total_deadline_seconds` / `llm.voice_deadline_seconds` deadline from 06ed825. Probe: single install -> `MultiProviderClient`, budget 30.0 normal / 12.0 for a 5 s call, provider info preserved; hook raises before any provider call. | UNTESTED |
+| C4 | `134b076` | (a) Read-only audit of the task log: the 3 failed `whatsapp_send` rows ("Aarya", "pappa", "der Arzt") all failed with `no contact matches ... Known contacts: (no contacts yet)` - `contacts.json` does not exist on this machine, so the lookup had nothing to match, not a WhatsApp/browser fault. (b) `messaging/resolver.py`: pure `resolve_contact(query, contacts)` - NFKC + casefold, emoji/punctuation dropped, spaces collapsed; exact, then alias, then near by token subset / substring (>= 3 chars) / `difflib` ratio >= 0.85; two or more candidates are `ambiguous` (max 3 names); `near` and `ambiguous` are never a selection. (c) Wired into `resolve_single`, the one lookup the precheck, `MessageFlow` and the WhatsApp tools share: `near` now refuses with "did you mean 'X'?" and `ambiguous` with "multiple contacts match ...", so nothing is ever sent on a guess. Probe: the real empty-store text is unchanged, "pappa" -> near 'Papa', "Ali" -> ambiguous, a 1-char query never fuzzy-matches, and the graph halts before any confirmation. | UNTESTED |
+
+Alias note: the contacts file format has no `aliases` field (and `ContactStore.save`
+would drop one), so the alias branch is implemented but dormant - supporting it needs
+a file-format change, which this pass did not make.
+
+C1 raw output (`py_compile` clean, `ruff` clean, 90 s limit, exit 0):
+
+```
+[S1 conversation answer]
+   node path: in>cr>mr>br>co>re>ms
+   final answer: 'Here is your answer.'
+   halted_reason: None
+   results: []
+   PASS
+[S2 one safe action]
+   node path: in>cr>mr>br>va>pg>ac>ve>co>re>ms
+   final answer: 'fake_echo ran hi'
+   halted_reason: None
+   results: [('s1', True)]
+   PASS
+[S3 all LLM providers fail]
+   node path: in>cr>mr>br>co>re>ms
+   final answer: "I couldn't safely understand that request."
+   halted_reason: "I couldn't safely understand that request."
+   results: []
+   PASS
+smoke: 3/3 passed
+```
+
+### Batch D (D1-D3)
+
+Implementation only, **UNTESTED** except the D2 smoke run (raw result below).
+No pytest, no new test files; checks were `ruff check` on the changed files,
+`py_compile` with `.venv\Scripts\python.exe`, the extended smoke script, and
+read-only probes (no LLM, no network, no browser). `PolicyEngine`, the tiers
+table, Tier 3 blocking, the target-binding hash, `llm/models.py`, `free_only`,
+`strict_zero_cost` and the provider order are untouched.
+
+| Step | Commit | Content | Status |
+|---|---|---|---|
+| D1 | `6530338` | Fresh confirmation for the clicks a scope grant used to cover silently: `rules.FRESH_CONFIRM_TOKENS` (now public) gained `login`, `post`, `publish`, `subscribe`, `donate`, `download`, `upload`, `install`, `book`, `reserve`, `checkout`, `place`, `order`, `transfer`, `withdraw`, and the new `FRESH_CONFIRM_PHRASES` (`log in`, `sign in`, `sign up`) covers what token matching cannot see (`_has_phrase`, whitespace-collapsed whole-phrase match). `browse_grant.RISK_WORDS` is now `_MONEY_RISK_WORDS` + the shared set + the phrases, so a word needing a fresh confirmation is never browse-covered either; the probe proves the browse grant refuses **every** fresh-confirm word (`missing: none`). Payment words are still classified first (`Pay now` -> `payment`, `Buy now` -> `payment`) and Tier 3 is untouched; everything added raises `min_tier` to Tier 1 only. | UNTESTED |
+| D2 | `6d4377f` | `scripts/smoke_flow.py` grew S4-S9 on the real graph with fakes only: clarification -> answer -> action, unknown-tool plan repaired, confirmation approved, confirmation refused, failing tool retried then replanned, and cancel after the prompt (the resumed run raises `Cancelled` before the approved step and nothing runs). Each prints a note, node path, answer, halted reason, results and PASS/FAIL; exit 1 on any FAIL. **9/9 PASS** (raw below). | smoke 9/9 PASS |
+| D3 | this commit | This section and the remaining-items list. | docs |
+
+Before/after classification (D1 probe, real `rules.risky_control` / `browse_grant.risky_label`):
+
+```
+label        risky_control  browse risky_label      | after edit
+Log in       -              log in                   confirm / log in
+Post         -              post                     confirm / post
+Publish      -              publish                  confirm / publish
+Subscribe    -              subscribe                confirm / subscribe
+Search       -              -                        -              / -            (unchanged)
+Next         -              -                        -              / -            (unchanged)
+Play         -              -                        -              / -            (unchanged)
+Buy now      payment        buy                      payment        / buy          (unchanged, Tier 3)
+Send         confirm        send                     confirm        / send         (unchanged)
+Pay          payment        pay                      payment        / pay          (unchanged, Tier 3)
+```
+
+Known consequence for the test phase: two existing expectations in
+`tests/unit/test_domain_policy.py` encode the **old** (looser) classification -
+`("Checkout", "button", None)` in `test_risky_control_classification` and
+`("Login", "button")` in `test_risky_control_false_positives`. Both now return
+`CONTROL_FRESH_CONFIRM`, so those two cases must be updated when the test phase
+runs (the tests were not edited in this pass, per the batch rules).
+
+D2 raw output (`ruff` clean, `py_compile` clean, 90 s limit, exit 0; the one
+stderr line `brain call failed: ...` is S3 deliberately exhausting its script):
+
+```
+[S1 conversation answer]
+   node path: in>cr>mr>br>co>re>ms
+   final answer: 'Here is your answer.'
+   halted_reason: None
+   results: []
+   PASS
+[S2 one safe action]
+   node path: in>cr>mr>br>va>pg>ac>ve>co>re>ms
+   final answer: 'fake_echo ran hi'
+   halted_reason: None
+   results: [('s1', True)]
+   PASS
+[S3 all LLM providers fail]
+   node path: in>cr>mr>br>co>re>ms
+   final answer: "I couldn't safely understand that request."
+   halted_reason: "I couldn't safely understand that request."
+   results: []
+   PASS
+[S4 clarify, then answer, then act]
+   note: asked first: True
+   node path: in>cr>mr>br>cl x2>br>va>pg>ac>ve>co>re>ms
+   final answer: 'fake_echo ran hi'
+   halted_reason: None
+   results: [('s1', True)]
+   PASS
+[S5 invalid plan, then repair]
+   note: validate attempts: 0
+   node path: in>cr>mr>br>va>br>va>pg>ac>ve>co>re>ms
+   final answer: 'fake_echo ran hi'
+   halted_reason: None
+   results: [('s1', True)]
+   PASS
+[S6 confirmation yes]
+   note: asked first: True
+   node path: in>cr>mr>br>va>pg x2>ac>ve>co>re>ms
+   final answer: 'fake_echo ran hi'
+   halted_reason: None
+   results: [('s1', True)]
+   PASS
+[S7 confirmation no]
+   node path: in>cr>mr>br>va>pg x2>co>re>ms
+   final answer: "Refused by you (confirmation answered with 'no' or a mismatched action)."
+   halted_reason: "Refused by you (confirmation answered with 'no' or a mismatched action)."
+   results: []
+   PASS
+[S8 tool fails, then replans]
+   note: tools called: ['fake_echo', 'fake_echo', 'fake_echo', 'fake_fix']
+   node path: in>cr>mr>br>va>pg>ac>ve>ac>ve>ac>ve>rp>va>pg>ac>ve>co>re>ms
+   final answer: 'fake_fix ran fixed'
+   halted_reason: None
+   results: [('s2', True)]
+   PASS
+[S9 cancelled before acting]
+   note: the run raised Cancelled at the next node
+   outcome: none (the run ended by raising)
+   results: []
+   PASS
+smoke: 9/9 passed
+```
+
+Cancel hook through the composite client (D2 probe, read-only):
+
+```
+cancelled hook: Cancelled raised before any provider call
+provider calls while cancelled: []
+no hook: provider was reached, error: LLMError
+provider calls without a hook: ['structured']
+```
+
+Worker threads: the only thread pool in `src/jarvis/llm` + `src/jarvis/agent`
+is `agent/nodes/memory_retrieve.py` (the bounded memory read), and it makes **no**
+LLM call, so the C3 `ContextVar` is installed and read on the same thread as
+every provider call. The daemon runs a task in its own worker thread
+(`daemon/server.py:1017,1201,1245`), but the graph and its `ctx.llm` calls are
+built and run inside that one thread, so the hook still applies. A future change
+that moved an LLM call into an executor would silently lose the hook (a
+`ContextVar` does not propagate into a new thread or a `to_thread` call).
+
+### Still open
+
+- `browser_final_click` code: designed (`docs/FINAL_CLICK_DESIGN.md`, B4) but blocked
+  on the eight owner decisions listed there - nothing implemented.
+- Screenshot and `show_file` tools: not written.
+- Wider system tools: not written.
+- `agent.prompt_trim_enabled` (tool-group prompt trimming, A3) is still **off** by default.
+- The test phase (golden-path S1-S10) per `docs/BACKBONE_PLAN.md` has not started; every
+  step from A1 to D2 is implementation-only and UNTESTED by pytest. Two
+  `test_domain_policy.py` cases must be updated first (see the D1 note).
+- `contacts.json` still does not exist on this machine: the WhatsApp paths refuse with
+  "no contact matches ... Known contacts: (no contacts yet)" until the user adds contacts
+  (`jarvis contacts add`).
+
 Next: the test phase (golden-path S1-S10) per `docs/BACKBONE_PLAN.md`.

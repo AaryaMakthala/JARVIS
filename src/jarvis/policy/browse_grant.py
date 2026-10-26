@@ -35,6 +35,8 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from jarvis.policy.rules import FRESH_CONFIRM_PHRASES, FRESH_CONFIRM_TOKENS
+
 __all__ = [
     "BROWSE_TOOLS",
     "RISK_WORDS",
@@ -65,29 +67,21 @@ BROWSE_TOOLS = frozenset(
 
 #: Whole-word, case-folded words that mean "this click does something the user
 #: must approve every time" (money, publishing, deleting, signing in, ...).
-RISK_WORDS = (
+#: Built from the policy module's fresh-confirm set so the two can never drift
+#: apart: a word that needs its own confirmation is never browse-covered.
+_MONEY_RISK_WORDS = (
     "buy",
-    "order",
-    "pay",
     "purchase",
-    "place",
-    "checkout",
-    "check out",
-    "submit",
-    "send",
-    "post",
-    "publish",
-    "delete",
+    "pay",
+    "payment",
+    "payments",
     "remove",
-    "confirm",
-    "sign in",
-    "log in",
-    "login",
-    "download",
-    "upload",
-    "subscribe",
-    "install",
-    "donate",
+    "check out",
+)
+RISK_WORDS = tuple(
+    dict.fromkeys(
+        (*_MONEY_RISK_WORDS, *sorted(FRESH_CONFIRM_TOKENS), *FRESH_CONFIRM_PHRASES)
+    )
 )
 
 _RISK_PATTERNS = tuple(
