@@ -110,6 +110,17 @@ def capture_foreground(hwnd: int = 0) -> bytes:
     return _grab_bbox(_foreground_bbox(hwnd))
 
 
+def capture_full_screen() -> bytes:
+    """Capture the whole virtual screen as PNG bytes, fully in memory."""
+    user32 = ctypes.windll.user32
+    left, top, right, bottom = _virtual_screen_box(user32)
+    if right <= left or bottom <= top:
+        raise RuntimeError("the virtual screen has an empty size")
+    return _grab_bbox(
+        {"left": left, "top": top, "width": right - left, "height": bottom - top}
+    )
+
+
 def _grab_bbox(bbox: dict[str, int]) -> bytes:
     """Grab pixel ``bbox`` and return PNG bytes, fully in memory."""
     import io

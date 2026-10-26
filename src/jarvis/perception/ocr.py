@@ -16,6 +16,7 @@ import importlib
 import importlib.util
 import logging
 import threading
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger("jarvis.perception.ocr")
@@ -61,22 +62,62 @@ def _get_engine() -> Any:
     return _engine
 
 
-def ocr_image(image_bytes: bytes) -> str:
-    """Run local OCR on PNG bytes and return the recognised text, one line each.
+@dataclass(frozen=True)
+class OcrBlock:
+    """One recognised text block and its backend confidence (0..1)."""
+
+    text: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class OcrResult:
+    """Recognised OCR text plus per-block and mean confidence."""
+
+    text: str
+    blocks: tuple[OcrBlock, ...]
+    mean_confidence: float | None
+
+
+def ocr_image_with_confidence(image_bytes: bytes) -> OcrResult:
+    """Run local OCR and return the text with block and mean confidence.
 
     Raises when no backend is installed or the engine fails; the caller decides
-    whether that is fatal (it is not - UIA text is retained).
+    whether that is fatal (it is not - UIA text is retained).  The mean is
+    rounded to two decimals and is ``None`` when the backend returned no blocks.
     """
     result = _get_engine()(image_bytes)
     boxes = result[0] if isinstance(result, tuple) else result
     if not boxes:
-        return ""
-    lines: list[str] = []
+        return OcrResult(text="", blocks=(), mean_confidence=None)
+    blocks: list[OcrBlock] = []
     for item in boxes:
         try:
             text = str(item[1]).strip()
         except (IndexError, TypeError):
             continue
-        if text:
-            lines.append(text)
-    return "\n".join(lines)
+        if not text:
+            continue
+        confidence = _confidence(item)
+        blocks.append(OcrBlock(text=text, confidence=confidence))
+    text_out = "\n".join(block.text for block in blocks)
+    mean = round(sum(block.confidence for block in blocks) / len(blocks), 2) if blocks else None
+    return OcrResult(text=text_out, blocks=tuple(blocks), mean_confidence=mean)
+
+
+def _confidence(item: Any) -> float:
+    """Read a block score from ``item[2]`` and clamp it to 0..1 (default 0)."""
+    try:
+        value = float(item[2])
+    except (IndexError, TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, value))
+
+
+def ocr_image(image_bytes: bytes) -> str:
+    """Run local OCR and return the recognised text, one line each.
+
+    Raises when no backend is installed or the engine fails; the caller decides
+    whether that is fatal (it is not - UIA text is retained).
+    """
+    return ocr_image_with_confidence(image_bytes).text

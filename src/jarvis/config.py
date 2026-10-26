@@ -125,6 +125,11 @@ default_save_dir = ""
 #   jarvis = "C:/Users/me/OneDrive/Desktop/Jarvis"
 # Values must be absolute. Alias roots are never added to allowed_roots.
 
+[files]
+# Allow file tools anywhere under the user profile except protected folders.
+# Off by default; the narrower policy.allowed_roots remain in force.
+profile_wide = false
+
 [apps]
 notepad = "notepad.exe"
 calculator = "calc.exe"
@@ -423,6 +428,12 @@ class PolicySettings(BaseModel):
     typed_confirmation_for_folders: bool = True
 
 
+class FilesSettings(BaseModel):
+    """File-discovery settings (``[files]`` in config.toml)."""
+
+    profile_wide: bool = False
+
+
 class PathSettings(BaseModel):
     """Default save folder and folder aliases (Step D1).
 
@@ -660,6 +671,17 @@ class ToolsSettings(BaseModel):
     max_code_chars: int = 4000
 
 
+class PerceptionSettings(BaseModel):
+    """Perception thresholds (``[perception]`` in config.toml)."""
+
+    ocr_low_conf: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Mean OCR confidence below this is reported as low.",
+    )
+
+
 class ScreenSettings(BaseModel):
     """Screen-perception settings (``[screen]`` in config.toml, Stage 6).
 
@@ -848,6 +870,7 @@ class Settings(BaseSettings):
     compose: ComposeSettings = ComposeSettings()
     policy: PolicySettings = PolicySettings()
     paths: PathSettings = PathSettings()
+    files: FilesSettings = FilesSettings()
     apps: AppSettings = AppSettings()
     daemon: DaemonSettings = DaemonSettings()
     voice: VoiceSettings = VoiceSettings()
@@ -855,6 +878,7 @@ class Settings(BaseSettings):
     memory: MemorySettings = MemorySettings()
     risk: RiskSettings = RiskSettings()
     tools: ToolsSettings = ToolsSettings()
+    perception: PerceptionSettings = PerceptionSettings()
     screen: ScreenSettings = ScreenSettings()
     camera: CameraSettings = CameraSettings()
     browser: BrowserSettings = BrowserSettings()

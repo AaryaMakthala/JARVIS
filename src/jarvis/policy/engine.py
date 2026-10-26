@@ -231,7 +231,7 @@ class PolicyEngine:
                 resolved = paths.resolve_safe(raw)
             except paths.PathError as exc:
                 return _blocked(step, [f"bad path in argument {name!r}: {exc}"], str(exc))
-            if paths.is_protected(resolved):
+            if paths.is_protected(resolved, settings=ctx.settings):
                 return _blocked(step, [f"path is protected: {resolved}"], str(resolved))
             if not paths.within_any_root(resolved, roots):
                 return _blocked(

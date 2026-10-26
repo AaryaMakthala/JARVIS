@@ -171,7 +171,7 @@ def _run_open_in_app(args: OpenInAppArgs, ctx: ToolContext) -> ToolResult:
     resolved, refusal = _resolve_target(args.path)
     if resolved is None:
         return ToolResult(ok=False, error=refusal)
-    if paths.is_protected(resolved):
+    if paths.is_protected(resolved, settings=ctx.settings):
         return ToolResult(ok=False, error=f"path is protected: {resolved}")
     roots = paths.roots_from_settings(ctx.settings)
     if not paths.within_any_root(resolved, roots):
@@ -271,7 +271,7 @@ def _run_open_path(args: OpenPathArgs, ctx: ToolContext, launcher: ViewerFunc) -
             error=f"refusing to open {suffix or 'this file'!r}; the default viewer only "
             f"opens these types: {allowed}",
         )
-    if paths.is_protected(resolved):
+    if paths.is_protected(resolved, settings=ctx.settings):
         return ToolResult(ok=False, error=f"path is protected: {resolved}")
     if not paths.within_any_root(resolved, paths.roots_from_settings(ctx.settings)):
         return ToolResult(ok=False, error=f"path is outside the allowed folders: {resolved}")

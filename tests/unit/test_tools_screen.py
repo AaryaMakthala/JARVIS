@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from jarvis.agent.state import Step
 from jarvis.config import ScreenSettings, Settings
+from jarvis.perception.ocr import OcrResult
 from jarvis.policy import engine as engine_module
 from jarvis.policy import rules
 from jarvis.policy.engine import _WINDOWS_ONLY_REASON, PolicyContext, PolicyEngine
@@ -76,7 +77,10 @@ def _install(
         lambda **_kw: UiaText(text=uia, controls=3, secure_controls=1),
     )
     monkeypatch.setattr("jarvis.perception.ocr.ocr_available", lambda: ocr_available)
-    monkeypatch.setattr("jarvis.perception.ocr.ocr_image", lambda _b: ocr)
+    monkeypatch.setattr(
+        "jarvis.perception.ocr.ocr_image_with_confidence",
+        lambda _b: OcrResult(ocr, (), None),
+    )
     return captures
 
 

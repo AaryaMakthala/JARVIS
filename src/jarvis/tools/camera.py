@@ -197,7 +197,7 @@ def _run_take_photo(
                 "add it to policy.allowed_roots (or set camera.save_dir)"
             ),
         )
-    if paths.is_protected(directory):
+    if paths.is_protected(directory, settings=ctx.settings):
         return ToolResult(ok=False, error=f"the photo folder is protected: {directory}")
 
     try:

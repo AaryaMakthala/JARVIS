@@ -728,7 +728,7 @@ def _check_target(raw: str, ctx: ToolContext) -> tuple[Path | None, str | None]:
         resolved = paths.resolve_safe(raw)
     except paths.PathError as exc:
         return None, str(exc)
-    if paths.is_protected(resolved):
+    if paths.is_protected(resolved, settings=ctx.settings):
         return None, f"path is protected: {resolved}"
     roots = paths.roots_from_settings(ctx.settings)
     if not paths.within_any_root(resolved, roots):

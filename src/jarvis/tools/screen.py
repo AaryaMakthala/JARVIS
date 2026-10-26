@@ -78,6 +78,9 @@ class _Extracted:
     capture_failed: bool
     uia_controls: int
     secure_controls: int
+    ocr_mean_confidence: float | None = None
+    ocr_block_confidences: tuple[float, ...] = ()
+    ocr_low_confidence: bool = False
     image: bytes | None = None
 
 
@@ -119,6 +122,8 @@ def _extract(ctx: ToolContext, *, hwnd: int = 0, want_image: bool = False) -> _E
     have_ocr = ocr.ocr_available()
     image: bytes | None = None
     capture_failed = False
+    ocr_mean: float | None = None
+    ocr_confidences: tuple[float, ...] = ()
     if have_ocr or want_image:
         try:
             image = screen.capture_foreground(hwnd=hwnd)
@@ -127,7 +132,10 @@ def _extract(ctx: ToolContext, *, hwnd: int = 0, want_image: bool = False) -> _E
             capture_failed = True
     if have_ocr and image is not None:
         try:
-            ocr_text = (ocr.ocr_image(image) or "").strip()
+            ocr_result = ocr.ocr_image_with_confidence(image)
+            ocr_text = (ocr_result.text or "").strip()
+            ocr_mean = ocr_result.mean_confidence
+            ocr_confidences = tuple(block.confidence for block in ocr_result.blocks)
         except Exception as exc:  # noqa: BLE001 - OCR is best-effort
             logger.warning("local OCR failed: %s", type(exc).__name__)
             ocr_text = ""
@@ -139,6 +147,8 @@ def _extract(ctx: ToolContext, *, hwnd: int = 0, want_image: bool = False) -> _E
     truncated = len(combined) > settings.max_text_chars
     if truncated:
         combined = combined[: settings.max_text_chars].rstrip() + "\n[truncated]"
+    threshold = float(getattr(getattr(ctx.settings, "perception", None), "ocr_low_conf", 0.6))
+    low = ocr_mean is not None and ocr_mean < threshold
     return _Extracted(
         text=combined,
         source=source,
@@ -147,6 +157,9 @@ def _extract(ctx: ToolContext, *, hwnd: int = 0, want_image: bool = False) -> _E
         capture_failed=capture_failed,
         uia_controls=uia.controls,
         secure_controls=uia.secure_controls,
+        ocr_mean_confidence=ocr_mean,
+        ocr_block_confidences=ocr_confidences,
+        ocr_low_confidence=low,
         image=image,
     )
 
@@ -162,7 +175,19 @@ def _data(info: screen.ForegroundWindow, extracted: _Extracted) -> dict[str, obj
         "capture_failed": extracted.capture_failed,
         "uia_controls": extracted.uia_controls,
         "secure_controls_skipped": extracted.secure_controls,
+        "ocr_mean_confidence": extracted.ocr_mean_confidence,
+        "ocr_block_confidences": list(extracted.ocr_block_confidences),
+        "ocr_low_confidence": extracted.ocr_low_confidence,
     }
+
+
+def _confidence_note(extracted: _Extracted) -> str:
+    """A printable OCR confidence line, marked ``(low)`` below the threshold."""
+    mean = extracted.ocr_mean_confidence
+    if mean is None:
+        return ""
+    suffix = " (low)" if extracted.ocr_low_confidence else ""
+    return f"\nOCR confidence: {mean:.2f}{suffix}"
 
 
 def _unavailable_note(extracted: _Extracted) -> str:
@@ -221,7 +246,10 @@ def _read_screen(args: ReadScreenArgs, ctx: ToolContext) -> ToolResult:
         )
     return ToolResult(
         ok=True,
-        output=f"Foreground window: {title} ({info.process}).\n{extracted.text}",
+        output=(
+            f"Foreground window: {title} ({info.process}).\n{extracted.text}"
+            f"{_confidence_note(extracted)}"
+        ),
         data=data,
         tainted=True,
     )
@@ -302,7 +330,10 @@ def _describe_screen(args: DescribeScreenArgs, ctx: ToolContext) -> ToolResult:
         )
     return ToolResult(
         ok=True,
-        output=f"Foreground window: {title} ({info.process}).\n{extracted.text}",
+        output=(
+            f"Foreground window: {title} ({info.process}).\n{extracted.text}"
+            f"{_confidence_note(extracted)}"
+        ),
         data=data,
         tainted=True,
     )

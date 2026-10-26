@@ -109,6 +109,10 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "ui_list_controls",
         "ui_click",
     ),
+    "capture": (
+        "take_screenshot",
+        "show_file",
+    ),
     "memory": (),
 }
 
@@ -200,6 +204,12 @@ _GROUP_KEYWORDS: dict[str, tuple[str, ...]] = {
         "control",
         "interface",
         "window",
+    ),
+    "capture": (
+        "screenshot",
+        "show ",
+        "display ",
+        "view ",
     ),
 }
 

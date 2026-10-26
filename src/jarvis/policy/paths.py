@@ -73,6 +73,32 @@ _BROWSER_PROFILES = (
     ("APPDATA", "Mozilla", "Firefox", "Profiles"),
 )
 
+#: Components denied when ``files.profile_wide`` widens access to the profile.
+_PROFILE_DENY_NAMES = frozenset(
+    {
+        "appdata",
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        ".azure",
+        ".kube",
+        ".venv",
+        ".git",
+        "credentials",
+        "secrets",
+        "wallets",
+        "keychain",
+        "personal vault",
+    }
+)
+
+#: Adjacent components denied as a pair (e.g. ``.config/gh``).
+_PROFILE_DENY_PAIRS = ((".config", "gh"),)
+
 
 class PathError(ValueError):
     """Raised when a path string is rejected before any operation happens."""
@@ -165,17 +191,37 @@ def normalise_key(path: Path | str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def roots_from_settings(settings: config.Settings) -> list[Path]:
-    """Expand ``settings.policy.allowed_roots`` into resolved absolute roots.
+def _profile_wide(settings: config.Settings | None) -> bool:
+    """Whether profile-wide file access is enabled for ``settings``."""
+    return bool(getattr(getattr(settings, "files", None), "profile_wide", False))
 
-    The camera's photo folder (:func:`jarvis.tools.default_dirs.photo_dir`) is
-    always appended, so a picture taken by ``take_photo`` can be viewed and
-    deleted by the normal file tools.  That folder is JARVIS-owned
-    (``Pictures/JARVIS`` by default) and never the whole Pictures folder, so the
-    rest of the user's pictures stay outside the roots.  The lookup is imported
-    lazily to avoid a policy <-> tools import cycle, and any failure keeps only
-    the configured roots (fail closed: it never widens access on error).
+
+def _profile_denied(path: Path) -> bool:
+    """Return ``True`` when a resolved profile path is on the deny list."""
+    parts = [part.casefold() for part in path.parts]
+    if any(part in _PROFILE_DENY_NAMES for part in parts):
+        return True
+    return any((parts[i], parts[i + 1]) in _PROFILE_DENY_PAIRS for i in range(len(parts) - 1))
+
+
+def roots_from_settings(settings: config.Settings) -> list[Path]:
+    """Expand allowed roots, or the whole profile when ``files.profile_wide``.
+
+    ``profile_wide`` replaces ``policy.allowed_roots`` with the resolved home
+    folder; protected components are still refused by :func:`is_protected`.
+    Otherwise the configured roots are used and the camera photo folder
+    (:func:`jarvis.tools.default_dirs.photo_dir`) is appended, so a picture
+    taken by ``take_photo`` can be viewed and deleted by the normal file tools.
+    The camera folder is JARVIS-owned (``Pictures/JARVIS`` by default), never
+    the whole Pictures folder.  The lookup is imported lazily to avoid a policy
+    <-> tools import cycle, and any failure keeps only the configured roots
+    (fail closed: it never widens access on error).
     """
+    if _profile_wide(settings):
+        try:
+            return [resolve_safe("~")]
+        except PathError:
+            return []
     roots = [resolve_safe(value) for value in settings.policy.allowed_roots]
     try:
         from jarvis.tools.default_dirs import photo_dir
@@ -311,12 +357,14 @@ def is_protected(
     exact: list[Path] | None = None,
     containers: list[Path] | None = None,
     patterns: tuple[str, ...] | None = None,
+    settings: config.Settings | None = None,
 ) -> bool:
     """Return ``True`` when ``path`` may not be targeted by a file tool.
 
     Protected means one of:
 
     * a drive root;
+    * a denied component when ``files.profile_wide`` is enabled;
     * equal to / an ancestor of an ``exact`` protected root (e.g. the home
       folder itself);
     * equal to / an ancestor of / **inside** a ``containers`` protected root
@@ -328,15 +376,18 @@ def is_protected(
     ``containers`` and ``patterns`` are injectable so tests can pin them.
     """
     if exact is None:
-        exact = protected_roots()
+        exact = protected_roots(settings)
     if containers is None:
-        containers = protected_containers()
+        containers = protected_containers(settings)
     if patterns is None:
         patterns = _wildcard_patterns()
 
     key = normalise_key(path)
     if key == normalise_key(path.anchor):
         return True  # a drive root itself is always protected
+
+    if _profile_wide(settings) and _profile_denied(path):
+        return True
 
     if _pattern_region_hit(key, path, patterns):
         return True
