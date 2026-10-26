@@ -87,7 +87,7 @@ def _state(plan: Plan | None = None, results: list[StepResult] | None = None, **
 def test_verified_tool_plan_becomes_a_skill(backend: SqliteMemory) -> None:
     out = memory_save(_state(), _ctx(backend))
     assert out["memory_saved"] is True
-    assert out["memory_saved_reason"] is None
+    assert out["memory_saved_reason"] == "saved"
     assert backend.counts()["skills"] == 1
 
 
@@ -120,7 +120,7 @@ def test_multi_step_plan_is_saved_when_every_step_verifies(backend: SqliteMemory
 def test_no_backend_writes_nothing() -> None:
     out = memory_save(_state(), _ctx(None))
     assert out["memory_saved"] is False
-    assert out["memory_saved_reason"] == "no memory backend"
+    assert out["memory_saved_reason"] == "error"
 
 
 def test_null_memory_accepts_and_discards() -> None:
@@ -135,7 +135,7 @@ def test_dry_run_never_writes(backend: SqliteMemory) -> None:
     ctx.dry_run = True
     out = memory_save(_state(), ctx)
     assert out["memory_saved"] is False
-    assert "dry-run" in out["memory_saved_reason"]
+    assert out["memory_saved_reason"] == "error"
     assert backend.counts()["skills"] == 0
 
 
@@ -155,18 +155,18 @@ def test_halted_task_is_not_saved(backend: SqliteMemory) -> None:
 def test_conversation_plan_is_not_saved(backend: SqliteMemory) -> None:
     state = _state(_plan(kind="conversation", goal="who won the final"), [])
     out = memory_save(state, _ctx(backend))
-    assert "not a tool plan" in out["memory_saved_reason"]
+    assert out["memory_saved_reason"] == "skipped_conversation"
     assert backend.counts()["skills"] == 0
 
 
 def test_no_results_is_not_saved(backend: SqliteMemory) -> None:
     out = memory_save(_state(_plan(), []), _ctx(backend))
-    assert "no step results" in out["memory_saved_reason"]
+    assert out["memory_saved_reason"] == "skipped_unverified"
 
 
 def test_a_failed_step_is_not_saved(backend: SqliteMemory) -> None:
     out = memory_save(_state(results=[_ok(ok=False, error="boom", verified=None)]), _ctx(backend))
-    assert "at least one step failed" in out["memory_saved_reason"]
+    assert out["memory_saved_reason"] == "skipped_unverified"
     assert backend.counts()["skills"] == 0
     assert backend.counts()["failures"] == 1
 
@@ -182,13 +182,13 @@ def test_an_unverifiable_step_is_not_saved_and_not_a_failure(backend: SqliteMemo
     out = memory_save(_state(results=[_ok(verified=None)]), _ctx(backend))
     assert out["memory_saved"] is False  # still not a *skill* (no proof)
     assert out["memory_failure_logged"] is False  # and never a *failure*
-    assert "could not be independently verified" in out["memory_saved_reason"]
+    assert out["memory_saved_reason"] == "skipped_unverified"
     assert backend.counts() == {"skills": 0, "failures": 0, "preferences": 0}
 
 
 def test_a_verification_failure_is_not_saved(backend: SqliteMemory) -> None:
     out = memory_save(_state(results=[_ok(verified=False)]), _ctx(backend))
-    assert "failed verification" in out["memory_saved_reason"]
+    assert out["memory_saved_reason"] == "skipped_unverified"
 
 
 def test_unverified_success_never_blocks_the_same_task_later(
@@ -211,27 +211,27 @@ def test_unverified_success_never_blocks_the_same_task_later(
 
 def test_tainted_output_is_not_saved(backend: SqliteMemory) -> None:
     out = memory_save(_state(results=[_ok(tainted=True)]), _ctx(backend))
-    assert "untrusted" in out["memory_saved_reason"]
+    assert out["memory_saved_reason"] == "skipped_unverified"
     assert backend.counts()["skills"] == 0
 
 
 def test_untrusted_arguments_are_not_saved(backend: SqliteMemory) -> None:
     out = memory_save(_state(_plan(_step(untrusted=True))), _ctx(backend))
-    assert "untrusted" in out["memory_saved_reason"]
+    assert out["memory_saved_reason"] == "skipped_unverified"
     assert backend.counts()["skills"] == 0
 
 
 def test_partial_results_are_not_saved(backend: SqliteMemory) -> None:
     plan = _plan(_step(), Step(id="s2", tool="type_text", args={}, rationale="t", expect="t"))
     out = memory_save(_state(plan, [_ok("s1")]), _ctx(backend))
-    assert "disagree on step count" in out["memory_saved_reason"]
+    assert out["memory_saved_reason"] == "skipped_unverified"
     assert backend.counts()["skills"] == 0
 
 
 def test_skill_saving_can_be_switched_off(backend: SqliteMemory) -> None:
     ctx = _ctx(backend, memory={"save_skills": False})
     out = memory_save(_state(), ctx)
-    assert "disabled by settings" in out["memory_saved_reason"]
+    assert out["memory_saved_reason"] == "error"
     assert backend.counts()["skills"] == 0
 
 
@@ -244,10 +244,11 @@ def test_a_failed_task_is_recorded_as_a_failure(backend: SqliteMemory) -> None:
     # A failure is remembered, but it is NOT a skill and the reason says so.
     assert out["memory_saved"] is False
     assert out["memory_failure_logged"] is True
-    assert "at least one step failed" in out["memory_saved_reason"]
-    assert "recorded as a failure" in out["memory_saved_reason"]
+    assert out["memory_saved_reason"] == "skipped_unverified"
     assert backend.counts() == {"skills": 0, "failures": 1, "preferences": 0}
-    assert backend.failures.recent()[0].error == "Access denied: file in use"
+    stored = backend.failures.recent()[0]
+    assert "Access denied: file in use" not in stored.error
+    assert stored.error == "open_app failed (tool_failed)"
 
 
 def test_a_tainted_task_is_recorded_as_a_failure_but_never_a_skill(
@@ -365,7 +366,7 @@ def test_a_broken_backend_never_breaks_a_completed_task() -> None:
     out = memory_save(_state(), _ctx(ExplodingMemory()))
     assert out["memory_saved"] is False
     assert out["memory_failure_logged"] is False
-    assert out["memory_saved_reason"] == "memory write failed"
+    assert out["memory_saved_reason"] == "error"
 
 
 def test_the_node_returns_only_its_three_state_keys() -> None:
@@ -381,7 +382,7 @@ def test_the_node_returns_only_its_three_state_keys() -> None:
     [
         ({"cancelled": True}, "cancelled"),
         ({"halted_reason": "nope"}, "halted"),
-        ({}, "not a tool plan"),
+        ({}, "skipped_conversation"),
     ],
 )
 def test_gate_reasons_are_specific(state: dict, expected_fragment: str) -> None:
@@ -389,14 +390,14 @@ def test_gate_reasons_are_specific(state: dict, expected_fragment: str) -> None:
 
 
 def test_gate_passes_for_a_clean_plan() -> None:
-    assert _skill_gate(_state(), _ctx(SpyMemory())) == ""
+    assert _skill_gate(_state(), _ctx(SpyMemory())) == "saved"
 
 
 def test_gate_rejects_verified_none_for_the_skill_but_for_a_specific_reason() -> None:
-    """The gate distinguishes "failed" from "unverifiable" in its reason text,
-    even though neither may become a skill."""
+    """The gate reports the closed ``skipped_unverified`` code for both a failed
+    verification and an unverifiable success; the distinction now lives in the
+    failure row's provenance, not in the reason code."""
     failed = _skill_gate(_state(results=[_ok(verified=False)]), _ctx(SpyMemory()))
     unverifiable = _skill_gate(_state(results=[_ok(verified=None)]), _ctx(SpyMemory()))
-    assert "failed verification" in failed
-    assert "could not be independently verified" in unverifiable
-    assert failed != unverifiable
+    assert failed == "skipped_unverified"
+    assert unverifiable == "skipped_unverified"

@@ -1,6 +1,6 @@
 # JARVIS Handoff
 
-Last updated: 2026-10-23
+Last updated: 2026-10-26
 
 ## 1. Project summary
 
@@ -320,9 +320,10 @@ WhatsApp: send a message to mom saying running late (T032) - make_send_whatsapp_
 ## Backbone (docs/BACKBONE_PLAN.md)
 
 Implementation-only pass over the prompt -> LLM -> plan -> run -> answer
-backbone. **Every step below is UNTESTED**: no tests were written and pytest was
-not run (per the plan's rules: `ruff check` + `py_compile` + read-only scripts
-only). `act.py`, `policy_gate.py` and `tests/unit/test_browse_grant_wiring.py`
+backbone. **Every step below was UNTESTED at implementation time**: no tests were
+written and pytest was not run then (per the plan's rules: `ruff check` +
+`py_compile` + read-only scripts only); see "Test phase results" for the areas
+verified later. `act.py`, `policy_gate.py` and `tests/unit/test_browse_grant_wiring.py`
 were not touched by that pass; they were WIP then and are committed now in the
 browser hardening pass (B2, `9e88856`).
 
@@ -344,8 +345,9 @@ deadline; "sir" is only used when a `user_name` preference already exists.
 
 ### Memory pass (M0a-M7)
 
-All implementation-only and **UNTESTED** (ruff + py_compile + read-only scripts
-only; no tests written, pytest not run). `act.py`, `policy_gate.py` and
+All implementation-only and **UNTESTED at the time** (ruff + py_compile + read-only
+scripts only; no tests written, pytest not run then); see "Test phase results" for
+the save gate and graph files verified later. `act.py`, `policy_gate.py` and
 `tests/unit/test_browse_grant_wiring.py` were left untouched by that pass; they
 are committed now in the browser hardening pass (B2, `9e88856`).
 
@@ -365,10 +367,11 @@ Cross-host item: **RESOLVED-IN-CODE / UNTESTED** (B1-B3 below).
 
 ### Browser hardening pass (B1-B4)
 
-Implementation + design docs only, **UNTESTED**: no pytest run (the test phase is
-later); checks were `ruff check` on the changed files, `py_compile` with
-`.venv\Scripts\python.exe`, and read-only probe scripts with a `FakeLLM` (no
-network). `PolicyEngine`, `tiers`, Tier 3 blocking, the target-binding hash
+Implementation + design docs only, **UNTESTED at the time**: no pytest run then (the
+test phase was later); checks were `ruff check` on the changed files, `py_compile`
+with `.venv\Scripts\python.exe`, and read-only probe scripts with a `FakeLLM`
+(no network). See "Test phase results" for the browsing-grant wiring file verified
+later. `PolicyEngine`, `tiers`, Tier 3 blocking, the target-binding hash
 algorithm, `llm/models.py`, `free_only` and `strict_zero_cost` are untouched.
 
 | Step | Commit | Content | Status |
@@ -387,7 +390,8 @@ a bug: only a read is known not to move focus.
 
 ### Batch C (C1-C4)
 
-Implementation only, **UNTESTED** except the C1 smoke run (raw result below).
+Implementation only, **UNTESTED at the time** except the C1 smoke run (raw result below);
+see "Test phase results" for the files verified later.
 No pytest, no new test files; checks were `ruff check` on the changed files,
 `py_compile` with `.venv\Scripts\python.exe`, and read-only probe scripts with
 fakes (no LLM, no network, no browser). `PolicyEngine`, `tiers`, Tier 3, the
@@ -431,7 +435,8 @@ smoke: 3/3 passed
 
 ### Batch D (D1-D3)
 
-Implementation only, **UNTESTED** except the D2 smoke run (raw result below).
+Implementation only, **UNTESTED at the time** except the D2 smoke run (raw result below);
+see "Test phase results" for `test_domain_policy.py` verified later.
 No pytest, no new test files; checks were `ruff check` on the changed files,
 `py_compile` with `.venv\Scripts\python.exe`, the extended smoke script, and
 read-only probes (no LLM, no network, no browser). `PolicyEngine`, the tiers
@@ -556,11 +561,61 @@ that moved an LLM call into an executor would silently lose the hook (a
 - Screenshot and `show_file` tools: not written.
 - Wider system tools: not written.
 - `agent.prompt_trim_enabled` (tool-group prompt trimming, A3) is still **off** by default.
-- The test phase (golden-path S1-S10) per `docs/BACKBONE_PLAN.md` has not started; every
-  step from A1 to D2 is implementation-only and UNTESTED by pytest. Two
-  `test_domain_policy.py` cases must be updated first (see the D1 note).
+- The test phase has started: the files in "Test phase results" below were run; areas
+  without a passing file there remain UNTESTED.
 - `contacts.json` still does not exist on this machine: the WhatsApp paths refuse with
   "no contact matches ... Known contacts: (no contacts yet)" until the user adds contacts
   (`jarvis contacts add`).
 
-Next: the test phase (golden-path S1-S10) per `docs/BACKBONE_PLAN.md`.
+Next: continue the test phase for the areas still marked UNTESTED.
+
+## Test phase results (E3/F1/F2)
+
+One named file per run, 90 s limit, `-q -x -p no:cacheprovider`; no full suite, integration,
+windows_only, voice, camera, browser-fixture or live tests. Failures were classified before
+editing: every edit below was a stale test expectation or a stale test fixture, not a source
+change.
+
+| File | Result | Action |
+|---|---|---|
+| `tests/unit/test_domain_policy.py` | 61 passed | none |
+| `tests/unit/test_browse_grant.py` | 15 passed | none |
+| `tests/unit/test_browse_grant_wiring.py` | 10 passed | none |
+| `tests/unit/test_invariants.py` | 37 passed | none |
+| `tests/unit/test_specialist_loop_e2e.py` | 6 passed | none |
+| `tests/unit/test_agent_architecture.py` | 20 passed | none |
+| `tests/unit/test_brain.py` | not run - file not found | reported, not substituted (`test_brain_prompt.py` is the only brain test file) |
+| `tests/unit/test_memory_save_node.py` | 36 passed | stale reason/gate expectations updated (`4b07f4d`) |
+| `tests/unit/test_brain_prompt.py` | 14 passed | none |
+| `tests/unit/test_memory_graph.py` | 8 passed | stale `memory_saved_reason` expectation updated (`4b07f4d`) |
+| `tests/unit/test_agent.py` | 14 passed | none |
+| `tests/unit/test_cli.py` | 41 passed | none |
+| `tests/unit/test_skills_cli.py` | 17 passed | none |
+| `tests/unit/test_task_log.py` | 30 passed | none |
+| `tests/unit/test_answer.py` | 36 passed | none |
+| `tests/unit/test_completeness.py` | 7 passed | none |
+| `tests/unit/test_freeonly.py` | 35 passed | none |
+| `tests/unit/test_llm_rotation.py` | 8 passed | stale default-timeout expectation updated (`06ed825`) |
+| `tests/unit/test_gemini.py` | 11 passed | stale sleep fixture updated to `sleep_within_deadline` (`b20a2c1`) |
+| `tests/unit/test_daemon_server.py` | 30 passed | none |
+| `tests/unit/test_daemon_browser_wiring.py` | 16 passed | none |
+| `tests/unit/test_approval_words.py` | 3 passed | none |
+
+### Area status after this pass
+
+VERIFIED means at least one named file above passed and directly covers the area. Everything
+not listed here remains **UNTESTED**.
+
+| Area | Status | Evidence |
+|---|---|---|
+| Policy rules / fresh confirmation (D1) | VERIFIED | `test_domain_policy.py` |
+| Browsing grant and wiring (Phase 4, B1-B3) | VERIFIED | `test_browse_grant.py`, `test_browse_grant_wiring.py` |
+| Safety invariants | VERIFIED | `test_invariants.py` |
+| Specialist loop | VERIFIED | `test_specialist_loop_e2e.py` |
+| Agent architecture / backbone routing | VERIFIED | `test_agent_architecture.py`, `test_agent.py` |
+| Brain prompt | VERIFIED | `test_brain_prompt.py` (the named `test_brain.py` does not exist) |
+| Memory save gate and graph save path (M3) | VERIFIED | `test_memory_save_node.py`, `test_memory_graph.py` |
+| CLI, skills CLI, task log, answer, completeness, free-only | VERIFIED | `test_cli.py`, `test_skills_cli.py`, `test_task_log.py`, `test_answer.py`, `test_completeness.py`, `test_freeonly.py` |
+| LLM rotation, overall deadline, Gemini client | VERIFIED | `test_llm_rotation.py`, `test_gemini.py` |
+| Daemon server, daemon browser wiring, approval words | VERIFIED | `test_daemon_server.py`, `test_daemon_browser_wiring.py`, `test_approval_words.py` |
+| Memory retrieval/CLI, messaging resolver, live browser, voice, camera, OCR, benchmark, packaging | UNTESTED | not run in this pass |

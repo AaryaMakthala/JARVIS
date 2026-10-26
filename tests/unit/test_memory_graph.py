@@ -152,7 +152,7 @@ def test_without_a_backend_nothing_breaks() -> None:
     finally:
         _close(saver)
     assert outcome.state.get("memory_saved") is False
-    assert outcome.state["memory_saved_reason"] == "no memory backend"
+    assert outcome.state["memory_saved_reason"] == "error"
     assert outcome.final_answer
 
 

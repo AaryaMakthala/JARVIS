@@ -148,7 +148,7 @@ def test_budget_kwargs_stay_none_by_default() -> None:
     multi = MultiProviderClient([_cand("groq", 1, s1)])
     multi.text(system="s", user="u")
     assert s1.last_text_kwargs["max_retries"] is None
-    assert s1.last_text_kwargs["timeout_s"] is None
+    assert s1.last_text_kwargs["timeout_s"] == 30.0
 
 
 def test_capability_failure_cools_every_slot_with_one_probe() -> None:

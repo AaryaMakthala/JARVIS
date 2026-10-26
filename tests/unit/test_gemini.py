@@ -239,7 +239,7 @@ def test_text_still_works() -> None:
 def _no_real_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     import jarvis.llm.gemini as gemini_module
 
-    monkeypatch.setattr(gemini_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gemini_module, "sleep_within_deadline", lambda *a, **k: None)
 
 
 def test_default_retries_a_transient_500_once() -> None:
