@@ -1317,13 +1317,18 @@ class BrowserFinalClickArgs(BaseModel):
     expect: str = Field(default="", max_length=120, description="One line describing the effect.")
 
 
-def _resolve_browser_element(session: Any, ref: str) -> Any | None:
+def _observe_element_for_readback(session: Any, ref: str) -> Any | None:
     """Read-only re-resolution of one transient ref (a failed read is ``None``).
 
     The single place the guarded final-click path asks the session for an
     element, so the gate's observation and the tool's immediate pre-click
     re-observation can never diverge in *how* they look the element up.  It
     resolves, never clicks/types/navigates.
+
+    Deliberately *not* named ``_resolve_browser_element``: that name is the
+    ``spec.resolve`` hook of ``browser_click``/``browser_type`` (called as
+    ``resolve(args, ctx)``), and a second module-level definition would shadow
+    it for every spec-maker in this module.
     """
     if session is None or not ref:
         return None
@@ -1354,7 +1359,7 @@ def _resolve_browser_final_click(args: BaseModel, ctx: ToolContext) -> ResolvedT
     ref = str(getattr(args, "ref", "") or "")
     action = str(getattr(args, "action", "") or "")
     session = _require_session(ctx)
-    element = _resolve_browser_element(session, ref)
+    element = _observe_element_for_readback(session, ref)
     if element is None:
         return None
     _max_total, spending_cap, currency, _ttl, _voice = _final_click_limits(ctx)
@@ -1406,7 +1411,7 @@ def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> T
     # check below runs against this observation - never against the plan, the
     # confirmation text or the model's own words.  The model's ``expect`` is
     # carried only as an explicitly unverified proposal.
-    element = _resolve_browser_element(session, args.ref)
+    element = _observe_element_for_readback(session, args.ref)
     if element is None:
         return ToolResult(ok=False, error="refusing to click: no reliable target element")
     observation = build_observed_readback(

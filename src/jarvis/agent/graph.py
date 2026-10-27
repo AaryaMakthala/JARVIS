@@ -228,13 +228,13 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
         g.add_conditional_edges(
             "verify",
             route_after_verify,
-            {"act": "act", "replan": "replan", "policy_gate": "policy_gate", "respond": "compose", "specialist_observe": "specialist_observe"},
+            {"act": "act", "replan": "replan", "policy_gate": "prepare_readback", "respond": "compose", "specialist_observe": "specialist_observe"},
         )
     else:
         g.add_conditional_edges(
             "verify",
             route_after_verify,
-            {"act": "act", "replan": "replan", "policy_gate": "policy_gate", "respond": "compose"},
+            {"act": "act", "replan": "replan", "policy_gate": "prepare_readback", "respond": "compose"},
         )
     g.add_conditional_edges(
         "replan", route_after_replan, {"validate": "validate", "respond": "compose"}

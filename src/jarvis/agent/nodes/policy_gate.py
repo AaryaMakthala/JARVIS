@@ -807,12 +807,18 @@ def _approve_single_step(
                 "decisions": decisions,
                 "gated_resolved_paths": gated,
                 "gated_content_hashes": content_hashes,
+                # Phase 5C: a non-approval never leaves a pending readback behind,
+                # so a timeout can never be replayed into a later interrupt.
+                "pending_readback": None,
                 "halted_reason": "Confirmation timed out. I did not perform the action.",
             }
         return {
             "decisions": decisions,
             "gated_resolved_paths": gated,
             "gated_content_hashes": content_hashes,
+            # Phase 5C: decline/cancel clears the pending observation and writes
+            # no readback binding.
+            "pending_readback": None,
             "halted_reason": refusal_sentence(answer),
         }
     if not _typed_confirmation_ok(answer, decision):
@@ -820,6 +826,7 @@ def _approve_single_step(
             "decisions": decisions,
             "gated_resolved_paths": gated,
             "gated_content_hashes": content_hashes,
+            "pending_readback": None,
             "halted_reason": "Refused: the typed folder-name confirmation did not match the plan.",
         }
     # Stage 3 opt-in: a voice-approved Tier 2 step may satisfy *this* step's
@@ -834,6 +841,7 @@ def _approve_single_step(
             "decisions": decisions,
             "gated_resolved_paths": gated,
             "gated_content_hashes": content_hashes,
+            "pending_readback": None,
             "halted_reason": "Refused: Tier 2 action needs an unlocked JARVIS session.",
         }
 

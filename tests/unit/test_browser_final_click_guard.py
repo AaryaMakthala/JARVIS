@@ -16,7 +16,9 @@ second call to the same function with the same state dict.
 
 from __future__ import annotations
 
+import ast
 from importlib import import_module
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -710,6 +712,29 @@ def test_decline_cancel_timeout_and_mismatch_create_no_binding(monkeypatch, answ
     assert session.untouched is True
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"approved": False, "action_hash": "to-be-filled"},  # decline
+        {},  # cancel / no approval at all
+        {"timed_out": True},  # timeout
+    ],
+)
+def test_non_approval_clears_the_pending_readback(monkeypatch, answer: dict) -> None:
+    """Decline, cancel and timeout must clear -- and never bind -- the readback."""
+    session = FakeSession({_REF: _element("Post")})
+    ctx = _ctx(session)
+    step = _step()
+    state = _prepared(_state(step), ctx)
+    if answer.get("action_hash") == "to-be-filled":
+        answer = {**answer, "action_hash": state[PENDING_READBACK_KEY]["action_hash"]}
+    updates = _resume(state, ctx, monkeypatch, answer)
+    assert updates.get("halted_reason")
+    assert "pending_readback" in updates and updates["pending_readback"] is None
+    assert not (updates.get("gated_browser_readback_hashes") or {})
+    assert session.untouched is True
+
+
 def test_prepare_readback_resets_for_steps_that_are_not_a_final_click() -> None:
     session = FakeSession()
     ctx = _ctx(session)
@@ -1035,3 +1060,102 @@ def test_voice_approval_is_still_disabled_and_never_implied() -> None:
     settings = _settings()
     assert settings.voice.allow_consequential_voice_approval is False
     assert "browser_final_click" not in BROWSE_TOOLS
+
+
+# ── F. the two regressions this slice fixes, pinned in source ──────────────
+
+_SRC = Path(__file__).resolve().parents[2] / "src" / "jarvis"
+
+
+def _top_level_defs(path: Path) -> list[str]:
+    """Names of every module-level function defined in *path* (AST, no import)."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return [
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+
+def test_tools_module_defines_exactly_one_resolve_browser_element() -> None:
+    """The click/type resolve hook must not be shadowed by a second helper.
+
+    A duplicate module-level definition silently wins for every later
+    ``resolve=`` binding in the module, so ``browser_click``/``browser_type``
+    would be handed a helper with a different signature and refuse every step.
+    """
+    names = _top_level_defs(_SRC / "browser" / "tools.py")
+    assert names.count("_resolve_browser_element") == 1
+    assert names.count("_observe_element_for_readback") == 1
+
+
+def test_click_and_type_resolve_hooks_accept_args_and_ctx() -> None:
+    """Both hooks must be callable exactly as ``resolve(args, ctx)``."""
+    from jarvis.browser.tools import make_browser_click_spec, make_browser_type_spec
+
+    session = FakeSession({_REF: _element("Post")})
+    ctx = _ctx(session)
+    tool_ctx = ctx.tool_context()
+    cases = (
+        (make_browser_click_spec(), {"ref": _REF}),
+        (make_browser_type_spec(), {"ref": _REF, "text": "hello"}),
+    )
+    for spec, raw in cases:
+        assert spec.resolve is not None
+        assert spec.resolve.__name__ == "_resolve_browser_element"
+        args = spec.args_model.model_validate(raw)
+        target = spec.resolve(args, tool_ctx)  # must not raise
+        assert target is not None, spec.name
+        assert target.origin == _ORIGIN
+        assert target.name == "Post"
+    assert session.untouched is True
+
+
+def _declared_edges() -> list[tuple[str, str]]:
+    """Every ``(source, target)`` pair declared in ``agent/graph.py`` via AST."""
+    tree = ast.parse((_SRC / "agent" / "graph.py").read_text(encoding="utf-8"))
+    pairs: list[tuple[str, str]] = []
+
+    def _const(node: ast.AST) -> str:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return str(node.value)
+        return ""
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        name = node.func.attr
+        if name == "add_edge" and len(node.args) == 2:
+            source, target = _const(node.args[0]), _const(node.args[1])
+            if source and target:
+                pairs.append((source, target))
+        elif name == "add_conditional_edges" and len(node.args) >= 3:
+            source = _const(node.args[0])
+            mapping = node.args[2]
+            if source and isinstance(mapping, ast.Dict):
+                for value in mapping.values:
+                    target = _const(value)
+                    if target:
+                        pairs.append((source, target))
+    return pairs
+
+
+def test_only_prepare_readback_edges_into_policy_gate() -> None:
+    """Every declared edge into ``policy_gate`` comes from ``prepare_readback``.
+
+    Otherwise a step could be gated without the live readback being re-observed
+    and persisted first, which is what makes the confirmation bound to what the
+    user was actually shown.
+    """
+    pairs = _declared_edges()
+    assert ("prepare_readback", "policy_gate") in pairs
+    into_policy_gate = {source for source, target in pairs if target == "policy_gate"}
+    assert into_policy_gate == {"prepare_readback"}
+
+
+def test_every_gate_router_key_still_targets_prepare_readback() -> None:
+    """The routers that send a step to the gate must land on the pre-node."""
+    pairs = _declared_edges()
+    gate_sources = {source for source, target in pairs if target == "prepare_readback"}
+    # validate (both variants) and verify (both variants) route to the gate.
+    assert gate_sources == {"validate", "verify"}
