@@ -36,6 +36,7 @@ from jarvis.agent.nodes.intake import intake
 from jarvis.agent.nodes.memory_retrieve import memory_retrieve
 from jarvis.agent.nodes.memory_save import memory_save
 from jarvis.agent.nodes.policy_gate import policy_gate
+from jarvis.agent.nodes.prepare_readback import prepare_readback
 from jarvis.agent.nodes.replan import replan
 from jarvis.agent.nodes.respond import respond
 from jarvis.agent.nodes.telemetry import trace_node
@@ -55,6 +56,7 @@ __all__ = [
     "memory_retrieve",
     "memory_save",
     "policy_gate",
+    "prepare_readback",
     "replan",
     "respond",
     "route_after_act",

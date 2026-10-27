@@ -162,6 +162,14 @@ class AgentState(TypedDict, total=False):
     gated_content_hashes: dict[str, list[str]]
     # Phase 5C: bound readback digests for browser_final_click
     gated_browser_readback_hashes: dict[str, str]
+    # Phase 5C: the live observation the current confirmation is bound to,
+    # written by the ``prepare_readback`` node (which completes BEFORE the
+    # node that interrupts) so it survives the interrupt/resume round trip.
+    # Plain JSON only - strings, numbers, booleans and nested dicts - so the
+    # checkpoint serializer's allowlist is unchanged and no new first-party
+    # type is revived.  Consumed (set back to ``None``) the moment the
+    # approval is bound, so it is one-time by construction.
+    pending_readback: dict[str, Any] | None
     halted_reason: str | None
     retry_now: bool | None
     # operational (Phase 7: classification, replanning)

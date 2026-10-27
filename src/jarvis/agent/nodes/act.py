@@ -54,6 +54,7 @@ from jarvis.agent.nodes.util import (
 from jarvis.agent.precheck import step_precheck_error
 from jarvis.agent.session_context import SESSION_THREAD
 from jarvis.agent.state import StepResult
+from jarvis.browser.final_click import FINAL_CLICK_TOOL, is_hex64
 from jarvis.policy.paths import ContentHashError, content_hash
 
 logger = logging.getLogger(__name__)
@@ -400,14 +401,24 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         # refuses when it no longer holds, so the element that is acted on is
         # the element that was confirmed (Stage 8.6).
         tool_ctx.approved_target_identity = str(resolved.target.ref or "")
-    # Phase 5C: propagate bound readback hash for consequential browser actions
-    try:
-        gated_rb = state.get("gated_browser_readback_hashes") or {}
-        rb_hash = gated_rb.get(step.id)
-        if rb_hash:
-            tool_ctx.approved_final_click_readback_hash = str(rb_hash)
-    except Exception:
-        pass
+    # Phase 5C: a consequential browser click must present the trusted readback
+    # digest the gate minted for *this* step and action.  It is read from
+    # ``gated_browser_readback_hashes``, which only the gate ever writes, only
+    # after every approval check has passed, and only with the digest of the
+    # *observed* readback (never the value the client echoed back).  A missing,
+    # malformed or unassociated binding is refused here, before the tool is
+    # dispatched; the tool then re-observes the real target and compares
+    # digests again immediately before it clicks.
+    if str(getattr(spec, "name", "") or "") == FINAL_CLICK_TOOL and not ctx.dry_run:
+        bound_readback = (state.get("gated_browser_readback_hashes") or {}).get(step.id)
+        if not is_hex64(bound_readback):
+            return _refuse(
+                state,
+                step.id,
+                "readback binding is missing or malformed",
+                "Refused: I could not match your approval to the observed action — not clicking.",
+            )
+        tool_ctx.approved_final_click_readback_hash = str(bound_readback)
     start = time.perf_counter()
     result = spec.execute(args, tool_ctx)
     elapsed_ms = int((time.perf_counter() - start) * 1000)

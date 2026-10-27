@@ -177,6 +177,9 @@ class ConfirmRequest(BaseModel):
     readback_summary: str = ""
     readback_details: dict[str, Any] = Field(default_factory=dict)
     readback_hash: str = ""
+    #: The model's own words about the action, shown to the user under an
+    #: explicit "proposed, unverified" label.  Never part of the digest.
+    readback_proposed: str = ""
 
 
 class ClarificationRequest(BaseModel):

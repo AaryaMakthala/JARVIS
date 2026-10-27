@@ -1247,6 +1247,15 @@ def resolve_interrupts(outcome: Any, ctx: AppContext, saver: SqliteSaver) -> Any
                 )
             )
         )
+        if req.get("readback_required") and req.get("readback_summary"):
+            # The observed readback the approval will be bound to, rendered
+            # before the question and exactly as the gate persisted it.
+            console.print("[bold]Readback (observed):[/bold]")
+            console.print(str(req.get("readback_summary") or ""))
+            proposed = str(req.get("readback_proposed") or "")
+            if proposed:
+                console.print(f"[dim]{proposed}[/dim]")
+            console.print("")
         console.print(req.get("summary") or "(no summary)")
         if req.get("untrusted"):
             console.print(
@@ -1417,25 +1426,13 @@ def _handle_confirm_request(client: Any, msg: Any) -> None:
 
     console.print("".join(("[yellow]approval needed[/yellow] (", _tiers.tier_label(msg.tier), ")")))
     if getattr(msg, "readback_required", False) and getattr(msg, "readback_summary", ""):
+        # The observed readback, rendered exactly once and exactly as the gate
+        # persisted it (the summary is built from the observed fields only).
         console.print("[bold]Readback (observed):[/bold]")
         console.print(str(getattr(msg, "readback_summary") or ""))
-        details = getattr(msg, "readback_details", None) or {}
-        if isinstance(details, dict):
-            try:
-                if details.get("recipient"):
-                    console.print(f"  - Recipient: {details.get('recipient')}")
-                if details.get("message"):
-                    console.print(f"  - Message: {details.get('message')}")
-                if details.get("destination"):
-                    console.print(f"  - Destination: {details.get('destination')}")
-                if details.get("item") or details.get("service"):
-                    console.print(f"  - Item: {details.get('item') or details.get('service')}")
-                if details.get("amount") is not None or details.get("price") is not None:
-                    amt = details.get("amount") if details.get("amount") is not None else details.get("price")
-                    cur = details.get("currency") or ""
-                    console.print(f"  - Amount: {amt} {cur}".strip())
-            except Exception:
-                pass
+        proposed = str(getattr(msg, "readback_proposed", "") or "")
+        if proposed:
+            console.print(f"[dim]{proposed}[/dim]")
         console.print("")
     console.print(msg.summary or "(no summary)")
     if msg.untrusted:

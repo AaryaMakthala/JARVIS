@@ -971,6 +971,7 @@ class DaemonServer:
                     readback_summary=str(payload.get("readback_summary") or ""),
                     readback_details=dict(payload.get("readback_details") or {}),
                     readback_hash=str(payload.get("readback_hash") or ""),
+                    readback_proposed=str(payload.get("readback_proposed") or ""),
                 )
             await owner.send(req)
             slot.confirm_sent_at = time.time()

@@ -1317,39 +1317,62 @@ class BrowserFinalClickArgs(BaseModel):
     expect: str = Field(default="", max_length=120, description="One line describing the effect.")
 
 
-def _resolve_browser_final_click(args: BaseModel, ctx: ToolContext) -> ResolvedTarget | None:
-    ref = getattr(args, "ref", "")
-    session = _require_session(ctx)
+def _resolve_browser_element(session: Any, ref: str) -> Any | None:
+    """Read-only re-resolution of one transient ref (a failed read is ``None``).
+
+    The single place the guarded final-click path asks the session for an
+    element, so the gate's observation and the tool's immediate pre-click
+    re-observation can never diverge in *how* they look the element up.  It
+    resolves, never clicks/types/navigates.
+    """
     if session is None or not ref:
         return None
     try:
-        element = session.resolve(str(ref))
-    except Exception:
+        return session.resolve(str(ref))
+    except Exception:  # noqa: BLE001 - a failed observation is a refusal, not a guess
         return None
+
+
+def _final_click_limits(ctx: ToolContext) -> tuple[int, float | None, str, float, bool]:
+    """``(max_total, spending_cap, currency, binding_ttl_s, voice_opt_in)``."""
+    from jarvis.browser.final_click import final_click_limits
+
+    return final_click_limits(getattr(ctx, "settings", None))
+
+
+def _resolve_browser_final_click(args: BaseModel, ctx: ToolContext) -> ResolvedTarget | None:
+    """Resolve the real target read-only, so the gate can observe it pre-approval.
+
+    Returns ``None`` (never a fabricated target) when the element cannot be
+    resolved, when the declared action is not an allowed one, when the control
+    is a password or payment/purchase control, or when the configured spending
+    cap cannot be checked against an observed amount and currency.
+    """
+    from jarvis.browser.final_click import build_observed_readback
+    from jarvis.browser.find import match_identity
+
+    ref = str(getattr(args, "ref", "") or "")
+    action = str(getattr(args, "action", "") or "")
+    session = _require_session(ctx)
+    element = _resolve_browser_element(session, ref)
     if element is None:
         return None
-    # Classify payment first - if payment-like, treat as unresolvable for safe path
-    from jarvis.browser.final_click import (
-        classify_label_for_payment,
-        label_matches_allowed_action,
-        readback_details_for_element,
-        validate_readback_details,
+    _max_total, spending_cap, currency, _ttl, _voice = _final_click_limits(ctx)
+    observation = build_observed_readback(
+        element, action, spending_cap=spending_cap, spending_currency=currency
     )
-
-    action = getattr(args, "action", "")
-    details = readback_details_for_element(element, action)
-    ok, _reason = validate_readback_details(details, action)
-    if not ok:
+    if not observation.ok:
         return None
-    if classify_label_for_payment(getattr(element, "name", "")) == "payment":
+    try:
+        identity = match_identity(str(element.role), str(element.name), 1)
+    except Exception:  # noqa: BLE001 - an unidentifiable target is refused upstream
         return None
-    if element.is_password:
-        return None
-    # Build enriched target with details in data context is not directly possible;
-    # return ResolvedTarget as before
     return ResolvedTarget(
         kind="browser",
-        ref=element.ref,
+        # The *stable* identity (role|name|position), exactly as the other
+        # composite browser tools bind it - never the transient ``e1..eN``
+        # handle, which changes on every observation.
+        ref=identity,
         name=element.name,
         role=element.role,
         origin=element.origin,
@@ -1360,13 +1383,12 @@ def _resolve_browser_final_click(args: BaseModel, ctx: ToolContext) -> ResolvedT
 
 def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> ToolResult:
     from jarvis.browser.final_click import (
-        ALLOWED_ACTIONS,
         FinalClickJournalRow,
-        classify_label_for_payment,
+        build_observed_readback,
+        digests_equal,
         get_journal,
-        label_matches_allowed_action,
-        readback_details_for_element,
-        validate_readback_details,
+        is_hex64,
+        readback_digest,
         sha256_hex,
         _now_iso,
     )
@@ -1376,55 +1398,26 @@ def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> T
     if session is None:
         return ToolResult(ok=False, error="the managed browser is not available in this context")
 
-    # Re-read element (immediate pre-click re-resolution)
-    element = None
-    try:
-        element = session.resolve(args.ref)
-    except Exception:
-        element = None
+    max_total, spending_cap, spending_currency, _ttl, _voice = _final_click_limits(ctx)
+
+    # Immediate pre-click re-observation.  The element, its origin, its password
+    # status, its payment marker and (when a spending limit is configured) the
+    # amount and currency are all re-read from the live page *here*, and every
+    # check below runs against this observation - never against the plan, the
+    # confirmation text or the model's own words.  The model's ``expect`` is
+    # carried only as an explicitly unverified proposal.
+    element = _resolve_browser_element(session, args.ref)
     if element is None:
         return ToolResult(ok=False, error="refusing to click: no reliable target element")
-
-    details = readback_details_for_element(element, args.action)
-    ok_rd, rd_reason = validate_readback_details(details, args.action)
-    if not ok_rd:
-        return ToolResult(ok=False, error=f"refused: {rd_reason}")
-    # For consequential actions requiring material details, ensure we have concrete info
-    try:
-        actn = str(args.action or "")
-        if actn in ("send", "post", "submit", "publish", "book", "subscribe"):
-            # If no concrete material detail observable, fail closed
-            if not (details.get("recipient") or details.get("element_name") or details.get("destination") or details.get("amount")):
-                return ToolResult(ok=False, error="missing or ambiguous material action details")
-    except Exception:
-        pass
-
-    # Payment/purchase is blocked as Tier 3 regardless
-    if classify_label_for_payment(getattr(element, "name", "")) == "payment":
-        return ToolResult(ok=False, error="payment/purchase control is blocked")
-    if element.is_password:
-        return ToolResult(ok=False, error="refusing to interact with a password field")
-
-    if args.action not in ALLOWED_ACTIONS:
-        return ToolResult(ok=False, error="action not allowed")
-
-    if not label_matches_allowed_action(getattr(element, "name", ""), args.action):
-        return ToolResult(ok=False, error="declared action does not match the page control")
-
-    # Config checks
-    settings = getattr(ctx, "settings", None)
-    browser_cfg = getattr(settings, "browser", None) if settings is not None else None
-    max_total = 0
-    voice_opt_in = False
-    binding_ttl_s = 180
-    spending_cap = None
-    spending_currency = "USD"
-    if browser_cfg is not None:
-        max_total = int(getattr(browser_cfg, "final_click_max_total", 0) or 0)
-        voice_opt_in = bool(getattr(browser_cfg, "final_click_voice_approval", False))
-        binding_ttl_s = float(getattr(browser_cfg, "final_click_binding_ttl_s", 180) or 180)
-        spending_cap = getattr(browser_cfg, "final_click_spending_cap", None)
-        spending_currency = str(getattr(browser_cfg, "final_click_spending_currency", "USD") or "USD")
+    observation = build_observed_readback(
+        element,
+        args.action,
+        proposed={"expect": args.expect},
+        spending_cap=spending_cap,
+        spending_currency=spending_currency,
+    )
+    if not observation.ok:
+        return ToolResult(ok=False, error=f"refused: {observation.reason}")
 
     journal = get_journal()
     # If max_total == 0 -> disabled, refuse every call (fail closed)
@@ -1461,40 +1454,22 @@ def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> T
     if approved_ident and approved_ident != fingerprint:
         return ToolResult(ok=False, error="the target changed after you confirmed it; nothing was done")
 
-    # Also bind to readback details hash to invalidate on material change
-    readback_hash = sha256_hex(str(details))
+    # Readback binding.  ``approved_final_click_readback_hash`` is minted by the
+    # policy gate from the readback the *user* approved, and is verified by
+    # recomputing the digest of this fresh observation with the same canonical
+    # helper.  Fail closed: a missing, malformed or stale digest refuses, and
+    # neither ``confirmed=True`` nor an arbitrary non-empty string is ever
+    # authorization on its own.
     approved_readback_hash = str(getattr(ctx, "approved_final_click_readback_hash", "") or "")
-    if not approved_readback_hash:
-        return ToolResult(ok=False, error="missing approved readback binding for this consequential action")
-    if approved_readback_hash != readback_hash:
-        return ToolResult(ok=False, error="the action details changed after you confirmed them; nothing was done")
-
-    # Spending cap: fail closed on ambiguity/unavailable
-    if spending_cap is not None:
-        import re
-
-        text = str(getattr(element, "name", "") or "") + " " + str(details.get("element_name") or "")
-        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
-        if not m:
-            return ToolResult(ok=False, error="missing or ambiguous spending amount/currency")
-        try:
-            amt = float(m.group(1))
-        except Exception:
-            return ToolResult(ok=False, error="invalid or ambiguous spending amount/currency")
-        # Check currency if present
-        cur_match = re.search(r"\b(USD|EUR|GBP|INR|JPY|AUD|CAD)\b", text, re.IGNORECASE)
-        if cur_match:
-            cur = cur_match.group(1).upper()
-            if cur != str(spending_currency or "USD").upper():
-                return ToolResult(ok=False, error="currency mismatch with configured spending currency")
-        else:
-            # If currency not observable but cap configured, be conservative
-            return ToolResult(ok=False, error="missing or ambiguous spending amount/currency")
-        try:
-            if amt > float(spending_cap):
-                return ToolResult(ok=False, error="amount above configured spending cap")
-        except Exception:
-            return ToolResult(ok=False, error="invalid or ambiguous spending amount/currency")
+    if not is_hex64(approved_readback_hash):
+        return ToolResult(
+            ok=False, error="missing approved readback binding for this consequential action"
+        )
+    if not digests_equal(approved_readback_hash, readback_digest(observation.details or {})):
+        return ToolResult(
+            ok=False,
+            error="the action details changed after you confirmed them; nothing was done",
+        )
 
     # Host/origin binding
     host = getattr(element, "origin", "") or ""

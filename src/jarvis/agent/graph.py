@@ -10,12 +10,12 @@ Topology (docs/02_ARCHITECTURE.md sec. 4):
               respond                    validate                   clarify        specialist_decide
                                              |  ^        (answer)        |                |
                                              v  +- replan<-...           +----> brain     (act)->validate
-                       policy_gate <--------+      (validate rejected)                |
+                  prepare_readback <- - - - +      (validate rejected)                |
                                                                                       observe<-verify
                                                                                          |
                                                                                       act/decide
 
-                       policy_gate -> act -> verify -> policy_gate (next step) | respond
+                       prepare_readback -> policy_gate -> act -> verify -> ... | respond
 
                        compose -> respond -> memory_save -> END
 
@@ -25,7 +25,10 @@ answer and the screen answer and then hands over to ``respond`` (the single
 sanitizer and task-log writer).  With ``compose.enabled = false`` compose writes
 nothing and ``respond`` produces exactly its old text.
 
-Confirmations suspend inside ``policy_gate`` via ``interrupt`` and
+Every entry into ``policy_gate`` passes through ``prepare_readback`` first: it
+observes the real target, read-only, and persists the readback a consequential
+browser click is confirmed against (Phase 5C).  Confirmations suspend inside
+``policy_gate`` via ``interrupt`` and
 clarifications suspend inside ``clarify``; resume re-enters that node
 deterministically.  ``brain`` is the only LLM classification step and projects
 its transient :class:`BrainDecision` onto the checkpointed Plan/Step shape
@@ -54,6 +57,7 @@ from jarvis.agent.nodes import (
     memory_retrieve,
     memory_save,
     policy_gate,
+    prepare_readback,
     replan,
     respond,
     route_after_act,
@@ -140,6 +144,12 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
     g.add_node("brain", wrap(brain, ctx, cancel))
     g.add_node("clarify", wrap(clarify, ctx, cancel))
     g.add_node("validate", wrap(validate, ctx, cancel))
+    # Phase 5C: observe the real target ONE HOP BEFORE the node that interrupts.
+    # An interrupted node re-runs from the top on resume and loses anything it
+    # wrote first, so the readback has to be persisted by a node that already
+    # completed - otherwise the resume value could be matched against a
+    # re-observation of a target that changed while the user was reading.
+    g.add_node("prepare_readback", wrap(prepare_readback, ctx, cancel))
     g.add_node("policy_gate", wrap(policy_gate, ctx, cancel))
     g.add_node("act", wrap(act, ctx, cancel))
     g.add_node("verify", wrap(verify, ctx, cancel))
@@ -180,6 +190,7 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
     g.add_conditional_edges(
         "clarify", route_after_clarify, {"brain": "brain", "respond": "compose"}
     )
+    g.add_edge("prepare_readback", "policy_gate")
 
     if use_sp is not None and getattr(use_sp, "use_specialists", False):
         g.add_conditional_edges(
@@ -188,7 +199,7 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
             {
                 "brain": "brain",
                 "replan": "replan",
-                "policy_gate": "policy_gate",
+                "policy_gate": "prepare_readback",
                 "respond": "compose",
                 "specialist_decide": "specialist_decide",
             },
@@ -205,7 +216,7 @@ def build_graph(ctx: AppContext, checkpointer: Any = None, cancel: Any = None) -
             {
                 "brain": "brain",
                 "replan": "replan",
-                "policy_gate": "policy_gate",
+                "policy_gate": "prepare_readback",
                 "respond": "compose",
             },
         )

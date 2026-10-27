@@ -58,6 +58,11 @@ from jarvis.agent.precheck import (
 )
 from jarvis.agent.schemas import ConfirmationRequest
 from jarvis.agent.state import Decision
+from jarvis.browser.final_click import (
+    FINAL_CLICK_TOOL,
+    digests_equal,
+    is_hex64,
+)
 from jarvis.policy import rules, tiers
 from jarvis.policy.browse_grant import BROWSE_TOOLS, BrowseGrantError
 from jarvis.policy.paths import ContentHashError, content_hash
@@ -186,6 +191,15 @@ def policy_gate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         approved_hashes=already_approved,
         blocked_steps=blocked,
     )
+    # Phase 5C: a consequential browser click is only ever confirmed against the
+    # live readback ``prepare_readback`` persisted one hop earlier.  A missing,
+    # stale or unobservable readback is refused *before* the user is asked (fail
+    # closed), and the step is never described from the plan's own words.
+    pending, readback_refusal, readback_halting = _pending_readback_for(state, step, decision)
+    if pending is None and readback_refusal:
+        return _readback_refusal_result(state, step, decisions, readback_refusal, readback_halting)
+    if pending is not None:
+        payload = _attach_readback(payload, pending)
     answer = interrupt(payload)  # graph pauses; checkpoint saved; no side effects above
 
     if _is_plan_approval_payload(payload):
@@ -548,7 +562,13 @@ def _scope_confirm(
 
     # A risky control (or unlock / typed confirmation) still needs its own fresh
     # action confirmation, independent of the domain approval (owner §3).
-    action_answer = interrupt(_fresh_confirm_payload(decision, step))  # index 1
+    pending, readback_refusal, readback_halting = _pending_readback_for(state, step, decision)
+    if pending is None and readback_refusal:
+        return _readback_refusal_result(state, step, decisions, readback_refusal, readback_halting)
+    fresh_payload = _fresh_confirm_payload(decision, step)
+    if pending is not None:
+        fresh_payload = _attach_readback(fresh_payload, pending)
+    action_answer = interrupt(fresh_payload)  # index 1
     grant = _issue_scope_grant(ctx, task_id, plan_hash_v, resolved.host)
     if grant is None:
         return {
@@ -836,12 +856,43 @@ def _approve_single_step(
             }
         content_hashes[str(step.id)] = list(hashes or [])
 
+    # Phase 5C: the readback binding is minted only now, after *every* approval
+    # check has passed, and only for this exact step/action.  What is recorded is
+    # the TRUSTED expected digest from the persisted observation - never the
+    # value the client echoed back - and the pending observation is consumed
+    # (one-time) in the same update.  A declined, cancelled, timed-out, locked or
+    # readback-mismatched answer reaches none of this and leaves no binding.
+    readbacks = dict(state.get("gated_browser_readback_hashes") or {})
+    pending, readback_refusal, _halting = _pending_readback_for(state, step, decision)
+    if pending is None and readback_refusal:
+        return {
+            "decisions": decisions,
+            "gated_resolved_paths": gated,
+            "gated_content_hashes": content_hashes,
+            "gated_browser_readback_hashes": readbacks,
+            "halted_reason": readback_refusal,
+        }
+    if pending is not None:
+        acknowledged = answer.get(READBACK_ACK_KEY) if isinstance(answer, dict) else None
+        if not digests_equal(acknowledged, pending.get("digest")):
+            return {
+                "decisions": decisions,
+                "gated_resolved_paths": gated,
+                "gated_content_hashes": content_hashes,
+                "gated_browser_readback_hashes": readbacks,
+                "pending_readback": None,
+                "halted_reason": _READBACK_MISMATCH,
+            }
+        readbacks[str(step.id)] = str(pending.get("digest") or "")
+
     _record_binding_for(ctx, state, step, decision, target, scope_cid)
     approved_hashes = list(state.get("approved_hashes") or []) + [str(decision.action_hash)]
     return {
         "decisions": decisions,
         "gated_resolved_paths": gated,
         "gated_content_hashes": content_hashes,
+        "gated_browser_readback_hashes": readbacks,
+        "pending_readback": None,
         "approved_hashes": approved_hashes,
     }
 
@@ -912,14 +963,22 @@ def _voice_tier2_ok(
     return ok
 
 
-def confirmation_payload(decision: Decision, untrusted: bool) -> dict[str, Any]:
+def confirmation_payload(
+    decision: Decision,
+    untrusted: bool,
+    pending_readback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """The interrupt payload the daemon/CLI forwards to the user.
 
     Retained for tests and for callers that build a single-step payload
     directly.  The gate node itself now uses ``decide_and_build_payload``
     (batch-aware) so a two-step Tier 1 plan raises one interrupt.
+
+    ``pending_readback`` (optional) is the persisted live observation; passing it
+    adds the observed readback and its digest, which is what an in-process
+    caller must render before it asks the user to approve a consequential click.
     """
-    payload = ConfirmationRequest(
+    request = ConfirmationRequest(
         step_id=decision.step_id,
         tier=decision.tier,
         summary=decision.summary,
@@ -929,7 +988,10 @@ def confirmation_payload(decision: Decision, untrusted: bool) -> dict[str, Any]:
         action_hash=decision.action_hash,
         untrusted=bool(untrusted),
     )
-    return payload.model_dump(mode="json")
+    payload: dict[str, Any] = request.model_dump(mode="json")
+    if isinstance(pending_readback, dict) and pending_readback:
+        _attach_readback(payload, pending_readback)
+    return payload
 
 
 def _is_plan_approval_payload(payload: Any) -> bool:
@@ -965,67 +1027,105 @@ def refusal_text(decision: Decision, step_id: str) -> str:
     return f"Refused: {decision.summary} [step {step_id}] ({reason})"
 
 
-# Phase 5C: enhance confirmation payload with readback for browser_final_click
-from jarvis.browser.final_click import (
-    readback_details_for_element,
-    format_readback_summary,
-    validate_readback_details,
-    sha256_hex,
+
+# ── Phase 5C: the live readback a consequential click is bound to ──────────
+#
+# ``prepare_readback`` (one hop earlier in the graph) observes the real target
+# and persists it as ``state["pending_readback"]``.  This module never
+# re-observes: the readback the user was shown must stay the readback their
+# approval is checked against, even though an interrupted node re-runs from the
+# top on resume.  The gate only ever *reads* the persisted value, refuses when
+# it is missing or no longer matches this exact action, and writes the **trusted
+# expected digest** - never the value the client sent back - into
+# ``gated_browser_readback_hashes`` for the act node to hand to the tool.
+
+#: The state key ``prepare_readback`` writes and this module consumes.
+PENDING_READBACK_KEY = "pending_readback"
+
+#: The field a resume answer must echo the readback digest in.
+READBACK_ACK_KEY = "readback_hash"
+
+_READBACK_MISSING = (
+    "Refused: I could not observe the action's real target, so I did not ask you to approve it."
+)
+_READBACK_STALE = (
+    "Refused: the page changed while that approval was pending, so I did not act on it."
+)
+_READBACK_MISMATCH = (
+    "Refused: the readback you approved did not match the observed action, so nothing was done."
 )
 
 
-_original_fresh_confirm_payload = _fresh_confirm_payload
+def _pending_readback_for(
+    state: dict[str, Any], step: Any, decision: Decision
+) -> tuple[dict[str, Any] | None, str, bool]:
+    """Validate the persisted observation against this exact action.
+
+    Returns ``(pending, refusal, halting)``; ``refusal``/``halting`` only mean
+    anything when ``pending`` is ``None``.  A tool that carries no live readback
+    gets ``(None, "", False)``, so every other tool is gated exactly as before.
+
+    Association is checked field by field - task, step, action hash, target
+    identity, origin, digest shape and the presence of observed details - so an
+    observation made for another step, another task or another page can never
+    authorize this one.  Nothing here re-observes the page.
+    """
+    if str(getattr(step, "tool", "") or "") != FINAL_CLICK_TOOL:
+        return None, "", False
+    pending = state.get(PENDING_READBACK_KEY)
+    if not isinstance(pending, dict):
+        return None, _READBACK_MISSING, False
+    observed_refusal = str(pending.get("refusal") or "")
+    if observed_refusal:
+        return (
+            None,
+            f"Refused: {observed_refusal}, so I did not confirm this action.",
+            bool(pending.get("halting")),
+        )
+    if str(pending.get("task_id") or "") != str(state.get("task_id") or ""):
+        return None, _READBACK_STALE, False
+    if str(pending.get("step_id") or "") != str(getattr(step, "id", "") or ""):
+        return None, _READBACK_STALE, False
+    if str(pending.get("action_hash") or "") != str(getattr(decision, "action_hash", "") or ""):
+        return None, _READBACK_STALE, False
+    if not is_hex64(pending.get("digest")):
+        return None, _READBACK_STALE, False
+    if not str(pending.get("target_identity") or "") or not str(pending.get("origin") or ""):
+        return None, _READBACK_STALE, False
+    details = pending.get("details")
+    if not isinstance(details, dict) or not details:
+        return None, _READBACK_STALE, False
+    return pending, "", False
 
 
-def _fresh_confirm_payload_enhanced(decision: Decision, step: Any) -> dict[str, Any]:
-    payload = _original_fresh_confirm_payload(decision, step)
-    try:
-        tool_name = str(getattr(step, "tool", "") or "")
-        if tool_name == "browser_final_click":
-            payload["readback_required"] = True
-            # Build observed readback from args/decision as best-effort; real resolution
-            # happens in tool, but we must present something concrete. Enrich with args.
-            args = getattr(step, "args", None)
-            details: dict[str, Any] = {}
-            if isinstance(args, dict):
-                details = {
-                    "action": args.get("action"),
-                    "ref": args.get("ref"),
-                    "expect": args.get("expect", ""),
-                }
-            try:
-                # Create a lightweight "element-like" view from args if possible
-                class _E:
-                    def __init__(self, d: dict[str, Any]):
-                        self.name = str(d.get("expect") or "")
-                        self.role = "button"
-                        self.origin = ""
-                        self.ref = str(d.get("ref") or "")
-                        self.is_password = False
-                        self.input_type = ""
+def _attach_readback(payload: dict[str, Any], pending: dict[str, Any]) -> dict[str, Any]:
+    """Add the persisted observed readback to a confirmation payload.
 
-                rd = readback_details_for_element(_E(details), str(details.get("action") or ""))
-                rd.update(details)
-                s = format_readback_summary(rd)
-                payload["readback_summary"] = s
-                payload["readback_details"] = rd
-                payload["readback_hash"] = sha256_hex(str(rd))
-            except Exception:
-                payload["readback_summary"] = str(getattr(decision, "summary", "") or "")
-                payload["readback_details"] = details
-                try:
-                    payload["readback_hash"] = sha256_hex(str(details))
-                except Exception:
-                    payload["readback_hash"] = ""
-            payload["final_click"] = {
-                "action": details.get("action"),
-                "ref": details.get("ref"),
-                "expect": details.get("expect", ""),
-            }
-    except Exception:
-        pass
+    Additive keys only, so a transport that does not know them keeps working
+    unchanged for every non-final-click confirmation.  ``readback_hash`` is the
+    digest of the *observed* fields; the model's own words travel separately in
+    ``readback_proposed``, labelled unverified, and are deliberately not part of
+    the digest.
+    """
+    payload["readback_required"] = True
+    payload["readback_summary"] = str(pending.get("summary") or "")
+    payload["readback_details"] = dict(pending.get("details") or {})
+    payload["readback_hash"] = str(pending.get("digest") or "")
+    payload["readback_proposed"] = str(pending.get("proposed_note") or "")
     return payload
 
 
-# Override
-_fresh_confirm_payload = _fresh_confirm_payload_enhanced
+def _readback_refusal_result(
+    state: dict[str, Any], step: Any, decisions: dict[str, Any], refusal: str, halting: bool
+) -> dict[str, Any]:
+    """Stop *before* authorization, letting a specialist task recover if it can.
+
+    ``halting`` mirrors :func:`_specialist_refusal`'s ``hard`` flag: a hard
+    policy block (a payment control, a password field, an over-cap amount) ends
+    the loop, a recoverable one (the page moved, the target is not on screen)
+    lets a specialist re-plan.
+    """
+    recovered = _specialist_refusal(state, step, refusal, hard=halting)
+    if recovered is not None:
+        return {**recovered, "decisions": decisions}
+    return {"decisions": decisions, "halted_reason": refusal}
