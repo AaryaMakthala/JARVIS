@@ -1389,6 +1389,15 @@ def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> T
     ok_rd, rd_reason = validate_readback_details(details, args.action)
     if not ok_rd:
         return ToolResult(ok=False, error=f"refused: {rd_reason}")
+    # For consequential actions requiring material details, ensure we have concrete info
+    try:
+        actn = str(args.action or "")
+        if actn in ("send", "post", "submit", "publish", "book", "subscribe"):
+            # If no concrete material detail observable, fail closed
+            if not (details.get("recipient") or details.get("element_name") or details.get("destination") or details.get("amount")):
+                return ToolResult(ok=False, error="missing or ambiguous material action details")
+    except Exception:
+        pass
 
     # Payment/purchase is blocked as Tier 3 regardless
     if classify_label_for_payment(getattr(element, "name", "")) == "payment":
@@ -1455,31 +1464,37 @@ def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> T
     # Also bind to readback details hash to invalidate on material change
     readback_hash = sha256_hex(str(details))
     approved_readback_hash = str(getattr(ctx, "approved_final_click_readback_hash", "") or "")
-    if approved_readback_hash and approved_readback_hash != readback_hash:
+    if not approved_readback_hash:
+        return ToolResult(ok=False, error="missing approved readback binding for this consequential action")
+    if approved_readback_hash != readback_hash:
         return ToolResult(ok=False, error="the action details changed after you confirmed them; nothing was done")
 
     # Spending cap: fail closed on ambiguity/unavailable
-    # If it's a purchase-like action and cap configured, we cannot safely parse here without
-    # observed price; be conservative - if cap is explicitly set and we cannot validate,
-    # do not proceed for payment-classified labels (already blocked) and also refuse if
-    # action implies purchase and amount ambiguous when cap required
     if spending_cap is not None:
-        # Try to find amount/currency in element text (untrusted) conservatively
         import re
 
-        text = str(getattr(element, "name", "") or "")
+        text = str(getattr(element, "name", "") or "") + " " + str(details.get("element_name") or "")
         m = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
-        if m:
-            try:
-                amt = float(m.group(1))
-                if amt > float(spending_cap):
-                    return ToolResult(ok=False, error="amount above configured spending cap")
-            except Exception:
-                return ToolResult(ok=False, error="invalid or ambiguous spending amount/currency")
+        if not m:
+            return ToolResult(ok=False, error="missing or ambiguous spending amount/currency")
+        try:
+            amt = float(m.group(1))
+        except Exception:
+            return ToolResult(ok=False, error="invalid or ambiguous spending amount/currency")
+        # Check currency if present
+        cur_match = re.search(r"\b(USD|EUR|GBP|INR|JPY|AUD|CAD)\b", text, re.IGNORECASE)
+        if cur_match:
+            cur = cur_match.group(1).upper()
+            if cur != str(spending_currency or "USD").upper():
+                return ToolResult(ok=False, error="currency mismatch with configured spending currency")
         else:
-            # If cap is configured but amount not observable, fail closed for purchase-related
-            # but our allowed actions exclude purchase; still be conservative
-            pass
+            # If currency not observable but cap configured, be conservative
+            return ToolResult(ok=False, error="missing or ambiguous spending amount/currency")
+        try:
+            if amt > float(spending_cap):
+                return ToolResult(ok=False, error="amount above configured spending cap")
+        except Exception:
+            return ToolResult(ok=False, error="invalid or ambiguous spending amount/currency")
 
     # Host/origin binding
     host = getattr(element, "origin", "") or ""

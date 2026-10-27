@@ -90,6 +90,7 @@ class ConfirmResponse(BaseModel):
     password: str | None = None  # only for Tier 2 unlocks; discarded after use
     typed_confirmation: str | None = None  # folder-name confirmation
     source: Literal["terminal", "dialog", "voice"] = "terminal"
+    readback_hash: str = ""
 
 
 class CancelMessage(BaseModel):
@@ -172,6 +173,10 @@ class ConfirmRequest(BaseModel):
     confirmation_id: str = ""  # I3 correlation (not wired into any flow yet)
     plan_hash: str = ""
     untrusted: bool = False
+    readback_required: bool = False
+    readback_summary: str = ""
+    readback_details: dict[str, Any] = Field(default_factory=dict)
+    readback_hash: str = ""
 
 
 class ClarificationRequest(BaseModel):

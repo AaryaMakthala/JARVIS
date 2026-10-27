@@ -101,6 +101,10 @@ class ToolContext:
     #: re-resolved the target itself.  A tool must treat ``None``/empty as
     #: "no approval binding" and refuse (fail closed).
     approved_target_identity: str | None = None
+    #: Bound readback digest for consequential browser actions (Phase 5C).
+    #: Must be set from the approved readback presented to the user and
+    #: compared by the tool after re-resolving the target.
+    approved_final_click_readback_hash: str | None = None
     #: The shared, in-memory browser result sets (Stage 8, P2).  A
     #: ``jarvis.browser.results.BrowserResultStore`` or ``None`` when the caller
     #: wired none; ``None`` simply disables position/title selection against a

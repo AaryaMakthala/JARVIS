@@ -400,6 +400,14 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         # refuses when it no longer holds, so the element that is acted on is
         # the element that was confirmed (Stage 8.6).
         tool_ctx.approved_target_identity = str(resolved.target.ref or "")
+    # Phase 5C: propagate bound readback hash for consequential browser actions
+    try:
+        gated_rb = state.get("gated_browser_readback_hashes") or {}
+        rb_hash = gated_rb.get(step.id)
+        if rb_hash:
+            tool_ctx.approved_final_click_readback_hash = str(rb_hash)
+    except Exception:
+        pass
     start = time.perf_counter()
     result = spec.execute(args, tool_ctx)
     elapsed_ms = int((time.perf_counter() - start) * 1000)

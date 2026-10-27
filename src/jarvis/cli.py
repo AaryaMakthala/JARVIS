@@ -1160,6 +1160,13 @@ def _confirmation_answer(
         answer["typed_confirmation"] = typed
     if reason is not None:
         answer["reason"] = reason
+    # Propagate readback hash if present in request for consequential actions
+    try:
+        rb_hash = req.get("readback_hash") or (req.get("readback_details") or {}).get("hash")
+        if rb_hash:
+            answer["readback_hash"] = str(rb_hash)
+    except Exception:
+        pass
     return answer
 
 
@@ -1409,6 +1416,27 @@ def _handle_confirm_request(client: Any, msg: Any) -> None:
     from jarvis.policy import tiers as _tiers
 
     console.print("".join(("[yellow]approval needed[/yellow] (", _tiers.tier_label(msg.tier), ")")))
+    if getattr(msg, "readback_required", False) and getattr(msg, "readback_summary", ""):
+        console.print("[bold]Readback (observed):[/bold]")
+        console.print(str(getattr(msg, "readback_summary") or ""))
+        details = getattr(msg, "readback_details", None) or {}
+        if isinstance(details, dict):
+            try:
+                if details.get("recipient"):
+                    console.print(f"  - Recipient: {details.get('recipient')}")
+                if details.get("message"):
+                    console.print(f"  - Message: {details.get('message')}")
+                if details.get("destination"):
+                    console.print(f"  - Destination: {details.get('destination')}")
+                if details.get("item") or details.get("service"):
+                    console.print(f"  - Item: {details.get('item') or details.get('service')}")
+                if details.get("amount") is not None or details.get("price") is not None:
+                    amt = details.get("amount") if details.get("amount") is not None else details.get("price")
+                    cur = details.get("currency") or ""
+                    console.print(f"  - Amount: {amt} {cur}".strip())
+            except Exception:
+                pass
+        console.print("")
     console.print(msg.summary or "(no summary)")
     if msg.untrusted:
         console.print("[red]NOTE: this action was derived from untrusted content[/red]")
@@ -1422,6 +1450,7 @@ def _handle_confirm_request(client: Any, msg: Any) -> None:
         password = _chat_password_prompt("JARVIS password: ")
 
     try:
+        rb_hash = getattr(msg, "readback_hash", "") or ""
         client.send_confirm(
             msg.task_id,
             approved=agreed,
@@ -1430,6 +1459,7 @@ def _handle_confirm_request(client: Any, msg: Any) -> None:
             typed_confirmation=typed,
             confirmation_id=getattr(msg, "confirmation_id", ""),
             plan_hash=getattr(msg, "plan_hash", ""),
+            readback_hash=rb_hash,
         )
         console.print("[dim](working...)[/dim]")
     except DaemonError as exc:

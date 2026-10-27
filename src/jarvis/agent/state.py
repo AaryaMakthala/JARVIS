@@ -160,6 +160,8 @@ class AgentState(TypedDict, total=False):
     # immediately before dispatch.  All-or-nothing: a file that cannot be hashed
     # is a refusal, never an empty entry.
     gated_content_hashes: dict[str, list[str]]
+    # Phase 5C: bound readback digests for browser_final_click
+    gated_browser_readback_hashes: dict[str, str]
     halted_reason: str | None
     retry_now: bool | None
     # operational (Phase 7: classification, replanning)

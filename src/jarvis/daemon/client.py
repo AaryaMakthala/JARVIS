@@ -179,6 +179,7 @@ class DaemonClient:
         typed_confirmation: str | None = None,
         confirmation_id: str = "",
         plan_hash: str = "",
+        readback_hash: str = "",
     ) -> None:
         """Send a confirmation response (echoing the I3 id/plan_hash)."""
         msg = ConfirmResponse(
@@ -190,6 +191,12 @@ class DaemonClient:
             confirmation_id=confirmation_id,
             plan_hash=plan_hash,
         )
+        # Attach readback hash if protocol allows (store in extra via model copy if needed)
+        try:
+            if readback_hash and hasattr(msg, "model_copy"):
+                msg = msg.model_copy(update={"readback_hash": readback_hash})  # type: ignore
+        except Exception:
+            pass
         self._send_recv_ack(msg)
 
     def send_clarification(self, task_id: str, *, answer: str) -> None:

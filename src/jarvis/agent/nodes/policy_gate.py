@@ -966,7 +966,12 @@ def refusal_text(decision: Decision, step_id: str) -> str:
 
 
 # Phase 5C: enhance confirmation payload with readback for browser_final_click
-from jarvis.browser.final_click import readback_details_for_element, format_readback_summary, validate_readback_details
+from jarvis.browser.final_click import (
+    readback_details_for_element,
+    format_readback_summary,
+    validate_readback_details,
+    sha256_hex,
+)
 
 
 _original_fresh_confirm_payload = _fresh_confirm_payload
@@ -977,18 +982,46 @@ def _fresh_confirm_payload_enhanced(decision: Decision, step: Any) -> dict[str, 
     try:
         tool_name = str(getattr(step, "tool", "") or "")
         if tool_name == "browser_final_click":
-            # Try to resolve target for readback
-            # We don't have full ctx here; best effort via decision/step
             payload["readback_required"] = True
-            payload["readback_summary"] = str(getattr(decision, "summary", "") or "")
-            # Add material details if available in args
+            # Build observed readback from args/decision as best-effort; real resolution
+            # happens in tool, but we must present something concrete. Enrich with args.
             args = getattr(step, "args", None)
+            details: dict[str, Any] = {}
             if isinstance(args, dict):
-                payload["final_click"] = {
+                details = {
                     "action": args.get("action"),
                     "ref": args.get("ref"),
                     "expect": args.get("expect", ""),
                 }
+            try:
+                # Create a lightweight "element-like" view from args if possible
+                class _E:
+                    def __init__(self, d: dict[str, Any]):
+                        self.name = str(d.get("expect") or "")
+                        self.role = "button"
+                        self.origin = ""
+                        self.ref = str(d.get("ref") or "")
+                        self.is_password = False
+                        self.input_type = ""
+
+                rd = readback_details_for_element(_E(details), str(details.get("action") or ""))
+                rd.update(details)
+                s = format_readback_summary(rd)
+                payload["readback_summary"] = s
+                payload["readback_details"] = rd
+                payload["readback_hash"] = sha256_hex(str(rd))
+            except Exception:
+                payload["readback_summary"] = str(getattr(decision, "summary", "") or "")
+                payload["readback_details"] = details
+                try:
+                    payload["readback_hash"] = sha256_hex(str(details))
+                except Exception:
+                    payload["readback_hash"] = ""
+            payload["final_click"] = {
+                "action": details.get("action"),
+                "ref": details.get("ref"),
+                "expect": details.get("expect", ""),
+            }
     except Exception:
         pass
     return payload

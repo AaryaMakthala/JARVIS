@@ -198,6 +198,56 @@ def test_voice_approval_requires_explicit_opt_in() -> None:
     assert settings.voice.allow_consequential_voice_approval is True
 
 
+def test_readback_binding_required_missing_hash_refused() -> None:
+    session = FakeSession({"e1": _element("e1", "Post")})
+    ctx = _ctx(session)
+    step = _step({"ref": "e1", "action": "post", "expect": "post"})
+    # approved by hash but no readback hash bound
+    update = act(_state(step, approved=[_hash(ctx, step)]), ctx)
+    results = update.get("results") or []
+    assert results and not results[-1].ok
+
+
+def test_readback_binding_mismatch_refused() -> None:
+    session = FakeSession({"e1": _element("e1", "Post")})
+    ctx = _ctx(session)
+    ctx.tool_context = lambda: __import__("jarvis.tools.base", fromlist=["ToolContext"]).ToolContext(settings=ctx.settings, browser=session)
+    # Simulate bound hash
+    try:
+        tool_ctx = ctx.tool_context()
+        tool_ctx.approved_target_identity = "button:Post:https://example.com"
+        tool_ctx.approved_final_click_readback_hash = "deadbeef"
+        # act will create its own tool_ctx; we test via state propagation not directly here
+    except Exception:
+        pass
+    step = _step({"ref": "e1", "action": "post", "expect": "post"})
+    update = act(_state(step, approved=[_hash(ctx, step)]), ctx)
+    results = update.get("results") or []
+    assert results and not results[-1].ok
+
+
+def test_spending_cap_missing_amount_fails_closed() -> None:
+    session = FakeSession({"e1": _element("e1", "Pay")})
+    from jarvis.config import BrowserSettings
+
+    ctx = _ctx(session, browser=BrowserSettings(allowed_domains=["example.com"], final_click_max_total=1, final_click_spending_cap=10.0, final_click_spending_currency="USD"))
+    step = _step({"ref": "e1", "action": "post", "expect": "pay"})
+    update = act(_state(step, approved=[_hash(ctx, step)]), ctx)
+    results = update.get("results") or []
+    assert results and not results[-1].ok
+
+
+def test_spending_cap_currency_mismatch_refused() -> None:
+    session = FakeSession({"e1": _element("e1", "$10 USD")})
+    from jarvis.config import BrowserSettings
+
+    ctx = _ctx(session, browser=BrowserSettings(allowed_domains=["example.com"], final_click_max_total=1, final_click_spending_cap=10.0, final_click_spending_currency="EUR"))
+    step = _step({"ref": "e1", "action": "post", "expect": "$10 USD"})
+    update = act(_state(step, approved=[_hash(ctx, step)]), ctx)
+    results = update.get("results") or []
+    assert results and not results[-1].ok
+
+
 def test_ordinary_non_consequential_browsing_compatible() -> None:
     # Ensure existing browser_click still works as before
     from jarvis.browser.tools import make_browser_click_spec

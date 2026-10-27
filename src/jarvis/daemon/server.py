@@ -967,6 +967,10 @@ class DaemonServer:
                     confirmation_id=payload.get("confirmation_id", ""),
                     plan_hash=payload.get("plan_hash", ""),
                     untrusted=payload.get("untrusted", False),
+                    readback_required=bool(payload.get("readback_required", False)),
+                    readback_summary=str(payload.get("readback_summary") or ""),
+                    readback_details=dict(payload.get("readback_details") or {}),
+                    readback_hash=str(payload.get("readback_hash") or ""),
                 )
             await owner.send(req)
             slot.confirm_sent_at = time.time()
@@ -1809,6 +1813,11 @@ class DaemonServer:
         }
         if msg.typed_confirmation is not None:
             answer["typed_confirmation"] = msg.typed_confirmation
+        try:
+            if getattr(msg, "readback_hash", ""):
+                answer["readback_hash"] = str(msg.readback_hash)
+        except Exception:
+            pass
         if msg.source == "voice" and slot.confirm_tier >= 2:
             # Advisory marker for the graph: the gate still re-verifies it from
             # its own decision.  Set only after the registry check above passed.

@@ -238,6 +238,22 @@ def readback_details_for_element(element: Any, action: str) -> dict[str, Any]:
         details["host"] = str(host).lower().rstrip(".")
     except Exception:
         details["host"] = ""
+    # Also extract recipient/message/amount/currency if present in name/text
+    try:
+        name = str(details.get("element_name") or "")
+        import re
+
+        # Try to find email/phone as recipient hint
+        m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", name)
+        if m:
+            details["recipient"] = m.group(0)
+        # Amount/currency
+        m2 = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(USD|EUR|GBP|INR|JPY|AUD|CAD)\b", name, re.IGNORECASE)
+        if m2:
+            details["amount"] = float(m2.group(1))
+            details["currency"] = m2.group(2).upper()
+    except Exception:
+        pass
     return details
 
 
@@ -252,6 +268,13 @@ def format_readback_summary(details: dict[str, Any]) -> str:
         parts.append(f"Target: {name!r} ({role})")
     else:
         parts.append(f"Target: ({role})")
+    if details.get("recipient"):
+        parts.append(f"Recipient: {details.get('recipient')}")
+    if details.get("destination"):
+        parts.append(f"Destination: {details.get('destination')}")
+    if details.get("amount") is not None:
+        cur = details.get("currency") or ""
+        parts.append(f"Amount: {details.get('amount')} {cur}".strip())
     if host:
         parts.append(f"Site: {host}")
     elif origin:
