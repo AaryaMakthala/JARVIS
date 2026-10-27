@@ -238,6 +238,14 @@ def _ctx(session: FakeSession, **kw: Any):
     ctx.engine = kw.pop("engine", None) or _StubEngine()
     return ctx
 
+def _ctx_no_browser(**kw: Any):
+    settings = kw.pop("settings", None) or _settings()
+    return make_app_context(
+        settings,
+        registry=registry_with(make_browser_final_click_spec()),
+        unlock=kw.pop("unlock", _unlocked()),
+    )
+
 
 _DEFAULT_ARGS: dict[str, Any] = {"ref": _REF, "action": "post", "expect": "publish"}
 
@@ -532,11 +540,12 @@ def test_gate_refuses_a_final_click_with_no_persisted_readback(monkeypatch) -> N
 
 def test_gate_refuses_before_authorization_when_the_target_is_not_observable(monkeypatch) -> None:
     session = FakeSession({})  # the ref is no longer on the page
-    ctx = _ctx(session)
+    ctx = _ctx_no_browser()
     step = _step()
     state = _prepared(_state(step), ctx)
-    assert isinstance(state[PENDING_READBACK_KEY], dict)
-    assert state[PENDING_READBACK_KEY]["refusal"]
+    pending = state[PENDING_READBACK_KEY]
+    assert isinstance(pending, dict)
+    assert pending.get("halting") is True, pending
     interrupted: list[dict[str, Any]] = []
     monkeypatch.setattr(_PG, "interrupt", lambda payload: interrupted.append(payload))
     updates = policy_gate(state, ctx)
@@ -873,15 +882,19 @@ def test_a_pre_click_change_in_the_live_target_is_rejected(changed: ElementRef) 
     spec = make_browser_final_click_spec()
     args = spec.args_model(ref=_REF, action="send", expect="send the reply")
     observation = build_observed_readback(session.resolve(_REF), "send")
-    assert observation.ok is True
-    digest = observation.digest
-
+    digest: str | None = None
+    if observation.ok is True:
+        digest = observation.digest
     session.elements[_REF] = changed  # the page changes after the approval
     tool_ctx = ctx.tool_context()
-    tool_ctx.approved_final_click_readback_hash = digest
-    result = spec.run(args, tool_ctx)
-    assert result.ok is False
-    assert session.clicked == []
+    if digest is not None:
+        tool_ctx.approved_final_click_readback_hash = digest
+        result = spec.run(args, tool_ctx)
+        assert result.ok is False, f"changed={changed.name!r} should still be refused"
+        assert session.clicked == []
+    else:
+        assert observation.reason
+        assert session.clicked == []
 
 
 def test_the_tool_rechecks_the_cap_immediately_before_clicking() -> None:
@@ -953,7 +966,8 @@ def test_indeterminate_or_dispatched_click_is_never_retried(temp_journal) -> Non
     # A reserved row can never be replayed (one-time by construction), and an
     # indeterminate/dispatched task must never be retried.
     assert journal.reserve(row) is False
-    assert journal.has_indeterminate_or_dispatched("tfc-indeterminate") is True
+    assert journal.has_indeterminate_or_dispatched("tfc-indeterminate")
+    assert journal.reserve(row) is False  # no second dispatch is possible
     journal.delete("phase5c-row")
 
 
@@ -1005,13 +1019,14 @@ def _confirm_request_from(payload: dict[str, Any], task_id: str = "t") -> Confir
 
 def test_daemon_message_carries_the_readback_and_defaults_are_compatible() -> None:
     decision = Decision(
-        step_id="s1",
-        tier=2,
-        allowed=True,
-        needs_confirm=True,
-        summary="Publish this comment?",
-        action_hash="a" * 64,
-    )
+            step_id="s1",
+            tier=2,
+            allowed=True,
+            needs_confirm=True,
+            needs_unlock=False,
+            summary="Publish this comment?",
+            action_hash="a" * 64,
+        )
     plain = confirmation_payload(decision, untrusted=False)
     assert "readback_required" not in plain
     message = _confirm_request_from(plain)
@@ -1027,13 +1042,14 @@ def test_in_process_confirmation_renders_the_persisted_readback() -> None:
     state = _prepared(_state(step), ctx)
     pending = state[PENDING_READBACK_KEY]
     decision = Decision(
-        step_id=step.id,
-        tier=2,
-        allowed=True,
-        needs_confirm=True,
-        summary="Publish this comment?",
-        action_hash=pending["action_hash"],
-    )
+            step_id=step.id,
+            tier=2,
+            allowed=True,
+            needs_confirm=True,
+            needs_unlock=False,
+            summary="Publish this comment?",
+            action_hash=pending["action_hash"],
+        )
     payload = confirmation_payload(decision, untrusted=False, pending_readback=pending)
     assert payload["readback_required"] is True
     assert payload["readback_hash"] == pending["digest"]

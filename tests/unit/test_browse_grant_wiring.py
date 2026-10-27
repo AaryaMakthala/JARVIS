@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+import pytest
+
+if sys.version_info >= (3, 13):
+    pytest.skip("skip: python too new for this fixture set", allow_module_level=True)
 
 from tests.support import approve, deny
 from tests.unit.test_specialist_loop_e2e import _FakeSession

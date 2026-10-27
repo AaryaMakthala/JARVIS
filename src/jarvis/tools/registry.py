@@ -129,6 +129,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_browser_read_spec,
         make_browser_screenshot_spec,
         make_browser_search_spec,
+        make_browser_scroll_spec,
         make_browser_tabs_spec,
         make_browser_type_spec,
         make_browser_wait_spec,
