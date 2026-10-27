@@ -78,6 +78,7 @@ def _block_dangerous_calls_in_tests(monkeypatch: pytest.MonkeyPatch, request: py
     import subprocess as _subprocess
     import os as _os
     import webbrowser as _webbrowser
+    import platform as _platform
 
     def _blocked(*args, **kwargs):
         raise RuntimeError("blocked in tests")
@@ -110,6 +111,11 @@ def _block_dangerous_calls_in_tests(monkeypatch: pytest.MonkeyPatch, request: py
         monkeypatch.setattr(_webbrowser, "open", _blocked)
         monkeypatch.setattr(_webbrowser, "open_new", _blocked)
         monkeypatch.setattr(_webbrowser, "open_new_tab", _blocked)
+    except Exception:
+        pass
+
+    try:
+        monkeypatch.setattr(_platform, "win32_ver", lambda: ("10", "10.0", "22621", ""))
     except Exception:
         pass
 

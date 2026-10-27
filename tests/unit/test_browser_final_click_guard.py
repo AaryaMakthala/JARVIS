@@ -877,33 +877,36 @@ def test_the_tool_refuses_missing_or_wrong_digests(temp_journal) -> None:
     ],
 )
 def test_a_pre_click_change_in_the_live_target_is_rejected(changed: ElementRef) -> None:
+    action = "post"
     session = FakeSession({_REF: _element("Post to aarya@example.com")})
     ctx = _ctx(session)
     spec = make_browser_final_click_spec()
-    args = spec.args_model(ref=_REF, action="send", expect="send the reply")
-    observation = build_observed_readback(session.resolve(_REF), "send")
-    digest: str | None = None
-    if observation.ok is True:
-        digest = observation.digest
+    args = spec.args_model(ref=_REF, action=action, expect="publish")
+    baseline = build_observed_readback(session.resolve(_REF), action)
+    assert baseline.ok is True, f"baseline should observe the declared control; got {baseline.reason!r}"
+    baseline_digest = baseline.digest
+
+    assert baseline.digest != ""
+
     session.elements[_REF] = changed  # the page changes after the approval
+    live = build_observed_readback(session.resolve(_REF), action)
+    assert live.digest != baseline_digest, f"changed={changed.name!r}"
+
     tool_ctx = ctx.tool_context()
-    if digest is not None:
-        tool_ctx.approved_final_click_readback_hash = digest
-        result = spec.run(args, tool_ctx)
-        assert result.ok is False, f"changed={changed.name!r} should still be refused"
-        assert session.clicked == []
-    else:
-        assert observation.reason
-        assert session.clicked == []
+    tool_ctx.approved_final_click_readback_hash = baseline_digest
+    result = spec.run(args, tool_ctx)
+    assert result.ok is False, f"changed={changed.name!r} should still be refused"
+    assert session.clicked == []
 
 
 def test_the_tool_rechecks_the_cap_immediately_before_clicking() -> None:
+    action = "subscribe"
     session = FakeSession({_REF: _element("Subscribe for 9.99 USD")})
     ctx = _ctx(session, settings=_settings(cap=10.0, currency="USD"))
     spec = make_browser_final_click_spec()
-    args = spec.args_model(ref=_REF, action="subscribe", expect="subscribe")
+    args = spec.args_model(ref=_REF, action=action, expect="subscribe")
     observation = build_observed_readback(
-        session.resolve(_REF), "subscribe", spending_cap=10.0, spending_currency="USD"
+        session.resolve(_REF), action, spending_cap=10.0, spending_currency="USD"
     )
     assert observation.ok is True
     # The price changes after the approval; the fresh observation is refused

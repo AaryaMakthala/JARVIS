@@ -335,7 +335,40 @@ def test_enter_after_cross_host_navigation_is_not_covered_by_act(tmp_path: Path)
     search-typing step and Enter breaks that binding, so act must refuse the
     key press and must not dispatch it.
     """
-    pytest.skip("skip: no live-host model in the current fake session")
+    ctx = _ctx(_FakeSession())
+    saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
+    try:
+        out, payloads = _run(
+            ctx,
+            saver,                [
+                    _browse(),
+                    _goto(),
+                    SpecialistDecision(
+                        kind="act",
+                        tool="browser_type",
+                        args={"ref": "q", "text": "example search"},
+                        rationale="type into searchbox",
+                    ),
+                    _goto("https://other.example/page"),
+                    SpecialistDecision(
+                        kind="act",
+                        tool="browser_press_key",
+                        args={"key": "Enter"},
+                        rationale="press enter after search",
+                    ),
+                    _done("Done."),
+                ],
+            )
+        press_payloads = [p for p in payloads if p.get("tool") == "browser_press_key"]
+        key_payloads = [p for p in press_payloads if str(p.get("key")) == "Enter"]
+        assert key_payloads
+        enter_payload = key_payloads[-1]
+        assert enter_payload.get("allowed") is False, enter_payload
+        assert enter_payload.get("halted") is True or enter_payload.get("error") or out.halted_reason, (enter_payload, out.halted_reason)
+        assert ctx.browse_grants.consumed("t1") >= 1, ctx.browse_grants.consumed("t1")
+        assert out.halted_reason is None, out.halted_reason
+    finally:
+        saver.conn.close()
 
 def test_daemon_end_task_runtime_revokes_the_grant() -> None:
     ctx = _ctx(_FakeSession())

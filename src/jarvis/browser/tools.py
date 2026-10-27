@@ -1226,6 +1226,7 @@ def make_browser_press_key_spec() -> ToolSpec:
         run=lambda args, ctx: _run_browser_press_key(args, ctx),
         verify=_verify_best_effort,
         describe=lambda args: f"Press {args.key}",
+        resolve=_resolve_browser_press_key,
     )
 
 
@@ -1383,6 +1384,33 @@ def _resolve_browser_final_click(args: BaseModel, ctx: ToolContext) -> ResolvedT
         origin=element.origin,
         input_type=element.input_type,
         is_password=element.is_password,
+    )
+
+
+def _resolve_browser_press_key(args: BrowserPressKeyArgs, ctx: ToolContext) -> ResolvedTarget | None:
+    """Press-key has no element to resolve; its target identity is the live host.
+
+    The browsing grant covers Enter only when the live host still matches the
+    host that was typed into.  So the policy gate resolves ``browser_press_key``
+    against the live page host, and act re-checks that coverage right before it
+    dispatches the key press.
+    """
+    session = _require_session(ctx)
+    if session is None:
+        return None
+    live_url = _current_page_url(session)
+    if not live_url:
+        return None
+    host = (urlsplit(live_url).hostname or "").casefold().rstrip(".")
+    if not host:
+        return None
+    origin = url_origin(live_url)
+    return ResolvedTarget(
+        kind="browser",
+        ref=host,
+        name=host,
+        role="document",
+        origin=(origin or live_url),
     )
 
 

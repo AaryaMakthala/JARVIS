@@ -147,15 +147,6 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_start_dictation_spec,
         make_stop_dictation_spec,
     )
-    from jarvis.tools.files import (
-        make_append_file_spec,
-        make_create_file_spec,
-        make_delete_path_spec,
-        make_file_search_spec,
-        make_list_dir_spec,
-        make_read_file_spec,
-        make_undo_last_delete_spec,
-    )
     from jarvis.tools.keyboard import make_type_text_spec
     from jarvis.tools.open_in_app import make_open_in_app_spec, make_open_path_spec
     from jarvis.tools.screen import make_describe_screen_spec, make_read_screen_spec
@@ -176,7 +167,33 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     from jarvis.tools.windows_list import make_list_windows_spec
     from jarvis.uia.tools import make_ui_click_spec, make_ui_list_controls_spec
 
+    _file_specs: tuple[ToolSpec, ...] = ()
+
+    def _file_specs_loaded() -> tuple[ToolSpec, ...]:
+        nonlocal _file_specs
+        if not _file_specs:
+            from jarvis.tools.files import (
+                make_append_file_spec,
+                make_create_file_spec,
+                make_delete_path_spec,
+                make_file_search_spec,
+                make_list_dir_spec,
+                make_read_file_spec,
+                make_undo_last_delete_spec,
+            )
+            _file_specs = (
+                make_append_file_spec(),
+                make_create_file_spec(),
+                make_delete_path_spec(),
+                make_file_search_spec(),
+                make_list_dir_spec(),
+                make_read_file_spec(),
+                make_undo_last_delete_spec(),
+            )
+        return _file_specs
+
     registry = ToolRegistry()
+    _file_specs = _file_specs_loaded()
     for spec in (
         make_open_app_spec(),
         make_open_url_spec(),
@@ -196,13 +213,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_audit_run_spec(),
         make_defender_status_spec(),
         make_defender_quick_scan_spec(),
-        make_create_file_spec(),
-        make_append_file_spec(),
-        make_list_dir_spec(),
-        make_read_file_spec(),
-        make_file_search_spec(),
-        make_delete_path_spec(),
-        make_undo_last_delete_spec(),
+        *_file_specs,
         make_take_photo_spec(),
         make_type_text_spec(),
         make_open_in_app_spec(),

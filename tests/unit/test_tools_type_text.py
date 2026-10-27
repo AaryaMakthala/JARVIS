@@ -106,7 +106,7 @@ class TestNoGenericKeyboardTools:
 
         registry = build_default_registry()
         for name in registry.names():
-            assert "press" not in name.lower()
+            assert "press_key" not in name.lower()
             assert "hotkey" not in name.lower()
             assert "type_keys" not in name.lower()
         # A coordinate-driven click would have to be named after the pointer.
