@@ -217,3 +217,59 @@ def label_matches_allowed_action(name: str, action: str) -> bool:
         if _norm(s) in n:
             return True
     return False
+
+
+def readback_details_for_element(element: Any, action: str) -> dict[str, Any]:
+    """Build exact readback details from observed element data (untrusted)."""
+    details = {
+        "action": str(action or ""),
+        "element_name": str(getattr(element, "name", "") or ""),
+        "element_role": str(getattr(element, "role", "") or ""),
+        "origin": str(getattr(element, "origin", "") or ""),
+        "host": "",
+        "ref": str(getattr(element, "ref", "") or ""),
+        "is_password": bool(getattr(element, "is_password", False)),
+        "input_type": str(getattr(element, "input_type", "") or ""),
+    }
+    try:
+        from urllib.parse import urlsplit
+
+        host = urlsplit(details["origin"]).hostname or ""
+        details["host"] = str(host).lower().rstrip(".")
+    except Exception:
+        details["host"] = ""
+    return details
+
+
+def format_readback_summary(details: dict[str, Any]) -> str:
+    action = str(details.get("action") or "").strip()
+    name = str(details.get("element_name") or "").strip()
+    role = str(details.get("element_role") or "").strip()
+    origin = str(details.get("origin") or "").strip()
+    host = str(details.get("host") or "").strip()
+    parts = [f"Final click action: {action}"]
+    if name:
+        parts.append(f"Target: {name!r} ({role})")
+    else:
+        parts.append(f"Target: ({role})")
+    if host:
+        parts.append(f"Site: {host}")
+    elif origin:
+        parts.append(f"Site: {origin}")
+    return " | ".join(parts)
+
+
+def validate_readback_details(details: dict[str, Any], action: str) -> tuple[bool, str]:
+    if action not in ALLOWED_ACTIONS:
+        return False, "action not allowed"
+    if classify_label_for_payment(details.get("element_name", "")) == "payment":
+        return False, "payment/purchase control is blocked"
+    if details.get("is_password"):
+        return False, "refusing to interact with a password field"
+    if not details.get("element_name") and not details.get("element_role"):
+        return False, "missing or ambiguous target details"
+    if not details.get("origin"):
+        return False, "missing origin/host details"
+    if not label_matches_allowed_action(details.get("element_name", ""), action):
+        return False, "declared action does not match the page control"
+    return True, ""

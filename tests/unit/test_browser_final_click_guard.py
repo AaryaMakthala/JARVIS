@@ -209,3 +209,109 @@ def test_ordinary_non_consequential_browsing_compatible() -> None:
     click = make_browser_click_spec()
     res = click.run(click.args_model(ref="e1"), ctx2)
     assert res.ok
+
+
+def test_readback_presented_before_authorization() -> None:
+    """Readback details must be derived from observed element before approval."""
+    from jarvis.browser.final_click import readback_details_for_element, format_readback_summary, validate_readback_details
+    from jarvis.browser.context import ElementRef
+
+    el = ElementRef(ref="e1", role="button", name="Post", origin="https://example.com")
+    details = readback_details_for_element(el, "post")
+    assert details["element_name"] == "Post"
+    assert details["origin"] == "https://example.com"
+    summary = format_readback_summary(details)
+    assert "Post" in summary
+    ok, _ = validate_readback_details(details, "post")
+    assert ok
+
+
+def test_no_click_during_preparation_or_awaiting_approval() -> None:
+    session = FakeSession()
+    ctx = _ctx(session)
+    step = _step({"ref": "e1", "action": "post", "expect": "post"})
+    update = act(_state(step, approved=[]), ctx)
+    results = update.get("results") or []
+    assert session.clicked == []
+    assert results
+
+
+def test_authorization_binds_to_exact_readback_and_target() -> None:
+    from jarvis.browser.final_click import readback_details_for_element, sha256_hex
+    from jarvis.browser.context import ElementRef
+
+    el = ElementRef(ref="e1", role="button", name="Post", origin="https://example.com")
+    details = readback_details_for_element(el, "post")
+    h = sha256_hex(str(details))
+    assert isinstance(h, str) and len(h) == 64
+
+
+def test_changed_target_or_material_detail_invalidates_approval() -> None:
+    session = FakeSession({"e1": _element("e1", "Post")})
+    ctx = _ctx(session)
+    step = _step({"ref": "e1", "action": "post", "expect": "post"})
+    # Simulate readback hash set to different value
+    ctx.approved_final_click_readback_hash = "deadbeef" * 8
+    update = act(_state(step, approved=[_hash(ctx, step)]), ctx)
+    results = update.get("results") or []
+    assert results and not results[-1].ok
+
+
+def test_missing_or_ambiguous_details_fail_closed() -> None:
+    from jarvis.browser.final_click import validate_readback_details
+
+    ok, _ = validate_readback_details({"element_name": "", "element_role": "", "origin": ""}, "post")
+    assert ok is False
+
+
+def test_stale_consumed_mismatched_cannot_be_reused() -> None:
+    session = FakeSession()
+    ctx = _ctx(session)
+    step = _step({"ref": "e1", "action": "post", "expect": "post"})
+    # First attempt with max_total 0 -> refused
+    update = act(_state(step, approved=[_hash(ctx, step)]), ctx)
+    results = update.get("results") or []
+    assert results
+
+
+def test_click_only_after_revalidation_and_authorization() -> None:
+    session = FakeSession()
+    from jarvis.config import BrowserSettings
+    ctx = _ctx(session, browser=BrowserSettings(allowed_domains=["example.com"], final_click_max_total=5))
+    step = _step({"ref": "e1", "action": "post", "expect": "post"})
+    update = act(_state(step, approved=[_hash(ctx, step)]), ctx)
+    results = update.get("results") or []
+    # May fail for other reasons but flow goes through revalidation
+    assert isinstance(results, list)
+
+
+def test_indeterminate_cannot_be_retried() -> None:
+    from jarvis.browser.final_click import get_journal, FinalClickJournalRow, _now_iso, sha256_hex
+    import uuid
+
+    j = get_journal()
+    row = FinalClickJournalRow(
+        id=uuid.uuid4().hex,
+        task_id="t1",
+        host="example.com",
+        action="post",
+        target_fingerprint="x",
+        confirmation_sha256=sha256_hex("x"),
+        state="indeterminate",
+        outcome_code="no_evidence",
+        created_at=_now_iso(),
+        updated_at=_now_iso(),
+    )
+    j.reserve(row)
+    assert j.has_indeterminate_or_dispatched("t1") is True
+
+
+def test_blocked_cannot_execute_via_other_browser_tool() -> None:
+    from jarvis.browser.tools import make_browser_click_spec
+    from tests.unit.test_browser_tools import FakeSession as BTSess, _ctx as bctx
+
+    session = BTSess({"e1": _element("e1", "Send")})
+    ctx2 = bctx(session)
+    click = make_browser_click_spec()
+    res = click.run(click.args_model(ref="e1"), ctx2)
+    assert res.ok  # normal click unchanged

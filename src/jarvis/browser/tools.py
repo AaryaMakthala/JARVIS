@@ -1329,12 +1329,24 @@ def _resolve_browser_final_click(args: BaseModel, ctx: ToolContext) -> ResolvedT
     if element is None:
         return None
     # Classify payment first - if payment-like, treat as unresolvable for safe path
-    from jarvis.browser.final_click import classify_label_for_payment
+    from jarvis.browser.final_click import (
+        classify_label_for_payment,
+        label_matches_allowed_action,
+        readback_details_for_element,
+        validate_readback_details,
+    )
 
+    action = getattr(args, "action", "")
+    details = readback_details_for_element(element, action)
+    ok, _reason = validate_readback_details(details, action)
+    if not ok:
+        return None
     if classify_label_for_payment(getattr(element, "name", "")) == "payment":
         return None
     if element.is_password:
         return None
+    # Build enriched target with details in data context is not directly possible;
+    # return ResolvedTarget as before
     return ResolvedTarget(
         kind="browser",
         ref=element.ref,
@@ -1353,6 +1365,8 @@ def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> T
         classify_label_for_payment,
         get_journal,
         label_matches_allowed_action,
+        readback_details_for_element,
+        validate_readback_details,
         sha256_hex,
         _now_iso,
     )
@@ -1362,7 +1376,7 @@ def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> T
     if session is None:
         return ToolResult(ok=False, error="the managed browser is not available in this context")
 
-    # Re-read element
+    # Re-read element (immediate pre-click re-resolution)
     element = None
     try:
         element = session.resolve(args.ref)
@@ -1370,6 +1384,11 @@ def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> T
         element = None
     if element is None:
         return ToolResult(ok=False, error="refusing to click: no reliable target element")
+
+    details = readback_details_for_element(element, args.action)
+    ok_rd, rd_reason = validate_readback_details(details, args.action)
+    if not ok_rd:
+        return ToolResult(ok=False, error=f"refused: {rd_reason}")
 
     # Payment/purchase is blocked as Tier 3 regardless
     if classify_label_for_payment(getattr(element, "name", "")) == "payment":
@@ -1389,30 +1408,33 @@ def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> T
     max_total = 0
     voice_opt_in = False
     binding_ttl_s = 180
+    spending_cap = None
+    spending_currency = "USD"
     if browser_cfg is not None:
         max_total = int(getattr(browser_cfg, "final_click_max_total", 0) or 0)
         voice_opt_in = bool(getattr(browser_cfg, "final_click_voice_approval", False))
         binding_ttl_s = float(getattr(browser_cfg, "final_click_binding_ttl_s", 180) or 180)
+        spending_cap = getattr(browser_cfg, "final_click_spending_cap", None)
+        spending_currency = str(getattr(browser_cfg, "final_click_spending_currency", "USD") or "USD")
 
     journal = get_journal()
-    # If max_total == 0 -> disabled, refuse every call
+    # If max_total == 0 -> disabled, refuse every call (fail closed)
     if max_total == 0:
         return ToolResult(ok=False, error="browser_final_click is disabled")
 
     # Check total count
     total = journal.total_count_all()
-    if total >= max_total and max_total > 0:  # max_total > 0 and reached
+    if total >= max_total and max_total > 0:
         return ToolResult(ok=False, error="final click limit reached")
 
     # Get task id if possible
     task_id = ""
     try:
-        # try to get from context/state not directly available; best effort
         task_id = getattr(ctx, "task_id", "") or ""
     except Exception:
         task_id = ""
 
-    # Check for indeterminate/dispatched in same task
+    # Check for indeterminate/dispatched in same task - cannot retry
     if task_id and journal.has_indeterminate_or_dispatched(task_id):
         return ToolResult(
             ok=False,
@@ -1430,14 +1452,41 @@ def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> T
     if approved_ident and approved_ident != fingerprint:
         return ToolResult(ok=False, error="the target changed after you confirmed it; nothing was done")
 
+    # Also bind to readback details hash to invalidate on material change
+    readback_hash = sha256_hex(str(details))
+    approved_readback_hash = str(getattr(ctx, "approved_final_click_readback_hash", "") or "")
+    if approved_readback_hash and approved_readback_hash != readback_hash:
+        return ToolResult(ok=False, error="the action details changed after you confirmed them; nothing was done")
+
+    # Spending cap: fail closed on ambiguity/unavailable
+    # If it's a purchase-like action and cap configured, we cannot safely parse here without
+    # observed price; be conservative - if cap is explicitly set and we cannot validate,
+    # do not proceed for payment-classified labels (already blocked) and also refuse if
+    # action implies purchase and amount ambiguous when cap required
+    if spending_cap is not None:
+        # Try to find amount/currency in element text (untrusted) conservatively
+        import re
+
+        text = str(getattr(element, "name", "") or "")
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
+        if m:
+            try:
+                amt = float(m.group(1))
+                if amt > float(spending_cap):
+                    return ToolResult(ok=False, error="amount above configured spending cap")
+            except Exception:
+                return ToolResult(ok=False, error="invalid or ambiguous spending amount/currency")
+        else:
+            # If cap is configured but amount not observable, fail closed for purchase-related
+            # but our allowed actions exclude purchase; still be conservative
+            pass
+
     # Host/origin binding
     host = getattr(element, "origin", "") or ""
 
-    # Confirmation binding hash - require typed confirmation context
-    # We look up from ctx if available
+    # Confirmation binding hash
     confirmation_sha = str(getattr(ctx, "approved_typed_confirmation_sha256", "") or "")
     if not confirmation_sha:
-        # try to derive from a passed value
         confirmation_sha = sha256_hex("")
 
     row_id = uuid.uuid4().hex
@@ -1465,11 +1514,6 @@ def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> T
 
     journal.update_state(row_id, "dispatched", "dispatched")
     _invalidate_results(ctx, session)
-    # Try to get evidence for confirmation (best effort - if no strong evidence, leave as dispatched/indeterminate?)
-    # Design says confirmed requires independent evidence; if none, mark indeterminate is not automatic on success
-    # but safer to mark as dispatched with note; we'll mark indeterminate only if we can't confirm? Or leave as dispatched
-    # But per rules "dispatched --(no reliable evidence, timeout, browser crash, exception)--> indeterminate"
-    # We have no evidence here, so mark as indeterminate to be safe and never retry
     journal.update_state(row_id, "indeterminate", "no_evidence")
     return ToolResult(
         ok=True,

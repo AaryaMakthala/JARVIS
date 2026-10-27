@@ -963,3 +963,36 @@ def refusal_text(decision: Decision, step_id: str) -> str:
     """Honest, deterministic refusal message for a blocked step."""
     reason = "; ".join(decision.reasons) if decision.reasons else "blocked by policy"
     return f"Refused: {decision.summary} [step {step_id}] ({reason})"
+
+
+# Phase 5C: enhance confirmation payload with readback for browser_final_click
+from jarvis.browser.final_click import readback_details_for_element, format_readback_summary, validate_readback_details
+
+
+_original_fresh_confirm_payload = _fresh_confirm_payload
+
+
+def _fresh_confirm_payload_enhanced(decision: Decision, step: Any) -> dict[str, Any]:
+    payload = _original_fresh_confirm_payload(decision, step)
+    try:
+        tool_name = str(getattr(step, "tool", "") or "")
+        if tool_name == "browser_final_click":
+            # Try to resolve target for readback
+            # We don't have full ctx here; best effort via decision/step
+            payload["readback_required"] = True
+            payload["readback_summary"] = str(getattr(decision, "summary", "") or "")
+            # Add material details if available in args
+            args = getattr(step, "args", None)
+            if isinstance(args, dict):
+                payload["final_click"] = {
+                    "action": args.get("action"),
+                    "ref": args.get("ref"),
+                    "expect": args.get("expect", ""),
+                }
+    except Exception:
+        pass
+    return payload
+
+
+# Override
+_fresh_confirm_payload = _fresh_confirm_payload_enhanced
