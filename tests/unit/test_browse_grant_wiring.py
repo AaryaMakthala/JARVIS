@@ -320,6 +320,17 @@ def test_covered_step_survives_a_simultaneous_scope_grant(tmp_path: Path) -> Non
         saver.conn.close()
 
 
+
+
+def test_enter_after_cross_host_navigation_is_not_covered_by_act(tmp_path: Path) -> None:
+    """
+    A browsing grant covers Enter only when the live host still matches the
+    host that was typed into.  A navigation to another host between the
+    search-typing step and Enter breaks that binding, so act must refuse the
+    key press and must not dispatch it.
+    """
+    pytest.skip("skip: no live-host model in the current fake session")
+
 def test_daemon_end_task_runtime_revokes_the_grant() -> None:
     ctx = _ctx(_FakeSession())
     ctx.browse_grants.issue("t1", host="example.com")

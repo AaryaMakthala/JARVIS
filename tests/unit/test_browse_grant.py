@@ -49,6 +49,21 @@ def test_tool_outside_the_allowlist_is_not_covered() -> None:
     assert _covered(grant, tool="browser_screenshot") == (False, "tool_not_allowed")
 
 
+
+def test_browser_final_click_is_not_covered_by_the_browsing_grant() -> None:
+    """browser_final_click is excluded from BROWSE_TOOLS, so the pure rule refuses."""
+    registry = _registry()
+    grant = registry.issue(TASK, host=HOST)
+    # A final click never uses a browsing grant, even with a valid grant, host and tier.
+    assert _covered(
+        grant,
+        tool="browser_final_click",
+        tier=1,
+        host=HOST,
+        label="Post",
+        role="button",
+    ) == (False, "tool_not_allowed")
+
 def test_wrong_domain_is_not_covered() -> None:
     registry = _registry()
     grant = registry.issue(TASK, host=HOST)
