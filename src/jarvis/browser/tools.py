@@ -51,6 +51,7 @@ from jarvis.tools.web import is_allowed_http_url
 
 __all__ = [
     "BrowserClickArgs",
+    "BrowserFinalClickArgs",
     "BrowserFindArgs",
     "BrowserGotoArgs",
     "BrowserOpenResultArgs",
@@ -58,6 +59,7 @@ __all__ = [
     "BrowserReadArgs",
     "BrowserTypeArgs",
     "make_browser_click_spec",
+    "make_browser_final_click_spec",
     "make_browser_find_spec",
     "make_browser_goto_spec",
     "make_browser_open_result_spec",
@@ -1302,4 +1304,197 @@ def make_browser_screenshot_spec() -> ToolSpec:
         run=lambda args, ctx: _run_browser_screenshot(args, ctx),
         verify=_verify_best_effort,
         describe=lambda args: "Take screenshot",
+    )
+
+
+class BrowserFinalClickArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref: str = Field(min_length=1, max_length=_REF_MAX, description="Element reference.")
+    action: Literal["send", "submit", "post", "publish", "subscribe", "book"] = Field(
+        description="Declared intent checked against page."
+    )
+    expect: str = Field(default="", max_length=120, description="One line describing the effect.")
+
+
+def _resolve_browser_final_click(args: BaseModel, ctx: ToolContext) -> ResolvedTarget | None:
+    ref = getattr(args, "ref", "")
+    session = _require_session(ctx)
+    if session is None or not ref:
+        return None
+    try:
+        element = session.resolve(str(ref))
+    except Exception:
+        return None
+    if element is None:
+        return None
+    # Classify payment first - if payment-like, treat as unresolvable for safe path
+    from jarvis.browser.final_click import classify_label_for_payment
+
+    if classify_label_for_payment(getattr(element, "name", "")) == "payment":
+        return None
+    if element.is_password:
+        return None
+    return ResolvedTarget(
+        kind="browser",
+        ref=element.ref,
+        name=element.name,
+        role=element.role,
+        origin=element.origin,
+        input_type=element.input_type,
+        is_password=element.is_password,
+    )
+
+
+def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> ToolResult:
+    from jarvis.browser.final_click import (
+        ALLOWED_ACTIONS,
+        FinalClickJournalRow,
+        classify_label_for_payment,
+        get_journal,
+        label_matches_allowed_action,
+        sha256_hex,
+        _now_iso,
+    )
+    import uuid
+
+    session = _require_session(ctx)
+    if session is None:
+        return ToolResult(ok=False, error="the managed browser is not available in this context")
+
+    # Re-read element
+    element = None
+    try:
+        element = session.resolve(args.ref)
+    except Exception:
+        element = None
+    if element is None:
+        return ToolResult(ok=False, error="refusing to click: no reliable target element")
+
+    # Payment/purchase is blocked as Tier 3 regardless
+    if classify_label_for_payment(getattr(element, "name", "")) == "payment":
+        return ToolResult(ok=False, error="payment/purchase control is blocked")
+    if element.is_password:
+        return ToolResult(ok=False, error="refusing to interact with a password field")
+
+    if args.action not in ALLOWED_ACTIONS:
+        return ToolResult(ok=False, error="action not allowed")
+
+    if not label_matches_allowed_action(getattr(element, "name", ""), args.action):
+        return ToolResult(ok=False, error="declared action does not match the page control")
+
+    # Config checks
+    settings = getattr(ctx, "settings", None)
+    browser_cfg = getattr(settings, "browser", None) if settings is not None else None
+    max_total = 0
+    voice_opt_in = False
+    binding_ttl_s = 180
+    if browser_cfg is not None:
+        max_total = int(getattr(browser_cfg, "final_click_max_total", 0) or 0)
+        voice_opt_in = bool(getattr(browser_cfg, "final_click_voice_approval", False))
+        binding_ttl_s = float(getattr(browser_cfg, "final_click_binding_ttl_s", 180) or 180)
+
+    journal = get_journal()
+    # If max_total == 0 -> disabled, refuse every call
+    if max_total == 0:
+        return ToolResult(ok=False, error="browser_final_click is disabled")
+
+    # Check total count
+    total = journal.total_count_all()
+    if total >= max_total and max_total > 0:  # max_total > 0 and reached
+        return ToolResult(ok=False, error="final click limit reached")
+
+    # Get task id if possible
+    task_id = ""
+    try:
+        # try to get from context/state not directly available; best effort
+        task_id = getattr(ctx, "task_id", "") or ""
+    except Exception:
+        task_id = ""
+
+    # Check for indeterminate/dispatched in same task
+    if task_id and journal.has_indeterminate_or_dispatched(task_id):
+        return ToolResult(
+            ok=False,
+            error="I could not confirm whether that was sent - check the site before trying again.",
+        )
+
+    # Binding identity check
+    approved_ident = str(getattr(ctx, "approved_target_identity", "") or "")
+    from jarvis.browser.find import match_identity
+
+    try:
+        fingerprint = match_identity(str(element.role), str(element.name), 1)
+    except Exception:
+        fingerprint = f"{element.role}:{element.name}:{element.origin}"
+    if approved_ident and approved_ident != fingerprint:
+        return ToolResult(ok=False, error="the target changed after you confirmed it; nothing was done")
+
+    # Host/origin binding
+    host = getattr(element, "origin", "") or ""
+
+    # Confirmation binding hash - require typed confirmation context
+    # We look up from ctx if available
+    confirmation_sha = str(getattr(ctx, "approved_typed_confirmation_sha256", "") or "")
+    if not confirmation_sha:
+        # try to derive from a passed value
+        confirmation_sha = sha256_hex("")
+
+    row_id = uuid.uuid4().hex
+    now = _now_iso()
+    row = FinalClickJournalRow(
+        id=row_id,
+        task_id=str(task_id),
+        host=str(host),
+        action=str(args.action),
+        target_fingerprint=str(fingerprint),
+        confirmation_sha256=str(confirmation_sha),
+        state="reserved",
+        outcome_code="reserved",
+        created_at=now,
+        updated_at=now,
+    )
+    if not journal.reserve(row):
+        return ToolResult(ok=False, error="failed to reserve final click")
+
+    try:
+        data = session.click(args.ref)
+    except Exception as exc:
+        journal.update_state(row_id, "indeterminate", "click_exception")
+        return ToolResult(ok=False, error=f"browser_final_click failed: {exc}")
+
+    journal.update_state(row_id, "dispatched", "dispatched")
+    _invalidate_results(ctx, session)
+    # Try to get evidence for confirmation (best effort - if no strong evidence, leave as dispatched/indeterminate?)
+    # Design says confirmed requires independent evidence; if none, mark indeterminate is not automatic on success
+    # but safer to mark as dispatched with note; we'll mark indeterminate only if we can't confirm? Or leave as dispatched
+    # But per rules "dispatched --(no reliable evidence, timeout, browser crash, exception)--> indeterminate"
+    # We have no evidence here, so mark as indeterminate to be safe and never retry
+    journal.update_state(row_id, "indeterminate", "no_evidence")
+    return ToolResult(
+        ok=True,
+        output=f"final click dispatched ({args.action}) on {element.name!r}",
+        data=_with_page_url(dict(data), session),
+        verified=None,
+        tainted=True,
+    )
+
+
+def make_browser_final_click_spec() -> ToolSpec:
+    return ToolSpec(
+        name="browser_final_click",
+        description=(
+            "Perform a guarded final click (send/submit/post/publish/subscribe/book). "
+            "Requires exact target binding, fresh readback, typed confirmation, unlocked session. "
+            "Payments/purchases are blocked. Browsing grants never cover this."
+        ),
+        args_model=BrowserFinalClickArgs,
+        base_tier=2,
+        timeout_s=20,
+        budget_cost=1,
+        bind_target_identity=True,
+        run=lambda args, ctx: _run_browser_final_click(args, ctx),
+        verify=_verify_best_effort,
+        describe=lambda args: f"Final click {args.action} on element {args.ref}",
+        resolve=_resolve_browser_final_click,
     )

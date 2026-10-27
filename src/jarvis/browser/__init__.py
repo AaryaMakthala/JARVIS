@@ -25,10 +25,12 @@ from jarvis.browser.context import (
 from jarvis.browser.lazy import LazyProfileBrowser
 from jarvis.browser.tools import (
     BrowserClickArgs,
+    BrowserFinalClickArgs,
     BrowserGotoArgs,
     BrowserReadArgs,
     BrowserTypeArgs,
     make_browser_click_spec,
+    make_browser_final_click_spec,
     make_browser_goto_spec,
     make_browser_read_spec,
     make_browser_type_spec,
@@ -56,6 +58,7 @@ __all__ = [
     "AttachmentScan",
     "BrowserClickArgs",
     "BrowserError",
+    "BrowserFinalClickArgs",
     "BrowserGotoArgs",
     "BrowserReadArgs",
     "BrowserSession",
@@ -72,6 +75,7 @@ __all__ = [
     "WhatsAppError",
     "WhatsAppPage",
     "make_browser_click_spec",
+    "make_browser_final_click_spec",
     "make_browser_goto_spec",
     "make_browser_read_spec",
     "make_browser_type_spec",

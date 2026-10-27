@@ -119,6 +119,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     from jarvis.browser.tools import (
         make_browser_back_spec,
         make_browser_click_spec,
+        make_browser_final_click_spec,
         make_browser_find_spec,
         make_browser_forward_spec,
         make_browser_goto_spec,
@@ -127,7 +128,6 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_browser_press_key_spec,
         make_browser_read_spec,
         make_browser_screenshot_spec,
-        make_browser_scroll_spec,
         make_browser_search_spec,
         make_browser_tabs_spec,
         make_browser_type_spec,
@@ -216,6 +216,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_browser_read_spec(),
         make_browser_click_spec(),
         make_browser_type_spec(),
+        make_browser_final_click_spec(),
         make_browser_open_site_spec(),
         make_browser_find_spec(),
         make_browser_open_result_spec(),

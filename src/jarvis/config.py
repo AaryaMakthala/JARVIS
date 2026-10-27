@@ -579,6 +579,8 @@ class VoiceSettings(BaseModel):
     #: It never lowers a tier, never unlocks the session, and never reaches
     #: Tier 3.  See docs/03 §7.9.
     allow_tier2_by_voice: bool = False
+    #: Phase 5C: opt-in voice approval for guarded consequential browser actions.
+    allow_consequential_voice_approval: bool = False
     #: Speak ``"I heard: <transcript>"`` before a Tier >= 1 confirmation prompt,
     #: so the user can catch a mis-heard command before answering it.  The
     #: transcript is spoken only; the INFO log records a flag/count, never the
@@ -783,6 +785,12 @@ class BrowserSettings(BaseModel):
     task_grant_enabled: bool = True
     task_grant_max_actions: int = 30
     task_grant_ttl_s: float = 600.0
+    # Phase 5C: guarded final-click (consequential browser actions)
+    final_click_max_total: int = 0  # 0 = disabled by default (fail closed)
+    final_click_voice_approval: bool = False  # opt-in only
+    final_click_binding_ttl_s: float = 180.0
+    final_click_spending_cap: float | None = None  # per-transaction spending cap; None = disabled
+    final_click_spending_currency: str = "USD"
 
     @field_validator("allowed_domains")
     @classmethod
