@@ -345,7 +345,7 @@ def test_live_target_is_resolved_read_only_before_any_confirmation() -> None:
 
 
 def test_unresolvable_target_is_refused_and_never_fabricated() -> None:
-    session = FakeSession({})  # the ref is gone from the page
+    session = FakeSession({_REF: None})  # the ref resolves to nothing, never fabricated
     observation = observe_live_readback(session, _REF, "post")
     assert observation.ok is False
     assert observation.details is None
