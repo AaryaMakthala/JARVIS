@@ -35,6 +35,8 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from jarvis.policy.denylist import host_is_denied
+
 __all__ = [
     "ScopeCheck",
     "ScopeError",
@@ -155,6 +157,14 @@ class ScopeRegistry:
         domains = frozenset(
             host for raw in allowed_domains if (host := str(raw or "").strip().lower())
         )
+        # A permanently denied host can never be part of an approved scope, so a
+        # grant for it is refused at issue time instead of only at use time (W1).
+        denied = sorted(host for host in domains if host_is_denied(host))
+        if denied:
+            raise ScopeError(
+                f"host {denied[0]!r} is reserved for the dedicated WhatsApp integration "
+                "and cannot be scoped by the general browser"
+            )
         with self._lock:
             if cid in self._seen_ids:
                 raise ScopeError(f"confirmation_id {cid!r} has already been used")

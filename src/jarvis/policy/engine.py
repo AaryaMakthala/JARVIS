@@ -23,7 +23,7 @@ from pydantic import ValidationError
 from jarvis.agent.state import Decision, Step
 from jarvis.config import Settings
 from jarvis.platform_guard import is_windows
-from jarvis.policy import paths, rules, targets, tiers
+from jarvis.policy import denylist, paths, rules, targets, tiers
 from jarvis.tools.registry import ToolRegistry, UnknownTool
 
 #: Reason recorded for a ``windows_only`` tool on a host that is not Windows.
@@ -123,6 +123,16 @@ def _target_checks(ctx: PolicyContext) -> tuple[bool, list[str], int]:
         canonical = rules.url_origin(raw_origin) if raw_origin else None
         if canonical is None:
             return True, ["browser action with a missing or invalid origin"], tiers.TIER_BLOCKED
+        # A permanently denied host is refused here, before the approved-scope
+        # checks, so neither a dynamic allowed-domain entry nor a grant issued
+        # for this host can authorize it (W1).  The dedicated WhatsApp profile
+        # does not go through this cluster; it pins its own exact origin.
+        if denylist.host_is_denied(canonical):
+            return (
+                True,
+                [denylist.denied_host_reason(canonical)],
+                tiers.TIER_BLOCKED,
+            )
         if not ctx.allowed_domains:
             return True, ["browser action without an approved domain scope"], tiers.TIER_BLOCKED
         if not rules.domain_allowed(canonical, list(ctx.allowed_domains)):

@@ -21,8 +21,11 @@ from jarvis.policy.engine import PolicyContext
 from jarvis.policy.targets import ResolvedTarget
 from support import make_spec, registry_with
 
-WEB = "https://web.whatsapp.com"
-SCOPE = ("web.whatsapp.com",)
+# A generic in-scope host.  WhatsApp hosts are permanently denied to the
+# generic browser (W1), so they can no longer serve as the "allowed" example
+# here; test_whatsapp_browser_denylist.py pins that rule.
+WEB = "https://example.com"
+SCOPE = ("example.com",)
 
 
 def _app(*, base_tier: int = 0, name: str = "fake_act") -> tuple[Any, str]:
@@ -87,8 +90,8 @@ def test_origin_is_canonicalised_before_scope_check() -> None:
     decision = _decide(
         app,
         name,
-        origin="https://WEB.WhatsApp.com:443",
-        allowed_domains=("web.whatsapp.com",),
+        origin="https://WEB.Example.COM:443",
+        allowed_domains=("web.example.com",),
         scope_approved=True,
     )
     assert decision.allowed

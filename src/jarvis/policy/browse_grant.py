@@ -35,6 +35,7 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from jarvis.policy.denylist import denied_host_reason, host_is_denied
 from jarvis.policy.rules import FRESH_CONFIRM_PHRASES, FRESH_CONFIRM_TOKENS
 
 __all__ = [
@@ -220,6 +221,10 @@ class BrowseGrantRegistry:
             raise BrowseGrantError("task_id is required")
         if not grant_host:
             raise BrowseGrantError("host is required")
+        # A permanently denied host can never be granted to the generic browser
+        # (W1); it is refused at issue time instead of only at use time.
+        if host_is_denied(grant_host):
+            raise BrowseGrantError(denied_host_reason(grant_host))
         gid = str(grant_id or "").strip() or secrets.token_hex(8)
         requested = self._default_max_actions if max_actions is None else int(max_actions)
         if requested <= 0:
@@ -378,6 +383,10 @@ def coverage(
         return False, "budget_exhausted"
     if not host:
         return False, "host_missing"
+    # An already-issued grant for a denied host (or a step whose resolved host
+    # is denied) never covers anything: refusal wins over the grant's host match.
+    if host_is_denied(host):
+        return False, "host_denied"
     if not grant.covers_host(host):
         return False, "cross_domain"
 

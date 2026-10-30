@@ -44,6 +44,7 @@ from jarvis.browser.results import (
     parse_ordinal,
 )
 from jarvis.browser.sites import sites_from_settings
+from jarvis.policy.denylist import denied_host_reason, host_is_denied
 from jarvis.policy.rules import url_origin
 from jarvis.policy.targets import ResolvedTarget
 from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
@@ -461,6 +462,11 @@ def _run_browser_goto(args: BrowserGotoArgs, ctx: ToolContext) -> ToolResult:
             ok=False,
             error="refusing a URL that is not absolute http(s) without userinfo",
         )
+    # Permanently denied hosts are refused here as well as in the policy engine,
+    # so no code path that reaches the driver can navigate the generic browser
+    # to them (W1).  The dedicated WhatsApp profile is unaffected.
+    if host_is_denied(args.url):
+        return ToolResult(ok=False, error=denied_host_reason(args.url))
     session = _require_session(ctx)
     if session is None:
         return ToolResult(ok=False, error="the managed browser is not available in this context")
@@ -551,6 +557,8 @@ def _resolve_browser_goto(args: BaseModel, ctx: ToolContext) -> ResolvedTarget |
     origin = _safe_goto(raw)
     if origin is None:
         return None
+    if host_is_denied(raw):
+        return None  # denied hosts have no authorizable browser target (W1)
     host = urllib.parse.urlsplit(raw).hostname or ""
     return ResolvedTarget(
         kind="browser",

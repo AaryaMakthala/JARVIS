@@ -36,6 +36,7 @@ from typing import Any, Protocol
 from jarvis.browser.find import match_identity, match_indexes
 from jarvis.config import BROWSER_PROFILE_NAMES, Settings, browser_profile_dir
 from jarvis.platform_guard import is_windows
+from jarvis.policy.denylist import denied_host_reason, host_is_denied
 from jarvis.policy.rules import domain_allowed, url_origin
 from jarvis.tools.web import is_allowed_http_url
 from jarvis.tools.default_dirs import photo_dir
@@ -368,6 +369,11 @@ class PlaywrightBrowser:
             raise BrowserError("refusing a URL that is not absolute http(s) without userinfo")
         intents = url_origin(url)
         assert intents is not None  # guaranteed by the check above
+        # The generic browser can never navigate to a permanently denied host,
+        # whatever the approved domain list says (W1).  The dedicated WhatsApp
+        # profile drives its own page and does not pass through this method.
+        if host_is_denied(url):
+            raise BrowserError(denied_host_reason(url))
         page.goto(url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
         self._snapshots.clear()
         final_url = str(page.url)
@@ -379,7 +385,7 @@ class PlaywrightBrowser:
         if (
             final_origin is not None
             and final_origin != intents
-            and not domain_allowed(final_url, allowed)
+            and (not domain_allowed(final_url, allowed) or host_is_denied(final_url))
         ):
             self._redirect_blocked = True
             raise BrowserError(f"navigation redirected to unauthorized origin {final_origin!r}")
