@@ -6,11 +6,11 @@ Maintained by the coding agent. Condensed from historical log.
 
 - **Agent graph**: LangGraph pipeline with brain/replan/validate/policy_gate/act/verify/respond/memory nodes; checkpoints SQLite; state typed (Pydantic).
 - **Policy**: Deterministic tier engine, path resolution/symlink checks, confirmations bound to action hash, Tier 3 blocked in code, deletes go to Recycle Bin.
-- **Tools**: 39 registered tools in closed registry; browser/WhatsApp/screen/UIA/camera/dictation present.
+- **Tools**: 40 registered tools in closed registry; browser/WhatsApp/screen/UIA/camera/dictation present.
 - **Daemon**: IPC on 127.0.0.1 with token, task slots, confirmations, autostart support.
 - **Voice**: Wake word/stt/tts present; barge-in supports bare 'stop' per D22 (overrides old Stage 1 note).
 - **Browser**: Managed Playwright browser + UIA tools; session referents exist but page referent cleared by unrelated actions (P3 added).
-- **WhatsApp**: WhatsApp Web via isolated profile; content-hash binding, recipient precheck, rate limiting.
+- **WhatsApp**: WhatsApp Web via isolated profile; content-hash binding, recipient precheck, rate limiting, and W3 read-only conversation access (`whatsapp_read_messages`, Tier 1, bounded to 20 visible text messages, tainted output).
 - **Memory**: SQLite memory store (skills/failures/preferences/task_log), retrieval capped; explicit preferred-name capture persists (`user_name`), with targeted CLI deletion (`memory forget-pref`).
 - **Benchmark**: Harness exists in benchmarks/; full runs not completed in condensed form.
 
@@ -34,6 +34,7 @@ Maintained by the coding agent. Condensed from historical log.
 ## Known bugs, limitations, and open items
 
 - **Stage 8 (WhatsApp/camera/browser selection)**: NOT complete. P2 (browser result selection) and P3 (reference invalidation) logic added but mandatory live checks not fully verified; camera/WhatsApp smoke tests deferred.
+- **W3 WhatsApp reads**: unit-verified only. The message-container/text selectors are conservative fallbacks and have **not** been checked against a live WhatsApp DOM; summary generation is unit-tested with a capturing fake LLM, not a live provider. Name-only ambiguity remains a W2 limitation (same-display-name contacts are refused when ambiguous).
 - **Browser referents**: Page referent cleared by unrelated actions; cross-thread isolation exists in logic, live verification partial (P2/P3 NOT VERIFIED in places).
 - **OCR**: Local OCR dependency not installed; OCR accuracy unvalidated.
 - **Gemini/strict_zero_cost**: Under strict default Groq/Gemini would be refused; current config has strict_zero_cost=false.
@@ -42,13 +43,15 @@ Maintained by the coding agent. Condensed from historical log.
 
 ## Test and benchmark status
 
-- **Unit/integration tests**: Extensive suite exists (140 files noted earlier). Last automated check for browser/referents: 118 passed, 0 failed (2026-10-23 context).
+- **Unit/integration tests**: Extensive suite exists (140 files noted earlier). Last automated check for browser/referents: 118 passed, 0 failed (2026-10-23 context). W3 focused run (2026-10-30): `test_whatsapp_read_messages.py` 36 passed; WhatsApp/messaging/browser/invariants regression files passed except the pre-existing `test_whatsapp_browser_denylist.py::test_the_dedicated_driver_still_opens_a_chat_on_its_own_origin` failure (fake page lacks the `wait_for_ready`/`session_state` methods introduced before W3; source path unchanged by W3).
 - **Lint/format**: Ruff/mypy used; last recorded ruff check passed for affected files.
 - **Benchmark**: Harness in benchmarks/ with tasks.yaml; full benchmark runs not recorded as complete.
 
 ## Chronological milestones (condensed)
 
 - **Phases 0-6**: Core graph/policy/tools/daemon/voice/screen implemented and tested.
+- **W0-W2 (WhatsApp)**: session-state fail-closed checks, browser denylist hardening, and verified number-based contact search committed.
+- **W3 (2026-10-30)**: read-only WhatsApp conversation access added. `WhatsAppDriver.recent_messages` validates 1..20, requires an authenticated session, proves the chat header before and after the read, refuses a conversation switch, and skips media/malformed entries. `PlaywrightWhatsAppPage` reads only `#main`, the newest window, visible text (last non-empty text node), sender/timestamp when exposed. `WhatsAppWebAdapter.read_messages` opens via the W2 number-search route. `whatsapp_read_messages` is Tier 1, ContactStore-resolved, has no send/file/url args, returns `tainted=True`, and optionally summarizes through a dedicated untrusted-data prompt that escapes delimiter characters. Unit coverage: 36 tests in `tests/unit/test_whatsapp_read_messages.py`; live WhatsApp DOM and live summarizer NOT verified.
 - **Stage 7**: Browser DOM+UIA implemented (code complete; some live checks noted).
 - **Stage 8**: Camera/WhatsApp/referents work in progress; not complete.
 - **D22**: Bare 'stop' barge-in enabled (voice).

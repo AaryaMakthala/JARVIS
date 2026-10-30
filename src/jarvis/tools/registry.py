@@ -128,8 +128,8 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_browser_press_key_spec,
         make_browser_read_spec,
         make_browser_screenshot_spec,
-        make_browser_search_spec,
         make_browser_scroll_spec,
+        make_browser_search_spec,
         make_browser_tabs_spec,
         make_browser_type_spec,
         make_browser_wait_spec,
@@ -162,6 +162,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     from jarvis.tools.whatsapp import make_whatsapp_send_spec
     from jarvis.tools.whatsapp_web import (
         make_whatsapp_open_chat_spec,
+        make_whatsapp_read_messages_spec,
         make_whatsapp_send_file_spec,
     )
     from jarvis.tools.windows_list import make_list_windows_spec
@@ -224,6 +225,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_whatsapp_send_spec(),
         make_whatsapp_send_file_spec(),
         make_whatsapp_open_chat_spec(),
+        make_whatsapp_read_messages_spec(),
         make_browser_goto_spec(),
         make_browser_read_spec(),
         make_browser_click_spec(),

@@ -15,15 +15,18 @@ in - so this module can be imported on any platform.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
 from jarvis.browser.whatsapp_web import (
+    MAX_RECENT_MESSAGES,
     AttachmentCandidate,
     AttachmentScan,
     SearchHit,
     SendControl,
     WhatsAppError,
+    WhatsAppMessage,
     WhatsAppNotReady,
     WhatsAppSessionState,
 )
@@ -58,6 +61,27 @@ _SEARCH_RESULT_SELECTORS = (
     '[data-testid="cell-frame"]',
     '[role="button"]',
 )
+
+#: Candidate message-container groups, in priority order.  WhatsApp's markup
+#: is not stable, so the first group that matches anything is used; the in/out
+#: group is combined so a fallback never loses one direction.  Every group is
+#: scoped to the open conversation panel (``#main``).
+_MESSAGE_CONTAINER_GROUPS = (
+    '[data-testid="msg-container"]',
+    "div.message-in, div.message-out",
+    '#main [role="row"]',
+)
+
+#: The node that holds a message's visible text.
+_MESSAGE_TEXT_SELECTOR = "span.selectable-text, [data-testid=\"msg-text\"]"
+
+#: Per-message bounds: a read is a summary surface, not a full archive.
+_MAX_MESSAGE_TEXT_CHARS = 2000
+_MAX_MESSAGE_PRE_CHARS = 240
+_MAX_MESSAGE_META_CHARS = 80
+
+#: ``data-pre-plain-text`` is ``"[time, date] sender: "``.
+_PRE_PLAIN_TEXT_RE = re.compile(r"^\[(?P<timestamp>[^\]]*)\]\s*(?P<sender>.*?):\s*$", re.DOTALL)
 
 #: The hidden file input WhatsApp uses for attachments (approach B).
 _FILE_INPUT_SELECTOR = 'input[type="file"]'
@@ -150,6 +174,53 @@ _JS_HEADER = """
     if (title) return title;
   }
   return (header.innerText || '').trim();
+}
+"""
+
+_JS_RECENT_MESSAGES = """
+(cfg) => {
+  const panel = document.querySelector(cfg.panel);
+  if (!panel) return {panelFound: false, messages: []};
+  // Use the first container group that matches anything: WhatsApp changes its
+  // markup, but one of these has always named a message node.
+  let nodes = [];
+  for (const sel of cfg.containers) {
+    const found = Array.from(panel.querySelectorAll(sel));
+    if (found.length) { nodes = found; break; }
+  }
+  if (!nodes.length) nodes = Array.from(panel.querySelectorAll('[role="row"]'));
+  nodes = nodes.filter((node) => !!node.querySelector(cfg.textSelector));
+  const total = nodes.length;
+  if (!total) return {panelFound: true, messages: []};
+  // Only the most recent `limit` containers are examined, so older message
+  // bodies are never read into the result.
+  const start = Math.max(0, total - cfg.limit);
+  const out = [];
+  for (let i = start; i < total && out.length < cfg.limit; i++) {
+    const node = nodes[i];
+    // A bubble can contain quoted-message text before its own text: keep the
+    // last non-empty text node so the actual message wins.
+    let text = '';
+    for (const textNode of node.querySelectorAll(cfg.textSelector)) {
+      const candidate = (textNode.innerText || '').trim();
+      if (candidate) text = candidate;
+    }
+    if (!text) continue;  // media-only or empty container
+    const preNode = node.querySelector('[data-pre-plain-text]');
+    const pre = preNode ? (preNode.getAttribute('data-pre-plain-text') || '') : '';
+    const meta = node.querySelector('[data-testid="msg-meta"]');
+    const metaText = meta ? (meta.innerText || '').trim() : '';
+    let outgoing = null;
+    if (node.classList.contains('message-out') || node.closest('.message-out')) outgoing = true;
+    else if (node.classList.contains('message-in') || node.closest('.message-in')) outgoing = false;
+    out.push({
+      text: text.slice(0, cfg.maxChars),
+      pre: pre.slice(0, cfg.maxPreChars),
+      meta: metaText.slice(0, cfg.maxMetaChars),
+      outgoing: outgoing,
+    });
+  }
+  return {panelFound: true, messages: out};
 }
 """
 
@@ -358,6 +429,65 @@ class PlaywrightWhatsAppPage:
             logger.debug("reading the WhatsApp chat header failed: %s", exc)
             return ""
 
+    # ── conversation reading ───────────────────────────────────────────────
+
+    def recent_messages(self, limit: int) -> tuple[WhatsAppMessage, ...]:
+        """Read at most ``limit`` recent visible text messages (read-only).
+
+        Only the open conversation panel (``#main``) is inspected, and only the
+        last ``limit`` message containers.  Media-only or empty containers are
+        skipped.  Sender and timestamp are left empty when the page does not
+        expose them; nothing is invented.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise WhatsAppError("the message limit must be an integer; refusing to read")
+        if not 1 <= limit <= MAX_RECENT_MESSAGES:
+            raise WhatsAppError(
+                f"the message limit must be between 1 and {MAX_RECENT_MESSAGES}; "
+                "refusing to read"
+            )
+        config = {
+            "panel": _PANEL_SELECTOR,
+            "containers": list(_MESSAGE_CONTAINER_GROUPS),
+            "textSelector": _MESSAGE_TEXT_SELECTOR,
+            "limit": limit,
+            "maxChars": _MAX_MESSAGE_TEXT_CHARS,
+            "maxPreChars": _MAX_MESSAGE_PRE_CHARS,
+            "maxMetaChars": _MAX_MESSAGE_META_CHARS,
+        }
+        try:
+            raw = self._page.evaluate(_JS_RECENT_MESSAGES, config)
+        except Exception as exc:
+            logger.debug("reading the WhatsApp messages failed: %s", exc)
+            raise WhatsAppError("the WhatsApp conversation could not be read") from exc
+        if not isinstance(raw, dict) or not raw.get("panelFound"):
+            raise WhatsAppError(
+                "the WhatsApp conversation panel could not be located; refusing to read"
+            )
+        messages: list[WhatsAppMessage] = []
+        for item in raw.get("messages") or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            sender, timestamp = _split_pre_plain_text(str(item.get("pre") or ""))
+            if not timestamp:
+                timestamp = str(item.get("meta") or "").strip()
+            outgoing = item.get("outgoing")
+            messages.append(
+                WhatsAppMessage(
+                    text=text[:_MAX_MESSAGE_TEXT_CHARS],
+                    sender=sender,
+                    timestamp=timestamp[:_MAX_MESSAGE_META_CHARS],
+                    is_outgoing=outgoing if isinstance(outgoing, bool) else None,
+                    sequence=len(messages),
+                )
+            )
+            if len(messages) >= limit:
+                break
+        return tuple(messages)
+
     # ── session state ──────────────────────────────────────────────────────
 
     def session_state(self) -> WhatsAppSessionState:
@@ -532,6 +662,18 @@ class PlaywrightWhatsAppPage:
             raise WhatsAppError(f"the WhatsApp Send control could not be clicked: {exc}") from exc
         if int(count) != 1:
             raise WhatsAppError("the WhatsApp Send control is no longer unique; refusing to send")
+
+
+def _split_pre_plain_text(raw: str) -> tuple[str, str]:
+    """Split WhatsApp's ``"[time, date] sender: "`` prefix.
+
+    Returns ``("", "")`` when the prefix is absent or malformed: an unreadable
+    sender or timestamp is unavailable, never guessed.
+    """
+    match = _PRE_PLAIN_TEXT_RE.match(str(raw or "").strip())
+    if match is None:
+        return "", ""
+    return match.group("sender").strip(), match.group("timestamp").strip()
 
 
 def _candidates(raw: Any) -> tuple[AttachmentCandidate, ...]:

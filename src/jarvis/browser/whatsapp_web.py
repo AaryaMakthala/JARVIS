@@ -49,6 +49,7 @@ from typing import Protocol, runtime_checkable
 from jarvis.policy.rules import url_origin
 
 __all__ = [
+    "MAX_RECENT_MESSAGES",
     "WHATSAPP_BASE_URL",
     "WHATSAPP_ORIGIN",
     "WHATSAPP_SEND_URL",
@@ -60,6 +61,7 @@ __all__ = [
     "WhatsAppDriver",
     "WhatsAppError",
     "WhatsAppLoggedOut",
+    "WhatsAppMessage",
     "WhatsAppNotReady",
     "WhatsAppPage",
     "WhatsAppQRRequired",
@@ -89,6 +91,10 @@ _MAX_PREVIEW_CONTAINER_CHARS = 200
 #: Readiness budget used after every WhatsApp navigation.  The page adapter
 #: clamps it to its own hard maximum, so a caller cannot raise it arbitrarily.
 _READY_TIMEOUT_S = 20.0
+
+#: Hard cap on how many recent messages one read may return.  A read is a
+#: bounded look at the open conversation, never a conversation dump.
+MAX_RECENT_MESSAGES = 20
 
 
 class WhatsAppError(RuntimeError):
@@ -171,6 +177,24 @@ class SearchHit:
 
 
 @dataclass(frozen=True)
+class WhatsAppMessage:
+    """One visible text message from the verified conversation.
+
+    The message text is **untrusted external content**.  It is data for the
+    owner and the summarizer, never an instruction to JARVIS.  ``sender`` and
+    ``timestamp`` are empty when the page did not expose them; ``is_outgoing``
+    is ``None`` when the page did not say.  ``sequence`` is the chronological
+    position in this bounded read (0 is the oldest returned message).
+    """
+
+    text: str
+    sender: str = ""
+    timestamp: str = ""
+    is_outgoing: bool | None = None
+    sequence: int = 0
+
+
+@dataclass(frozen=True)
 class SendControl:
     """One control that may be WhatsApp's Send button."""
 
@@ -248,6 +272,9 @@ class WhatsAppPage(Protocol):
 
     def chat_header(self) -> str:
         """The conversation header text ("" when it cannot be read)."""
+
+    def recent_messages(self, limit: int) -> tuple[WhatsAppMessage, ...]:
+        """The most recent visible text messages of the open conversation."""
 
     def fill_search(self, query: str) -> None:
         """Type a query into the WhatsApp search box."""
@@ -464,6 +491,65 @@ class WhatsAppDriver:
             "whatsapp chat opened through a number search (digits=%d)", len(number)
         )
         return header
+
+    # ── reading ────────────────────────────────────────────────────────────
+
+    def recent_messages(self, limit: int) -> tuple[WhatsAppMessage, ...]:
+        """Read the most recent visible messages of the *verified* chat.
+
+        The session and the chat identity are proven before and after the read,
+        so a conversation switch during the read is refused.  The limit is
+        validated here (1..:data:`MAX_RECENT_MESSAGES`): an out-of-range request
+        is refused rather than silently clamped.  Only visible text is returned;
+        attachments, empty containers and malformed entries are skipped.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise WhatsAppError("the message limit must be an integer; refusing to read")
+        if not 1 <= limit <= MAX_RECENT_MESSAGES:
+            raise WhatsAppError(
+                f"the message limit must be between 1 and {MAX_RECENT_MESSAGES}; "
+                "refusing to read"
+            )
+        self.require_authenticated()
+        before = self._read_header()
+        self._verify_header_for_search(before)
+        try:
+            raw = self._page.recent_messages(limit)
+        except WhatsAppError:
+            raise
+        except Exception as exc:
+            raise WhatsAppError(
+                "the WhatsApp conversation could not be read; refusing to continue"
+            ) from exc
+        after = self._read_header()
+        self._verify_header_for_search(after)
+        if normalize_text(before).casefold() != normalize_text(after).casefold():
+            raise WhatsAppError(
+                "the WhatsApp conversation changed while it was being read; refusing"
+            )
+        messages: list[WhatsAppMessage] = []
+        # A correct page already returns at most ``limit`` chronological items;
+        # taking the tail too means even a misbehaving page cannot make this read
+        # return more than the caller asked for, and keeps the *newest* window.
+        for item in tuple(raw or ())[-limit:]:
+            if not isinstance(item, WhatsAppMessage):
+                continue
+            text = normalize_text(item.text)
+            if not text:
+                continue
+            messages.append(
+                WhatsAppMessage(
+                    text=text,
+                    sender=normalize_text(item.sender),
+                    timestamp=normalize_text(item.timestamp),
+                    is_outgoing=item.is_outgoing,
+                    sequence=len(messages),
+                )
+            )
+            if len(messages) >= limit:
+                break
+        self._logger.info("whatsapp messages read count=%d", len(messages))
+        return tuple(messages)
 
     # ── attaching ──────────────────────────────────────────────────────────
 

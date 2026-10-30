@@ -28,10 +28,11 @@ import json
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from jarvis.browser.whatsapp_web import WhatsAppDriver, WhatsAppError
+from jarvis.browser.whatsapp_web import WhatsAppDriver, WhatsAppError, WhatsAppMessage
 from jarvis.messaging.base import (
     CAPABILITY_FILE,
     CHANNEL_WHATSAPP_WEB,
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "RESEND_WINDOW_S",
+    "ConversationRead",
     "FileSendGuard",
     "WhatsAppWebAdapter",
     "content_digest",
@@ -58,6 +60,19 @@ RESEND_WINDOW_S = 600.0
 
 #: Fallback cap when the policy module does not expose its content-hash cap.
 _DEFAULT_HASH_CAP = 16 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ConversationRead:
+    """The result of a read-only WhatsApp conversation read.
+
+    ``messages`` are already bounded and chronological.  The message text is
+    untrusted external content: it is returned to the tool, never to the
+    planner as instructions.
+    """
+
+    header: str
+    messages: tuple[WhatsAppMessage, ...]
 
 
 class FileSendGuard:
@@ -292,6 +307,31 @@ class WhatsAppWebAdapter:
             return driver.open_chat_by_search(contact.number, contact.name)
         except WhatsAppError as exc:
             raise MessageError(f"could not open the WhatsApp chat: {exc}") from exc
+
+    def read_messages(self, contact: Contact, limit: int) -> ConversationRead:
+        """Read recent messages from ``contact``'s verified chat (read-only).
+
+        The chat is opened through the W2 number-search route, so the
+        conversation is bound to the trusted contact number rather than to a
+        display name.  The driver proves the session and the chat identity
+        before and after the read; no message is ever sent, staged or clicked.
+        """
+        page = self._open_page()
+        if page is None:
+            raise MessageError("the WhatsApp browser session is not available; refusing to read")
+        driver = WhatsAppDriver(page)
+        try:
+            header = driver.open_chat_by_search(contact.number, contact.name)
+            messages = driver.recent_messages(limit)
+        except WhatsAppError as exc:
+            raise MessageError(f"could not read the WhatsApp conversation: {exc}") from exc
+        logger.info(
+            "whatsapp messages read contact=%s phone_digits=%d count=%d",
+            contact.name,
+            len(contact.number),
+            len(messages),
+        )
+        return ConversationRead(header=header, messages=messages)
 
     # ── internals ────────────────────────────────────────────────────────
 
