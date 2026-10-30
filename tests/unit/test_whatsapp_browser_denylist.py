@@ -24,7 +24,12 @@ from jarvis.browser.tools import (
     _resolve_browser_goto,
     _run_browser_goto,
 )
-from jarvis.browser.whatsapp_web import WHATSAPP_ORIGIN, WhatsAppDriver, WhatsAppError
+from jarvis.browser.whatsapp_web import (
+    WHATSAPP_ORIGIN,
+    WhatsAppDriver,
+    WhatsAppError,
+    WhatsAppSessionState,
+)
 from jarvis.config import Settings
 from jarvis.policy import tiers
 from jarvis.policy.browse_grant import (
@@ -261,6 +266,13 @@ class _WhatsAppPage:
     def goto(self, url: str) -> None:
         # A redirect is the interesting case: the page ends up somewhere else.
         self._url = self._redirect_to or url
+
+    def session_state(self) -> WhatsAppSessionState:
+        return WhatsAppSessionState.AUTHENTICATED
+
+    def wait_for_ready(self, timeout_s: float = 20.0) -> WhatsAppSessionState:
+        del timeout_s
+        return WhatsAppSessionState.AUTHENTICATED
 
     def chat_header(self) -> str:
         return self._header
