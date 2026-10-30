@@ -26,15 +26,22 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from jarvis.browser.whatsapp_web import WhatsAppDriver, WhatsAppError, WhatsAppMessage
+from jarvis.browser.whatsapp_web import (
+    WhatsAppDriver,
+    WhatsAppError,
+    WhatsAppMessage,
+    WhatsAppSendUncertain,
+)
 from jarvis.messaging.base import (
     CAPABILITY_FILE,
+    CAPABILITY_TEXT,
     CHANNEL_WHATSAPP_WEB,
     MessageError,
     MessageOutcome,
@@ -50,7 +57,9 @@ __all__ = [
     "ConversationRead",
     "FileSendGuard",
     "WhatsAppWebAdapter",
+    "WhatsAppWebTextAdapter",
     "content_digest",
+    "operation_guard_key",
 ]
 
 #: How long a send attempt blocks an identical retry (same contact + content).
@@ -60,6 +69,25 @@ RESEND_WINDOW_S = 600.0
 
 #: Fallback cap when the policy module does not expose its content-hash cap.
 _DEFAULT_HASH_CAP = 16 * 1024 * 1024
+
+#: One lock per guard file, shared by every instance in this process.  The tool
+#: builds a fresh :class:`FileSendGuard` for each dispatch, so an instance lock
+#: alone would let two concurrent dispatches of the *same* approval both read
+#: the file before either writes it.  The lock makes ``claim`` atomic for every
+#: guard pointed at the same file (the persisted file still covers restarts).
+_GUARD_LOCKS: dict[str, threading.Lock] = {}
+_GUARD_LOCKS_GUARD = threading.Lock()
+
+
+def _guard_lock(path: Path) -> threading.Lock:
+    """Return the process-wide lock for one guard file (created on demand)."""
+    key = os.path.normcase(str(path.resolve(strict=False)))
+    with _GUARD_LOCKS_GUARD:
+        lock = _GUARD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _GUARD_LOCKS[key] = lock
+        return lock
 
 
 @dataclass(frozen=True)
@@ -76,14 +104,20 @@ class ConversationRead:
 
 
 class FileSendGuard:
-    """Persisted, short-lived "this file was already attempted" guard.
+    """Persisted, short-lived "this operation was already attempted" guard.
 
     ``claim`` atomically records an attempt and returns ``False`` when the same
-    (contact, content) pair was attempted inside :data:`RESEND_WINDOW_S`.  The
-    key is a sha256, so the file holds no readable phone numbers or paths.
-    This is a safety guard, not an authorization control: a corrupt/missing
-    file is treated as empty, while the content-hash approval binding remains
-    the security boundary.
+    opaque key was attempted inside :data:`RESEND_WINDOW_S`.  The file send uses
+    a sha256 of (contact number, content digest); the text send uses a sha256 of
+    the approved operation id.  Either way the file holds no readable phone
+    numbers, paths or message text.  This is a safety guard, not an
+    authorization control: a corrupt/missing file is treated as empty, while the
+    approval binding remains the security boundary.
+
+    Every guard for the same file shares one process-wide lock, so concurrent
+    dispatches of the same approval cannot both claim it (the tool constructs a
+    new guard per invocation).  The persisted file covers restarts; a second
+    *process* is outside this lock and relies on the recorded window.
     """
 
     def __init__(
@@ -96,7 +130,7 @@ class FileSendGuard:
         self.path = Path(path)
         self.window_s = float(window_s)
         self._clock = clock if clock is not None else time.time
-        self._lock = threading.Lock()
+        self._lock = _guard_lock(self.path)
 
     def is_recent(self, key: str) -> bool:
         """Whether ``key`` was attempted inside the window (read-only)."""
@@ -160,6 +194,17 @@ def content_digest(target: Path, max_bytes: int) -> str | None:
 def guard_key(contact: Contact, digest: str) -> str:
     """Opaque key for one (contact number, content) send attempt."""
     payload = f"{contact.number}\n{digest}".encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def operation_guard_key(operation_id: str) -> str:
+    """Opaque key for one approved operation (task id + action hash).
+
+    The key is operation-bound, not content-bound: a retry/replan of the *same*
+    approval cannot send twice, while a genuinely new task with the same text
+    is a new approval and is allowed.
+    """
+    payload = str(operation_id or "").encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -352,3 +397,135 @@ class WhatsAppWebAdapter:
         except Exception:
             logger.warning("the WhatsApp page is not available", exc_info=True)
             return None
+
+
+class WhatsAppWebTextAdapter(WhatsAppWebAdapter):
+    """Text messages through the isolated WhatsApp Web profile (W4).
+
+    The reusable flow has already resolved the recipient and checked the rate
+    limit.  This adapter opens the chat through the W2 number-search route,
+    composes the exact approved text, claims an operation-bound duplicate-send
+    guard immediately before the click, and presses Send only when the chat,
+    the composer contents and the single Send control all agree.
+
+    An unobservable click outcome is **not** an exception to the tool: it is a
+    successful ``MessageOutcome`` with ``send_outcome="unknown"`` and
+    ``delivery_verified=False``.  That keeps the graph from retrying a message
+    that may already have gone out.  The adapter never claims delivery.
+    """
+
+    def __init__(
+        self,
+        *,
+        holder: Any = None,
+        guard: FileSendGuard,
+        operation_id: str,
+    ) -> None:
+        super().__init__(holder=holder, guard=guard)
+        self._operation_id = str(operation_id or "")
+
+    def capabilities(self) -> frozenset[str]:
+        """This channel carries text."""
+        return frozenset({CAPABILITY_TEXT})
+
+    def send(self, request: MessageRequest, contact: Contact) -> MessageOutcome:
+        """Send exactly ``request.text`` to the verified chat, once per approval."""
+        text = str(request.text or "")
+        if not text.strip():
+            raise MessageError("there is no message to send")
+        operation_id = self._operation_id.strip()
+        if not operation_id:
+            raise MessageError(
+                "the message is not bound to an approved operation; refusing to send"
+            )
+
+        key = operation_guard_key(operation_id)
+        try:
+            recent = self._guard.is_recent(key)
+        except OSError as exc:
+            raise MessageError(
+                f"the duplicate-send guard could not be read ({exc}); refusing to send"
+            ) from exc
+        if recent:
+            raise MessageError(
+                "this approved message was already attempted; refusing to send it again"
+            )
+
+        page = self._open_page()
+        if page is None:
+            raise MessageError("the WhatsApp browser session is not available; refusing to send")
+        driver = WhatsAppDriver(page)
+        try:
+            driver.open_chat_by_search(contact.number, contact.name)
+        except WhatsAppError as exc:
+            raise MessageError(f"could not open the WhatsApp chat: {exc}") from exc
+        try:
+            driver.compose_text(text)
+        except WhatsAppError as exc:
+            raise MessageError(f"could not compose the WhatsApp message: {exc}") from exc
+
+        # Claim immediately before the click: a retry, replan or restarted
+        # daemon cannot send the same approved operation twice inside the window.
+        try:
+            claimed = self._guard.claim(key)
+        except OSError as exc:
+            raise MessageError(
+                f"the duplicate-send guard could not be recorded ({exc}); refusing to send"
+            ) from exc
+        if not claimed:
+            raise MessageError(
+                "this approved message was already attempted; refusing to send it again"
+            )
+
+        try:
+            outcome = driver.send_text(text)
+        except WhatsAppSendUncertain:
+            logger.warning(
+                "whatsapp text send outcome is unknown contact=%s phone_digits=%d chars=%d",
+                contact.name,
+                len(contact.number),
+                len(text),
+            )
+            return MessageOutcome(
+                channel=self.name,
+                contact=contact.name,
+                sent=True,
+                detail=(
+                    f"the WhatsApp Send action for {contact.name} was attempted but "
+                    "its outcome is unknown; not retrying automatically"
+                ),
+                data={
+                    "recipient": contact.name,
+                    "phone_digits": contact.number,
+                    "send_outcome": "unknown",
+                    "delivery_verified": False,
+                    "chat_confirmed": True,
+                    "control": "",
+                },
+            )
+        except WhatsAppError as exc:
+            raise MessageError(
+                f"the WhatsApp message send could not be confirmed: {exc} "
+                "(the duplicate-send guard stays in place)"
+            ) from exc
+
+        logger.info(
+            "whatsapp text send dispatched contact=%s phone_digits=%d chars=%d",
+            contact.name,
+            len(contact.number),
+            len(text),
+        )
+        return MessageOutcome(
+            channel=self.name,
+            contact=contact.name,
+            sent=True,
+            detail=f"dispatched the WhatsApp message to {contact.name}; delivery is not verified",
+            data={
+                "recipient": contact.name,
+                "phone_digits": contact.number,
+                "send_outcome": "dispatched",
+                "delivery_verified": False,
+                "chat_confirmed": True,
+                "control": outcome.control,
+            },
+        )

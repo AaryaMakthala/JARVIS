@@ -98,6 +98,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "whatsapp_read_messages",
         "whatsapp_send",
         "whatsapp_send_file",
+        "whatsapp_send_message",
     ),
     "media": (
         "start_dictation",

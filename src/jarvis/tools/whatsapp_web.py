@@ -51,7 +51,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from jarvis import config
 from jarvis.browser.whatsapp_web import MAX_RECENT_MESSAGES, WhatsAppMessage
@@ -67,6 +67,7 @@ from jarvis.messaging.whatsapp_web import (
     RESEND_WINDOW_S,
     FileSendGuard,
     WhatsAppWebAdapter,
+    WhatsAppWebTextAdapter,
     content_digest,
 )
 from jarvis.policy import paths
@@ -76,14 +77,17 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "APPROVED_HASHES_ATTR",
+    "MAX_MESSAGE_CHARS",
     "RESEND_WINDOW_S",
     "FileSendGuard",
     "WhatsAppOpenChatArgs",
     "WhatsAppReadMessagesArgs",
     "WhatsAppSendFileArgs",
+    "WhatsAppSendMessageArgs",
     "make_whatsapp_open_chat_spec",
     "make_whatsapp_read_messages_spec",
     "make_whatsapp_send_file_spec",
+    "make_whatsapp_send_message_spec",
 ]
 
 #: ``act`` sets this attribute on the ``ToolContext`` with the sha256 digests the
@@ -96,6 +100,10 @@ APPROVED_HASHES_ATTR = "approved_content_hashes"
 _DEFAULT_HASH_CAP = 16 * 1024 * 1024
 
 _MAX_DESCRIBE_CHARS = 100
+
+#: Hard cap on an approved WhatsApp text message.  Well below WhatsApp's own
+#: limit so the confirmation summary and the composer read-back stay bounded.
+MAX_MESSAGE_CHARS = 4096
 
 
 class WhatsAppSendFileArgs(BaseModel):
@@ -167,6 +175,40 @@ class WhatsAppReadMessagesArgs(BaseModel):
     )
 
 
+class WhatsAppSendMessageArgs(BaseModel):
+    """Arguments for ``whatsapp_send_message`` -- a contact and exact text.
+
+    The message is the *approved content*: it is shown verbatim in the
+    confirmation, hashed into the action binding, composed, read back and only
+    then sent.  ``hide_input_in_errors`` keeps the text out of validation
+    errors; the tool also never logs or returns it.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    contact: str = Field(
+        min_length=1, max_length=100, description="Contact name from `jarvis contacts`"
+    )
+    message: str = Field(
+        min_length=1,
+        max_length=MAX_MESSAGE_CHARS,
+        description=(
+            "The exact text to send. Newlines are preserved. It is shown to the "
+            "user for confirmation and must be sent unchanged."
+        ),
+    )
+
+    @field_validator("message")
+    @classmethod
+    def _message_is_sendable(cls, value: str) -> str:
+        """Reject empty/whitespace-only and NUL-containing messages."""
+        if not value.strip():
+            raise ValueError("the WhatsApp message must contain visible text")
+        if "\x00" in value:
+            raise ValueError("the WhatsApp message must not contain NUL characters")
+        return value
+
+
 def _hash_cap(ctx: ToolContext) -> int:
     """The effective cap: the setting, never above the content-binding cap."""
     configured = max(1, int(ctx.settings.whatsapp.max_file_bytes))
@@ -198,6 +240,15 @@ def _describe_send_file(store: ContactStore | None, args: WhatsAppSendFileArgs) 
     if len(name) > _MAX_DESCRIBE_CHARS:
         name = name[: _MAX_DESCRIBE_CHARS - 1] + "\u2026"
     return f"send WhatsApp file {name!r} to {who} (full path: {args.path!r})"
+
+
+def _describe_send_message(store: ContactStore | None, args: WhatsAppSendMessageArgs) -> str:
+    """Confirmation summary: the exact text and the (masked) contact."""
+    who = _describe_contact(store, args.contact)
+    return (
+        f"send this exact WhatsApp message to {who}:\n"
+        f"--- message ---\n{args.message}\n--- end message ---"
+    )
 
 
 def _describe_open_chat(store: ContactStore | None, args: WhatsAppOpenChatArgs) -> str:
@@ -441,6 +492,70 @@ def _send_file_run(
     )
 
 
+def _text_adapter(
+    ctx: ToolContext,
+    guard: FileSendGuard | None,
+    operation_id: str,
+) -> WhatsAppWebTextAdapter:
+    """The WhatsApp Web text adapter, wired to this approved operation."""
+    return WhatsAppWebTextAdapter(
+        holder=ctx.whatsapp_browser,
+        guard=guard or FileSendGuard(config.whatsapp_text_sent_file()),
+        operation_id=operation_id,
+    )
+
+
+def _send_message_run(
+    store: ContactStore | None,
+    limiter: RateLimiter | None,
+    guard: FileSendGuard | None,
+    args: WhatsAppSendMessageArgs,
+    ctx: ToolContext,
+) -> ToolResult:
+    """The full guarded text flow; nothing is sent without a bound approval."""
+    refusal = _require_windows("whatsapp_send_message")
+    if refusal is not None:
+        return refusal
+
+    operation_id = str(getattr(ctx, "operation_id", "") or "").strip()
+    if not operation_id:
+        return ToolResult(
+            ok=False,
+            error="the message is not bound to an approved operation; refusing to send",
+        )
+
+    store = store or ContactStore(config.contacts_file())
+    limiter = _limiter_for(limiter, ctx)
+    adapter = _text_adapter(ctx, guard, operation_id)
+    flow = MessageFlow([adapter], store=store, limiter=limiter)
+    request = MessageRequest(
+        channel=CHANNEL_WHATSAPP_WEB,
+        contact=args.contact,
+        text=args.message,
+    )
+    try:
+        prepared = flow.prepare(request)
+        outcome = flow.dispatch(prepared, request)
+    except MessageError as exc:
+        return ToolResult(ok=False, error=str(exc))
+
+    send_outcome = str(outcome.data.get("send_outcome") or "")
+    if send_outcome == "unknown":
+        note = (
+            "the WhatsApp Send action was attempted but its outcome is unknown; "
+            "it is not retried automatically"
+        )
+    else:
+        note = "the WhatsApp message was dispatched; delivery is not verified"
+    return ToolResult(
+        ok=True,
+        output=outcome.detail,
+        verified=None,
+        verify_note=note,
+        data=dict(outcome.data),
+    )
+
+
 def _open_chat_run(
     store: ContactStore | None,
     args: WhatsAppOpenChatArgs,
@@ -559,6 +674,40 @@ def make_whatsapp_send_file_spec(
         "describe": lambda args: _describe_send_file(store, args),
     }
     return ToolSpec(**options)
+
+
+def make_whatsapp_send_message_spec(
+    store: ContactStore | None = None,
+    limiter: RateLimiter | None = None,
+    guard: FileSendGuard | None = None,
+) -> ToolSpec:
+    """Build the ``whatsapp_send_message`` spec (Tier 2 - Confirm + unlocked).
+
+    The approval is bound to the canonical args, so it covers both the contact
+    query and the exact message text.  The tool is not content-hash bound: text
+    has no file to re-hash, and the adapter instead re-reads the composer and
+    requires it to match the approved text immediately before the click.
+    ``store`` / ``limiter`` / ``guard`` are injection points for tests.
+    """
+    return ToolSpec(
+        name="whatsapp_send_message",
+        description=(
+            "Send exactly one text message to exactly one known WhatsApp contact "
+            "through the isolated WhatsApp Web profile. Requires an unlocked "
+            "JARVIS session. The approval is bound to the exact message text. "
+            "If the chat, the composer contents or the Send control cannot be "
+            "verified, nothing is sent. Delivery is not verified; an unknown "
+            "click outcome is reported and never retried automatically."
+        ),
+        args_model=WhatsAppSendMessageArgs,
+        base_tier=2,
+        windows_only=True,
+        timeout_s=90,
+        budget_cost=1,
+        run=lambda args, ctx: _send_message_run(store, limiter, guard, args, ctx),
+        precheck=make_recipient_precheck(store),
+        describe=lambda args: _describe_send_message(store, args),
+    )
 
 
 def make_whatsapp_open_chat_spec(store: ContactStore | None = None) -> ToolSpec:

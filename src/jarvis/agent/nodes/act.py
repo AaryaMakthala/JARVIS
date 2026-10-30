@@ -390,6 +390,10 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             )
 
     tool_ctx = ctx.tool_context()
+    # The stable identity of this approved dispatch, for operation-bound
+    # duplicate-send guards.  It is derived from the same task id and action
+    # hash act just re-checked, never from planner output.
+    tool_ctx.operation_id = f"{task_id}:{decision.action_hash}"
     if approved_digests is not None:
         # The digests the gate bound the approval to, after act's own re-read
         # matched them.  The tool may use them only to re-verify, never as a

@@ -110,6 +110,11 @@ class ToolContext:
     #: wired none; ``None`` simply disables position/title selection against a
     #: result list (the tool then refuses instead of guessing).
     browser_results: Any | None = None
+    #: Stable identity of this approved dispatch (``task_id:action_hash``).
+    #: Set by ``act`` immediately before the tool runs, so an operation-bound
+    #: duplicate-send guard can distinguish a retry from a new approval.  A tool
+    #: that needs it must treat ``""`` as "no approved operation" and refuse.
+    operation_id: str = ""
 
 
 ArgsModel = type[BaseModel]

@@ -28,6 +28,7 @@ from jarvis.browser.whatsapp_web import (
     WhatsAppError,
     WhatsAppMessage,
     WhatsAppNotReady,
+    WhatsAppSendUncertain,
     WhatsAppSessionState,
 )
 
@@ -85,6 +86,20 @@ _PRE_PLAIN_TEXT_RE = re.compile(r"^\[(?P<timestamp>[^\]]*)\]\s*(?P<sender>.*?):\
 
 #: The hidden file input WhatsApp uses for attachments (approach B).
 _FILE_INPUT_SELECTOR = 'input[type="file"]'
+
+#: The message composer.  Scoped to the open conversation's footer first so the
+#: left-hand search box (also a contenteditable textbox) can never be filled.
+_COMPOSER_INPUT_SELECTORS = (
+    '#main footer [contenteditable="true"][role="textbox"]',
+    '#main footer [data-testid="conversation-compose-box-input"]',
+    '#main footer [contenteditable="true"]',
+    '[data-testid="conversation-compose-box-input"]',
+    '[contenteditable="true"][data-tab="10"]',
+)
+
+#: Hard bound on the composer text a read may return (the tool's own message cap
+#: is far smaller; this only keeps a hostile page from returning a transcript).
+_MAX_COMPOSER_TEXT_CHARS = 65536
 
 #: Every element that can act as a control.  Controls are *enumerated* and
 #: judged by their accessible name - no selector is guessed for "the Send
@@ -174,6 +189,17 @@ _JS_HEADER = """
     if (title) return title;
   }
   return (header.innerText || '').trim();
+}
+"""
+
+_JS_COMPOSER_TEXT = """
+(cfg) => {
+  for (const selector of cfg.selectors) {
+    const node = document.querySelector(selector);
+    if (!node) continue;
+    return (node.innerText || node.textContent || '').slice(0, cfg.maxChars);
+  }
+  return '';
 }
 """
 
@@ -579,6 +605,41 @@ class PlaywrightWhatsAppPage:
         if int(count) != 1:
             raise WhatsAppError("the WhatsApp search result is no longer unique; refusing")
 
+    # ── composer ───────────────────────────────────────────────────────────
+
+    def fill_composer(self, text: str) -> None:
+        """Replace the active chat composer's contents with ``text``.
+
+        Only the composer of the open conversation is tried, so the search box
+        can never be filled.  The driver reads the composer back afterwards and
+        refuses on any mismatch; this method only reports mechanics.
+        """
+        if not isinstance(text, str) or not text.strip():
+            raise WhatsAppError("the WhatsApp composer needs a non-empty message")
+        for selector in _COMPOSER_INPUT_SELECTORS:
+            try:
+                locator = self._page.locator(selector)
+                if locator.count() == 0:
+                    continue
+                locator.first.fill(text)
+                return
+            except Exception as exc:  # noqa: BLE001 - try the next candidate
+                logger.debug("WhatsApp composer %r unusable: %s", selector, exc)
+                continue
+        raise WhatsAppError("the WhatsApp message composer could not be located")
+
+    def composer_text(self) -> str:
+        """The active chat composer's visible text ("" when unreadable)."""
+        config = {
+            "selectors": list(_COMPOSER_INPUT_SELECTORS),
+            "maxChars": _MAX_COMPOSER_TEXT_CHARS,
+        }
+        try:
+            return str(self._page.evaluate(_JS_COMPOSER_TEXT, config) or "")
+        except Exception as exc:  # noqa: BLE001 - an unreadable composer is not a pass
+            logger.debug("reading the WhatsApp composer failed: %s", exc)
+            return ""
+
     # ── attachments ────────────────────────────────────────────────────────
 
     def set_input_files(self, path: str) -> None:
@@ -654,12 +715,20 @@ class PlaywrightWhatsAppPage:
         return tuple(controls)
 
     def click_send(self, name: str) -> None:
-        """Click the single control whose accessible name is exactly ``name``."""
+        """Click the single control whose accessible name is exactly ``name``.
+
+        An evaluation failure is reported as :class:`WhatsAppSendUncertain`: the
+        click may already have reached WhatsApp, so the caller must not treat it
+        as "nothing was sent".  A non-unique control is a plain refusal because
+        nothing was clicked.
+        """
         config = {"controls": _CONTROL_SELECTOR, "name": name}
         try:
             count = self._page.evaluate(_JS_CLICK_SEND, config)
         except Exception as exc:
-            raise WhatsAppError(f"the WhatsApp Send control could not be clicked: {exc}") from exc
+            raise WhatsAppSendUncertain(
+                "the WhatsApp Send control could not be clicked; its outcome is unknown"
+            ) from exc
         if int(count) != 1:
             raise WhatsAppError("the WhatsApp Send control is no longer unique; refusing to send")
 

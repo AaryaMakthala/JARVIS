@@ -65,9 +65,11 @@ __all__ = [
     "WhatsAppNotReady",
     "WhatsAppPage",
     "WhatsAppQRRequired",
+    "WhatsAppSendUncertain",
     "WhatsAppSessionError",
     "WhatsAppSessionState",
     "WhatsAppSessionUnknown",
+    "composer_matches",
     "header_confirms_recipient",
 ]
 
@@ -166,6 +168,16 @@ class WhatsAppSessionUnknown(WhatsAppSessionError):
 
 class WhatsAppNotReady(WhatsAppSessionUnknown):
     """The page stayed unrecognizable for the whole readiness budget."""
+
+
+class WhatsAppSendUncertain(WhatsAppError):
+    """The Send click was attempted, but its result could not be observed.
+
+    A subclass of :class:`WhatsAppError` so every existing refusal path keeps
+    working.  It is distinct because the caller must **not** treat it as "not
+    sent": the click may have reached WhatsApp.  The caller reports the outcome
+    as unknown and never retries automatically.
+    """
 
 
 @dataclass(frozen=True)
@@ -285,6 +297,12 @@ class WhatsAppPage(Protocol):
     def open_search_result(self, hit: SearchHit) -> None:
         """Open exactly one search result; refuse when it is not unique."""
 
+    def fill_composer(self, text: str) -> None:
+        """Replace the active chat composer's contents with ``text``."""
+
+    def composer_text(self) -> str:
+        """The active chat composer's visible text ("" when it cannot be read)."""
+
     def set_input_files(self, path: str) -> None:
         """Stage a file through the hidden ``input[type=file]`` (approach B)."""
 
@@ -346,6 +364,25 @@ def header_confirms_recipient(header: str, name: str = "", digits: str = "") -> 
         return bool(wanted) and wanted in seen
     expected = normalize_text(name)
     return bool(expected) and text.casefold() == expected.casefold()
+
+
+def _composer_visible(value: str) -> str:
+    """Normalise a composer value for exact comparison (never for sending)."""
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u200b", "").replace("\ufeff", "").replace("\u00a0", " ")
+    # WhatsApp's contenteditable often exposes a trailing newline; remove only
+    # that artifact, never internal newlines or spaces the owner typed.
+    return text.rstrip("\n")
+
+
+def composer_matches(expected: str, actual: str) -> bool:
+    """Whether the composer holds exactly the approved message text.
+
+    Newlines are preserved; only invisible formatting differences that WhatsApp
+    itself introduces (CRLF, zero-width characters, non-breaking spaces and a
+    trailing newline) are ignored.  Any other difference is a refusal.
+    """
+    return _composer_visible(expected) == _composer_visible(actual)
 
 
 def is_send_name(name: str) -> bool:
@@ -551,6 +588,80 @@ class WhatsAppDriver:
         self._logger.info("whatsapp messages read count=%d", len(messages))
         return tuple(messages)
 
+    # ── text messages ──────────────────────────────────────────────────────
+
+    def compose_text(self, text: str) -> None:
+        """Type the approved message into the verified chat's composer.
+
+        The session and the chat identity are proven *before* anything is
+        typed, and the composer is read back immediately afterwards.  A
+        composer that does not hold exactly ``text`` is a refusal; nothing is
+        sent here.
+        """
+        message = str(text or "")
+        if not message.strip():
+            raise WhatsAppError("refusing to compose an empty WhatsApp message")
+        self.require_authenticated()
+        self._verify_header_for_search(self._read_header())
+        try:
+            self._page.fill_composer(message)
+        except WhatsAppError:
+            raise
+        except Exception as exc:
+            raise WhatsAppError(
+                "the WhatsApp message composer could not be filled; refusing to send"
+            ) from exc
+        actual = self._read_composer()
+        if not composer_matches(message, actual):
+            raise WhatsAppError(
+                "the WhatsApp composer does not contain the approved message; refusing to send"
+            )
+        self._logger.info("whatsapp message composed for a verified contact (chars=%d)", len(message))
+
+    def send_text(self, expected_text: str) -> SendOutcome:
+        """Press Send for exactly the composed message, refusing anything else.
+
+        Immediately before the click the session, the chat identity and the
+        composer contents are re-proven.  Exactly one Send control may match.
+        A click whose result cannot be observed raises
+        :class:`WhatsAppSendUncertain` (the click may have reached WhatsApp),
+        never a plain "nothing was sent" refusal.
+        """
+        message = str(expected_text or "")
+        if not message.strip():
+            raise WhatsAppError("refusing to send an empty WhatsApp message")
+        self.require_authenticated()
+        header = self._read_header()
+        self._verify_header_for_search(header)
+        if not composer_matches(message, self._read_composer()):
+            raise WhatsAppError(
+                "the WhatsApp composer no longer contains the approved message; refusing to send"
+            )
+        controls = self._page.send_controls()
+        matches = [control for control in controls if is_send_name(control.name)]
+        if not matches:
+            raise WhatsAppError("no WhatsApp Send control was found; refusing to send")
+        if len(matches) > 1:
+            raise WhatsAppError("more than one WhatsApp Send control was found; refusing to send")
+        control = matches[0]
+        count = send_count(control.name)
+        if count is not None and count != 1:
+            raise WhatsAppError(f"{count} items are staged for sending; expected exactly one")
+        try:
+            self._page.click_send(normalize_text(control.name))
+        except WhatsAppSendUncertain:
+            raise
+        except WhatsAppError:
+            # A definite refusal from the adapter (e.g. the control stopped
+            # being unique) means nothing was clicked; keep it a plain refusal.
+            raise
+        except Exception as exc:
+            raise WhatsAppSendUncertain(
+                "the WhatsApp Send action was attempted but its outcome is unknown"
+            ) from exc
+        self._logger.info("whatsapp text send performed after verification (control=%r)", control.name)
+        return SendOutcome(header=header, control=control.name)
+
     # ── attaching ──────────────────────────────────────────────────────────
 
     def attach(self, path: Path | str, expect_name: str = "") -> AttachmentScan:
@@ -687,6 +798,14 @@ class WhatsAppDriver:
             return normalize_text(self._page.chat_header())
         except Exception as exc:  # noqa: BLE001 - an unreadable header is not a pass
             self._logger.warning("the WhatsApp chat header could not be read: %s", exc)
+            return ""
+
+    def _read_composer(self) -> str:
+        """Read the composer's text ("" when unreadable)."""
+        try:
+            return str(self._page.composer_text() or "")
+        except Exception as exc:  # noqa: BLE001 - an unreadable composer is not a pass
+            self._logger.warning("the WhatsApp message composer could not be read: %s", exc)
             return ""
 
     def _verify_header_for_search(self, header: str) -> None:

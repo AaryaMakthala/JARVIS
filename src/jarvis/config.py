@@ -965,6 +965,11 @@ def whatsapp_sent_files_file() -> Path:
     return user_data_dir("whatsapp_sent_files.json")
 
 
+def whatsapp_text_sent_file() -> Path:
+    """Path to the short-lived WhatsApp text-send guard (hashed operation keys only)."""
+    return user_data_dir("whatsapp_text_sent.json")
+
+
 def memory_db() -> Path:
     """Path to the skill/failure/preference SQLite database."""
     return user_data_dir("memory.db")
