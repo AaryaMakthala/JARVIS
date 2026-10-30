@@ -42,6 +42,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -58,7 +59,13 @@ __all__ = [
     "SendOutcome",
     "WhatsAppDriver",
     "WhatsAppError",
+    "WhatsAppLoggedOut",
+    "WhatsAppNotReady",
     "WhatsAppPage",
+    "WhatsAppQRRequired",
+    "WhatsAppSessionError",
+    "WhatsAppSessionState",
+    "WhatsAppSessionUnknown",
 ]
 
 logger = logging.getLogger("jarvis.browser.whatsapp")
@@ -78,6 +85,10 @@ _SEND_NAME_RE = re.compile(r"^send(?:\s+(?P<count>\d+))?(?:\s+selected)?$", re.I
 #: "the file name is the staged preview".
 _MAX_PREVIEW_CONTAINER_CHARS = 200
 
+#: Readiness budget used after every WhatsApp navigation.  The page adapter
+#: clamps it to its own hard maximum, so a caller cannot raise it arbitrarily.
+_READY_TIMEOUT_S = 20.0
+
 
 class WhatsAppError(RuntimeError):
     """A WhatsApp step could not be completed safely.
@@ -86,6 +97,68 @@ class WhatsAppError(RuntimeError):
     ambiguous Send control, ...).  The message is safe to show to the owner:
     it never contains message bodies or full phone numbers.
     """
+
+
+class WhatsAppSessionState(str, Enum):
+    """The authentication state of the WhatsApp Web page.
+
+    Produced by one read-only probe (``WhatsAppPage.session_state``) and never
+    inferred from the chat header.  ``UNKNOWN`` is the fail-closed default: a
+    page that cannot be classified is never treated as authenticated.
+    """
+
+    AUTHENTICATED = "authenticated"
+    QR_REQUIRED = "qr_required"
+    LOGGED_OUT = "logged_out"
+    UNKNOWN = "unknown"
+
+
+#: Owner-facing refusal per state.  Safe to show: no QR payload, cookie, token,
+#: message body or phone number is ever included.
+_SESSION_MESSAGES: dict[WhatsAppSessionState, str] = {
+    WhatsAppSessionState.AUTHENTICATED: "the WhatsApp session is authenticated",
+    WhatsAppSessionState.QR_REQUIRED: (
+        "WhatsApp Web needs a QR-code sign-in; open the WhatsApp browser profile "
+        "and link this device before trying again"
+    ),
+    WhatsAppSessionState.LOGGED_OUT: (
+        "the WhatsApp Web session is logged out; link this device again before trying again"
+    ),
+    WhatsAppSessionState.UNKNOWN: (
+        "the WhatsApp Web session could not be authenticated; refusing to continue"
+    ),
+}
+
+
+class WhatsAppSessionError(WhatsAppError):
+    """The WhatsApp session is not authenticated; nothing was staged or sent.
+
+    Carries the detected :attr:`state`, so a caller can report the real cause
+    (QR sign-in needed, logged out, unrecognizable page) instead of a generic
+    chat-header failure.  Still a :class:`WhatsAppError`, so every existing
+    ``except WhatsAppError`` site keeps working.
+    """
+
+    def __init__(self, state: WhatsAppSessionState, message: str = "") -> None:
+        """Record the detected state and the owner-facing refusal text."""
+        self.state = state
+        super().__init__(message or _SESSION_MESSAGES[state])
+
+
+class WhatsAppQRRequired(WhatsAppSessionError):
+    """WhatsApp Web is showing the QR-code sign-in surface."""
+
+
+class WhatsAppLoggedOut(WhatsAppSessionError):
+    """WhatsApp Web reports that this device/session was logged out."""
+
+
+class WhatsAppSessionUnknown(WhatsAppSessionError):
+    """The page could not be classified, so authentication cannot be assumed."""
+
+
+class WhatsAppNotReady(WhatsAppSessionUnknown):
+    """The page stayed unrecognizable for the whole readiness budget."""
 
 
 @dataclass(frozen=True)
@@ -166,6 +239,12 @@ class WhatsAppPage(Protocol):
     def goto(self, url: str) -> None:
         """Navigate to an absolute URL."""
 
+    def session_state(self) -> WhatsAppSessionState:
+        """The page's authentication state (read-only probe)."""
+
+    def wait_for_ready(self, timeout_s: float = _READY_TIMEOUT_S) -> WhatsAppSessionState:
+        """Poll the session state, bounded, until it is recognizable."""
+
     def chat_header(self) -> str:
         """The conversation header text ("" when it cannot be read)."""
 
@@ -235,6 +314,15 @@ def send_count(name: str) -> int | None:
     return int(raw) if raw is not None else None
 
 
+def _session_error(state: WhatsAppSessionState) -> WhatsAppSessionError:
+    """Build the specific refusal for an unauthenticated state."""
+    if state is WhatsAppSessionState.QR_REQUIRED:
+        return WhatsAppQRRequired(state)
+    if state is WhatsAppSessionState.LOGGED_OUT:
+        return WhatsAppLoggedOut(state)
+    return WhatsAppSessionUnknown(state)
+
+
 class WhatsAppDriver:
     """Drives one WhatsApp Web chat, refusing anything it cannot prove.
 
@@ -249,6 +337,22 @@ class WhatsAppDriver:
         self._logger = logger or logging.getLogger("jarvis.browser.whatsapp")
         self._expected_name = ""
         self._expected_digits = ""
+
+    # ── session ────────────────────────────────────────────────────────────
+
+    def require_authenticated(self) -> WhatsAppSessionState:
+        """Refuse unless the page proves an authenticated WhatsApp session.
+
+        The exact-origin check runs first, so the session probe never touches a
+        page that is not exactly ``https://web.whatsapp.com``.  A probe failure,
+        an unrecognized value or an unreadable page is ``unknown`` and refuses:
+        authentication is never assumed.
+        """
+        self._require_origin()
+        state = self._probe_session()
+        if state is WhatsAppSessionState.AUTHENTICATED:
+            return state
+        raise _session_error(state)
 
     # ── opening a chat ─────────────────────────────────────────────────────
 
@@ -265,6 +369,10 @@ class WhatsAppDriver:
         self._expected_digits = number
         self._page.goto(WHATSAPP_SEND_URL.format(digits=number))
         self._require_origin()
+        # The page is rendered client-side, so wait (bounded) for a recognizable
+        # state before reading identity, then refuse unless it is authenticated.
+        self._wait_until_ready()
+        self.require_authenticated()
         header = self._read_header()
         self._verify_header(header)
         self._logger.info("whatsapp chat opened for a verified contact (digits=%d)", len(number))
@@ -283,6 +391,8 @@ class WhatsAppDriver:
         self._expected_digits = digits_only(digits)
         self._page.goto(WHATSAPP_BASE_URL)
         self._require_origin()
+        self._wait_until_ready()
+        self.require_authenticated()
         self._page.fill_search(query)
         hits = self._page.search_results()
         exact = [hit for hit in hits if normalize_text(hit.name).casefold() == query.casefold()]
@@ -316,6 +426,9 @@ class WhatsAppDriver:
             raise WhatsAppError("the attachment has no file name to verify")
         if not target.is_file():
             raise WhatsAppError("the attachment file does not exist; nothing was staged")
+        # Authentication is proven on the live page *before* anything is staged,
+        # so a logged-out or QR-only profile can never receive an attachment.
+        self.require_authenticated()
         self._verify_header(self._read_header())
         self._page.set_input_files(str(target))
         scan = self._page.attachment_scan(name)
@@ -356,6 +469,7 @@ class WhatsAppDriver:
         click, so a chat switch or a cleared preview stops the send.
         """
         name = normalize_text(expect_name)
+        self.require_authenticated()
         header = self._read_header()
         self._verify_header(header)
         if name:
@@ -386,6 +500,38 @@ class WhatsAppDriver:
         return SendOutcome(header=header, control=control.name, staged_count=count)
 
     # ── internals ──────────────────────────────────────────────────────────
+
+    def _probe_session(self) -> WhatsAppSessionState:
+        """The page's session state; any failure is ``unknown``, never a pass."""
+        try:
+            raw = self._page.session_state()
+        except Exception as exc:  # noqa: BLE001 - a failed probe is not a pass
+            self._logger.warning("the WhatsApp session probe failed: %s", exc)
+            return WhatsAppSessionState.UNKNOWN
+        if isinstance(raw, WhatsAppSessionState):
+            return raw
+        try:
+            return WhatsAppSessionState(str(raw))
+        except ValueError:
+            self._logger.warning("the WhatsApp session probe returned an unrecognized state")
+            return WhatsAppSessionState.UNKNOWN
+
+    def _wait_until_ready(self) -> WhatsAppSessionState:
+        """Run the page's bounded readiness wait, wrapping a failure.
+
+        The wait itself lives in the narrow page adapter (no sleep, no polling
+        and no DOM access here), so the driver can never spin or hold a generic
+        page handle.
+        """
+        try:
+            return self._page.wait_for_ready(_READY_TIMEOUT_S)
+        except WhatsAppError:
+            raise
+        except Exception as exc:
+            raise WhatsAppNotReady(
+                WhatsAppSessionState.UNKNOWN,
+                "the WhatsApp page did not become ready; refusing to continue",
+            ) from exc
 
     def _require_origin(self) -> None:
         """Refuse anything that is not exactly the WhatsApp origin."""

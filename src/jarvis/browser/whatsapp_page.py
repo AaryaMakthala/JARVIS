@@ -15,6 +15,7 @@ in - so this module can be imported on any platform.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from jarvis.browser.whatsapp_web import (
@@ -23,6 +24,8 @@ from jarvis.browser.whatsapp_web import (
     SearchHit,
     SendControl,
     WhatsAppError,
+    WhatsAppNotReady,
+    WhatsAppSessionState,
 )
 
 __all__ = ["PlaywrightWhatsAppPage"]
@@ -71,8 +74,70 @@ _MAX_CANDIDATES = 40
 #: Upper bound on the named controls returned by one scan.
 _MAX_CONTROLS = 40
 
+#: How long ``wait_for_ready`` polls before it refuses (seconds).
+_READY_DEFAULT_TIMEOUT_S = 20.0
+#: Hard ceiling, so a caller can never wait indefinitely.
+_READY_MAX_TIMEOUT_S = 45.0
+#: Delay between polls: small enough to notice a render, large enough not to spin.
+_READY_POLL_INTERVAL_MS = 250
+
+#: The signed-in application shell.  ``#pane-side`` is the left-hand chat list
+#: and exists whenever a device is linked; an open conversation's header is
+#: equally good evidence that the session is signed in.
+_AUTHENTICATED_SELECTORS = (
+    "#pane-side",
+    '[data-testid="chat-list"]',
+    "#main header",
+)
+
+#: The QR sign-in surface.  Only a QR node counts - not the surrounding copy.
+_QR_SURFACE_SELECTORS = (
+    '[data-testid="qrcode"]',
+    'canvas[aria-label*="qr" i]',
+    '[data-testid*="qr-code" i]',
+)
+
+#: Explicit logged-out markers.  A page that merely lacks a chat list is never
+#: reported as logged out: it stays ``unknown`` (fail closed).
+_LOGGED_OUT_SELECTORS = (
+    '[data-testid="logged-out"]',
+    '[data-testid="auth-failure"]',
+    '[data-testid="session-expired"]',
+)
+
+#: English copy WhatsApp uses on its logged-out screen.  Read only from a small
+#: slice of body text, and only when neither the shell nor a QR node exists, so
+#: a chat transcript can never be read for classification.
+_LOGGED_OUT_PHRASES = (
+    "logged out",
+    "use whatsapp on your phone",
+    "click to reload",
+)
+_MAX_LOGIN_TEXT_CHARS = 400
+
 
 # ── read-only DOM scripts (never click, never navigate) ───────────────────
+
+_JS_SESSION_STATE = """
+(cfg) => {
+  const has = (selectors) => {
+    for (const selector of selectors) {
+      try { if (document.querySelector(selector)) return true; } catch (e) { /* ignore */ }
+    }
+    return false;
+  };
+  if (has(cfg.authenticated)) return 'authenticated';
+  if (has(cfg.qr)) return 'qr_required';
+  if (has(cfg.loggedOut)) return 'logged_out';
+  // A chat surface exists but no shell marker matched: never read page text
+  // (it could be a transcript) and never claim a state.
+  if (document.querySelector('#main')) return 'unknown';
+  const body = (document.body && document.body.innerText) || '';
+  const text = body.slice(0, cfg.maxText).toLowerCase();
+  for (const phrase of cfg.phrases) { if (text.includes(phrase)) return 'logged_out'; }
+  return 'unknown';
+}
+"""
 
 _JS_HEADER = """
 () => {
@@ -292,6 +357,56 @@ class PlaywrightWhatsAppPage:
         except Exception as exc:  # noqa: BLE001 - an unreadable header is not a pass
             logger.debug("reading the WhatsApp chat header failed: %s", exc)
             return ""
+
+    # ── session state ──────────────────────────────────────────────────────
+
+    def session_state(self) -> WhatsAppSessionState:
+        """Return the page's authentication state (read-only and bounded)."""
+        config = {
+            "authenticated": list(_AUTHENTICATED_SELECTORS),
+            "qr": list(_QR_SURFACE_SELECTORS),
+            "loggedOut": list(_LOGGED_OUT_SELECTORS),
+            "phrases": list(_LOGGED_OUT_PHRASES),
+            "maxText": _MAX_LOGIN_TEXT_CHARS,
+        }
+        try:
+            raw = self._page.evaluate(_JS_SESSION_STATE, config)
+        except Exception as exc:  # noqa: BLE001 - a failed probe is not a pass
+            logger.debug("the WhatsApp session probe failed: %s", exc)
+            return WhatsAppSessionState.UNKNOWN
+        try:
+            return WhatsAppSessionState(str(raw or ""))
+        except ValueError:
+            logger.debug("the WhatsApp session probe returned an unrecognized state")
+            return WhatsAppSessionState.UNKNOWN
+
+    def wait_for_ready(
+        self, timeout_s: float = _READY_DEFAULT_TIMEOUT_S
+    ) -> WhatsAppSessionState:
+        """Poll the session state until it is recognizable or the budget ends.
+
+        Returns as soon as the page is ``authenticated``, ``qr_required`` or
+        ``logged_out``.  A page that stays ``unknown`` raises
+        :class:`~jarvis.browser.whatsapp_web.WhatsAppNotReady`; nothing is
+        assumed.  Each poll is preceded by Playwright's own bounded wait, so this
+        never busy-spins.
+        """
+        timeout = max(1.0, min(float(timeout_s), _READY_MAX_TIMEOUT_S))
+        deadline = time.monotonic() + timeout
+        while True:
+            state = self.session_state()
+            if state is not WhatsAppSessionState.UNKNOWN:
+                return state
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WhatsAppNotReady(
+                    WhatsAppSessionState.UNKNOWN,
+                    f"the WhatsApp page did not become ready within {timeout:.0f}s; "
+                    "refusing to continue",
+                )
+            self._page.wait_for_timeout(
+                max(1, min(_READY_POLL_INTERVAL_MS, int(remaining * 1000)))
+            )
 
     # ── search ─────────────────────────────────────────────────────────────
 

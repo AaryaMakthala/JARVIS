@@ -29,6 +29,7 @@ from jarvis.browser.whatsapp_web import (
     SendControl,
     WhatsAppDriver,
     WhatsAppError,
+    WhatsAppSessionState,
     header_matches,
     is_send_name,
     send_count,
@@ -50,9 +51,13 @@ class _FakePage:
         scan: AttachmentScan | None = None,
         controls: tuple[SendControl, ...] = (),
         redirect_to: str = "",
+        state: WhatsAppSessionState = WhatsAppSessionState.AUTHENTICATED,
+        probe_error: Exception | None = None,
     ) -> None:
         self.current_url = url
         self.header = header
+        self.state = state
+        self.probe_error = probe_error
         self.hits = hits
         self.staged = staged
         self.scan = scan if scan is not None else _composer_scan()
@@ -65,6 +70,16 @@ class _FakePage:
         self.clicked: list[str] = []
 
     # ── WhatsAppPage protocol ───────────────────────────────────────────
+
+    def session_state(self) -> WhatsAppSessionState:
+        """The fake's explicit state (a probe failure is modelled too)."""
+        if self.probe_error is not None:
+            raise self.probe_error
+        return self.state
+
+    def wait_for_ready(self, timeout_s: float = 20.0) -> WhatsAppSessionState:
+        del timeout_s
+        return self.session_state()
 
     def url(self) -> str:
         return self.current_url

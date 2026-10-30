@@ -17,7 +17,12 @@ from typing import Any
 import pytest
 
 from jarvis.browser.whatsapp_page import PlaywrightWhatsAppPage
-from jarvis.browser.whatsapp_web import WHATSAPP_BASE_URL, WhatsAppDriver, WhatsAppError
+from jarvis.browser.whatsapp_web import (
+    WHATSAPP_BASE_URL,
+    WhatsAppDriver,
+    WhatsAppError,
+    WhatsAppSessionState,
+)
 
 pytestmark = pytest.mark.windows_only
 
@@ -55,6 +60,20 @@ _PAGE = """
 
 _PREVIEW_IN_COMPOSER = '<div class="preview" aria-label="photo.jpg">photo.jpg</div>'
 _PREVIEW_IN_MESSAGES = '<div class="msg" aria-label="photo.jpg">sent earlier</div>'
+
+#: A local imitation of the QR sign-in surface.  No account, no network and no
+#: QR payload: it only proves the probe classifies a QR-shaped page correctly.
+_QR_PAGE = """
+<!doctype html>
+<html>
+  <body>
+    <div id="app">
+      <div data-testid="qrcode"><canvas aria-label="Scan this QR code"></canvas></div>
+      <div>Link with phone number</div>
+    </div>
+  </body>
+</html>
+"""
 
 
 def _write_fixture(tmp_path: Path, preview: str, extra: str = "") -> Path:
@@ -212,3 +231,35 @@ def test_driver_refuses_when_the_preview_is_outside_the_composer(
         driver.attach(target)
 
     assert chrome_page.evaluate("() => window.__sent") is False
+
+
+# ── session state (W0) ────────────────────────────────────────────────────
+
+
+def test_session_state_detects_the_authenticated_chat_fixture(
+    chrome_page: Any, tmp_path: Path
+) -> None:
+    adapter = _open_fixture(chrome_page, tmp_path, _PREVIEW_IN_COMPOSER)
+
+    assert adapter.session_state() is WhatsAppSessionState.AUTHENTICATED
+
+
+def test_session_state_detects_the_qr_login_surface(chrome_page: Any, tmp_path: Path) -> None:
+    """A QR-only page is ``qr_required``; no chat panel or account is needed."""
+    fixture = tmp_path / "qr.html"
+    fixture.write_text(_QR_PAGE, encoding="utf-8")
+    chrome_page.goto(fixture.as_uri(), wait_until="domcontentloaded")
+    adapter = _LocalWhatsAppPage(chrome_page, fixture)
+
+    assert adapter.session_state() is WhatsAppSessionState.QR_REQUIRED
+
+
+def test_session_state_is_unknown_for_an_unrecognizable_page(
+    chrome_page: Any, tmp_path: Path
+) -> None:
+    fixture = tmp_path / "unknown.html"
+    fixture.write_text("<html><body><p>nothing familiar</p></body></html>", encoding="utf-8")
+    chrome_page.goto(fixture.as_uri(), wait_until="domcontentloaded")
+    adapter = _LocalWhatsAppPage(chrome_page, fixture)
+
+    assert adapter.session_state() is WhatsAppSessionState.UNKNOWN

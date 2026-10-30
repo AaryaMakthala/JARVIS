@@ -20,6 +20,7 @@ from jarvis.browser.whatsapp_web import (
     AttachmentCandidate,
     AttachmentScan,
     SendControl,
+    WhatsAppSessionState,
 )
 from jarvis.messaging.base import MessageError, MessageRequest
 from jarvis.messaging.contacts import Contact
@@ -191,6 +192,14 @@ class _Page:
 
     def search_results(self) -> tuple[Any, ...]:
         return ()
+
+    def session_state(self) -> WhatsAppSessionState:
+        """These adapter tests run on an authenticated session."""
+        return WhatsAppSessionState.AUTHENTICATED
+
+    def wait_for_ready(self, timeout_s: float = 20.0) -> WhatsAppSessionState:
+        del timeout_s
+        return self.session_state()
 
     def open_search_result(self, hit: Any) -> None:
         del hit

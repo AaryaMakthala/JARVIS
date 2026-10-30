@@ -38,6 +38,7 @@ from jarvis.browser.whatsapp_web import (
     AttachmentScan,
     SearchHit,
     SendControl,
+    WhatsAppSessionState,
 )
 from jarvis.config import Settings
 from jarvis.llm.client import FakeLLM
@@ -128,6 +129,14 @@ class _Page:
         self.staged = (Path(path).name,)
         if self.on_stage is not None:
             self.on_stage()
+
+    def session_state(self) -> WhatsAppSessionState:
+        """These tests exercise the send path on an authenticated session."""
+        return WhatsAppSessionState.AUTHENTICATED
+
+    def wait_for_ready(self, timeout_s: float = 20.0) -> WhatsAppSessionState:
+        del timeout_s
+        return self.session_state()
 
     def staged_file_names(self) -> tuple[str, ...]:
         return self.staged
