@@ -47,7 +47,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -110,10 +110,24 @@ class WhatsAppSendFileArgs(BaseModel):
 
 
 class WhatsAppOpenChatArgs(BaseModel):
-    """Arguments for ``whatsapp_open_chat`` -- a contact name only."""
+    """Arguments for ``whatsapp_open_chat`` -- a contact and a route.
+
+    ``via`` selects *how* the chat is located, never *which* result is chosen:
+    ``phone`` is the trusted deep link (the default and the strongest route),
+    while ``search`` searches WhatsApp for the contact's stored **number** and
+    still requires a unique hit and a verified header.
+    """
 
     contact: str = Field(
         min_length=1, max_length=100, description="Contact name from `jarvis contacts`"
+    )
+    via: Literal["phone", "search"] = Field(
+        default="phone",
+        description=(
+            "How to open the chat: the phone deep link (default) or WhatsApp's "
+            "own search keyed to the contact's stored number. The search route "
+            "refuses an ambiguous hit or a chat that does not prove the contact."
+        ),
     )
 
 
@@ -152,7 +166,10 @@ def _describe_send_file(store: ContactStore | None, args: WhatsAppSendFileArgs) 
 
 def _describe_open_chat(store: ContactStore | None, args: WhatsAppOpenChatArgs) -> str:
     """Confirmation summary for opening a chat (no file is involved)."""
-    return f"open the WhatsApp chat with {_describe_contact(store, args.contact)}"
+    return (
+        f"open the WhatsApp chat with {_describe_contact(store, args.contact)} "
+        f"via {args.via}"
+    )
 
 
 def _require_windows(tool_name: str) -> ToolResult | None:
@@ -300,14 +317,23 @@ def _open_chat_run(
     flow = MessageFlow([adapter], store=store)
     try:
         contact = flow.resolve_contact(args.contact)
-        header = adapter.open_chat(contact)
+        header = (
+            adapter.open_chat(contact)
+            if args.via == "phone"
+            else adapter.open_chat_by_search(contact)
+        )
     except MessageError as exc:
         return ToolResult(ok=False, error=str(exc))
     return ToolResult(
         ok=True,
         output=f"opened the WhatsApp chat with {contact.name}",
         verified=True,
-        data={"recipient": contact.name, "phone_digits": contact.number, "header": header},
+        data={
+            "recipient": contact.name,
+            "phone_digits": contact.number,
+            "header": header,
+            "via": args.via,
+        },
     )
 
 
@@ -358,7 +384,9 @@ def make_whatsapp_open_chat_spec(store: ContactStore | None = None) -> ToolSpec:
         description=(
             "Open the existing WhatsApp Web chat for exactly one known contact "
             "and stop. This only navigates to the conversation; it never sends "
-            "a message or attaches a file."
+            "a message or attaches a file. With via='search' the chat is found "
+            "by searching WhatsApp for the contact's stored number; an "
+            "ambiguous hit or a chat that does not prove the contact is refused."
         ),
         args_model=WhatsAppOpenChatArgs,
         base_tier=1,

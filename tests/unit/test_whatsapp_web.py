@@ -258,7 +258,9 @@ def test_open_chat_by_name_refuses_an_ambiguous_search() -> None:
     page = _FakePage(hits=(SearchHit(name="Mom's sister"), SearchHit(name="Mom's brother")))
     driver = WhatsAppDriver(page)
 
-    with pytest.raises(WhatsAppError, match="not unique"):
+    # A partial hit is no longer a candidate at all: name search requires one
+    # exact match, so this search has none.
+    with pytest.raises(WhatsAppError, match="no exact match"):
         driver.open_chat_by_name("Mom")
 
     assert page.opened == []

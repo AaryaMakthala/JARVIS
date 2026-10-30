@@ -275,6 +275,24 @@ class WhatsAppWebAdapter:
         except WhatsAppError as exc:
             raise MessageError(f"could not open the WhatsApp chat: {exc}") from exc
 
+    def open_chat_by_search(self, contact: Contact) -> str:
+        """Open ``contact``'s chat through WhatsApp's own number search.
+
+        Same guards as :meth:`open_chat`: the page comes from the isolated
+        WhatsApp profile, the session must be authenticated, and the driver
+        refuses an ambiguous hit or an unproven header.  The query is the
+        contact's trusted number, so a display name alone can never select a
+        conversation.
+        """
+        page = self._open_page()
+        if page is None:
+            raise MessageError("the WhatsApp browser session is not available; refusing to open")
+        driver = WhatsAppDriver(page)
+        try:
+            return driver.open_chat_by_search(contact.number, contact.name)
+        except WhatsAppError as exc:
+            raise MessageError(f"could not open the WhatsApp chat: {exc}") from exc
+
     # ── internals ────────────────────────────────────────────────────────
 
     def _open_page(self) -> Any | None:

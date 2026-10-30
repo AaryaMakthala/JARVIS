@@ -245,7 +245,10 @@ def test_open_chat_is_tier1_navigation_only() -> None:
     assert spec is not None
     assert spec.base_tier == 1
     assert spec.budget_cost == 1
-    assert set(spec.args_model.model_fields) == {"contact"}
+    # ``via`` chooses the route only (phone deep link vs number search); there
+    # is still no message, path, caption or result-selection argument.
+    assert set(spec.args_model.model_fields) == {"contact", "via"}
+    assert spec.args_model.model_fields["via"].default == "phone"
 
 
 def test_config_defaults_include_the_file_cap() -> None:

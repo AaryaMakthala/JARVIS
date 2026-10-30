@@ -66,6 +66,7 @@ __all__ = [
     "WhatsAppSessionError",
     "WhatsAppSessionState",
     "WhatsAppSessionUnknown",
+    "header_confirms_recipient",
 ]
 
 logger = logging.getLogger("jarvis.browser.whatsapp")
@@ -300,6 +301,26 @@ def header_matches(header: str, name: str = "", digits: str = "") -> bool:
     return bool(wanted and wanted in digits_only(text))
 
 
+def header_confirms_recipient(header: str, name: str = "", digits: str = "") -> bool:
+    """Whether a chat header is *exactly* this recipient (search routes).
+
+    Stricter than :func:`header_matches`, which the phone deep link still uses:
+    when the header shows any number at all it must contain the expected
+    number, so a header naming a different number is refused even when the name
+    matches; and a header with no number must equal the expected name exactly -
+    a substring ("Rahul Sharma" for "Rahul") is not proof.
+    """
+    text = normalize_text(header)
+    if not text:
+        return False
+    seen = digits_only(text)
+    wanted = digits_only(digits)
+    if seen:
+        return bool(wanted) and wanted in seen
+    expected = normalize_text(name)
+    return bool(expected) and text.casefold() == expected.casefold()
+
+
 def is_send_name(name: str) -> bool:
     """Whether ``name`` looks like WhatsApp's Send control."""
     return bool(_SEND_NAME_RE.match(normalize_text(name)))
@@ -395,20 +416,53 @@ class WhatsAppDriver:
         self.require_authenticated()
         self._page.fill_search(query)
         hits = self._page.search_results()
-        exact = [hit for hit in hits if normalize_text(hit.name).casefold() == query.casefold()]
-        if len(exact) == 1:
-            chosen = exact[0]
-        elif len(exact) > 1:
-            raise WhatsAppError("the WhatsApp search returned more than one exact match; refusing")
-        elif len(hits) == 1:
-            chosen = hits[0]
-        elif not hits:
+        if not hits:
             raise WhatsAppError("the WhatsApp search returned no contact; refusing")
-        else:
-            raise WhatsAppError("the WhatsApp search result was not unique; refusing")
-        self._page.open_search_result(chosen)
+        exact = [hit for hit in hits if normalize_text(hit.name).casefold() == query.casefold()]
+        if len(exact) > 1:
+            raise WhatsAppError("the WhatsApp search returned more than one exact match; refusing")
+        if not exact:
+            # A partial hit is *not* an identity: opening it would be a guess.
+            raise WhatsAppError(
+                "the WhatsApp search returned no exact match for that contact; refusing"
+            )
+        self._page.open_search_result(exact[0])
         header = self._read_header()
-        self._verify_header(header)
+        self._verify_header_for_search(header)
+        return header
+
+    def open_chat_by_search(self, digits: str, name: str = "") -> str:
+        """Open ``digits``' chat through WhatsApp's own search.
+
+        The query is the *number*, never a display name, so the selected
+        conversation is bound to the trusted number rather than to whatever
+        name WhatsApp happens to show.  Exactly one hit is required, and the
+        opened header must either show that number or be exactly the expected
+        saved name; anything else is refused and nothing is opened.
+        """
+        number = digits_only(digits)
+        if not 8 <= len(number) <= 15:
+            raise WhatsAppError("refusing to search for a number that is not 8-15 digits")
+        self._expected_name = normalize_text(name)
+        self._expected_digits = number
+        self._page.goto(WHATSAPP_BASE_URL)
+        self._require_origin()
+        self._wait_until_ready()
+        self.require_authenticated()
+        self._page.fill_search(number)
+        hits = self._page.search_results()
+        if not hits:
+            raise WhatsAppError("the WhatsApp search returned no chat for that number; refusing")
+        if len(hits) > 1:
+            raise WhatsAppError(
+                "the WhatsApp search returned more than one chat for that number; refusing"
+            )
+        self._page.open_search_result(hits[0])
+        header = self._read_header()
+        self._verify_header_for_search(header)
+        self._logger.info(
+            "whatsapp chat opened through a number search (digits=%d)", len(number)
+        )
         return header
 
     # ── attaching ──────────────────────────────────────────────────────────
@@ -548,6 +602,15 @@ class WhatsAppDriver:
         except Exception as exc:  # noqa: BLE001 - an unreadable header is not a pass
             self._logger.warning("the WhatsApp chat header could not be read: %s", exc)
             return ""
+
+    def _verify_header_for_search(self, header: str) -> None:
+        """Fail closed unless the opened chat proves exactly this recipient."""
+        if not header:
+            raise WhatsAppError("the WhatsApp chat header could not be read; refusing to continue")
+        if not header_confirms_recipient(header, self._expected_name, self._expected_digits):
+            raise WhatsAppError(
+                "the opened WhatsApp chat does not prove the requested contact; refusing to continue"
+            )
 
     def _verify_header(self, header: str) -> None:
         """Fail closed unless the header proves the chat identity."""
