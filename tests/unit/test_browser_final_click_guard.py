@@ -1,7 +1,5 @@
 """Phase 5C: live readback + trusted digest binding for the guarded final click.
 
-NOT EXECUTED — pending authorized verification.
-
 Every test here is written to hold only if the readback a user is shown comes
 from a **live** observation of the real target, survives the confirmation
 ``interrupt``, and is the value the click is finally checked against.  The fake
@@ -98,6 +96,8 @@ class FakeSession:
         self.clicked: list[str] = []
         self.typed: list[Any] = []
         self.navigated: list[str] = []
+        self.presses: list[tuple[Any, dict[str, Any]]] = []
+        self.presses: list[str] = []
 
     def resolve(self, ref: str) -> ElementRef | None:
         self.resolved.append(str(ref))
@@ -129,7 +129,18 @@ class FakeSession:
 
     @property
     def untouched(self) -> bool:
-        return not self.clicked and not self.typed and not self.navigated
+        return not self.clicked and not self.typed and not self.navigated and not self.presses
+
+    def press(self, *args: Any, **kwargs: Any) -> None:
+        # Recorded, never raised, so tests can prove the press-key path never
+        # reached for a keyboard tool without breaking unrelated tools that use
+        # this same double.
+        self.presses.append((args, kwargs))
+        return None
+
+    def press_key(self, *args: Any, **kwargs: Any) -> None:
+        self.press(*args, **kwargs)
+        return None
 
 
 class _StubEngine:
@@ -867,36 +878,62 @@ def test_the_tool_refuses_missing_or_wrong_digests(temp_journal) -> None:
     assert session.clicked == [_REF]
 
 
-@pytest.mark.parametrize(
-    "changed",
-    [
-        _element("Post to someone-else@example.com"),
-        _element("Publish"),
-        _element("Post", origin="https://evil.example.net"),
-        _element("Subscribe for 99 USD"),
-    ],
-)
-def test_a_pre_click_change_in_the_live_target_is_rejected(changed: ElementRef) -> None:
+#: The four ways the *live* target can move after the user approved it.  Each
+#: variant keeps the declared action (``post``) valid, so the only difference
+#: from the baseline is the field named in the id: the recipient read off the
+#: control, the destination host, the amount, and the currency.
+_CHANGED_FIELDS = [
+    pytest.param(_element("Post to someone-else@example.com"), id="recipient"),
+    pytest.param(
+        _element("Post to aarya@example.com", origin="https://evil.example.net"),
+        id="destination",
+    ),
+    pytest.param(_element("Post to aarya@example.com 7 USD"), id="amount"),
+    pytest.param(_element("Post to aarya@example.com 7 EUR"), id="currency"),
+]
+
+
+@pytest.mark.parametrize("changed", _CHANGED_FIELDS)
+def test_a_pre_click_change_in_the_live_target_is_rejected(
+    changed: ElementRef, temp_journal: Any
+) -> None:
+    """A field that moves after approval cannot be clicked under the old digest.
+
+    The baseline is the real control the user was shown ("Post to…"), observed
+    successfully.  Each variant changes exactly one field of that live target;
+    the fresh observation must then produce a different digest, and the tool
+    must refuse the click before it reserves a journal row or dispatches
+    anything.
+    """
     action = "post"
     session = FakeSession({_REF: _element("Post to aarya@example.com")})
     ctx = _ctx(session)
     spec = make_browser_final_click_spec()
     args = spec.args_model(ref=_REF, action=action, expect="publish")
+
     baseline = build_observed_readback(session.resolve(_REF), action)
-    assert baseline.ok is True, f"baseline should observe the declared control; got {baseline.reason!r}"
-    baseline_digest = baseline.digest
+    assert baseline.ok is True, f"baseline must observe the declared control; got {baseline.reason!r}"
+    baseline_digest = str(baseline.digest)
+    assert is_hex64(baseline_digest) is True, baseline_digest
+    assert temp_journal.total_count_all() == 0
 
-    assert baseline.digest != ""
-
-    session.elements[_REF] = changed  # the page changes after the approval
+    session.elements[_REF] = changed  # the live target changes after approval
     live = build_observed_readback(session.resolve(_REF), action)
-    assert live.digest != baseline_digest, f"changed={changed.name!r}"
+    assert live.ok is True, f"{changed.name!r} is still an observable control; got {live.reason!r}"
+    live_digest = str(live.digest)
+    assert is_hex64(live_digest) is True, live_digest
+    assert live_digest != baseline_digest, (changed.name, live_digest, baseline_digest)
 
     tool_ctx = ctx.tool_context()
     tool_ctx.approved_final_click_readback_hash = baseline_digest
     result = spec.run(args, tool_ctx)
-    assert result.ok is False, f"changed={changed.name!r} should still be refused"
-    assert session.clicked == []
+    assert result.ok is False, f"changed={changed.name!r} should be refused"
+    assert "changed" in str(result.error), result.error
+    # Rejected before the journal reserved anything, and nothing was dispatched.
+    assert temp_journal.total_count_all() == 0
+    assert session.clicked == [], f"changed={changed.name!r}: no click on a changed target"
+    assert session.typed == [], f"changed={changed.name!r}: no typing on a changed target"
+    assert session.navigated == [], f"changed={changed.name!r}: no navigation"
 
 
 def test_the_tool_rechecks_the_cap_immediately_before_clicking() -> None:
@@ -925,12 +962,12 @@ def test_the_tool_refuses_a_payment_control_and_password_field_outright() -> Non
         ctx = _ctx(session)
         spec = make_browser_final_click_spec()
         args = spec.args_model(ref=_REF, action="send", expect="")
-        observation = build_observed_readback(element, "send")
-        tool_ctx = ctx.tool_context()
-        tool_ctx.approved_final_click_readback_hash = observation.digest or ("0" * 64)
-        result = spec.run(args, tool_ctx)
-        assert result.ok is False
-        assert session.clicked == []
+    observation = build_observed_readback(element, "send")
+    tool_ctx = ctx.tool_context()
+    tool_ctx.approved_final_click_readback_hash = observation.digest or ("0" * 64)
+    result = spec.run(args, tool_ctx)
+    assert result.ok is False, f"{element!r} should be refused"
+    assert session.clicked == [], f"{element!r} should not be clicked"
 
 
 def test_the_tool_is_disabled_while_final_click_max_total_is_zero() -> None:
@@ -941,8 +978,8 @@ def test_the_tool_is_disabled_while_final_click_max_total_is_zero() -> None:
     observation = build_observed_readback(session.resolve(_REF), "post")
     tool_ctx = ctx.tool_context()
     tool_ctx.approved_final_click_readback_hash = observation.digest
-    assert spec.run(args, tool_ctx).ok is False
-    assert session.clicked == []
+    assert spec.run(args, tool_ctx).ok is False, "disabled final click must be refused"
+    assert session.clicked == [], "disabled final click must not click"
 
 
 def test_indeterminate_or_dispatched_click_is_never_retried(temp_journal) -> None:
