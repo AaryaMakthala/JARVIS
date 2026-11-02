@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import secrets
 import shutil
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -305,3 +308,83 @@ def make_voice_loop(
         tts=tts,
     )
     return loop, audio, wake, stt, tts
+
+
+# ── cross-process duplicate-send guard helpers (W4.4) ─────────────────────
+#
+# The guard's whole point is that a *second process* cannot claim the same
+# approved operation, so these tests spawn real interpreters instead of threads.
+
+_GUARD_CHILD = """
+import os
+import sys
+import time
+
+from jarvis.messaging.whatsapp_web import FileSendGuard
+
+db, key, start_at, mode = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
+guard = FileSendGuard(db)
+while time.time() < start_at:
+    time.sleep(0.001)
+try:
+    claimed = guard.claim(key)
+except OSError as exc:
+    print("ERROR:" + type(exc).__name__, flush=True)
+    raise SystemExit(3)
+print("CLAIMED" if claimed else "REFUSED", flush=True)
+if mode == "crash":
+    os._exit(9)
+"""
+
+
+def guard_claim_process(
+    db: Path,
+    key: str,
+    *,
+    start_at: float = 0.0,
+    crash: bool = False,
+    timeout: float = 120.0,
+) -> tuple[int, str, str]:
+    """Run one real child process that claims ``key``; return (rc, out, err).
+
+    ``crash=True`` makes the child exit abruptly (``os._exit``) *after* the
+    claim, which is how a killed JARVIS process is simulated.
+    """
+    mode = "crash" if crash else "ok"
+    completed = subprocess.run(
+        [sys.executable, "-c", _GUARD_CHILD, str(db), str(key), str(start_at), mode],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=timeout,
+    )
+    return (
+        completed.returncode,
+        (completed.stdout or "").strip(),
+        (completed.stderr or "").strip(),
+    )
+
+
+def guard_claim_race(
+    db: Path,
+    key: str,
+    *,
+    processes: int = 4,
+    timeout: float = 120.0,
+) -> list[tuple[int, str, str]]:
+    """Start ``processes`` children that claim ``key`` at the same instant."""
+    start_at = time.time() + 4.0  # let every child finish importing jarvis
+    children = [
+        subprocess.Popen(
+            [sys.executable, "-c", _GUARD_CHILD, str(db), str(key), str(start_at), "ok"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(processes)
+    ]
+    results: list[tuple[int, str, str]] = []
+    for child in children:
+        out, err = child.communicate(timeout=timeout)
+        results.append((child.returncode, (out or "").strip(), (err or "").strip()))
+    return results

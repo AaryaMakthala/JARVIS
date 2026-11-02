@@ -42,6 +42,8 @@ from jarvis.browser.whatsapp_web import (
 )
 from jarvis.config import Settings
 from jarvis.llm.client import FakeLLM
+from jarvis.messaging.contacts import Contact
+from jarvis.messaging.whatsapp_web import content_digest, guard_key
 from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
 from jarvis.tools.registry import build_default_registry
 from jarvis.tools.whatsapp import ContactStore, RateLimiter
@@ -53,7 +55,7 @@ from jarvis.tools.whatsapp_web import (
     make_whatsapp_open_chat_spec,
     make_whatsapp_send_file_spec,
 )
-from support import brain_action, brain_clarify, registry_with
+from support import brain_action, brain_clarify, guard_claim_race, registry_with
 
 _PHONE = "919876543210"
 
@@ -550,3 +552,20 @@ def test_a_contact_clarification_preserves_the_send_intent(
 
     assert second.interrupted is False
     assert record == [{"contact": "Rahul", "path": str(target)}]
+
+
+# ── W4.4: the attachment guard is cross-process atomic too ────────────────
+
+
+def test_the_attachment_guard_is_claimed_once_across_processes(tmp_path: Path) -> None:
+    target = _file(tmp_path)
+    digest = content_digest(target, 1024 * 1024)
+    assert digest is not None
+    key = guard_key(Contact(name="Rahul", number=_PHONE), digest)
+
+    results = guard_claim_race(tmp_path / "guard.sqlite3", key, processes=4)
+
+    assert all(rc == 0 for rc, _out, _err in results), results
+    outcomes = [out for _rc, out, _err in results]
+    assert outcomes.count("CLAIMED") == 1, results
+    assert outcomes.count("REFUSED") == 3, results

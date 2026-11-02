@@ -961,13 +961,13 @@ def whatsapp_ratelimit_file() -> Path:
 
 
 def whatsapp_sent_files_file() -> Path:
-    """Path to the short-lived WhatsApp file resend guard (hashed keys only)."""
-    return user_data_dir("whatsapp_sent_files.json")
+    """Path to the WhatsApp file resend guard (SQLite, hashed keys only)."""
+    return user_data_dir("whatsapp_sent_files.sqlite3")
 
 
 def whatsapp_text_sent_file() -> Path:
-    """Path to the short-lived WhatsApp text-send guard (hashed operation keys only)."""
-    return user_data_dir("whatsapp_text_sent.json")
+    """Path to the WhatsApp text-send guard (SQLite, hashed operation keys only)."""
+    return user_data_dir("whatsapp_text_sent.sqlite3")
 
 
 def memory_db() -> Path:

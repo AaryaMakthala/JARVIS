@@ -91,6 +91,10 @@ def _block_dangerous_calls_in_tests(monkeypatch: pytest.MonkeyPatch, request: py
         or "test_tools_dictation" in test_file
         or "test_tools_open_in_app" in test_file
         or "test_tools_apps" in test_file
+        # W4.4: these suites must spawn real interpreters to prove the
+        # duplicate-send guard is atomic between *processes*.
+        or "test_whatsapp_send_message" in test_file
+        or "test_whatsapp_send_file" in test_file
         or "test_memory.py" in test_file and "embed_is_process_stable" in request.node.name
     )
     if not allow_subprocess:

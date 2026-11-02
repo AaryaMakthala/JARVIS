@@ -24,10 +24,8 @@ WhatsApp** for the owner.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import os
-import threading
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +55,7 @@ __all__ = [
     "RESEND_WINDOW_S",
     "ConversationRead",
     "FileSendGuard",
+    "GuardStorageError",
     "WhatsAppWebAdapter",
     "WhatsAppWebTextAdapter",
     "content_digest",
@@ -71,26 +70,6 @@ RESEND_WINDOW_S = 600.0
 #: Fallback cap when the policy module does not expose its content-hash cap.
 _DEFAULT_HASH_CAP = 16 * 1024 * 1024
 
-#: One lock per guard file, shared by every instance in this process.  The tool
-#: builds a fresh :class:`FileSendGuard` for each dispatch, so an instance lock
-#: alone would let two concurrent dispatches of the *same* approval both read
-#: the file before either writes it.  The lock makes ``claim`` atomic for every
-#: guard pointed at the same file (the persisted file still covers restarts).
-_GUARD_LOCKS: dict[str, threading.Lock] = {}
-_GUARD_LOCKS_GUARD = threading.Lock()
-
-
-def _guard_lock(path: Path) -> threading.Lock:
-    """Return the process-wide lock for one guard file (created on demand)."""
-    key = os.path.normcase(str(path.resolve(strict=False)))
-    with _GUARD_LOCKS_GUARD:
-        lock = _GUARD_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _GUARD_LOCKS[key] = lock
-        return lock
-
-
 @dataclass(frozen=True)
 class ConversationRead:
     """The result of a read-only WhatsApp conversation read.
@@ -104,21 +83,45 @@ class ConversationRead:
     messages: tuple[WhatsAppMessage, ...]
 
 
+class GuardStorageError(OSError):
+    """The duplicate-send guard storage could not be used, so sending is refused.
+
+    It subclasses :class:`OSError` deliberately: both channel adapters already
+    wrap ``is_recent``/``claim`` in ``except OSError`` and refuse to send, so a
+    broken store can never be read as "nothing was sent yet".
+    """
+
+
+#: How long a claim waits for another *process* to release SQLite's write lock
+#: before refusing.  Bounded on purpose: a long wait only delays a refusal.
+GUARD_BUSY_TIMEOUT_S = 2.0
+
+_CLAIM_TABLE = (
+    "CREATE TABLE IF NOT EXISTS claims (key TEXT PRIMARY KEY, claimed_at REAL NOT NULL)"
+)
+
+
 class FileSendGuard:
-    """Persisted, short-lived "this operation was already attempted" guard.
+    """Persisted, **cross-process** "this operation was already attempted" guard.
 
-    ``claim`` atomically records an attempt and returns ``False`` when the same
-    opaque key was attempted inside :data:`RESEND_WINDOW_S`.  The file send uses
-    a sha256 of (contact number, content digest); the text send uses a sha256 of
-    the approved operation id.  Either way the file holds no readable phone
-    numbers, paths or message text.  This is a safety guard, not an
-    authorization control: a corrupt/missing file is treated as empty, while the
-    approval binding remains the security boundary.
+    Storage is a small SQLite database with one row per claimed key.  ``claim``
+    runs ``BEGIN IMMEDIATE`` and then ``INSERT OR IGNORE`` on a PRIMARY KEY, so
+    two *processes* racing for the same key cannot both win: SQLite's write lock
+    serialises them (bounded by ``busy_timeout_s``) and the loser's insert
+    reports 0 affected rows.  No Python lock is used as the security mechanism;
+    the database is the authority, which is what makes it work between processes.
 
-    Every guard for the same file shares one process-wide lock, so concurrent
-    dispatches of the same approval cannot both claim it (the tool constructs a
-    new guard per invocation).  The persisted file covers restarts; a second
-    *process* is outside this lock and relies on the recorded window.
+    The claim is committed **before** the irreversible click.  A process that
+    crashes after claiming leaves the row behind, so the same authorization
+    cannot be replayed, and an unknown click outcome is equally non-retryable
+    while the row is inside :data:`RESEND_WINDOW_S`.
+
+    The guard stores only opaque sha256 keys and a timestamp - never message
+    text, file paths or phone numbers.
+
+    Every storage problem (unwritable directory, corrupt file, busy timeout,
+    failed write) raises :class:`GuardStorageError`; a broken guard fails closed
+    instead of authorizing a send.
     """
 
     def __init__(
@@ -127,57 +130,97 @@ class FileSendGuard:
         *,
         window_s: float = RESEND_WINDOW_S,
         clock: Any = None,
+        busy_timeout_s: float = GUARD_BUSY_TIMEOUT_S,
     ) -> None:
         self.path = Path(path)
         self.window_s = float(window_s)
         self._clock = clock if clock is not None else time.time
-        self._lock = _guard_lock(self.path)
+        self._busy_timeout_s = float(busy_timeout_s)
+
+    # ── storage ──────────────────────────────────────────────────────────
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open the guard database, creating the table when needed.
+
+        Raises :class:`GuardStorageError` for every SQLite failure, so a locked,
+        corrupt or unwritable store can never look like an empty one.
+        """
+        conn: sqlite3.Connection | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(self.path), timeout=self._busy_timeout_s)
+            conn.isolation_level = None  # explicit BEGIN/COMMIT below
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute(_CLAIM_TABLE)
+        except (sqlite3.Error, OSError) as exc:
+            # Never leave a handle on a corrupt/locked store: on Windows that
+            # keeps the file locked and hides the original problem.
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    logger.debug("closing the unusable guard failed", exc_info=True)
+            raise GuardStorageError(
+                f"the WhatsApp duplicate-send guard is unusable ({exc})"
+            ) from exc
+        return conn
+
+    # ── the guard contract ───────────────────────────────────────────────
 
     def is_recent(self, key: str) -> bool:
-        """Whether ``key`` was attempted inside the window (read-only)."""
-        with self._lock:
-            entries = self._prune(self._load(), float(self._clock()))
-            return key in entries
+        """Whether ``key`` was claimed inside the window (read-only)."""
+        if not self.path.exists():
+            return False
+        if not self.path.is_file():
+            raise GuardStorageError(
+                "the WhatsApp duplicate-send guard path is not a file"
+            )
+        now = float(self._clock())
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM claims WHERE key = ? AND claimed_at > ?",
+                (str(key), now - self.window_s),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise GuardStorageError(
+                f"the WhatsApp duplicate-send guard could not be read ({exc})"
+            ) from exc
+        finally:
+            conn.close()
+        return row is not None
 
     def claim(self, key: str) -> bool:
-        """Atomically record ``key``; ``False`` when an attempt is recent."""
-        with self._lock:
-            now = float(self._clock())
-            entries = self._prune(self._load(), now)
-            if key in entries:
-                return False
-            entries[key] = now
-            self._write(entries)
-            return True
+        """Atomically claim ``key``; ``False`` when an attempt is already recent.
 
-    def _load(self) -> dict[str, float]:
-        if not self.path.is_file():
-            return {}
+        The prune, duplicate check and insert share one ``BEGIN IMMEDIATE``
+        transaction, so the decision is serialised across processes.  ``False``
+        is a safe refusal, never "cannot tell".
+        """
+        now = float(self._clock())
+        conn = self._connect()
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            records = data.get("entries", {})
-        except Exception:  # noqa: BLE001 - a bad guard file must not authorize a send
-            logger.warning("the WhatsApp resend guard is unreadable; treating it as empty")
-            return {}
-        if not isinstance(records, dict):
-            return {}
-        entries: dict[str, float] = {}
-        for key, timestamp in records.items():
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM claims WHERE claimed_at <= ?", (now - self.window_s,)
+            )
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO claims (key, claimed_at) VALUES (?, ?)",
+                (str(key), now),
+            )
+            claimed = cursor.rowcount == 1
+            conn.execute("COMMIT")
+        except sqlite3.Error as exc:
             try:
-                entries[str(key)] = float(timestamp)
-            except (TypeError, ValueError):
-                continue
-        return entries
-
-    def _prune(self, entries: dict[str, float], now: float) -> dict[str, float]:
-        cutoff = now - self.window_s
-        return {key: ts for key, ts in entries.items() if ts > cutoff}
-
-    def _write(self, entries: dict[str, float]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"entries": entries}), encoding="utf-8")
-        tmp.replace(self.path)
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                logger.debug("the guard rollback also failed", exc_info=True)
+            raise GuardStorageError(
+                f"the WhatsApp duplicate-send guard could not be recorded ({exc})"
+            ) from exc
+        finally:
+            conn.close()
+        return claimed
 
 
 def content_digest(target: Path, max_bytes: int) -> str | None:

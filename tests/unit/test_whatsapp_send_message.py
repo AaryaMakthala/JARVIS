@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import threading
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -47,7 +49,11 @@ from jarvis.browser.whatsapp_web import (
 )
 from jarvis.config import Settings
 from jarvis.messaging.contacts import ContactStore, RateLimiter
-from jarvis.messaging.whatsapp_web import FileSendGuard
+from jarvis.messaging.whatsapp_web import (
+    FileSendGuard,
+    GuardStorageError,
+    operation_guard_key,
+)
 from jarvis.policy import rules
 from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
 from jarvis.tools.registry import build_default_registry
@@ -56,7 +62,7 @@ from jarvis.tools.whatsapp_web import (
     WhatsAppSendMessageArgs,
     make_whatsapp_send_message_spec,
 )
-from support import registry_with
+from support import guard_claim_process, guard_claim_race, registry_with
 
 _PHONE = "919876543210"
 _MOM_PHONE = "919876543211"
@@ -1028,3 +1034,153 @@ def test_act_sets_the_operation_id_to_task_and_action_hash(tmp_path: Path) -> No
     assert results, "act must record a result"
     assert results[-1].ok, results[-1].error
     assert record == [f"t1:{action}"]
+
+
+# ── W4.4: cross-process atomic claiming ───────────────────────────────────
+#
+# These spawn real child interpreters: the persisted store, not a Python lock,
+# is what must stop a second JARVIS process holding the same approval.
+
+
+def test_four_processes_cannot_both_claim_the_same_approval(tmp_path: Path) -> None:
+    guard_path = tmp_path / "text_guard.sqlite3"
+    key = operation_guard_key("t1:abc")
+
+    results = guard_claim_race(guard_path, key, processes=4)
+
+    assert [rc for rc, _out, _err in results] == [0, 0, 0, 0], results
+    outcomes = [out for _rc, out, _err in results]
+    assert outcomes.count("CLAIMED") == 1, results
+    assert outcomes.count("REFUSED") == 3, results
+
+
+def test_the_claim_survives_the_claiming_process(tmp_path: Path) -> None:
+    guard_path = tmp_path / "text_guard.sqlite3"
+    key = operation_guard_key("t1:abc")
+
+    rc, out, err = guard_claim_process(guard_path, key)
+    assert (rc, out) == (0, "CLAIMED"), err
+
+    guard = FileSendGuard(guard_path)
+    assert guard.is_recent(key) is True
+    assert guard.claim(key) is False
+
+
+def test_a_crash_after_claiming_does_not_release_the_operation(tmp_path: Path) -> None:
+    guard_path = tmp_path / "text_guard.sqlite3"
+    key = operation_guard_key("t1:abc")
+
+    rc, out, _err = guard_claim_process(guard_path, key, crash=True)
+
+    assert (rc, out) == (9, "CLAIMED")
+    assert FileSendGuard(guard_path).claim(key) is False
+
+
+def test_a_second_process_is_refused_before_the_browser_opens(tmp_path: Path) -> None:
+    guard_path = tmp_path / "text_guard.sqlite3"
+    rc, out, err = guard_claim_process(guard_path, operation_guard_key("t1:abc"))
+    assert (rc, out) == (0, "CLAIMED"), err
+
+    page = _TextPage()
+    holder = _Holder(page)
+    spec = _spec(tmp_path, guard=FileSendGuard(guard_path))
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Rahul", message="hi"),
+        _ctx(holder, operation_id="t1:abc"),
+    )
+
+    assert result.ok is False
+    assert "already attempted" in result.error
+    assert holder.acquires == 0
+    assert page.clicked == []
+
+
+def test_a_new_authorization_can_send_identical_text(tmp_path: Path) -> None:
+    guard_path = tmp_path / "text_guard.sqlite3"
+    rc, out, _err = guard_claim_process(guard_path, operation_guard_key("t1:abc"))
+    assert (rc, out) == (0, "CLAIMED")
+
+    page = _TextPage()
+    holder = _Holder(page)
+    spec = _spec(tmp_path, guard=FileSendGuard(guard_path))
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Rahul", message="hi"),
+        _ctx(holder, operation_id="t2:def"),
+    )
+
+    assert result.ok, result.error
+    assert page.clicked == ["Send"]
+
+
+def test_a_corrupted_guard_fails_closed(tmp_path: Path) -> None:
+    guard_path = tmp_path / "text_guard.sqlite3"
+    guard_path.write_bytes(b"this is not a sqlite database")
+
+    with pytest.raises(GuardStorageError):
+        FileSendGuard(guard_path).claim(operation_guard_key("t1:abc"))
+
+    page = _TextPage()
+    holder = _Holder(page)
+    result = _spec(tmp_path, guard=FileSendGuard(guard_path)).execute(
+        WhatsAppSendMessageArgs(contact="Rahul", message="hi"), _ctx(holder)
+    )
+
+    assert result.ok is False
+    assert "duplicate-send guard could not be read" in result.error
+    assert holder.acquires == 0 and page.clicked == []
+
+
+def test_a_directory_where_the_guard_should_be_fails_closed(tmp_path: Path) -> None:
+    guard_path = tmp_path / "text_guard.sqlite3"
+    guard_path.mkdir()
+
+    with pytest.raises(GuardStorageError):
+        FileSendGuard(guard_path).is_recent(operation_guard_key("t1:abc"))
+
+    page = _TextPage()
+    holder = _Holder(page)
+    result = _spec(tmp_path, guard=FileSendGuard(guard_path)).execute(
+        WhatsAppSendMessageArgs(contact="Rahul", message="hi"), _ctx(holder)
+    )
+
+    assert result.ok is False
+    assert "duplicate-send guard could not be read" in result.error
+    assert holder.acquires == 0 and page.clicked == []
+
+
+def test_a_busy_guard_times_out_and_refuses(tmp_path: Path) -> None:
+    guard_path = tmp_path / "text_guard.sqlite3"
+    FileSendGuard(guard_path).claim("warmup")
+
+    blocker = sqlite3.connect(str(guard_path))
+    blocker.isolation_level = None
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        guard = FileSendGuard(guard_path, busy_timeout_s=0.05)
+        started = time.monotonic()
+        with pytest.raises(GuardStorageError):
+            guard.claim(operation_guard_key("t1:abc"))
+        assert time.monotonic() - started < 30.0  # bounded, never an endless wait
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+
+
+def test_the_guard_stores_only_opaque_keys(tmp_path: Path) -> None:
+    """No message text, contact name or phone number may be readable."""
+    guard_path = tmp_path / "text_guard.sqlite3"
+    page = _TextPage()
+    holder = _Holder(page)
+
+    result = _spec(tmp_path, guard=FileSendGuard(guard_path)).execute(
+        WhatsAppSendMessageArgs(contact="Rahul", message="a very secret plan"),
+        _ctx(holder),
+    )
+    assert result.ok, result.error
+
+    raw = guard_path.read_bytes()
+    assert b"secret plan" not in raw
+    assert b"Rahul" not in raw
+    assert _PHONE.encode() not in raw
