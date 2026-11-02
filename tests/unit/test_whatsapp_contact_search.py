@@ -345,17 +345,108 @@ def test_a_bare_word_opens_a_unique_decorated_contact(tmp_path: Path) -> None:
     assert page.searched == [_MOM_PHONE]
 
 
-def test_number_search_refuses_a_different_decorated_header(tmp_path: Path) -> None:
-    """"Mom ❤️" is saved; WhatsApp shows "Mom 💙" -> refused."""
+def test_number_search_accepts_a_unique_emoji_difference(tmp_path: Path) -> None:
+    """"Mom ❤️" is saved; a unique header "Mom 💙" proves the same identity."""
     page = _Page(hits=(SearchHit(name="Mom ❤️"),), header="Mom 💙")
 
     result, page, _holder = _open_contact(
         tmp_path, page, "Mom ❤️", ("Mom ❤️", _MOM_PHONE), via="search"
     )
 
+    assert result.ok, result.error
+    assert result.data["recipient"] == "Mom ❤️"
+    assert page.searched == [_MOM_PHONE]
+
+
+def test_number_search_accepts_a_bare_name_header_for_a_unique_contact(
+    tmp_path: Path,
+) -> None:
+    """A header without the saved emoji proves the unique saved contact."""
+    page = _Page(hits=(SearchHit(name="Mom ❤️"),), header="Mom")
+
+    result, page, _holder = _open_contact(
+        tmp_path, page, "Mom ❤️", ("Mom ❤️", _MOM_PHONE), via="search"
+    )
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "Mom ❤️"
+
+
+def test_a_name_only_header_cannot_resolve_an_ambiguous_emoji_key(
+    tmp_path: Path,
+) -> None:
+    """Two contacts share the key "mom"; a bare header cannot distinguish them."""
+    page = _Page(hits=(SearchHit(name="Mom ❤️"),), header="Mom")
+
+    result, _page, _holder = _open_contact(
+        tmp_path,
+        page,
+        "Mom ❤️",
+        ("Mom ❤️", _MOM_PHONE),
+        ("Mom 💙", _MOM_BLUE_PHONE),
+        via="search",
+    )
+
     assert result.ok is False
     assert "does not prove" in (result.error or "")
-    assert page.staged_paths == [] and page.clicked == []
+
+
+def test_a_different_decoration_cannot_resolve_an_ambiguous_emoji_key(
+    tmp_path: Path,
+) -> None:
+    page = _Page(hits=(SearchHit(name="Mom ❤️"),), header="Mom 🥰")
+
+    result, _page, _holder = _open_contact(
+        tmp_path,
+        page,
+        "Mom ❤️",
+        ("Mom ❤️", _MOM_PHONE),
+        ("Mom 💙", _MOM_BLUE_PHONE),
+        via="search",
+    )
+
+    assert result.ok is False
+    assert "does not prove" in (result.error or "")
+
+
+def test_an_exact_decorated_header_resolves_an_ambiguous_emoji_key(
+    tmp_path: Path,
+) -> None:
+    """The whole exact saved name is distinguishing evidence."""
+    page = _Page(hits=(SearchHit(name="Mom ❤️"),), header="Mom ❤️")
+
+    result, _page, _holder = _open_contact(
+        tmp_path,
+        page,
+        "Mom ❤️",
+        ("Mom ❤️", _MOM_PHONE),
+        ("Mom 💙", _MOM_BLUE_PHONE),
+        via="search",
+    )
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "Mom ❤️"
+
+
+def test_a_matching_header_number_resolves_an_ambiguous_emoji_key(
+    tmp_path: Path,
+) -> None:
+    """The trusted number remains the stronger identity evidence."""
+    page = _Page(
+        hits=(SearchHit(name="Mom ❤️"),),
+        header=f"Mom ❤️ +91 {_MOM_PHONE[-10:-5]} {_MOM_PHONE[-5:]}",
+    )
+
+    result, _page, _holder = _open_contact(
+        tmp_path,
+        page,
+        "Mom ❤️",
+        ("Mom ❤️", _MOM_PHONE),
+        ("Mom 💙", _MOM_BLUE_PHONE),
+        via="search",
+    )
+
+    assert result.ok, result.error
 
 
 def test_number_search_refuses_a_header_naming_a_different_phone(tmp_path: Path) -> None:
@@ -408,9 +499,36 @@ def test_ambiguous_decorated_names_are_refused_before_the_browser(
         ("", "Rahul", _PHONE, False),
         ("Rahul", "", "", False),
         ("Mom ❤️", "Mom ❤️", _PHONE, True),
-        ("Mom 💙", "Mom ❤️", _PHONE, False),
+        ("Mom", "Mom ❤️", _PHONE, True),
+        ("Mom 💙", "Mom ❤️", _PHONE, True),
+        ("Mom 🥰", "Mom ❤️", _PHONE, True),
+        ("❤️ Mom", "Mom ❤️", _PHONE, True),
+        ("Dad", "Mom ❤️", _PHONE, False),
         ("Mamá ❤️", "Mamá ❤️", _PHONE, True),
+        ("Mamá", "Mamá ❤️", _PHONE, True),
+        ("Mama", "Mamá ❤️", _PHONE, False),
     ],
 )
 def test_header_confirms_recipient(header: str, name: str, digits: str, expected: bool) -> None:
     assert header_confirms_recipient(header, name, digits) is expected
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("Mom", False),
+        ("Mom 🥰", False),
+        ("Mom ❤️", True),
+        ("Mom ❤️ +91 98765 43211", True),
+    ],
+)
+def test_header_confirms_recipient_when_the_name_key_is_ambiguous(
+    header: str, expected: bool
+) -> None:
+    """A name-only header must distinguish two contacts sharing the key "mom"."""
+    assert (
+        header_confirms_recipient(
+            header, "Mom ❤️", _MOM_PHONE, unique_name=False
+        )
+        is expected
+    )

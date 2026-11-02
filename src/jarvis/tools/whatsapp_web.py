@@ -413,11 +413,16 @@ def _resolve_file(raw: str, ctx: ToolContext) -> tuple[Path | None, int, ToolRes
     return target, size, None
 
 
-def _adapter(ctx: ToolContext, guard: FileSendGuard | None) -> WhatsAppWebAdapter:
-    """The WhatsApp Web channel adapter, wired to this context."""
+def _adapter(
+    ctx: ToolContext,
+    guard: FileSendGuard | None,
+    store: ContactStore | None = None,
+) -> WhatsAppWebAdapter:
+    """The WhatsApp Web channel adapter, wired to this context and store."""
     return WhatsAppWebAdapter(
         holder=ctx.whatsapp_browser,
         guard=guard or FileSendGuard(config.whatsapp_sent_files_file()),
+        store=store,
         max_bytes=_hash_cap(ctx),
     )
 
@@ -436,7 +441,7 @@ def _send_file_run(
 
     store = store or ContactStore(config.contacts_file())
     limiter = _limiter_for(limiter, ctx)
-    flow = MessageFlow([_adapter(ctx, guard)], store=store, limiter=limiter)
+    flow = MessageFlow([_adapter(ctx, guard, store)], store=store, limiter=limiter)
     request = MessageRequest(channel=CHANNEL_WHATSAPP_WEB, contact=args.contact)
 
     # 1. the recipient and the rate limit, before anything is opened
@@ -496,12 +501,14 @@ def _text_adapter(
     ctx: ToolContext,
     guard: FileSendGuard | None,
     operation_id: str,
+    store: ContactStore | None = None,
 ) -> WhatsAppWebTextAdapter:
-    """The WhatsApp Web text adapter, wired to this approved operation."""
+    """The WhatsApp Web text adapter, wired to this approval and store."""
     return WhatsAppWebTextAdapter(
         holder=ctx.whatsapp_browser,
         guard=guard or FileSendGuard(config.whatsapp_text_sent_file()),
         operation_id=operation_id,
+        store=store,
     )
 
 
@@ -526,7 +533,7 @@ def _send_message_run(
 
     store = store or ContactStore(config.contacts_file())
     limiter = _limiter_for(limiter, ctx)
-    adapter = _text_adapter(ctx, guard, operation_id)
+    adapter = _text_adapter(ctx, guard, operation_id, store)
     flow = MessageFlow([adapter], store=store, limiter=limiter)
     request = MessageRequest(
         channel=CHANNEL_WHATSAPP_WEB,
@@ -567,7 +574,7 @@ def _open_chat_run(
         return refusal
 
     store = store or ContactStore(config.contacts_file())
-    adapter = _adapter(ctx, None)
+    adapter = _adapter(ctx, None, store)
     flow = MessageFlow([adapter], store=store)
     try:
         contact = flow.resolve_contact(args.contact)
@@ -602,7 +609,7 @@ def _read_messages_run(
         return refusal
 
     store = store or ContactStore(config.contacts_file())
-    adapter = _adapter(ctx, None)
+    adapter = _adapter(ctx, None, store)
     flow = MessageFlow([adapter], store=store)
     try:
         contact = flow.resolve_contact(args.contact)

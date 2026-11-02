@@ -280,6 +280,30 @@ def test_emoji_decorated_contact_is_found_by_the_bare_word_only_when_unique(
     assert page.searched == [_MOM_PHONE]
 
 
+def test_a_bare_header_proves_a_unique_decorated_contact(tmp_path: Path) -> None:
+    """A header without the saved emoji proves the unique saved contact."""
+    store = _emoji_store(tmp_path)
+    page = _Page(messages=_messages(1), headers=("Mom",))
+
+    result, page, _holder = _run(tmp_path, page, store=store, contact="Mom ❤️", limit=1)
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "Mom ❤️"
+    assert page.read_limits == [1]
+
+
+def test_an_ambiguous_name_only_header_is_refused(tmp_path: Path) -> None:
+    """Two contacts share "mom"; a bare header is not enough to read."""
+    store = _store(tmp_path, ("Mom ❤️", _MOM_PHONE), ("Mom 💙", _MOM_BLUE_PHONE))
+    page = _Page(messages=_messages(1), headers=("Mom",))
+
+    result, page, _holder = _run(tmp_path, page, store=store, contact="Mom ❤️", limit=1)
+
+    assert not result.ok
+    assert "does not prove" in result.error
+    assert page.read_limits == []
+
+
 def test_two_emoji_decorated_contacts_are_ambiguous(
     tmp_path: Path,
 ) -> None:

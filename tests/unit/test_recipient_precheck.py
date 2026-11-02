@@ -159,6 +159,34 @@ def test_an_ambiguous_recipient_is_refused_before_confirmation(tmp_path: Any) ->
     assert "multiple contacts match" in (outcome.halted_reason or "")
 
 
+def test_a_unique_decorated_recipient_reaches_the_confirmation(tmp_path: Any) -> None:
+    outcome = _run(
+        tmp_path,
+        _store(tmp_path, ("Mom ❤️", _PHONE)),
+        "whatsapp_send",
+        {"contact": "Mom", "message": "hi"},
+    )
+
+    assert outcome.interrupted is True
+    assert outcome.confirmation is not None
+    assert outcome.halted_reason is None
+
+
+def test_an_ambiguous_decorated_recipient_produces_a_visible_response(tmp_path: Any) -> None:
+    store = _store(tmp_path, ("Mom ❤️", _PHONE), ("Mom 💙", "919876543211"))
+    outcome = _run(
+        tmp_path,
+        store,
+        "whatsapp_send",
+        {"contact": "Mom", "message": "hi"},
+    )
+
+    assert outcome.interrupted is False
+    assert outcome.halted_reason
+    assert "multiple contacts match" in outcome.halted_reason
+    assert "Mom ❤️" in outcome.halted_reason and "Mom 💙" in outcome.halted_reason
+
+
 def test_open_chat_is_prechecked_too(tmp_path: Any) -> None:
     outcome = _run(tmp_path, _store(tmp_path), "whatsapp_open_chat", {"contact": "Nobody"})
 

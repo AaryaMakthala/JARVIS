@@ -172,6 +172,9 @@ def test_send_count(name: str, expected: int | None) -> None:
     [
         ("Mom", "Mom", "", True),
         ("mom", "Mom", "", True),
+        ("Mom", "Mom ❤️", "", True),
+        ("Mom 🥰", "Mom ❤️", "", True),
+        ("Mum", "Mom ❤️", "", False),
         ("Mom +91 98765 43210", "Mom", _PHONE, True),
         ("+91 98765 43210", "", _PHONE, True),
         ("Mum", "Mom", "", False),

@@ -178,46 +178,25 @@ class ContactStore:
         return f"removed contact {name!r}"
 
     def resolve(self, query: str) -> list[Contact]:
-        """Case-insensitive lookup: exact name match first (NFC-canonical), then
-        a substring fallback on the same normalised form.
+        """Emoji-insensitive lookup: same normalized key first, then substring.
 
-        This is used by the CLI ``describe`` helpers and by the old tooling.
-        Message sending never uses this as its identity decision: the messaging
-        flow uses :func:`jarvis.messaging.resolver.resolve_contact`, which keeps
-        emoji/punctuation as lookup noise only and never promotes a lossy match
-        into an identity proof.
+        The comparison key is owned by :func:`jarvis.messaging.resolver.normalize_name`
+        and is imported lazily to avoid the module cycle (the resolver imports
+        :class:`Contact` from this module).  This helper is used by the CLI
+        ``describe`` paths; message sending still resolves through
+        :func:`jarvis.messaging.resolver.resolve_contact`, which never promotes a
+        lossy or ambiguous match into an identity proof.
         """
-        q = unicodedata.normalize("NFC", query.strip()).casefold()
-        q_sub = " ".join(q.split())
+        from jarvis.messaging.resolver import normalize_name
+
+        key = normalize_name(query)
+        if not key:
+            return []
         contacts = self.load()
-        exact = [
-            c
-            for c in contacts
-            if unicodedata.normalize("NFC", c.name).casefold() == q
-        ]
+        exact = [c for c in contacts if normalize_name(c.name) == key]
         if exact:
             return exact
-        return [
-            c for c in contacts
-            if q_sub in unicodedata.normalize("NFC", c.name).casefold()
-            or normalize_name_lite(c.name) == q_sub
-        ]
-
-
-def normalize_name_lite(name: str) -> str:
-    """Contact-store lookup key for display names (one algorithm, no recursion).
-
-    Only used by :meth:`ContactStore.resolve` as a last-resort fallback so a
-    bare-word CLI/describe lookup can still find a decorated saved name.  The
-    resolver owns the normalisation; importing it lazily avoids the module cycle
-    (the resolver imports :class:`Contact` from this module).  The result is a
-    lookup hint, never an identity proof: the send path resolves through
-    :func:`jarvis.messaging.resolver.resolve_contact` and keeps the trusted
-    phone number authoritative.
-    """
-    from jarvis.messaging.resolver import normalize_name
-
-    return normalize_name(name)
+        return [c for c in contacts if key in normalize_name(c.name)]
 
 
 class RateLimitError(Exception):

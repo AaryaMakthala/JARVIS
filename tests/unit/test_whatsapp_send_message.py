@@ -749,6 +749,68 @@ def test_the_exact_decorated_name_resolves_its_contact(
     assert page_is_verified(page, _MOM_PHONE)
 
 
+def test_a_bare_header_proves_a_unique_decorated_contact(tmp_path: Path) -> None:
+    """The user need not repeat the saved emoji; a bare header still proves it."""
+    page = _TextPage(header="Mom")
+    store = _store(tmp_path, ("Mom ❤️", _MOM_PHONE))
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Mom ❤️", message="hi"), _ctx(holder)
+    )
+
+    assert result.ok, result.error
+    assert page.fills == ["hi"] and page.clicked == ["Send"]
+
+
+def test_a_different_decoration_header_proves_a_unique_decorated_contact(
+    tmp_path: Path,
+) -> None:
+    page = _TextPage(header="Mom 🥰")
+    store = _store(tmp_path, ("Mom ❤️", _MOM_PHONE))
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Mom ❤️", message="hi"), _ctx(holder)
+    )
+
+    assert result.ok, result.error
+    assert page.clicked == ["Send"]
+
+
+def test_an_ambiguous_name_only_header_stops_before_composing(tmp_path: Path) -> None:
+    """Two contacts share "mom"; a bare header cannot pick one."""
+    page = _TextPage(header="Mom")
+    store = _store(tmp_path, ("Mom ❤️", _MOM_PHONE), ("Mom 💙", _MOM_BLUE_PHONE))
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Mom ❤️", message="hi"), _ctx(holder)
+    )
+
+    assert result.ok is False
+    assert "could not open the WhatsApp chat" in (result.error or "")
+    assert page.fills == [] and page.clicked == []
+
+
+def test_an_ambiguous_exact_decorated_header_is_accepted(tmp_path: Path) -> None:
+    """The whole exact saved name distinguishes the two decorated contacts."""
+    page = _TextPage(header="Mom ❤️")
+    store = _store(tmp_path, ("Mom ❤️", _MOM_PHONE), ("Mom 💙", _MOM_BLUE_PHONE))
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Mom ❤️", message="hi"), _ctx(holder)
+    )
+
+    assert result.ok, result.error
+    assert page.clicked == ["Send"]
+
+
 def test_mom_flag_love_is_found_by_the_bare_word_only_when_unique(
     tmp_path: Path,
 ) -> None:

@@ -48,6 +48,7 @@ from jarvis.messaging.base import (
     MessageRequest,
 )
 from jarvis.messaging.contacts import Contact
+from jarvis.messaging.resolver import normalize_name
 from jarvis.policy import paths
 
 logger = logging.getLogger(__name__)
@@ -227,11 +228,31 @@ class WhatsAppWebAdapter:
         *,
         holder: Any = None,
         guard: FileSendGuard,
+        store: Any = None,
         max_bytes: int = _DEFAULT_HASH_CAP,
     ) -> None:
         self._holder = holder
         self._guard = guard
+        self._store = store
         self._max_bytes = int(max_bytes)
+
+    def _name_key_is_unique(self, contact: Contact) -> bool:
+        """Whether no other stored contact shares this name's matching key.
+
+        The adapter is given the same ContactStore the flow resolved through.
+        If the store is missing or unreadable this returns ``False`` (fail
+        closed): a name-only header must then equal the whole exact saved name.
+        """
+        store = self._store
+        if store is None:
+            return False
+        try:
+            contacts = store.load()
+        except Exception:  # noqa: BLE001 - an unreadable store is not a proof
+            logger.warning("the contact store could not be read for header identity")
+            return False
+        key = normalize_name(contact.name)
+        return sum(1 for item in contacts if normalize_name(item.name) == key) == 1
 
     # ── the channel contract ─────────────────────────────────────────────
 
@@ -349,7 +370,11 @@ class WhatsAppWebAdapter:
             raise MessageError("the WhatsApp browser session is not available; refusing to open")
         driver = WhatsAppDriver(page)
         try:
-            return driver.open_chat_by_search(contact.number, contact.name)
+            return driver.open_chat_by_search(
+                contact.number,
+                contact.name,
+                name_is_unique=self._name_key_is_unique(contact),
+            )
         except WhatsAppError as exc:
             raise MessageError(f"could not open the WhatsApp chat: {exc}") from exc
 
@@ -366,7 +391,11 @@ class WhatsAppWebAdapter:
             raise MessageError("the WhatsApp browser session is not available; refusing to read")
         driver = WhatsAppDriver(page)
         try:
-            header = driver.open_chat_by_search(contact.number, contact.name)
+            header = driver.open_chat_by_search(
+                contact.number,
+                contact.name,
+                name_is_unique=self._name_key_is_unique(contact),
+            )
             messages = driver.recent_messages(limit)
         except WhatsAppError as exc:
             raise MessageError(f"could not read the WhatsApp conversation: {exc}") from exc
@@ -420,8 +449,9 @@ class WhatsAppWebTextAdapter(WhatsAppWebAdapter):
         holder: Any = None,
         guard: FileSendGuard,
         operation_id: str,
+        store: Any = None,
     ) -> None:
-        super().__init__(holder=holder, guard=guard)
+        super().__init__(holder=holder, guard=guard, store=store)
         self._operation_id = str(operation_id or "")
 
     def capabilities(self) -> frozenset[str]:
@@ -456,7 +486,11 @@ class WhatsAppWebTextAdapter(WhatsAppWebAdapter):
             raise MessageError("the WhatsApp browser session is not available; refusing to send")
         driver = WhatsAppDriver(page)
         try:
-            driver.open_chat_by_search(contact.number, contact.name)
+            driver.open_chat_by_search(
+                contact.number,
+                contact.name,
+                name_is_unique=self._name_key_is_unique(contact),
+            )
         except WhatsAppError as exc:
             raise MessageError(f"could not open the WhatsApp chat: {exc}") from exc
         try:

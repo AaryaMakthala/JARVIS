@@ -47,6 +47,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from jarvis.messaging.resolver import normalize_name
 from jarvis.policy.rules import url_origin
 
 __all__ = [
@@ -334,43 +335,50 @@ def header_matches(header: str, name: str = "", digits: str = "") -> bool:
     """Whether a chat header proves the identity of the open chat.
 
     The header passes when it shows the contact's saved name or the phone
-    digits (separators and spacing are ignored).  An empty header never
-    passes - "cannot read" is not "verified".
+    digits (separators and spacing are ignored).  The name comparison uses the
+    shared emoji-insensitive key, so a header showing "Mom" proves a saved
+    "Mom \u2764\ufe0f".  An empty header never passes - "cannot read" is not "verified".
     """
     text = normalize_text(header)
     if not text:
         return False
-    folded = text.casefold()
-    if name and normalize_text(name).casefold() in folded:
-        return True
     wanted = digits_only(digits)
-    return bool(wanted and wanted in digits_only(text))
+    if wanted and wanted in digits_only(text):
+        return True
+    expected = normalize_name(name)
+    return bool(expected) and normalize_name(text) == expected
 
 
-def _identity_name_key(value: str) -> str:
-    """Conservative identity key for a saved display name or a chat header.
+def _exact_name_key(value: str) -> str:
+    """Exact saved-name key: NFC + casefold + whitespace collapse, emoji kept.
 
-    NFC canonical equivalence plus Unicode-aware case folding, with whitespace
-    collapsed.  Emoji, emoji presentation selectors and accents are *kept*, so
-    two differently decorated names never collapse into one identity; the key
-    is only insensitive to how the same saved name was typed.
+    Only used to decide whether an ambiguous name-only header contains the
+    *whole* saved display name (including its decoration), which is the one
+    name-only form that can distinguish two contacts sharing an emoji-ignored
+    key.
     """
     return unicodedata.normalize("NFC", normalize_text(value)).casefold()
 
 
-def header_confirms_recipient(header: str, name: str = "", digits: str = "") -> bool:
-    """Whether a chat header is *exactly* this recipient (search routes).
+def header_confirms_recipient(
+    header: str,
+    name: str = "",
+    digits: str = "",
+    *,
+    unique_name: bool = True,
+) -> bool:
+    """Whether a chat header proves this recipient (search routes).
 
-    Stricter than :func:`header_matches`, which the phone deep link still uses:
-    when the header shows any number at all it must contain the expected
-    number, so a header naming a different number is refused even when the name
-    matches; and a header with no number must equal the expected name exactly -
-    a substring ("Rahul Sharma" for "Rahul") is not proof.
+    When the header shows a number it must contain the expected number, so a
+    header naming a different number is refused even when the name matches.
 
-    The name comparison uses the same NFC-canonical + casefold form as the store
-    and resolver, so a decorated header and a decorated saved name still confirm
-    when they are the same saved identity, while two differently decorated names
-    do not silently collapse into one.
+    A header with no number is compared with the saved name using the same
+    emoji-insensitive key as contact resolution.  ``unique_name`` records
+    whether the trusted contact is the only ContactStore entry with that key:
+    when it is not, an emoji-only difference cannot distinguish the contacts,
+    so only the whole exact saved name is accepted (a bare "Mom" or a different
+    decoration is refused).  An unmatched ordinary word, a substring, or an
+    unrelated name never passes.
     """
     text = normalize_text(header)
     if not text:
@@ -379,8 +387,14 @@ def header_confirms_recipient(header: str, name: str = "", digits: str = "") -> 
     wanted = digits_only(digits)
     if seen:
         return bool(wanted) and wanted in seen
-    expected = _identity_name_key(name)
-    return bool(expected) and _identity_name_key(text) == expected
+    expected = normalize_name(name)
+    if not expected:
+        # A name made only of emoji has no letters/digits to compare: it is
+        # inherently ambiguous, so only the whole exact saved name is proof.
+        return _exact_name_key(text) == _exact_name_key(name)
+    if normalize_name(text) != expected:
+        return False
+    return unique_name or _exact_name_key(text) == _exact_name_key(name)
 
 
 def _composer_visible(value: str) -> str:
@@ -439,6 +453,7 @@ class WhatsAppDriver:
         self._logger = logger or logging.getLogger("jarvis.browser.whatsapp")
         self._expected_name = ""
         self._expected_digits = ""
+        self._expected_name_is_unique = True
 
     # ── session ────────────────────────────────────────────────────────────
 
@@ -499,8 +514,8 @@ class WhatsAppDriver:
         hits = self._page.search_results()
         if not hits:
             raise WhatsAppError("the WhatsApp search returned no contact; refusing")
-        expected = _identity_name_key(query)
-        exact = [hit for hit in hits if _identity_name_key(hit.name) == expected]
+        expected = normalize_name(query)
+        exact = [hit for hit in hits if normalize_name(hit.name) == expected]
         if len(exact) > 1:
             raise WhatsAppError("the WhatsApp search returned more than one exact match; refusing")
         if not exact:
@@ -513,20 +528,31 @@ class WhatsAppDriver:
         self._verify_header_for_search(header)
         return header
 
-    def open_chat_by_search(self, digits: str, name: str = "") -> str:
+    def open_chat_by_search(
+        self,
+        digits: str,
+        name: str = "",
+        *,
+        name_is_unique: bool = True,
+    ) -> str:
         """Open ``digits``' chat through WhatsApp's own search.
 
         The query is the *number*, never a display name, so the selected
         conversation is bound to the trusted number rather than to whatever
         name WhatsApp happens to show.  Exactly one hit is required, and the
-        opened header must either show that number or be exactly the expected
-        saved name; anything else is refused and nothing is opened.
+        opened header must either show that number or match the expected saved
+        name under the shared emoji-insensitive key.
+
+        ``name_is_unique`` must be false when another ContactStore entry shares
+        the saved name's emoji-insensitive key; an emoji-only header then cannot
+        distinguish them, so only the whole exact saved name is accepted.
         """
         number = digits_only(digits)
         if not 8 <= len(number) <= 15:
             raise WhatsAppError("refusing to search for a number that is not 8-15 digits")
         self._expected_name = normalize_text(name)
         self._expected_digits = number
+        self._expected_name_is_unique = bool(name_is_unique)
         self._page.goto(WHATSAPP_BASE_URL)
         self._require_origin()
         self._wait_until_ready()
@@ -830,7 +856,12 @@ class WhatsAppDriver:
         """Fail closed unless the opened chat proves exactly this recipient."""
         if not header:
             raise WhatsAppError("the WhatsApp chat header could not be read; refusing to continue")
-        if not header_confirms_recipient(header, self._expected_name, self._expected_digits):
+        if not header_confirms_recipient(
+            header,
+            self._expected_name,
+            self._expected_digits,
+            unique_name=self._expected_name_is_unique,
+        ):
             raise WhatsAppError(
                 "the opened WhatsApp chat does not prove the requested contact; refusing to continue"
             )
