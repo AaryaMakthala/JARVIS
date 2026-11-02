@@ -21,6 +21,12 @@ rate limit → dispatch to the channel) are shared with every other channel,
 and this tool now only adapts the shared flow to the WhatsApp desktop
 channel.  The names below are re-exported so the old import paths keep
 working.
+
+Natural-language contact interpretation (W4.3) includes this desktop channel
+because its recipient also comes from ContactStore.  The shared tool set is kept
+in :mod:`jarvis.messaging.grounding`; this module only re-exports the one name
+it needs so the desktop send tool's spec stays consistent with the web-channel
+specs.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ from jarvis.messaging.contacts import (
     resolve_single,
 )
 from jarvis.messaging.flow import MessageFlow
+from jarvis.messaging.grounding import CONTACT_GROUNDABLE_TOOLS
 from jarvis.messaging.whatsapp_desktop import (
     DesktopWindowProvider,
     WhatsAppDesktopAdapter,
@@ -53,6 +60,7 @@ from jarvis.tools.base import ToolContext, ToolResult, ToolSpec
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CONTACT_GROUNDABLE_TOOLS",
     "Contact",
     "ContactStore",
     "DesktopWindowProvider",
@@ -65,6 +73,10 @@ __all__ = [
     "resolve_single",
 ]
 
+#: The desktop WhatsApp tool is a contact-groundable recipient tool.  The set is
+#: defined once in :mod:`jarvis.messaging.grounding` and re-exported here (see
+#: ``__all__``) so the desktop send channel is described by the same tool list as
+#: the web channel instead of a second copy.
 
 # ── the tool ─────────────────────────────────────────────────────────────
 

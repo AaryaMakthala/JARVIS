@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from jarvis import config
 from jarvis.agent.batch_approval import decide_and_build_payload
 from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import open_sqlite_checkpointer
@@ -51,10 +52,28 @@ def _saver(tmp_path: Any) -> Any:
     return open_sqlite_checkpointer(str(tmp_path / "checkpoints.db"))
 
 
-def _run(tmp_path: Any, store: Any, tool: str, args: dict[str, Any]) -> Any:
+def _run(
+    tmp_path: Any,
+    store: Any,
+    tool: str,
+    args: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    llm_text: str | None = None,
+) -> Any:
+    """Run the real graph with ``store`` as BOTH the tool store and the config one.
+
+    The brain's contact grounding resolves against ``config.contacts_file()``,
+    so the injected store has to be that file as well; otherwise the grounding
+    layer and the precheck would disagree about which contacts exist.
+    """
+    monkeypatch.setattr(config, "contacts_file", lambda: store.path)
+    responses: list[Any] = [brain_action(tool, args)]
+    if llm_text is not None:
+        responses.append(llm_text)
     ctx = make_app_context(
         Settings(),
-        llm=FakeLLM([brain_action(tool, args)]),
+        llm=FakeLLM(responses),
         registry=registry_with(
             make_whatsapp_send_spec(store=store)
             if tool == "whatsapp_send"
@@ -131,40 +150,56 @@ def test_the_default_messaging_specs_declare_a_precheck() -> None:
 # ── the gate refuses before any interrupt ─────────────────────────────────
 
 
-def test_an_unknown_recipient_is_refused_before_confirmation(tmp_path: Any) -> None:
+def test_an_unknown_recipient_is_refused_before_confirmation(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     outcome = _run(
         tmp_path,
         _store(tmp_path),
         "whatsapp_send",
         {"contact": "Pappa", "message": "hi"},
+        monkeypatch,
+        llm_text="NONE",
     )
 
     assert outcome.interrupted is False
     assert outcome.confirmation is None
-    assert "no contact matches" in (outcome.halted_reason or "")
+    assert "couldn't find a matching saved contact" in (outcome.halted_reason or "")
     assert outcome.results == []
     assert not any(getattr(r, "ok", False) for r in outcome.results)
 
 
-def test_an_ambiguous_recipient_is_refused_before_confirmation(tmp_path: Any) -> None:
+def test_an_ambiguous_recipient_is_asked_before_confirmation(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ambiguity becomes a question: no silent pick, no confirmation, no send."""
     store = _store(tmp_path, ("Ali Khan", "9112345678"), ("Ali Ahmed", _PHONE))
     outcome = _run(
         tmp_path,
         store,
         "whatsapp_send",
         {"contact": "Ali", "message": "hi"},
+        monkeypatch,
     )
 
-    assert outcome.interrupted is False
-    assert "multiple contacts match" in (outcome.halted_reason or "")
+    assert outcome.interrupted is True
+    assert outcome.interrupt_kind == "clarification"
+    assert outcome.confirmation is not None
+    question = str(outcome.confirmation.get("question") or "")
+    assert "Ali Khan" in question and "Ali Ahmed" in question
+    assert "9112345678" not in question and _PHONE not in question
+    assert outcome.results == []
 
 
-def test_a_unique_decorated_recipient_reaches_the_confirmation(tmp_path: Any) -> None:
+def test_a_unique_decorated_recipient_reaches_the_confirmation(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     outcome = _run(
         tmp_path,
         _store(tmp_path, ("Mom ❤️", _PHONE)),
         "whatsapp_send",
         {"contact": "Mom", "message": "hi"},
+        monkeypatch,
     )
 
     assert outcome.interrupted is True
@@ -172,34 +207,48 @@ def test_a_unique_decorated_recipient_reaches_the_confirmation(tmp_path: Any) ->
     assert outcome.halted_reason is None
 
 
-def test_an_ambiguous_decorated_recipient_produces_a_visible_response(tmp_path: Any) -> None:
+def test_an_ambiguous_decorated_recipient_produces_a_visible_response(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = _store(tmp_path, ("Mom ❤️", _PHONE), ("Mom 💙", "919876543211"))
     outcome = _run(
         tmp_path,
         store,
         "whatsapp_send",
         {"contact": "Mom", "message": "hi"},
+        monkeypatch,
+    )
+
+    assert outcome.interrupt_kind == "clarification"
+    assert outcome.confirmation is not None
+    question = str(outcome.confirmation.get("question") or "")
+    assert "Mom ❤️" in question and "Mom 💙" in question
+    assert "919876543211" not in question and _PHONE not in question
+
+
+def test_open_chat_is_prechecked_too(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome = _run(
+        tmp_path,
+        _store(tmp_path),
+        "whatsapp_open_chat",
+        {"contact": "Nobody"},
+        monkeypatch,
+        llm_text="NONE",
     )
 
     assert outcome.interrupted is False
-    assert outcome.halted_reason
-    assert "multiple contacts match" in outcome.halted_reason
-    assert "Mom ❤️" in outcome.halted_reason and "Mom 💙" in outcome.halted_reason
+    assert "couldn't find a matching saved contact" in (outcome.halted_reason or "")
 
 
-def test_open_chat_is_prechecked_too(tmp_path: Any) -> None:
-    outcome = _run(tmp_path, _store(tmp_path), "whatsapp_open_chat", {"contact": "Nobody"})
-
-    assert outcome.interrupted is False
-    assert "no contact matches" in (outcome.halted_reason or "")
-
-
-def test_a_valid_recipient_still_reaches_the_tier2_confirmation(tmp_path: Any) -> None:
+def test_a_valid_recipient_still_reaches_the_tier2_confirmation(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     outcome = _run(
         tmp_path,
         _store(tmp_path),
         "whatsapp_send",
         {"contact": "Rahul", "message": "hi"},
+        monkeypatch,
     )
 
     assert outcome.interrupted is True

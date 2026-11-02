@@ -518,9 +518,15 @@ def _recording_spec(record: list[dict[str, Any]]) -> ToolSpec:
     )
 
 
-def test_a_contact_clarification_preserves_the_send_intent(tmp_path: Path) -> None:
+def test_a_contact_clarification_preserves_the_send_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     record: list[dict[str, Any]] = []
     target = _file(tmp_path)
+    store = _store(tmp_path, ("Rahul", _PHONE))
+    # W4.3: the brain grounds WhatsApp recipients against the configured
+    # contacts file, so the saved contact has to be that file too.
+    monkeypatch.setattr(config, "contacts_file", lambda: store.path)
     decisions = [
         brain_clarify("Which contact should I send it to?"),
         brain_action("whatsapp_send_file", {"contact": "Rahul", "path": str(target)}),
