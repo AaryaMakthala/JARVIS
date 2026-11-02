@@ -59,6 +59,7 @@ GROUNDABLE_TOOLS = frozenset(
         "whatsapp_send_message",
         "whatsapp_open_chat",
         "whatsapp_read_messages",
+        "whatsapp_verify_message",
     }
 )
 

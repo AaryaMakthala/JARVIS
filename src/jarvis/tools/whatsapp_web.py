@@ -62,7 +62,9 @@ from jarvis.messaging.contacts import (
     make_recipient_precheck,
     masked_number,
 )
+from jarvis.messaging.dispatch_ledger import DispatchLedger
 from jarvis.messaging.flow import MessageFlow
+from jarvis.messaging.verification import MessageStatus, match_outgoing
 from jarvis.messaging.whatsapp_web import (
     RESEND_WINDOW_S,
     FileSendGuard,
@@ -78,16 +80,19 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "APPROVED_HASHES_ATTR",
     "MAX_MESSAGE_CHARS",
+    "MAX_VERIFY_WAIT_S",
     "RESEND_WINDOW_S",
     "FileSendGuard",
     "WhatsAppOpenChatArgs",
     "WhatsAppReadMessagesArgs",
     "WhatsAppSendFileArgs",
     "WhatsAppSendMessageArgs",
+    "WhatsAppVerifyMessageArgs",
     "make_whatsapp_open_chat_spec",
     "make_whatsapp_read_messages_spec",
     "make_whatsapp_send_file_spec",
     "make_whatsapp_send_message_spec",
+    "make_whatsapp_verify_message_spec",
 ]
 
 #: ``act`` sets this attribute on the ``ToolContext`` with the sha256 digests the
@@ -502,6 +507,7 @@ def _text_adapter(
     guard: FileSendGuard | None,
     operation_id: str,
     store: ContactStore | None = None,
+    ledger: DispatchLedger | None = None,
 ) -> WhatsAppWebTextAdapter:
     """The WhatsApp Web text adapter, wired to this approval and store."""
     return WhatsAppWebTextAdapter(
@@ -509,6 +515,7 @@ def _text_adapter(
         guard=guard or FileSendGuard(config.whatsapp_text_sent_file()),
         operation_id=operation_id,
         store=store,
+        ledger=ledger or DispatchLedger(config.whatsapp_dispatch_ledger_file()),
     )
 
 
@@ -516,6 +523,7 @@ def _send_message_run(
     store: ContactStore | None,
     limiter: RateLimiter | None,
     guard: FileSendGuard | None,
+    ledger: DispatchLedger | None,
     args: WhatsAppSendMessageArgs,
     ctx: ToolContext,
 ) -> ToolResult:
@@ -533,7 +541,7 @@ def _send_message_run(
 
     store = store or ContactStore(config.contacts_file())
     limiter = _limiter_for(limiter, ctx)
-    adapter = _text_adapter(ctx, guard, operation_id, store)
+    adapter = _text_adapter(ctx, guard, operation_id, store, ledger)
     flow = MessageFlow([adapter], store=store, limiter=limiter)
     request = MessageRequest(
         channel=CHANNEL_WHATSAPP_WEB,
@@ -687,6 +695,7 @@ def make_whatsapp_send_message_spec(
     store: ContactStore | None = None,
     limiter: RateLimiter | None = None,
     guard: FileSendGuard | None = None,
+    ledger: DispatchLedger | None = None,
 ) -> ToolSpec:
     """Build the ``whatsapp_send_message`` spec (Tier 2 - Confirm + unlocked).
 
@@ -711,7 +720,7 @@ def make_whatsapp_send_message_spec(
         windows_only=True,
         timeout_s=90,
         budget_cost=1,
-        run=lambda args, ctx: _send_message_run(store, limiter, guard, args, ctx),
+        run=lambda args, ctx: _send_message_run(store, limiter, guard, ledger, args, ctx),
         precheck=make_recipient_precheck(store),
         describe=lambda args: _describe_send_message(store, args),
     )
@@ -771,4 +780,198 @@ def make_whatsapp_read_messages_spec(store: ContactStore | None = None) -> ToolS
         run=lambda args, ctx: _read_messages_run(store, args, ctx),
         precheck=make_recipient_precheck(store),
         describe=lambda args: _describe_read_messages(store, args),
+    )
+
+
+# ── W5: read-only status verification ─────────────────────────────────────
+#
+# Verification never sends, replies, forwards, reacts, edits, deletes,
+# uploads, downloads or opens a URL.  It opens the *verified* conversation
+# through the existing W2 route, reads a bounded window, identifies exactly one
+# outgoing message by its recorded text digest, and reports the status the page
+# actually shows.  A click is not delivery and being present in the chat is not
+# delivery either, so a missing indicator stays ``unknown``.
+
+#: Hard bound on how long a verification may wait for a status to advance.
+MAX_VERIFY_WAIT_S = 30
+#: Delay between two reads while waiting.  No navigation happens in between.
+VERIFY_POLL_INTERVAL_S = 2.0
+#: How many recent messages one verification may read (the driver's own cap).
+_VERIFY_READ_LIMIT = MAX_RECENT_MESSAGES
+
+_STATUS_MESSAGES: dict[MessageStatus, str] = {
+    MessageStatus.DISPATCHED: (
+        "The message was submitted to WhatsApp, but I couldn't confirm delivery."
+    ),
+    MessageStatus.SENT: (
+        "WhatsApp shows that your message was sent, but delivery is not confirmed."
+    ),
+    MessageStatus.DELIVERED: "WhatsApp shows that your message was delivered to {name}.",
+    MessageStatus.READ: "WhatsApp shows that {name} has read your message.",
+    MessageStatus.UNKNOWN: (
+        "I couldn't reliably determine the message status. I won't resend it."
+    ),
+}
+
+
+class WhatsAppVerifyMessageArgs(BaseModel):
+    """Arguments for ``whatsapp_verify_message`` -- a contact and optional wait.
+
+    There is deliberately no message-body, message-id, URL, selector or
+    operation argument: the target message is bound to the local dispatch
+    record for this contact, so the planner cannot point verification at an
+    arbitrary conversation, message or operation.
+    """
+
+    contact: str = Field(
+        min_length=1, max_length=100, description="Contact name from `jarvis contacts`"
+    )
+    wait_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_VERIFY_WAIT_S,
+        description=(
+            "How long to keep re-reading the open chat for the status to advance "
+            f"(0..{MAX_VERIFY_WAIT_S}). Never re-navigates and never resends."
+        ),
+    )
+    expect: Literal["sent", "delivered", "read"] | None = Field(
+        default=None,
+        description=(
+            "Optional status to wait for. Stops early once it (or a higher status) "
+            "is observed; an unknown result never triggers a resend."
+        ),
+    )
+
+
+def _unknown_status_result(recipient: str, reason: str, text: str) -> ToolResult:
+    """An explicit, non-authorizing "I could not tell" result."""
+    return ToolResult(
+        ok=True,
+        output=text,
+        verified=False,
+        verify_note="the message status is not proven by WhatsApp's visible evidence",
+        data={
+            "recipient": recipient,
+            "status": MessageStatus.UNKNOWN.value,
+            "reason": reason,
+            "read_only": True,
+        },
+    )
+
+
+def _verify_message_run(
+    store: ContactStore | None,
+    ledger: DispatchLedger | None,
+    args: WhatsAppVerifyMessageArgs,
+    ctx: ToolContext,
+) -> ToolResult:
+    """Read-only: identify the recorded message and report its visible status."""
+    refusal = _require_windows("whatsapp_verify_message")
+    if refusal is not None:
+        return refusal
+
+    store = store or ContactStore(config.contacts_file())
+    ledger = ledger or DispatchLedger(config.whatsapp_dispatch_ledger_file())
+    adapter = _adapter(ctx, None, store)
+    flow = MessageFlow([adapter], store=store)
+    try:
+        contact = flow.resolve_contact(args.contact)
+    except MessageError as exc:
+        return ToolResult(
+            ok=False,
+            error=f"I couldn't verify the recipient conversation: {exc}",
+        )
+
+    try:
+        record = ledger.latest(contact.name)
+    except OSError as exc:
+        return ToolResult(
+            ok=False,
+            error=(
+                f"the local dispatch record could not be read ({exc}); "
+                "I won't guess the message status"
+            ),
+        )
+    if record is None:
+        return _unknown_status_result(
+            contact.name,
+            "no_dispatch_record",
+            f"I have no record of a dispatched WhatsApp message to {contact.name}, "
+            "so there is nothing I can verify. I won't send anything.",
+        )
+
+    expected = MessageStatus(args.expect) if args.expect else None
+    deadline = time.monotonic() + float(args.wait_seconds)
+    match = None
+    while True:
+        try:
+            read = adapter.read_messages(contact, _VERIFY_READ_LIMIT)
+        except MessageError as exc:
+            return ToolResult(ok=False, error=f"I couldn't check the message status: {exc}")
+        match = match_outgoing(read.messages, digest=record.message_sha256)
+        if match.status is MessageStatus.UNKNOWN:
+            break
+        if expected is None or match.status.rank >= expected.rank:
+            break
+        if time.monotonic() + VERIFY_POLL_INTERVAL_S > deadline:
+            break
+        time.sleep(VERIFY_POLL_INTERVAL_S)
+
+    status = match.status
+    output = _STATUS_MESSAGES[status].format(name=contact.name)
+    data = {
+        "recipient": contact.name,
+        "status": status.value,
+        "reason": match.reason,
+        "evidence": list(match.evidence),
+        "operation": record.operation_hash[:12],
+        "dispatched_at": record.dispatched_at,
+        "send_outcome": record.outcome,
+        "read_only": True,
+    }
+    proven = status in (MessageStatus.DELIVERED, MessageStatus.READ)
+    return ToolResult(
+        ok=True,
+        output=output,
+        verified=proven,
+        verify_note=(
+            ""
+            if proven
+            else "the delivery state is not proven by WhatsApp's visible evidence"
+        ),
+        data=data,
+    )
+
+
+def make_whatsapp_verify_message_spec(
+    store: ContactStore | None = None,
+    ledger: DispatchLedger | None = None,
+) -> ToolSpec:
+    """Build the ``whatsapp_verify_message`` spec (Tier 1 - Confirm).
+
+    Read-only: it can never send, retry, reply or edit.  The target message is
+    the newest recorded dispatch for the contact, so the planner can neither
+    invent an operation nor choose a different message.
+    """
+    return ToolSpec(
+        name="whatsapp_verify_message",
+        description=(
+            "Check whether a previously dispatched WhatsApp message to one known "
+            "contact was sent, delivered or read, using the visible status in the "
+            "verified conversation. Read-only: never sends, replies, forwards, "
+            "reacts, edits, deletes, uploads, downloads or opens links, and never "
+            "retries a message. Returns 'unknown' when WhatsApp's evidence is "
+            "missing, ambiguous or contradictory."
+        ),
+        args_model=WhatsAppVerifyMessageArgs,
+        base_tier=1,
+        windows_only=True,
+        timeout_s=120,
+        budget_cost=1,
+        run=lambda args, ctx: _verify_message_run(store, ledger, args, ctx),
+        precheck=make_recipient_precheck(store),
+        describe=lambda args: (
+            f"check WhatsApp delivery status for the message to {args.contact!r} (read-only)"
+        ),
     )

@@ -80,6 +80,9 @@ _MESSAGE_TEXT_SELECTOR = "span.selectable-text, [data-testid=\"msg-text\"]"
 _MAX_MESSAGE_TEXT_CHARS = 2000
 _MAX_MESSAGE_PRE_CHARS = 240
 _MAX_MESSAGE_META_CHARS = 80
+#: Per-message bounds on the status hints collected from the meta node.
+_MAX_STATUS_HINTS = 8
+_MAX_STATUS_HINT_CHARS = 80
 
 #: ``data-pre-plain-text`` is ``"[time, date] sender: "``.
 _PRE_PLAIN_TEXT_RE = re.compile(r"^\[(?P<timestamp>[^\]]*)\]\s*(?P<sender>.*?):\s*$", re.DOTALL)
@@ -236,6 +239,20 @@ _JS_RECENT_MESSAGES = """
     const pre = preNode ? (preNode.getAttribute('data-pre-plain-text') || '') : '';
     const meta = node.querySelector('[data-testid="msg-meta"]');
     const metaText = meta ? (meta.innerText || '').trim() : '';
+    // W5 status evidence: report only what the page exposes (icon names
+    // and accessible labels of the status node).  No status is inferred
+    // here; the bounded vocabulary mapping happens in Python.
+    const statusHints = [];
+    const hintScope = meta || node;
+    for (const el of Array.from(hintScope.querySelectorAll('[data-icon], [aria-label], [title]'))) {
+      for (const value of [el.getAttribute('data-icon'), el.getAttribute('aria-label'), el.getAttribute('title')]) {
+        const hint = (value || '').trim();
+        if (!hint) continue;
+        const clipped = hint.slice(0, cfg.maxHintChars);
+        if (!statusHints.includes(clipped)) statusHints.push(clipped);
+      }
+      if (statusHints.length >= cfg.maxHints) break;
+    }
     let outgoing = null;
     if (node.classList.contains('message-out') || node.closest('.message-out')) outgoing = true;
     else if (node.classList.contains('message-in') || node.closest('.message-in')) outgoing = false;
@@ -243,6 +260,7 @@ _JS_RECENT_MESSAGES = """
       text: text.slice(0, cfg.maxChars),
       pre: pre.slice(0, cfg.maxPreChars),
       meta: metaText.slice(0, cfg.maxMetaChars),
+      hints: statusHints,
       outgoing: outgoing,
     });
   }
@@ -480,6 +498,8 @@ class PlaywrightWhatsAppPage:
             "maxChars": _MAX_MESSAGE_TEXT_CHARS,
             "maxPreChars": _MAX_MESSAGE_PRE_CHARS,
             "maxMetaChars": _MAX_MESSAGE_META_CHARS,
+            "maxHints": _MAX_STATUS_HINTS,
+            "maxHintChars": _MAX_STATUS_HINT_CHARS,
         }
         try:
             raw = self._page.evaluate(_JS_RECENT_MESSAGES, config)
@@ -508,6 +528,11 @@ class PlaywrightWhatsAppPage:
                     timestamp=timestamp[:_MAX_MESSAGE_META_CHARS],
                     is_outgoing=outgoing if isinstance(outgoing, bool) else None,
                     sequence=len(messages),
+                    status_hints=tuple(
+                        str(hint)[:_MAX_STATUS_HINT_CHARS]
+                        for hint in (item.get("hints") or [])[:_MAX_STATUS_HINTS]
+                        if isinstance(hint, str)
+                    ),
                 )
             )
             if len(messages) >= limit:

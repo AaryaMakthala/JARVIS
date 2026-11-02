@@ -49,6 +49,7 @@ from jarvis.browser.whatsapp_web import (
 )
 from jarvis.config import Settings
 from jarvis.messaging.contacts import ContactStore, RateLimiter
+from jarvis.messaging.dispatch_ledger import DispatchLedger
 from jarvis.messaging.whatsapp_web import (
     FileSendGuard,
     GuardStorageError,
@@ -245,11 +246,15 @@ def _spec(
     store: ContactStore | None = None,
     limiter: RateLimiter | None = None,
     guard: FileSendGuard | None = None,
+    ledger: DispatchLedger | None = None,
 ) -> ToolSpec:
+    # W5: always inject a ledger, so the send path can never write into the
+    # machine's real JARVIS data directory during tests.
     return make_whatsapp_send_message_spec(
         store=store or _store(tmp_path),
         limiter=limiter or _limiter(tmp_path),
         guard=guard or _guard(tmp_path),
+        ledger=ledger or DispatchLedger(tmp_path / "dispatches.sqlite3"),
     )
 
 

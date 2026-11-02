@@ -165,6 +165,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_whatsapp_read_messages_spec,
         make_whatsapp_send_file_spec,
         make_whatsapp_send_message_spec,
+        make_whatsapp_verify_message_spec,
     )
     from jarvis.tools.windows_list import make_list_windows_spec
     from jarvis.uia.tools import make_ui_click_spec, make_ui_list_controls_spec
@@ -228,6 +229,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_whatsapp_send_message_spec(),
         make_whatsapp_open_chat_spec(),
         make_whatsapp_read_messages_spec(),
+        make_whatsapp_verify_message_spec(),
         make_browser_goto_spec(),
         make_browser_read_spec(),
         make_browser_click_spec(),

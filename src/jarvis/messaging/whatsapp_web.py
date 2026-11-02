@@ -46,6 +46,7 @@ from jarvis.messaging.base import (
     MessageRequest,
 )
 from jarvis.messaging.contacts import Contact
+from jarvis.messaging.dispatch_ledger import DispatchLedger
 from jarvis.messaging.resolver import normalize_name
 from jarvis.policy import paths
 
@@ -493,9 +494,38 @@ class WhatsAppWebTextAdapter(WhatsAppWebAdapter):
         guard: FileSendGuard,
         operation_id: str,
         store: Any = None,
+        ledger: DispatchLedger | None = None,
     ) -> None:
         super().__init__(holder=holder, guard=guard, store=store)
         self._operation_id = str(operation_id or "")
+        self._ledger = ledger
+
+    # ── dispatch ledger (W5) ─────────────────────────────────────────
+
+    def _record_dispatch(self, contact: Contact, text: str) -> None:
+        """Best-effort: remember this attempt so a later task can verify it.
+
+        Failure is logged, never raised: the send already passed its own
+        guard, and a missing record only means a later verification says
+        "I have no record", never that the message was delivered.
+        """
+        ledger = self._ledger
+        if ledger is None:
+            return
+        try:
+            ledger.record(self._operation_id, contact.name, text, outcome="pending")
+        except OSError:
+            logger.warning("the WhatsApp dispatch ledger could not record this attempt")
+
+    def _mark_dispatch(self, outcome: str) -> None:
+        """Best-effort: record the observed send outcome (no message body)."""
+        ledger = self._ledger
+        if ledger is None:
+            return
+        try:
+            ledger.mark(self._operation_id, outcome)
+        except OSError:
+            logger.warning("the WhatsApp dispatch ledger could not be updated")
 
     def capabilities(self) -> frozenset[str]:
         """This channel carries text."""
@@ -554,6 +584,10 @@ class WhatsAppWebTextAdapter(WhatsAppWebAdapter):
                 "this approved message was already attempted; refusing to send it again"
             )
 
+        # W5: remember the attempt before the irreversible click, so a crash
+        # after the click still leaves the message verifiable.
+        self._record_dispatch(contact, text)
+
         try:
             outcome = driver.send_text(text)
         except WhatsAppSendUncertain:
@@ -563,6 +597,7 @@ class WhatsAppWebTextAdapter(WhatsAppWebAdapter):
                 len(contact.number),
                 len(text),
             )
+            self._mark_dispatch("unknown")
             return MessageOutcome(
                 channel=self.name,
                 contact=contact.name,
@@ -586,6 +621,7 @@ class WhatsAppWebTextAdapter(WhatsAppWebAdapter):
                 "(the duplicate-send guard stays in place)"
             ) from exc
 
+        self._mark_dispatch("dispatched")
         logger.info(
             "whatsapp text send dispatched contact=%s phone_digits=%d chars=%d",
             contact.name,

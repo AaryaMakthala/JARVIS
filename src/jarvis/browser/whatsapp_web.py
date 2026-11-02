@@ -52,6 +52,7 @@ from jarvis.policy.rules import url_origin
 
 __all__ = [
     "MAX_RECENT_MESSAGES",
+    "MAX_STATUS_HINTS",
     "WHATSAPP_BASE_URL",
     "WHATSAPP_ORIGIN",
     "WHATSAPP_SEND_URL",
@@ -99,6 +100,10 @@ _READY_TIMEOUT_S = 20.0
 #: Hard cap on how many recent messages one read may return.  A read is a
 #: bounded look at the open conversation, never a conversation dump.
 MAX_RECENT_MESSAGES = 20
+
+#: W5: bounds on the status evidence one message may report.
+MAX_STATUS_HINTS = 8
+MAX_STATUS_HINT_CHARS = 80
 
 
 class WhatsAppError(RuntimeError):
@@ -206,6 +211,12 @@ class WhatsAppMessage:
     timestamp: str = ""
     is_outgoing: bool | None = None
     sequence: int = 0
+    #: Status evidence the page exposed for this bubble (W5): the
+    #: ``data-icon`` names and accessible labels of its status node.  Empty
+    #: when the page exposed none.  Classification lives in
+    #: :mod:`jarvis.messaging.verification` and only understands WhatsApp's
+    #: own status vocabulary, so unknown markup stays ``unknown``.
+    status_hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -625,6 +636,10 @@ class WhatsAppDriver:
                     timestamp=normalize_text(item.timestamp),
                     is_outgoing=item.is_outgoing,
                     sequence=len(messages),
+                    status_hints=tuple(
+                        str(hint)[:MAX_STATUS_HINT_CHARS]
+                        for hint in (item.status_hints or ())[:MAX_STATUS_HINTS]
+                    ),
                 )
             )
             if len(messages) >= limit:

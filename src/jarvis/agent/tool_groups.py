@@ -96,6 +96,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "messaging": (
         "whatsapp_open_chat",
         "whatsapp_read_messages",
+        "whatsapp_verify_message",
         "whatsapp_send",
         "whatsapp_send_file",
         "whatsapp_send_message",

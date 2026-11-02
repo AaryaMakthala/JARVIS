@@ -970,6 +970,11 @@ def whatsapp_text_sent_file() -> Path:
     return user_data_dir("whatsapp_text_sent.sqlite3")
 
 
+def whatsapp_dispatch_ledger_file() -> Path:
+    """Path to the WhatsApp dispatch ledger (SQLite, hashed text only)."""
+    return user_data_dir("whatsapp_dispatches.sqlite3")
+
+
 def memory_db() -> Path:
     """Path to the skill/failure/preference SQLite database."""
     return user_data_dir("memory.db")
