@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from jarvis.browser.whatsapp_web import (
+    ConversationSummary,
     WhatsAppDriver,
     WhatsAppError,
     WhatsAppMessage,
@@ -421,6 +422,25 @@ class WhatsAppWebAdapter:
             )
         except WhatsAppError as exc:
             raise MessageError(f"could not open the WhatsApp chat: {exc}") from exc
+
+    def list_unread(self, limit: int) -> tuple[ConversationSummary, ...]:
+        """List bounded unread conversations without opening one (W6).
+
+        The page comes from the isolated WhatsApp profile and the driver proves
+        the exact origin and an authenticated session first.  Only the visible
+        conversation list is read: no chat is opened, so this operation does
+        not change read receipts.  Nothing is sent, staged or clicked.
+        """
+        page = self._open_page()
+        if page is None:
+            raise MessageError("the WhatsApp browser session is not available; refusing to read")
+        driver = WhatsAppDriver(page)
+        try:
+            conversations = driver.list_unread(limit)
+        except WhatsAppError as exc:
+            raise MessageError(f"could not read the WhatsApp conversation list: {exc}") from exc
+        logger.info("whatsapp unread conversations listed count=%d", len(conversations))
+        return conversations
 
     def read_messages(self, contact: Contact, limit: int) -> ConversationRead:
         """Read recent messages from ``contact``'s verified chat (read-only).

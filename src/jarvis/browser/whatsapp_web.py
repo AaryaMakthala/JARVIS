@@ -51,13 +51,18 @@ from jarvis.messaging.resolver import normalize_name
 from jarvis.policy.rules import url_origin
 
 __all__ = [
+    "MAX_CONVERSATION_NAME_CHARS",
+    "MAX_CONVERSATION_PREVIEW_CHARS",
+    "MAX_CONVERSATION_TIMESTAMP_CHARS",
     "MAX_RECENT_MESSAGES",
     "MAX_STATUS_HINTS",
+    "MAX_UNREAD_CONVERSATIONS",
     "WHATSAPP_BASE_URL",
     "WHATSAPP_ORIGIN",
     "WHATSAPP_SEND_URL",
     "AttachmentCandidate",
     "AttachmentScan",
+    "ConversationSummary",
     "SearchHit",
     "SendControl",
     "SendOutcome",
@@ -100,6 +105,16 @@ _READY_TIMEOUT_S = 20.0
 #: Hard cap on how many recent messages one read may return.  A read is a
 #: bounded look at the open conversation, never a conversation dump.
 MAX_RECENT_MESSAGES = 20
+
+#: W6: hard cap on how many unread conversations one discovery may return.
+#: Discovery is a bounded look at the visible conversation list, never a dump.
+MAX_UNREAD_CONVERSATIONS = 20
+
+#: W6: per-field bounds for one conversation-list row.  These are display
+#: bound only; the fields are still untrusted external content.
+MAX_CONVERSATION_NAME_CHARS = 120
+MAX_CONVERSATION_PREVIEW_CHARS = 160
+MAX_CONVERSATION_TIMESTAMP_CHARS = 40
 
 #: W5: bounds on the status evidence one message may report.
 MAX_STATUS_HINTS = 8
@@ -193,6 +208,25 @@ class SearchHit:
 
     name: str
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class ConversationSummary:
+    """One visible row of the WhatsApp conversation list (W6 discovery).
+
+    The display name, preview and timestamp are **untrusted external content**:
+    they are data for the owner, never instructions.  Only fields the page
+    actually exposed are set; ``unread_count`` stays ``None`` when no count is
+    visible and the other text fields stay empty when unavailable.  Nothing in
+    this dataclass proves contact identity - that is decided against
+    ``ContactStore`` by the tool layer.
+    """
+
+    name: str
+    unread: bool = False
+    unread_count: int | None = None
+    preview: str = ""
+    timestamp: str = ""
 
 
 @dataclass(frozen=True)
@@ -297,6 +331,9 @@ class WhatsAppPage(Protocol):
 
     def chat_header(self) -> str:
         """The conversation header text ("" when it cannot be read)."""
+
+    def conversation_summaries(self, limit: int) -> tuple[ConversationSummary, ...]:
+        """The visible unread conversation rows (read-only; never clicks)."""
 
     def recent_messages(self, limit: int) -> tuple[WhatsAppMessage, ...]:
         """The most recent visible text messages of the open conversation."""
@@ -481,6 +518,62 @@ class WhatsAppDriver:
         if state is WhatsAppSessionState.AUTHENTICATED:
             return state
         raise _session_error(state)
+
+    # ── W6: unread discovery (no chat is opened) ───────────────────────────
+
+    def list_unread(self, limit: int) -> tuple[ConversationSummary, ...]:
+        """List bounded unread conversations from the visible conversation list.
+
+        This is deliberately not a chat-opening operation.  The exact origin
+        and an authenticated session are required, then the page reads only
+        the left-hand conversation list; nothing is clicked, no conversation is
+        opened and no composer/Send control is touched, so read receipts are
+        not changed by this call.  ``limit`` is validated (1..20) instead of
+        being clamped.  Only rows the page marked unread are returned, and
+        every text field is bounded and normalised.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise WhatsAppError("the unread limit must be an integer; refusing to read")
+        if not 1 <= limit <= MAX_UNREAD_CONVERSATIONS:
+            raise WhatsAppError(
+                f"the unread limit must be between 1 and {MAX_UNREAD_CONVERSATIONS}; "
+                "refusing to read"
+            )
+        self.require_authenticated()
+        try:
+            raw = self._page.conversation_summaries(limit)
+        except WhatsAppError:
+            raise
+        except Exception as exc:
+            raise WhatsAppError(
+                "the WhatsApp conversation list could not be read; refusing to continue"
+            ) from exc
+
+        summaries: list[ConversationSummary] = []
+        for item in tuple(raw or ()):
+            if not isinstance(item, ConversationSummary) or not item.unread:
+                continue
+            name = normalize_text(item.name)[:MAX_CONVERSATION_NAME_CHARS]
+            if not name:
+                continue
+            count = item.unread_count
+            summaries.append(
+                ConversationSummary(
+                    name=name,
+                    unread=True,
+                    unread_count=(
+                        count
+                        if isinstance(count, int) and not isinstance(count, bool) and count > 0
+                        else None
+                    ),
+                    preview=normalize_text(item.preview)[:MAX_CONVERSATION_PREVIEW_CHARS],
+                    timestamp=normalize_text(item.timestamp)[:MAX_CONVERSATION_TIMESTAMP_CHARS],
+                )
+            )
+            if len(summaries) >= limit:
+                break
+        self._logger.info("whatsapp unread conversations listed count=%d", len(summaries))
+        return tuple(summaries)
 
     # ── opening a chat ─────────────────────────────────────────────────────
 

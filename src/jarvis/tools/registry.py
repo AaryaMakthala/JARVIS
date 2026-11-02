@@ -161,6 +161,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
     from jarvis.tools.web import make_google_search_spec, make_open_url_spec, make_web_answer_spec
     from jarvis.tools.whatsapp import make_whatsapp_send_spec
     from jarvis.tools.whatsapp_web import (
+        make_whatsapp_list_unread_spec,
         make_whatsapp_open_chat_spec,
         make_whatsapp_read_messages_spec,
         make_whatsapp_send_file_spec,
@@ -228,6 +229,7 @@ def build_default_registry(settings: Settings | None = None) -> ToolRegistry:
         make_whatsapp_send_file_spec(),
         make_whatsapp_send_message_spec(),
         make_whatsapp_open_chat_spec(),
+        make_whatsapp_list_unread_spec(),
         make_whatsapp_read_messages_spec(),
         make_whatsapp_verify_message_spec(),
         make_browser_goto_spec(),

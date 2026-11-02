@@ -20,9 +20,14 @@ import time
 from typing import Any
 
 from jarvis.browser.whatsapp_web import (
+    MAX_CONVERSATION_NAME_CHARS,
+    MAX_CONVERSATION_PREVIEW_CHARS,
+    MAX_CONVERSATION_TIMESTAMP_CHARS,
     MAX_RECENT_MESSAGES,
+    MAX_UNREAD_CONVERSATIONS,
     AttachmentCandidate,
     AttachmentScan,
+    ConversationSummary,
     SearchHit,
     SendControl,
     WhatsAppError,
@@ -61,6 +66,39 @@ _SEARCH_RESULT_SELECTORS = (
     '[role="listitem"]',
     '[data-testid="cell-frame"]',
     '[role="button"]',
+)
+
+#: W6: candidate conversation rows in the left-hand pane.  These are the same
+#: structural rows the search already treats as results; discovery reads them
+#: in place and never clicks one.
+_CONVERSATION_ROW_SELECTORS = (
+    '[role="listitem"]',
+    '[data-testid="cell-frame"]',
+    '[role="row"]',
+)
+
+#: W6: nodes WhatsApp uses to mark a conversation unread or expose a count.
+#: The page reports only what it actually finds; no unread state is inferred
+#: from a missing badge.
+_UNREAD_BADGE_SELECTORS = (
+    '[data-testid="icon-unread-count"]',
+    '[data-icon="unread"]',
+    '[data-icon*="unread" i]',
+    '[aria-label*="unread" i]',
+)
+
+#: W6: nodes that may hold the latest visible message preview.
+_CONVERSATION_PREVIEW_SELECTORS = (
+    '[data-testid="last-msg-status"]',
+    '[data-testid="msg-preview"]',
+    '[data-testid="last-message"]',
+)
+
+#: W6: nodes that may hold the conversation preview timestamp.
+_CONVERSATION_TIME_SELECTORS = (
+    "time",
+    '[data-testid="last-msg-time"]',
+    '[data-testid="cell-frame-primary-detail"]',
 )
 
 #: Candidate message-container groups, in priority order.  WhatsApp's markup
@@ -291,6 +329,80 @@ _JS_SEARCH_RESULTS = """
 }
 """
 
+_JS_CONVERSATION_LIST = """
+(cfg) => {
+  const pane = document.querySelector(cfg.pane) || document.body;
+  const seen = new Set();
+  const out = [];
+  for (const sel of cfg.rows) {
+    for (const node of Array.from(pane.querySelectorAll(sel))) {
+      const titled = node.querySelector('span[title]');
+      const name = ((titled && titled.getAttribute('title'))
+        || node.getAttribute('aria-label') || '').trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      let unread = false;
+      let unreadCount = null;
+      for (const bsel of cfg.badges) {
+        const badge = node.querySelector(bsel);
+        if (!badge) continue;
+        unread = true;
+        const label = (badge.getAttribute('aria-label') || badge.getAttribute('title')
+          || badge.textContent || '').trim();
+        const match = label.match(/(\\d+)/);
+        if (match) {
+          const n = parseInt(match[1], 10);
+          if (Number.isFinite(n) && n > 0) unreadCount = n;
+        }
+        break;
+      }
+      if (!unread) {
+        const text = (node.textContent || '').toLowerCase();
+        if (text.includes('unread')) unread = true;
+      }
+      if (!unread) continue;
+
+      let preview = '';
+      for (const psel of cfg.preview) {
+        const el = node.querySelector(psel);
+        if (!el) continue;
+        const t = (el.getAttribute('aria-label') || el.getAttribute('title')
+          || el.innerText || el.textContent || '').trim();
+        if (t) { preview = t; break; }
+      }
+
+      let timestamp = '';
+      for (const tsel of cfg.time) {
+        const el = node.querySelector(tsel);
+        if (!el) continue;
+        if (el.tagName === 'TIME' && el.getAttribute('datetime')) {
+          timestamp = el.getAttribute('datetime') || '';
+        }
+        if (!timestamp) {
+          const t = (el.getAttribute('aria-label') || el.getAttribute('title')
+            || el.innerText || el.textContent || '').trim();
+          if (t) timestamp = t;
+        }
+        if (timestamp) break;
+      }
+
+      out.push({
+        name: name.slice(0, cfg.maxName),
+        unread: unread,
+        unreadCount: unreadCount,
+        preview: preview.slice(0, cfg.maxPreview),
+        timestamp: timestamp.slice(0, cfg.maxTime),
+      });
+      if (out.length >= cfg.limit) return out;
+    }
+  }
+  return out;
+}
+"""
+
 _JS_OPEN_RESULT = """
 (cfg) => {
   const selectors = cfg.selectors;
@@ -472,6 +584,75 @@ class PlaywrightWhatsAppPage:
         except Exception as exc:  # noqa: BLE001 - an unreadable header is not a pass
             logger.debug("reading the WhatsApp chat header failed: %s", exc)
             return ""
+
+    # ── conversation-list reading (W6, read-only) ──────────────────────────
+
+    def conversation_summaries(self, limit: int) -> tuple[ConversationSummary, ...]:
+        """Read the visible unread conversation rows without opening a chat.
+
+        Only the left-hand conversation list (``#pane-side``/chat list) is
+        inspected.  The script never clicks, navigates, fills a composer or
+        touches a Send control, so no read receipt can change.  Every field is
+        returned only when the row exposes it; nothing is invented.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise WhatsAppError("the unread limit must be an integer; refusing to read")
+        if not 1 <= limit <= MAX_UNREAD_CONVERSATIONS:
+            raise WhatsAppError(
+                f"the unread limit must be between 1 and {MAX_UNREAD_CONVERSATIONS}; "
+                "refusing to read"
+            )
+        config = {
+            "pane": "#pane-side",
+            "rows": list(_CONVERSATION_ROW_SELECTORS),
+            "badges": list(_UNREAD_BADGE_SELECTORS),
+            "preview": list(_CONVERSATION_PREVIEW_SELECTORS),
+            "time": list(_CONVERSATION_TIME_SELECTORS),
+            "limit": limit,
+            "maxName": MAX_CONVERSATION_NAME_CHARS,
+            "maxPreview": MAX_CONVERSATION_PREVIEW_CHARS,
+            "maxTime": MAX_CONVERSATION_TIMESTAMP_CHARS,
+        }
+        try:
+            raw = self._page.evaluate(_JS_CONVERSATION_LIST, config)
+        except Exception as exc:
+            logger.debug("reading the WhatsApp conversation list failed: %s", exc)
+            raise WhatsAppError("the WhatsApp conversation list could not be read") from exc
+        if not isinstance(raw, list):
+            raise WhatsAppError(
+                "the WhatsApp conversation list could not be located; refusing to read"
+            )
+        summaries: list[ConversationSummary] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            if item.get("unread") is not True:
+                continue
+            raw_count = item.get("unreadCount")
+            count = (
+                int(raw_count)
+                if isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count > 0
+                else None
+            )
+            summaries.append(
+                ConversationSummary(
+                    name=name[:MAX_CONVERSATION_NAME_CHARS],
+                    unread=True,
+                    unread_count=count,
+                    preview=str(item.get("preview") or "").strip()[
+                        :MAX_CONVERSATION_PREVIEW_CHARS
+                    ],
+                    timestamp=str(item.get("timestamp") or "").strip()[
+                        :MAX_CONVERSATION_TIMESTAMP_CHARS
+                    ],
+                )
+            )
+            if len(summaries) >= limit:
+                break
+        return tuple(summaries)
 
     # ── conversation reading ───────────────────────────────────────────────
 
