@@ -43,6 +43,9 @@ from jarvis.tools.whatsapp_web import (
 )
 
 _PHONE = "919876543210"
+_MOM_PHONE = "919876543211"
+_MOM_BLUE_PHONE = "919876543212"
+_MOM_LOGO_PHONE = "919876543213"
 _BODY = "SECRET-BODY-do-not-log"
 
 
@@ -168,17 +171,35 @@ class _ExplodingLLM:
         raise RuntimeError("provider unavailable")
 
 
-def _store(tmp_path: Path) -> ContactStore:
+def _store(tmp_path: Path, *contacts: tuple[str, str]) -> ContactStore:
+    """Build a contact store; Rahul is the default when no contacts are named.
+
+    Callers that intend several contacts pass all of them with distinct numbers,
+    so the store's duplicate-name/number guards are never triggered by a fixture.
+    """
     store = ContactStore(tmp_path / "contacts.json")
-    store.add("Rahul", _PHONE)
+    for name, number in contacts or (("Rahul", _PHONE),):
+        store.add(name, number)
     return store
+
+
+def _emoji_store(tmp_path: Path) -> ContactStore:
+    """A store that contains one decorated "Mom" contact."""
+    return _store(tmp_path, ("Mom ❤️", _MOM_PHONE))
+
+
+def _logo_store(tmp_path: Path) -> ContactStore:
+    """A store that contains a decorated contact with a flag."""
+    return _store(tmp_path, ("🇮🇳 Mom ❤️", _MOM_LOGO_PHONE))
 
 
 def _ambiguous_store(tmp_path: Path) -> ContactStore:
-    store = ContactStore(tmp_path / "contacts.json")
-    store.add("Rahul Sharma", _PHONE)
-    store.add("Rahul Verma", "919876543211")
-    return store
+    """Two contacts whose display names start the same way."""
+    return _store(
+        tmp_path,
+        ("Rahul Sharma", _PHONE),
+        ("Rahul Verma", "919876543211"),
+    )
 
 
 def _messages(count: int) -> tuple[WhatsAppMessage, ...]:
@@ -241,6 +262,99 @@ def test_ambiguous_contact_is_refused_before_any_read(tmp_path: Path) -> None:
     assert holder.acquires == 0
     assert page.read_limits == []
     assert page.searched == []
+
+
+def test_emoji_decorated_contact_is_found_by_the_bare_word_only_when_unique(
+    tmp_path: Path,
+) -> None:
+    """"Mom" resolves to "Mom ❤️" only when exactly one saved contact normalises to "mom"."""
+    store = _emoji_store(tmp_path)
+    page = _Page(messages=_messages(1), headers=("Mom ❤️",))
+    holder = _Holder(page)
+
+    result, page, holder = _run(tmp_path, page, store=store, contact="Mom", limit=1)
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "Mom ❤️"
+    assert holder.acquires == 1
+    assert page.searched == [_MOM_PHONE]
+
+
+def test_two_emoji_decorated_contacts_are_ambiguous(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path, ("Mom ❤️", _MOM_PHONE), ("Mom 💙", _MOM_BLUE_PHONE))
+    page = _Page(messages=_messages(1), headers=("Mom ❤️",))
+    holder = _Holder(page)
+
+    result, page, holder = _run(tmp_path, page, store=store, contact="Mom", limit=1)
+
+    assert not result.ok
+    assert "multiple contacts match" in result.error
+    assert "Mom ❤️" in result.error and "Mom 💙" in result.error
+    assert holder.acquires == 0
+
+
+def test_mamá_heart_is_found_by_the_bare_word_only_when_unique(
+    tmp_path: Path,
+) -> None:
+    """"Mamá ❤️" is found by "Mamá" because the canonical NFC forms still match."""
+    store = _store(tmp_path, ("Mamá ❤️", _MOM_PHONE))
+    page = _Page(messages=_messages(1), headers=("Mamá ❤️",))
+    holder = _Holder(page)
+
+    result, page, holder = _run(tmp_path, page, store=store, contact="Mamá", limit=1)
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "Mamá ❤️"
+    assert holder.acquires == 1
+    assert page.searched == [_MOM_PHONE]
+
+
+def test_unknown_decorated_contact_is_refused_before_any_read(
+    tmp_path: Path,
+) -> None:
+    store = _logo_store(tmp_path)
+    page = _Page(messages=_messages(1))
+    holder = _Holder(page)
+
+    result, page, holder = _run(tmp_path, page, store=store, contact="Dad 💙", limit=1)
+
+    assert not result.ok
+    assert "no contact matches" in result.error
+    assert "Mom ❤️" in result.error
+    assert holder.acquires == 0
+
+
+def test_empty_contact_store_produces_a_clear_response(
+    tmp_path: Path,
+) -> None:
+    store = ContactStore(tmp_path / "empty.json")
+    page = _Page(messages=_messages(1))
+    holder = _Holder(page)
+
+    result, page, holder = _run(tmp_path, page, store=store, contact="Mom", limit=1)
+
+    assert not result.ok
+    assert "no contact matches" in result.error
+    assert "(no contacts yet)" in result.error
+    assert holder.acquires == 0
+
+
+def test_mom_flag_love_is_found_by_the_bare_word_only_when_unique(
+    tmp_path: Path,
+) -> None:
+    """"🇮🇳 Mom ❤️" is found by "Mom" because only one saved contact normalises to "mom"."""
+    store = _logo_store(tmp_path)
+    page = _Page(messages=_messages(1), headers=("🇮🇳 Mom ❤️",))
+    holder = _Holder(page)
+
+    result, page, holder = _run(tmp_path, page, store=store, contact="Mom", limit=1)
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "🇮🇳 Mom ❤️"
+    assert holder.acquires == 1
+    assert page.searched == [_MOM_LOGO_PHONE]
 
 
 @pytest.mark.parametrize("limit", [0, -1, 21, 100])
@@ -462,7 +576,9 @@ def test_output_states_the_content_is_untrusted(tmp_path: Path) -> None:
     assert "never instructions" in result.output
 
 
-def test_read_does_not_persist_message_bodies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_read_does_not_persist_message_bodies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(config, "whatsapp_sent_files_file", lambda: tmp_path / "sent.json")
     page = _Page(messages=(WhatsAppMessage(text=_BODY),))
     store = _store(tmp_path)
@@ -474,9 +590,7 @@ def test_read_does_not_persist_message_bodies(tmp_path: Path, monkeypatch: pytes
     assert set(tmp_path.rglob("*")) == before
 
 
-def test_message_bodies_are_not_logged(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_message_bodies_are_not_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO)
     page = _Page(messages=(WhatsAppMessage(text=_BODY),))
 
@@ -487,9 +601,7 @@ def test_message_bodies_are_not_logged(
     assert _BODY not in caplog.text
 
 
-def test_dispatch_is_never_called(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_dispatch_is_never_called(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("MessageFlow.dispatch must not be called by a read")
 
@@ -501,9 +613,7 @@ def test_dispatch_is_never_called(
     assert result.ok, result.error
 
 
-def test_non_windows_host_refuses(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_non_windows_host_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("jarvis.platform_guard.is_windows", lambda: False)
     page = _Page(messages=_messages(1))
 

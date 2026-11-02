@@ -229,7 +229,7 @@ def _describe_contact(store: ContactStore | None, query: str) -> str:
     store = store or ContactStore(config.contacts_file())
     matches = store.resolve(query)
     if len(matches) == 1:
-        return f"{query!r} ({masked_number(matches[0].number)})"
+        return f"{matches[0].name} ({masked_number(matches[0].number)})"
     return f"{query!r} (unknown contact)"
 
 

@@ -24,6 +24,7 @@ import logging
 import re
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -153,7 +154,10 @@ class ContactStore:
             raise ValueError("contact name is empty")
         digits = normalize_number(number)
         contacts = self.load()
-        if any(c.name.lower() == name.lower() for c in contacts):
+        if any(
+            unicodedata.normalize("NFC", c.name).casefold() == unicodedata.normalize("NFC", name).casefold()
+            for c in contacts
+        ):
             raise ValueError(f"a contact named {name!r} already exists")
         if any(c.number == digits for c in contacts):
             raise ValueError(f"the number +{digits} is already assigned to another contact")
@@ -162,22 +166,58 @@ class ContactStore:
         return f"added contact {name!r} (+{digits})"
 
     def remove(self, name: str) -> str:
-        """Remove a contact by name (case-insensitive); raises ValueError."""
+        """Remove a contact by name (case-insensitive, NFC-canonical); raises ValueError."""
         contacts = self.load()
-        remaining = [c for c in contacts if c.name.lower() != name.strip().lower()]
+        cleaned = unicodedata.normalize("NFC", name.strip()).casefold()
+        remaining = [
+            c for c in contacts if unicodedata.normalize("NFC", c.name).casefold() != cleaned
+        ]
         if len(remaining) == len(contacts):
             raise ValueError(f"no contact named {name!r}")
         self.save(remaining)
         return f"removed contact {name!r}"
 
     def resolve(self, query: str) -> list[Contact]:
-        """Case-insensitive lookup: exact name match first, then substring."""
-        q = query.strip().lower()
+        """Case-insensitive lookup: exact name match first (NFC-canonical), then
+        a substring fallback on the same normalised form.
+
+        This is used by the CLI ``describe`` helpers and by the old tooling.
+        Message sending never uses this as its identity decision: the messaging
+        flow uses :func:`jarvis.messaging.resolver.resolve_contact`, which keeps
+        emoji/punctuation as lookup noise only and never promotes a lossy match
+        into an identity proof.
+        """
+        q = unicodedata.normalize("NFC", query.strip()).casefold()
+        q_sub = " ".join(q.split())
         contacts = self.load()
-        exact = [c for c in contacts if c.name.lower() == q]
+        exact = [
+            c
+            for c in contacts
+            if unicodedata.normalize("NFC", c.name).casefold() == q
+        ]
         if exact:
             return exact
-        return [c for c in contacts if q in c.name.lower()]
+        return [
+            c for c in contacts
+            if q_sub in unicodedata.normalize("NFC", c.name).casefold()
+            or normalize_name_lite(c.name) == q_sub
+        ]
+
+
+def normalize_name_lite(name: str) -> str:
+    """Contact-store lookup key for display names (one algorithm, no recursion).
+
+    Only used by :meth:`ContactStore.resolve` as a last-resort fallback so a
+    bare-word CLI/describe lookup can still find a decorated saved name.  The
+    resolver owns the normalisation; importing it lazily avoids the module cycle
+    (the resolver imports :class:`Contact` from this module).  The result is a
+    lookup hint, never an identity proof: the send path resolves through
+    :func:`jarvis.messaging.resolver.resolve_contact` and keeps the trusted
+    phone number authoritative.
+    """
+    from jarvis.messaging.resolver import normalize_name
+
+    return normalize_name(name)
 
 
 class RateLimitError(Exception):

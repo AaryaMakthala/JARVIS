@@ -23,11 +23,13 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import BaseModel, ValidationError
+from w41_helpers import page_is_verified
 
 from jarvis.agent.context import make_app_context
 from jarvis.agent.nodes.act import act
@@ -57,6 +59,9 @@ from jarvis.tools.whatsapp_web import (
 from support import registry_with
 
 _PHONE = "919876543210"
+_MOM_PHONE = "919876543211"
+_MOM_BLUE_PHONE = "919876543212"
+_MOM_LOGO_PHONE = "919876543213"
 _SECRET = "SECRET-TEXT-do-not-log"
 
 
@@ -185,12 +190,25 @@ class _Holder:
 
 
 def _store(tmp_path: Path, *contacts: tuple[str, str]) -> ContactStore:
+    """Build a contact store; Rahul is the default when no contacts are named.
+
+    A fixture that needs several contacts passes them all with distinct numbers so
+    ContactStore's duplicate-name/number guards are never triggered by test data.
+    """
     store = ContactStore(tmp_path / "contacts.json")
-    known = {contact.name.lower() for contact in store.load()}
+    known = {unicodedata.normalize("NFC", c.name).casefold() for c in store.load()}
     for name, number in contacts or (("Rahul", _PHONE),):
-        if name.lower() not in known:
-            store.add(name, number)
+        key = unicodedata.normalize("NFC", name).casefold()
+        if key in known:
+            continue
+        store.add(name, number)
+        known.add(key)
     return store
+
+
+def _emoji_store(tmp_path: Path) -> ContactStore:
+    """A store that contains a decorated contact with a flag."""
+    return _store(tmp_path, ("🇮🇳 Mom ❤️", _MOM_LOGO_PHONE))
 
 
 def _limiter(tmp_path: Path) -> RateLimiter:
@@ -661,6 +679,173 @@ def test_unknown_and_ambiguous_contacts_are_refused_with_options(tmp_path: Path)
     assert ambiguous.ok is False
     assert "multiple contacts match" in ambiguous.error
     assert "Ali Khan" in ambiguous.error and "Ali Ahmed" in ambiguous.error
+    assert holder.acquires == 0
+
+
+def test_contact_store_still_rejects_duplicate_contacts(tmp_path: Path) -> None:
+    """Test fixes must not weaken the store's duplicate protections."""
+    store = _store(tmp_path, ("Mom ❤️", _MOM_PHONE))
+
+    with pytest.raises(ValueError, match="already exists"):
+        store.add("Mom ❤️", _MOM_BLUE_PHONE)
+    with pytest.raises(ValueError, match="already assigned"):
+        store.add("Mom 💙", _MOM_PHONE)
+
+
+def test_an_emoji_saved_contact_is_found_by_the_bare_word_only_when_unique(
+    tmp_path: Path,
+) -> None:
+    """"Mom" resolves to "Mom ❤️" only because exactly one saved contact normalises to "mom"."""
+    page = _TextPage(header="Mom ❤️")
+    store = _store(tmp_path, ("Mom ❤️", _MOM_PHONE))
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+    ctx = _ctx(holder)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Mom", message="hi"), ctx
+    )
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "Mom ❤️"
+    assert holder.acquires == 1
+    assert page_is_verified(page, _MOM_PHONE)
+
+
+def test_two_emoji_decorated_mom_contacts_are_ambiguous(tmp_path: Path) -> None:
+    """"Mom" must not silently pick between "Mom ❤️" and "Mom 💙"."""
+    page = _TextPage(header="Mom ❤️")
+    store = _store(tmp_path, ("Mom ❤️", _MOM_PHONE), ("Mom 💙", _MOM_BLUE_PHONE))
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+    ctx = _ctx(holder)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Mom", message="hi"), ctx
+    )
+
+    assert result.ok is False
+    assert "multiple contacts match" in result.error
+    assert "Mom ❤️" in result.error and "Mom 💙" in result.error
+    assert holder.acquires == 0
+
+
+def test_the_exact_decorated_name_resolves_its_contact(
+    tmp_path: Path,
+) -> None:
+    page = _TextPage(header="Mom ❤️")
+    store = _store(tmp_path, ("Mom ❤️", _MOM_PHONE))
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+    ctx = _ctx(holder)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Mom ❤️", message="hi"), ctx
+    )
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "Mom ❤️"
+    assert holder.acquires == 1
+    assert page_is_verified(page, _MOM_PHONE)
+
+
+def test_mom_flag_love_is_found_by_the_bare_word_only_when_unique(
+    tmp_path: Path,
+) -> None:
+    """"🇮🇳 Mom ❤️" is found by "Mom" because only one saved contact normalises to "mom"."""
+    page = _TextPage(header="🇮🇳 Mom ❤️")
+    store = _emoji_store(tmp_path)
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+    ctx = _ctx(holder)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Mom", message="hi"), ctx
+    )
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "🇮🇳 Mom ❤️"
+    assert holder.acquires == 1
+    assert page_is_verified(page, _MOM_LOGO_PHONE)
+
+
+def test_mamá_heart_is_found_by_the_bare_word_only_when_unique(
+    tmp_path: Path,
+) -> None:
+    """"Mamá ❤️" can be found by "Mamá" because the canonical NFC forms still match."""
+    page = _TextPage(header="Mamá ❤️")
+    store = _store(tmp_path, ("Mamá ❤️", _MOM_PHONE))
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+    ctx = _ctx(holder)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Mamá", message="hi"), ctx
+    )
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "Mamá ❤️"
+    assert holder.acquires == 1
+    assert page_is_verified(page, _MOM_PHONE)
+
+
+def test_two_mom_contacts_with_different_emoji_remain_ambiguous(
+    tmp_path: Path,
+) -> None:
+    """Two differently decorated Mom contacts with different numbers are still ambiguous."""
+    page = _TextPage(header="Mom ❤️")
+    store = _store(
+        tmp_path,
+        ("Mom ❤️", _MOM_PHONE),
+        ("Mom 💙", _MOM_BLUE_PHONE),
+    )
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+    ctx = _ctx(holder)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Mom", message="hi"), ctx
+    )
+
+    assert result.ok is False
+    assert "multiple contacts match" in result.error
+    assert "Mom ❤️" in result.error and "Mom 💙" in result.error
+    assert holder.acquires == 0
+
+
+def test_an_unknown_decorated_contact_is_refused_with_options(
+    tmp_path: Path,
+) -> None:
+    page = _TextPage(header="Mom ❤️")
+    store = _store(tmp_path, ("Mom ❤️", _MOM_PHONE))
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+    ctx = _ctx(holder)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Dad 💙", message="hi"), ctx
+    )
+
+    assert result.ok is False
+    assert "no contact matches" in result.error
+    assert "Mom ❤️" in result.error
+    assert holder.acquires == 0
+
+
+def test_empty_contact_store_produces_a_clear_response(tmp_path: Path) -> None:
+    page = _TextPage()
+    store = ContactStore(tmp_path / "empty.json")
+    holder = _Holder(page)
+    spec = _spec(tmp_path, store=store)
+    ctx = _ctx(holder)
+
+    result = spec.execute(
+        WhatsAppSendMessageArgs(contact="Mom", message="hi"), ctx
+    )
+
+    assert result.ok is False
+    assert "no contact matches" in result.error
+    assert "(no contacts yet)" in result.error
     assert holder.acquires == 0
 
 

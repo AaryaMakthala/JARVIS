@@ -40,6 +40,8 @@ from jarvis.tools.base import ToolContext, ToolResult
 from jarvis.tools.whatsapp_web import WhatsAppOpenChatArgs, make_whatsapp_open_chat_spec
 
 _PHONE = "919876543210"
+_MOM_PHONE = "919876543211"
+_MOM_BLUE_PHONE = "919876543212"
 
 
 @pytest.fixture(autouse=True)
@@ -136,9 +138,15 @@ class _Holder:
         return _Session(self.page) if self.page is not None else None
 
 
-def _store(tmp_path: Path) -> ContactStore:
+def _store(tmp_path: Path, *contacts: tuple[str, str]) -> ContactStore:
+    """Build a contact store; Rahul is the default when no contacts are named.
+
+    Every intended contact gets a distinct number, so a test never collides with
+    ContactStore's (correct) duplicate-number guard.
+    """
     store = ContactStore(tmp_path / "contacts.json")
-    store.add("Rahul", _PHONE)
+    for name, number in contacts or (("Rahul", _PHONE),):
+        store.add(name, number)
     return store
 
 
@@ -146,12 +154,20 @@ def _ctx(holder: _Holder) -> ToolContext:
     return ToolContext(settings=Settings(), whatsapp_browser=holder)
 
 
-def _open(
-    tmp_path: Path, page: _Page, **args: Any
+def _open(tmp_path: Path, page: _Page, **args: Any) -> tuple[ToolResult, _Page, _Holder]:
+    return _open_contact(tmp_path, page, "Rahul", **args)
+
+
+def _open_contact(
+    tmp_path: Path,
+    page: _Page,
+    contact: str,
+    *contacts: tuple[str, str],
+    **args: Any,
 ) -> tuple[ToolResult, _Page, _Holder]:
     holder = _Holder(page)
-    spec = make_whatsapp_open_chat_spec(store=_store(tmp_path))
-    result = spec.execute(WhatsAppOpenChatArgs(contact="Rahul", **args), _ctx(holder))
+    spec = make_whatsapp_open_chat_spec(store=_store(tmp_path, *contacts))
+    result = spec.execute(WhatsAppOpenChatArgs(contact=contact, **args), _ctx(holder))
     return result, page, holder
 
 
@@ -230,9 +246,7 @@ def test_number_search_refuses_an_unauthenticated_session(tmp_path: Path) -> Non
 
 
 def test_number_search_refuses_a_foreign_origin(tmp_path: Path) -> None:
-    page = _Page(
-        hits=(SearchHit(name="Rahul"),), redirect_to="https://evil.example/send"
-    )
+    page = _Page(hits=(SearchHit(name="Rahul"),), redirect_to="https://evil.example/send")
 
     result = _search(tmp_path, page)
 
@@ -246,9 +260,7 @@ def test_an_unknown_contact_never_starts_the_browser(tmp_path: Path) -> None:
     holder = _Holder(page)
     spec = make_whatsapp_open_chat_spec(store=_store(tmp_path))
 
-    result = spec.execute(
-        WhatsAppOpenChatArgs(contact="Nobody", via="search"), _ctx(holder)
-    )
+    result = spec.execute(WhatsAppOpenChatArgs(contact="Nobody", via="search"), _ctx(holder))
 
     assert result.ok is False
     assert holder.acquires == 0
@@ -301,6 +313,87 @@ def test_name_search_still_opens_a_unique_exact_hit() -> None:
     assert page.opened == [SearchHit(name="Rahul")]
 
 
+def test_number_search_opens_a_decorated_contact_when_the_header_matches(
+    tmp_path: Path,
+) -> None:
+    """An exact decorated saved name opens when the header proves that identity."""
+    page = _Page(hits=(SearchHit(name="Mom ❤️"),), header="Mom ❤️")
+
+    # The trusted number is the identity; the decorated header only confirms the
+    # opened chat matches the resolved saved contact.
+    result, page, _holder = _open_contact(
+        tmp_path, page, "Mom ❤️", ("Mom ❤️", _MOM_PHONE), via="search"
+    )
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "Mom ❤️"
+    assert page.searched == [_MOM_PHONE]
+    assert page.opened == [SearchHit(name="Mom ❤️")]
+
+
+def test_a_bare_word_opens_a_unique_decorated_contact(tmp_path: Path) -> None:
+    """"Mom" resolves the only saved contact whose name normalises to "mom"."""
+    page = _Page(hits=(SearchHit(name="Mom ❤️"),), header="Mom ❤️")
+
+    result, page, holder = _open_contact(
+        tmp_path, page, "Mom", ("Mom ❤️", _MOM_PHONE), via="search"
+    )
+
+    assert result.ok, result.error
+    assert result.data["recipient"] == "Mom ❤️"
+    assert holder.acquires == 1
+    assert page.searched == [_MOM_PHONE]
+
+
+def test_number_search_refuses_a_different_decorated_header(tmp_path: Path) -> None:
+    """"Mom ❤️" is saved; WhatsApp shows "Mom 💙" -> refused."""
+    page = _Page(hits=(SearchHit(name="Mom ❤️"),), header="Mom 💙")
+
+    result, page, _holder = _open_contact(
+        tmp_path, page, "Mom ❤️", ("Mom ❤️", _MOM_PHONE), via="search"
+    )
+
+    assert result.ok is False
+    assert "does not prove" in (result.error or "")
+    assert page.staged_paths == [] and page.clicked == []
+
+
+def test_number_search_refuses_a_header_naming_a_different_phone(tmp_path: Path) -> None:
+    page = _Page(
+        hits=(SearchHit(name="Mom ❤️"),), header="Mom ❤️ +91 99999 11111"
+    )
+
+    result, page, _holder = _open_contact(
+        tmp_path, page, "Mom ❤️", ("Mom ❤️", _MOM_PHONE), via="search"
+    )
+
+    assert result.ok is False
+    assert "does not prove" in (result.error or "")
+    assert page.staged_paths == [] and page.clicked == []
+
+
+def test_ambiguous_decorated_names_are_refused_before_the_browser(
+    tmp_path: Path,
+) -> None:
+    """A bare "Mom" never picks between "Mom ❤️" and "Mom 💙"."""
+    page = _Page(hits=(SearchHit(name="Mom ❤️"),), header="Mom ❤️")
+
+    result, page, holder = _open_contact(
+        tmp_path,
+        page,
+        "Mom",
+        ("Mom ❤️", _MOM_PHONE),
+        ("Mom 💙", _MOM_BLUE_PHONE),
+        via="search",
+    )
+
+    assert result.ok is False
+    assert "multiple contacts match" in (result.error or "")
+    assert "Mom ❤️" in (result.error or "") and "Mom 💙" in (result.error or "")
+    assert holder.acquires == 0
+    assert page.visited == [] and page.searched == []
+
+
 # ── the header rule itself ─────────────────────────────────────────────────
 
 
@@ -314,9 +407,10 @@ def test_name_search_still_opens_a_unique_exact_hit() -> None:
         ("Rahul +91 99999 11111", "Rahul", _PHONE, False),
         ("", "Rahul", _PHONE, False),
         ("Rahul", "", "", False),
+        ("Mom ❤️", "Mom ❤️", _PHONE, True),
+        ("Mom 💙", "Mom ❤️", _PHONE, False),
+        ("Mamá ❤️", "Mamá ❤️", _PHONE, True),
     ],
 )
-def test_header_confirms_recipient(
-    header: str, name: str, digits: str, expected: bool
-) -> None:
+def test_header_confirms_recipient(header: str, name: str, digits: str, expected: bool) -> None:
     assert header_confirms_recipient(header, name, digits) is expected

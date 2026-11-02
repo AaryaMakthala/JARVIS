@@ -18,6 +18,7 @@ from __future__ import annotations
 import getpass
 import logging
 import traceback
+import unicodedata
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
@@ -1959,9 +1960,11 @@ def contacts_list_command(store: Any) -> list[str]:
     """Render contact rows with masked numbers (testable; no raw numbers)."""
     from jarvis.tools.whatsapp import masked_number
 
+    def key(contact: Any) -> str:
+        return unicodedata.normalize("NFC", contact.name).casefold()
+
     return [
-        f"{c.name:<20} {masked_number(c.number)}"
-        for c in sorted(store.load(), key=lambda c: c.name.lower())
+        f"{c.name:<20} {masked_number(c.number)}" for c in sorted(store.load(), key=key)
     ]
 
 

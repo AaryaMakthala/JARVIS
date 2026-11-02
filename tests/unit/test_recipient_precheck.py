@@ -71,6 +71,31 @@ def test_recipient_error_accepts_exactly_one_contact(tmp_path: Any) -> None:
     assert recipient_error(_store(tmp_path), "Rahul") is None
 
 
+def test_a_unique_decorated_contact_passes_the_precheck(tmp_path: Any) -> None:
+    """The resolver's exact normalised hit is not downgraded to a near match."""
+    store = _store(tmp_path, ("Mom ❤️", _PHONE))
+    assert recipient_error(store, "Mom") is None
+    assert recipient_error(store, "Mom ❤️") is None
+
+
+def test_ambiguous_decorated_contacts_are_refused_by_the_precheck(tmp_path: Any) -> None:
+    store = _store(
+        tmp_path,
+        ("Mom ❤️", _PHONE),
+        ("Mom 💙", "919876543211"),
+    )
+    error = recipient_error(store, "Mom")
+    assert error is not None
+    assert "multiple contacts match" in error
+    assert "Mom ❤️" in error and "Mom 💙" in error
+
+
+def test_a_near_match_is_still_refused_by_the_precheck(tmp_path: Any) -> None:
+    error = recipient_error(_store(tmp_path), "Rahu")
+    assert error is not None
+    assert "no exact match" in error
+
+
 def test_recipient_error_reports_unknown_contacts(tmp_path: Any) -> None:
     error = recipient_error(_store(tmp_path), "Pappa")
     assert error is not None

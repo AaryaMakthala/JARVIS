@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -346,6 +347,17 @@ def header_matches(header: str, name: str = "", digits: str = "") -> bool:
     return bool(wanted and wanted in digits_only(text))
 
 
+def _identity_name_key(value: str) -> str:
+    """Conservative identity key for a saved display name or a chat header.
+
+    NFC canonical equivalence plus Unicode-aware case folding, with whitespace
+    collapsed.  Emoji, emoji presentation selectors and accents are *kept*, so
+    two differently decorated names never collapse into one identity; the key
+    is only insensitive to how the same saved name was typed.
+    """
+    return unicodedata.normalize("NFC", normalize_text(value)).casefold()
+
+
 def header_confirms_recipient(header: str, name: str = "", digits: str = "") -> bool:
     """Whether a chat header is *exactly* this recipient (search routes).
 
@@ -354,6 +366,11 @@ def header_confirms_recipient(header: str, name: str = "", digits: str = "") -> 
     number, so a header naming a different number is refused even when the name
     matches; and a header with no number must equal the expected name exactly -
     a substring ("Rahul Sharma" for "Rahul") is not proof.
+
+    The name comparison uses the same NFC-canonical + casefold form as the store
+    and resolver, so a decorated header and a decorated saved name still confirm
+    when they are the same saved identity, while two differently decorated names
+    do not silently collapse into one.
     """
     text = normalize_text(header)
     if not text:
@@ -362,8 +379,8 @@ def header_confirms_recipient(header: str, name: str = "", digits: str = "") -> 
     wanted = digits_only(digits)
     if seen:
         return bool(wanted) and wanted in seen
-    expected = normalize_text(name)
-    return bool(expected) and text.casefold() == expected.casefold()
+    expected = _identity_name_key(name)
+    return bool(expected) and _identity_name_key(text) == expected
 
 
 def _composer_visible(value: str) -> str:
@@ -482,7 +499,8 @@ class WhatsAppDriver:
         hits = self._page.search_results()
         if not hits:
             raise WhatsAppError("the WhatsApp search returned no contact; refusing")
-        exact = [hit for hit in hits if normalize_text(hit.name).casefold() == query.casefold()]
+        expected = _identity_name_key(query)
+        exact = [hit for hit in hits if _identity_name_key(hit.name) == expected]
         if len(exact) > 1:
             raise WhatsAppError("the WhatsApp search returned more than one exact match; refusing")
         if not exact:
