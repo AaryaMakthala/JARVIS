@@ -163,13 +163,34 @@ _DESTRUCTIVE_PATTERNS: tuple[tuple[str, str], ...] = (
     ),
 )
 
+
+def _pair(verb: str, noun: str) -> str:
+    """Match a verb and its noun in either order, a few words apart."""
+    window = r"(?:\s+\w+){0,3}\s+"
+    return rf"\b(?:{verb})\b{window}\b(?:{noun})\b|\b(?:{noun})\b{window}\b(?:{verb})\b"
+
+
+#: A communication channel by itself is not dangerous: it is a noun.  It only
+#: becomes messaging risk when the same request also asks to send/share/forward
+#: something through it.  This mirrors the composite tamper signals below.
+_MESSAGING_VERB = (
+    r"(?:send|sending|forward|forwarding|share|sharing|broadcast|broadcasting|post|posting)"
+)
+_CHANNEL_NOUN = r"(?:whatsapp|signal|telegram|sms|text message|e-?mail|voicemail)"
+#: The channel name used as a verb with a recipient ("email/text/message
+#: someone").  Requiring the recipient keeps read-only mentions such as "the
+#: message from Mom" out of this signal.
+_CHANNEL_VERB = r"(?:e-?mail|text|message|dm|reply)"
+_CHANNEL_RECIPIENT = r"(?:me|us|him|her|them|someone|somebody|my|our|his|their)"
+_CHANNEL_PATTERN = (
+    rf"(?:{_pair(_MESSAGING_VERB, _CHANNEL_NOUN)})"
+    rf"|(?:\b{_CHANNEL_VERB}\s+{_CHANNEL_RECIPIENT}\b)"
+)
+
 #: Communicating with, or about, other people.  Tier 2 territory.
 _MESSAGING_PATTERNS: tuple[tuple[str, str], ...] = (
     ("send", r"\b(send|sending|forward|share|broadcast|post)\b"),
-    (
-        "channel",
-        r"\b(whatsapp|signal|telegram|sms|text message|e-?mail|voicemail)\b",
-    ),
+    ("channel", _CHANNEL_PATTERN),
     ("people", r"\b(recipient|everyone|all my friends)\b"),
 )
 
@@ -266,12 +287,6 @@ _INJECTION_PATTERNS: tuple[tuple[str, str], ...] = (
         r"new\s+(?:system\s+)?(?:instructions?|prompt)\s*:\s*you\s+must",
     ),
 )
-
-
-def _pair(verb: str, noun: str) -> str:
-    """Match a tampering verb and its noun in either order, a few words apart."""
-    window = r"(?:\s+\w+){0,3}\s+"
-    return rf"\b(?:{verb})\b{window}\b(?:{noun})\b|\b(?:{noun})\b{window}\b(?:{verb})\b"
 
 
 #: Composite signals need both a verb and a noun, so they are appended after

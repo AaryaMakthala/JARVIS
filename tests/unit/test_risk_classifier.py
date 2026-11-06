@@ -374,6 +374,61 @@ def test_ordinary_phrasings_keep_their_existing_tiers(registry: Any) -> None:
         assert classifier.min_tier(step, text) == expected, tool
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Do I have any unread WhatsApp messages?",
+        "Check my unread Signal messages.",
+    ],
+)
+def test_bare_channel_nouns_do_not_escalate_a_tier_zero_read(text: str) -> None:
+    step = Step(id="s1", tool="whatsapp_list_unread", args={"limit": 20}, rationale="r")
+    result = signals.assess(serialize.serialize_step(step, text), prior_label=signals.SAFE)
+    assert result.min_tier == 0
+    assert result.label == signals.SAFE
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "email someone",
+        "text someone",
+        "message someone",
+        "send an email to someone",
+        "send a text message to someone",
+        "send a message to someone",
+    ],
+)
+def test_channel_verb_use_remains_messaging_risk(text: str) -> None:
+    result = signals.assess(
+        serialize.serialize_action("system_info", {}, text), prior_label=signals.SAFE
+    )
+    assert result.min_tier == 2
+    assert result.label == signals.DANGEROUS
+
+
+def test_classifier_keeps_unread_discovery_at_tier_zero(registry: Any) -> None:
+    classifier = RiskClassifier.from_registry(registry)
+    step = Step(id="s1", tool="whatsapp_list_unread", args={"limit": 20}, rationale="r")
+    for text in (
+        "Do I have any unread WhatsApp messages?",
+        "Check my unread Signal messages.",
+    ):
+        assert classifier.min_tier(step, text) == 0, text
+
+
+def test_classifier_still_escalates_channel_actions_on_a_tier_zero_read(
+    registry: Any,
+) -> None:
+    classifier = RiskClassifier.from_registry(registry)
+    step = Step(id="s1", tool="whatsapp_list_unread", args={"limit": 20}, rationale="r")
+    for text in (
+        "Send a WhatsApp message to someone.",
+        "Forward this message through Telegram.",
+    ):
+        assert classifier.min_tier(step, text) == 2, text
+
+
 def test_tainted_flag_is_recorded_by_the_classifier(registry: Any) -> None:
     classifier = RiskClassifier.from_registry(registry)
     step = Step(id="s1", tool="list_dir", args={}, rationale="r")
@@ -577,6 +632,45 @@ def test_engine_raises_the_tier_and_records_why(ws: Path, registry: Any) -> None
     assert raised.tier == 2
     assert raised.needs_unlock is True
     assert any("risk classifier" in reason for reason in raised.reasons)
+
+
+def test_engine_keeps_unread_discovery_at_tier_zero(
+    ws: Path, registry: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("jarvis.policy.engine.is_windows", lambda: True)
+    classifier = RiskClassifier.from_registry(registry)
+    ctx = _ctx(registry, ws, classifier)
+    step = Step(id="s1", tool="whatsapp_list_unread", args={"limit": 20}, rationale="r")
+
+    for text in (
+        "Do I have any unread WhatsApp messages?",
+        "Check my unread Signal messages.",
+    ):
+        state = {"user_input": text, "results": []}
+        decision = ctx.engine.decide(step, policy_context_for(state, ctx.policy_ctx))
+        assert decision.tier == 0, text
+        assert decision.needs_confirm is False, text
+        assert decision.needs_unlock is False, text
+
+
+def test_engine_still_escalates_channel_actions_on_a_tier_zero_read(
+    ws: Path, registry: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("jarvis.policy.engine.is_windows", lambda: True)
+    classifier = RiskClassifier.from_registry(registry)
+    ctx = _ctx(registry, ws, classifier)
+    step = Step(id="s1", tool="whatsapp_list_unread", args={"limit": 20}, rationale="r")
+
+    for text in (
+        "Send a WhatsApp message to someone.",
+        "Forward this message through Telegram.",
+    ):
+        state = {"user_input": text, "results": []}
+        decision = ctx.engine.decide(step, policy_context_for(state, ctx.policy_ctx))
+        assert decision.tier == 2, text
+        assert decision.needs_confirm is True, text
+        assert decision.needs_unlock is True, text
+        assert any("risk classifier" in reason for reason in decision.reasons), text
 
 
 def test_the_classifier_cannot_lower_a_tier_for_any_tool(ws: Path, registry: Any) -> None:
