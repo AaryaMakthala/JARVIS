@@ -105,13 +105,15 @@ class TestNoGenericKeyboardTools:
         from jarvis.tools.registry import build_default_registry
 
         registry = build_default_registry()
-        for name in registry.names():
-            assert "press_key" not in name.lower()
-            assert "hotkey" not in name.lower()
-            assert "type_keys" not in name.lower()
+        names = registry.names()
+        names_lower = {n.lower() for n in names}
+        for forbidden in ("press_key", "hotkey", "type_keys", "press", "key"):
+            assert forbidden not in names_lower, forbidden
+        assert "browser_press_key" in names, sorted(names)
         # A coordinate-driven click would have to be named after the pointer.
         for name in registry.names():
-            assert name.lower() not in {"click", "click_at", "mouse_click", "move_mouse"}
+            assert name.lower() not in {"click", "click_at", "mouse_click", "move_mouse"}, name
+        assert "browser_press_key" in registry.names()
 
 
 # ── F1: foreground-window verification before any paste ─────────────────
