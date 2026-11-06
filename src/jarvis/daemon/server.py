@@ -22,6 +22,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -320,11 +321,299 @@ def _looks_like_jarvis_daemon(name: str, cmdline: list[str]) -> bool:
     ``jarvis`` + ``daemon`` marker on the command line.  This guards the
     single-instance check against pid reuse: a recycled pid owned by an
     unrelated process must not be mistaken for a running daemon.
+
+    An empty ``name`` is allowed when the command line is unambiguous: the
+    command line is independently strong evidence and some Windows processes
+    cannot be queried for a name at all.
     """
-    if "python" not in name and "jarvis" not in name:
+    text = " ".join(cmdline).lower()
+    if "jarvis" not in text or "daemon" not in text:
         return False
-    text = " ".join(cmdline)
-    return "jarvis" in text and "daemon" in text
+    name = name.lower()
+    return not name or "python" in name or "jarvis" in name
+
+
+#: Difference (seconds) above which two process creation timestamps are treated
+#: as different processes.  The underlying Windows FILETIME is coarse and
+#: psutil rounds it, so an exact comparison would reject the same process.
+_CREATE_TIME_TOLERANCE_S = 0.5
+
+_IDENTITY_JARVIS = "jarvis"
+_IDENTITY_FOREIGN = "foreign"
+_IDENTITY_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class _RuntimeRecord:
+    """A validated, backward-compatible view of ``daemon.json``."""
+
+    pid: int
+    port: int | None
+    started_at: float | None
+    process_create_time: float | None
+
+    def identity(self) -> tuple[Any, ...]:
+        return (self.pid, self.port, self.started_at, self.process_create_time)
+
+
+def _coerce_float(value: Any) -> float | None:
+    """Parse a positive float, or return ``None`` for a missing/invalid value."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _coerce_int(value: Any) -> int | None:
+    """Parse a positive int, or return ``None`` for a missing/invalid value."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _parse_runtime_record(data: Any) -> _RuntimeRecord | None:
+    """Validate a decoded runtime record; ``None`` means "not usable"."""
+    if not isinstance(data, dict):
+        return None
+    pid = _coerce_int(data.get("pid"))
+    if pid is None:
+        return None
+    return _RuntimeRecord(
+        pid=pid,
+        port=_coerce_int(data.get("port")),
+        started_at=_coerce_float(data.get("started_at")),
+        process_create_time=_coerce_float(data.get("process_create_time")),
+    )
+
+
+@dataclass
+class _ProcIdentity:
+    """Independently-read process metadata; missing fields stay ``None``."""
+
+    pid: int
+    gone: bool = False
+    denied: bool = False
+    name: str | None = None
+    exe: str | None = None
+    cmdline: list[str] | None = None
+    create_time: float | None = None
+    denied_fields: set[str] = field(default_factory=set)
+
+
+def _same_process_age(first: float, second: float) -> bool:
+    return abs(first - second) <= _CREATE_TIME_TOLERANCE_S
+
+
+def _inspect_process(pid: int) -> _ProcIdentity:
+    """Read process metadata without letting one denied field hide the others.
+
+    Each field is read independently so that an ``AccessDenied`` on
+    ``cmdline()`` (common for protected Windows processes) does not discard an
+    independently readable ``name()``/``exe()``.  ``NoSuchProcess`` and
+    ``ZombieProcess`` mean the process is gone.  A second creation-time read
+    guards against the pid being recycled during inspection.
+    """
+    identity = _ProcIdentity(pid=pid)
+    try:
+        process = psutil.Process(pid)
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        identity.gone = True
+        return identity
+    except psutil.AccessDenied:
+        identity.denied = True
+        return identity
+
+    def _read(attribute: str) -> Any:
+        try:
+            return getattr(process, attribute)()
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            raise
+        except psutil.AccessDenied:
+            identity.denied_fields.add(attribute)
+            return None
+        except (OSError, AttributeError):
+            return None
+
+    try:
+        identity.create_time = _coerce_float(_read("create_time"))
+        name = _read("name")
+        identity.name = str(name) if name else None
+        exe = _read("exe")
+        identity.exe = str(exe) if exe else None
+        cmdline = _read("cmdline")
+        if cmdline:
+            identity.cmdline = [str(part) for part in cmdline]
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        identity.gone = True
+        return identity
+
+    if identity.create_time is not None:
+        try:
+            again = psutil.Process(pid).create_time()
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            identity.gone = True
+        except (psutil.AccessDenied, OSError):
+            pass
+        else:
+            again_time = _coerce_float(again)
+            if again_time is not None and not _same_process_age(again_time, identity.create_time):
+                identity.gone = True
+    return identity
+
+
+def _process_kind(identity: _ProcIdentity) -> str:
+    """Classify a process as JARVIS, clearly foreign, or not provable."""
+    label = (identity.name or "").lower()
+    if not label and identity.exe:
+        label = Path(identity.exe).name.lower()
+    if identity.cmdline:
+        if _looks_like_jarvis_daemon(label, identity.cmdline):
+            return _IDENTITY_JARVIS
+        return _IDENTITY_FOREIGN
+    if label and "python" not in label and "jarvis" not in label:
+        return _IDENTITY_FOREIGN
+    return _IDENTITY_UNKNOWN
+
+
+def _current_process_create_time() -> float | None:
+    """The current process's creation time, or ``None`` if it is unavailable."""
+    try:
+        return float(psutil.Process(os.getpid()).create_time())
+    except (psutil.Error, OSError, AttributeError):
+        return None
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write ``data`` to ``path`` atomically; never leave a partial record."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+class _StartupLock:
+    """Advisory lock that serialises concurrent daemon startup attempts.
+
+    The lock lives in a separate file (``daemon.lock``), so the runtime record
+    can be replaced atomically while the lock is held.  The OS releases the
+    lock when the holding process exits, so a crash cannot leave permanent lock
+    state.  A process-local guard also serialises two ``DaemonServer``
+    instances inside one interpreter.
+    """
+
+    _process_guard = threading.Lock()
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle: Any = None
+        self._have_process_guard = False
+
+    def acquire(self, timeout: float = 0.0) -> bool:
+        """Try to take the lock, waiting at most ``timeout`` seconds."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if self._process_guard.acquire(blocking=False):
+                self._have_process_guard = True
+                break
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # The handle must stay open for the lock's lifetime, so a context
+            # manager is not appropriate here.
+            handle = open(self.path, "a+", encoding="utf-8")  # noqa: SIM115
+        except OSError:
+            self._release_process_guard()
+            return False
+
+        if not self._lock_file(handle, deadline):
+            try:
+                handle.close()
+            except OSError:
+                pass
+            self._release_process_guard()
+            return False
+        self._handle = handle
+        return True
+
+    def _lock_file(self, handle: Any, deadline: float) -> bool:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        return True
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            return False
+                        time.sleep(0.05)
+
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return True
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        return False
+                    time.sleep(0.05)
+        except (OSError, ImportError):
+            return False
+
+    def _release_process_guard(self) -> None:
+        if self._have_process_guard:
+            self._have_process_guard = False
+            try:
+                self._process_guard.release()
+            except RuntimeError:
+                pass
+
+    def release(self) -> None:
+        """Release the file lock (if held) and the process-local guard."""
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+        self._release_process_guard()
 
 
 class DaemonServer:
@@ -365,6 +654,11 @@ class DaemonServer:
         # loop via _wake_dispatch(), which schedules on the loop thread.
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pid_file: Any = None
+        #: Creation time recorded in the runtime file for this daemon.  Used by
+        #: shutdown cleanup so an old daemon can never delete a newer record.
+        self._process_create_time: float | None = None
+        #: Human-readable reason the last :meth:`run` refused to start.
+        self._startup_refusal_reason: str | None = None
         self._voice_service: Any = None  # VoiceService | None
         self._memory: Any = None  # SqliteMemory | None (Phase 8, opened lazily)
         self._app_registry: Any = None  # ToolRegistry | None (built with the context)
@@ -385,8 +679,15 @@ class DaemonServer:
 
     # ── public API ──────────────────────────────────────────────────────
 
-    def run(self) -> None:
-        """Start the server and block until shutdown."""
+    def run(self) -> bool:
+        """Start the server and block until shutdown.
+
+        Returns ``True`` only if this process actually served and then shut
+        down.  Returns ``False`` when startup was refused (another daemon is
+        running/starting, or the runtime record is ambiguous); the reason is
+        available on :attr:`startup_refusal_reason`.  Raises on a real startup
+        failure so the CLI can report it with a non-zero exit code.
+        """
         # Redirect first, then report: under ``pythonw`` ``sys.stdout`` is
         # ``None``, and every console write below would otherwise raise.  This
         # ordering also means the "log file" line lands in the log too.
@@ -398,25 +699,50 @@ class DaemonServer:
         logging_setup.configure_logging()
         logging_setup.console(f"[DAEMON] log file -> {log_file()}")
         self._install_excepthooks()
-        if not self._check_single_instance():
-            logger.info("daemon: another instance is already alive; exiting")
-            return
-        self._pid_file = daemon_runtime_file()
-        self._pid_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Serialise the check-and-publish sequence: without this, two daemons
+        # starting together could both observe an empty/stale record and both
+        # bind.  Held for the daemon's lifetime, so a second process is refused
+        # even before its runtime-record check runs.  The OS releases it on
+        # exit, so a crash never leaves a permanent lock.
+        startup_lock = _StartupLock(daemon_runtime_file().with_name("daemon.lock"))
+        if not startup_lock.acquire():
+            reason = (
+                "another JARVIS daemon is already starting or running "
+                f"(startup lock {startup_lock.path} is held)"
+            )
+            self._startup_refusal_reason = reason
+            logger.error("daemon startup refused: %s", reason)
+            return False
+
         try:
-            asyncio.run(self._serve())
-        except KeyboardInterrupt:
-            logger.info("daemon: interrupted by the user")
-            raise
-        except BaseException:
-            logger.exception("daemon: unhandled failure while serving")
-            raise
+            if not self._check_single_instance():
+                logger.info("daemon: another instance is already alive; exiting")
+                return False
+            self._pid_file = daemon_runtime_file()
+            self._pid_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                asyncio.run(self._serve())
+            except KeyboardInterrupt:
+                logger.info("daemon: interrupted by the user")
+                raise
+            except BaseException:
+                logger.exception("daemon: unhandled failure while serving")
+                raise
+            finally:
+                self._close_memory()
+                self._close_browser()
+                self._close_whatsapp_browser()
+                self._cleanup_pid_file()
         finally:
-            self._close_memory()
-            self._close_browser()
-            self._close_whatsapp_browser()
-            self._cleanup_pid_file()
+            startup_lock.release()
         logger.info("daemon: stopped cleanly")
+        return True
+
+    @property
+    def startup_refusal_reason(self) -> str | None:
+        """Why the last :meth:`run` refused to start, if it did."""
+        return self._startup_refusal_reason
 
     # ── stdio redirect for pythonw ─────────────────────────────────────
 
@@ -450,91 +776,167 @@ class DaemonServer:
 
     # ── single instance ────────────────────────────────────────────────
 
+    def _refuse_start(self, reason: str) -> bool:
+        """Record why startup is refused and return ``False``."""
+        self._startup_refusal_reason = reason
+        logger.error("daemon startup refused: %s", reason)
+        return False
+
     def _check_single_instance(self) -> bool:
-        """Return ``True`` if we should run; ``False`` if another daemon is alive."""
+        """Return ``True`` if we should run; ``False`` if startup is refused.
+
+        A runtime record is treated as stale only on positive evidence: the pid
+        is gone, its creation time differs from the recorded one, or the process
+        is independently identifiable as a non-JARVIS application.  Insufficient
+        evidence fails closed and preserves the record.
+        """
+        self._startup_refusal_reason = None
         pid_file = daemon_runtime_file()
         if not pid_file.is_file():
             return True
+
         try:
             data = json.loads(pid_file.read_text("utf-8"))
-            old_pid = int(data.get("pid", 0))
-        except (json.JSONDecodeError, ValueError, KeyError, TypeError):
+        except FileNotFoundError:
             return True
-        if old_pid <= 0 or old_pid == os.getpid():
-            return True
-        try:
-            if not psutil.pid_exists(old_pid):
-                return self._take_stale_pid_file(pid_file, old_pid)
-            # pid is alive — but is it really a JARVIS daemon, or a recycled pid
-            # now owned by an unrelated process after reboot?
-            return self._check_foreign_pid(old_pid, pid_file)
-        except OSError as exc:  # pragma: no cover - defensive; unlink may race
-            logger.debug("could not clean stale daemon.json: %s", exc, exc_info=True)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "daemon.json is unreadable (%s); treating it as stale without "
+                "deleting it (a new record will replace it atomically)",
+                type(exc).__name__,
+            )
             return True
 
-    def _take_stale_pid_file(self, pid_file: Path, old_pid: int) -> bool:
-        """Dead/reused pid: remove the stale runtime file and allow startup."""
-        logger.warning(
-            "stale daemon.json: pid %d is not alive; removing stale runtime file",
-            old_pid,
+        record = _parse_runtime_record(data)
+        if record is None:
+            logger.warning("daemon.json has no valid pid; treating it as stale without deleting it")
+            return True
+        if record.pid == os.getpid():
+            return True
+
+        try:
+            alive = psutil.pid_exists(record.pid)
+        except (psutil.Error, OSError):
+            alive = False
+        if not alive:
+            return self._take_stale_pid_file(pid_file, record)
+
+        identity = _inspect_process(record.pid)
+        if identity.gone:
+            logger.info(
+                "daemon.json pid %d disappeared or was reused during inspection; "
+                "treating the record as stale",
+                record.pid,
+            )
+            return self._take_stale_pid_file(pid_file, record)
+
+        if (
+            record.process_create_time is not None
+            and identity.create_time is not None
+            and not _same_process_age(identity.create_time, record.process_create_time)
+        ):
+            logger.warning(
+                "daemon.json pid %d is now a different process (creation "
+                "time changed); treating the record as stale",
+                record.pid,
+            )
+            return self._take_stale_pid_file(pid_file, record)
+
+        kind = _process_kind(identity)
+        if kind == _IDENTITY_JARVIS:
+            return self._refuse_start(
+                f"another JARVIS daemon is running (pid {record.pid}); "
+                "refusing to start a second instance"
+            )
+        if kind == _IDENTITY_FOREIGN:
+            logger.warning(
+                "daemon.json pid %d belongs to a non-JARVIS process; treating the record as stale",
+                record.pid,
+            )
+            return self._take_stale_pid_file(pid_file, record)
+
+        return self._refuse_start(
+            f"daemon.json names pid {record.pid}, which is alive but its identity "
+            "cannot be confirmed as JARVIS or as an unrelated process. Refusing to "
+            f"start a second daemon. Inspect pid {record.pid}; if no JARVIS daemon "
+            f"is running, move {pid_file} aside and retry."
         )
-        try:
-            pid_file.unlink(missing_ok=True)
-        except OSError as exc:
-            logger.debug("could not remove stale daemon.json: %s", exc, exc_info=True)
-        return True
 
-    def _check_foreign_pid(self, old_pid: int, pid_file: Path) -> bool:
-        """Decide whether an alive pid is a live JARVIS daemon.
+    def _remove_runtime_record(self, pid_file: Path, record: _RuntimeRecord) -> bool:
+        """Remove ``pid_file`` only if it still contains the inspected record.
 
-        Confirms the pid belongs to a JARVIS process (name + cmdline marker) to
-        avoid mistaking pid reuse after reboot for a running daemon.
-
-        - pid confirmed as a JARVIS daemon -> refuse (return ``False``)
-        - pid died in the race between ``pid_exists`` and ``Process`` -> stale (``True``)
-        - pid is alive but its identity cannot be read -> fail closed (``False``)
-        - pid is alive but is *not* JARVIS (pid reuse) -> stale (``True``)
+        Returns ``True`` when the record is gone (removed or already absent) and
+        ``False`` when it was replaced or cannot be verified - in which case the
+        caller must not proceed as if the stale record had been cleared.
         """
         try:
-            proc = psutil.Process(old_pid)
-            name = proc.name().lower()
-            cmdline = [c.lower() for c in proc.cmdline()]
-        except psutil.NoSuchProcess:
-            # Race: died between pid_exists() and Process().
-            return self._take_stale_pid_file(pid_file, old_pid)
-        except psutil.AccessDenied:
-            # Elevated / other-user process: we cannot confirm it is a JARVIS
-            # daemon, so do not assume it is safe to start a second one.
-            logger.error(
-                "pid %d is alive but its identity cannot be read; "
-                "assuming another daemon is running",
-                old_pid,
+            current_data = json.loads(pid_file.read_text("utf-8"))
+        except FileNotFoundError:
+            return True
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        current = _parse_runtime_record(current_data)
+        if current is None or current.identity() != record.identity():
+            return False
+        try:
+            pid_file.unlink()
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            logger.warning("could not remove stale daemon.json: %s", exc)
+            return False
+        return True
+
+    def _take_stale_pid_file(self, pid_file: Path, record: _RuntimeRecord) -> bool:
+        """Remove a stale runtime record (if unchanged) and allow startup."""
+        if not self._remove_runtime_record(pid_file, record):
+            logger.warning(
+                "daemon.json changed while it was being inspected; leaving the new record in place"
             )
-            return False
-
-        if _looks_like_jarvis_daemon(name, cmdline):
-            logger.error("another daemon is running (pid %d); exiting", old_pid)
-            return False
-
-        # Alive but not a JARVIS daemon: pid reuse after reboot.
-        logger.warning(
-            "daemon.json pid %d is not a JARVIS daemon process; treating as stale",
-            old_pid,
-        )
-        return self._take_stale_pid_file(pid_file, old_pid)
+            return self._refuse_start(
+                "daemon.json was replaced by another process during startup; refusing to start"
+            )
+        logger.warning("stale daemon.json for pid %d removed; startup may proceed", record.pid)
+        return True
 
     def _write_pid_file(self, port: int) -> None:
-        data = {"pid": os.getpid(), "port": port, "started_at": time.time()}
-        self._pid_file.write_text(json.dumps(data), encoding="utf-8")
+        create_time = _current_process_create_time()
+        self._process_create_time = create_time
+        data: dict[str, Any] = {
+            "pid": os.getpid(),
+            "port": port,
+            "started_at": time.time(),
+        }
+        if create_time is not None:
+            data["process_create_time"] = create_time
+        _atomic_write_json(self._pid_file, data)
 
     def _cleanup_pid_file(self) -> None:
+        """Remove this daemon's runtime record, never a newer daemon's."""
+        if not self._pid_file or not self._pid_file.is_file():
+            return
         try:
-            if self._pid_file and self._pid_file.is_file():
-                data = json.loads(self._pid_file.read_text("utf-8"))
-                if int(data.get("pid", 0)) == os.getpid():
-                    self._pid_file.unlink(missing_ok=True)
-        except Exception:
-            logger.debug("error cleaning pid file", exc_info=True)
+            data = json.loads(self._pid_file.read_text("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            logger.debug("runtime file unreadable during cleanup; leaving it", exc_info=True)
+            return
+        record = _parse_runtime_record(data)
+        if record is None or record.pid != os.getpid():
+            logger.warning(
+                "not removing daemon.json: it belongs to pid %s, not this daemon (%d)",
+                None if record is None else record.pid,
+                os.getpid(),
+            )
+            return
+        if (
+            record.process_create_time is not None
+            and self._process_create_time is not None
+            and not _same_process_age(record.process_create_time, self._process_create_time)
+        ):
+            logger.warning("not removing daemon.json: process creation identity does not match")
+            return
+        if not self._remove_runtime_record(self._pid_file, record):
+            logger.debug("runtime file changed before cleanup; leaving the newer record")
 
     # ── main serve loop ────────────────────────────────────────────────
 
@@ -547,36 +949,41 @@ class DaemonServer:
             self._host,
             self._port,
         )
-        assigned_port = server.sockets[0].getsockname()[1]
-        self._write_pid_file(assigned_port)
-        logger.info("daemon listening on %s:%d (pid=%d)", self._host, assigned_port, os.getpid())
-
-        # Background tasks
-        stale_task = asyncio.create_task(self._stale_confirmation_loop())
-        dispatch_task = asyncio.create_task(self._dispatch_loop())
-
-        # Graceful shutdown on SIGTERM/SIGINT
-        loop = asyncio.get_running_loop()
-        self._loop = loop
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, self._shutdown_event.set)
-            except NotImplementedError:
-                pass
-        logger.info("daemon ready — serving until shutdown is requested")
-
+        stale_task: asyncio.Task[Any] | None = None
+        dispatch_task: asyncio.Task[Any] | None = None
         try:
+            assigned_port = server.sockets[0].getsockname()[1]
+            self._write_pid_file(assigned_port)
+            logger.info(
+                "daemon listening on %s:%d (pid=%d)", self._host, assigned_port, os.getpid()
+            )
+
+            # Background tasks
+            stale_task = asyncio.create_task(self._stale_confirmation_loop())
+            dispatch_task = asyncio.create_task(self._dispatch_loop())
+
+            # Graceful shutdown on SIGTERM/SIGINT
+            loop = asyncio.get_running_loop()
+            self._loop = loop
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, self._shutdown_event.set)
+                except NotImplementedError:
+                    pass
+            logger.info("daemon ready — serving until shutdown is requested")
+
             await self._shutdown_event.wait()
         finally:
-            # Guaranteed cleanup: a client disconnect or worker failure must
-            # never stop the daemon.  The shutdown path is isolated so no
-            # exception can escape ``asyncio.run`` and kill the process.
-            for task in (stale_task, dispatch_task):
+            # Guaranteed cleanup: a client disconnect, a failed runtime write or
+            # a worker failure must never leave the listening socket open.
+            tasks = [task for task in (stale_task, dispatch_task) if task is not None]
+            for task in tasks:
                 task.cancel()
-            try:
-                await asyncio.gather(stale_task, dispatch_task, return_exceptions=True)
-            except Exception:
-                logger.debug("background tasks did not cancel cleanly", exc_info=True)
+            if tasks:
+                try:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                except Exception:
+                    logger.debug("background tasks did not cancel cleanly", exc_info=True)
             server.close()
             await server.wait_closed()
             for conn in list(self._clients.values()):

@@ -1068,10 +1068,11 @@ def daemon(
     console.print("[dim]JARVIS daemon starting (Ctrl+C to stop)...[/dim]")
     console.print(f"[dim]logs: {config.log_file()}[/dim]")
     try:
-        server.run()
+        started = server.run()
     except KeyboardInterrupt:
         print("[DIAG] daemon(): server.run() raised KeyboardInterrupt", flush=True)
         console.print("[dim]daemon stopped[/dim]")
+        return
     except Exception:
         print("[DIAG] daemon(): server.run() raised Exception", flush=True)
         traceback.print_exc()
@@ -1080,6 +1081,15 @@ def daemon(
         logging.getLogger(__name__).exception("daemon crashed")
         console.print("[red]daemon crashed — see the log file for details[/red]")
         raise typer.Exit(code=1) from None
+
+    if not started:
+        reason = server.startup_refusal_reason or "daemon did not start"
+        console.print(f"[red]daemon did not start: {reason}[/red]")
+        console.print(
+            "[yellow]If you are sure no JARVIS daemon is running, inspect "
+            f"{config.daemon_runtime_file()} and the daemon log, then retry.[/yellow]"
+        )
+        raise typer.Exit(code=1)
 
 
 # ── autostart ────────────────────────────────────────────────────────────
