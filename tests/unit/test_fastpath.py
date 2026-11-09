@@ -171,6 +171,17 @@ def test_brain_hit_skips_even_an_exploding_llm() -> None:
     assert update["tokens"] == 0
 
 
+def test_system_query_hit_skips_even_an_exploding_llm() -> None:
+    ctx = make_app_context(Settings(), llm=_ExplodingLLM())
+
+    update = brain({"user_input": "battery level", "task_id": "t1"}, ctx)
+
+    assert update["plan"].steps[0].tool == "system_info"
+    assert update["plan"].steps[0].args == {"what": "battery"}
+    assert update["api_calls"] == 0
+    assert update["tokens"] == 0
+
+
 def test_brain_voice_hit_skips_even_an_exploding_llm() -> None:
     """A voice fast-path hit (e.g. "open notepad") still asks the LLM nothing."""
     ctx = make_app_context(Settings(), llm=_ExplodingLLM())
