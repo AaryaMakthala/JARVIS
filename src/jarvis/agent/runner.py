@@ -94,7 +94,7 @@ def run_task(
     ``cancel`` is the caller's per-task :class:`CancelToken`; the graph checks it
     before entering every node, so a cancelled run stops at the next step.
     """
-    task_id = thread_id or uuid4().hex[:12]
+    task_id = thread_id or str(uuid4())
     graph = build_graph(ctx, checkpointer, cancel)
     config = {"configurable": {"thread_id": task_id}}
     # Seed ``task_id`` so the graph and the outcome agree on one identifier.

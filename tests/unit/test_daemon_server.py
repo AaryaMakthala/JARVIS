@@ -25,6 +25,8 @@ from jarvis.daemon.server import (
     _parse_message,
 )
 
+TASK_1 = "00000000-0000-4000-8000-000000000001"
+
 # ── Message parsing (delegated from protocol.py) ─────────────────────────
 
 
@@ -329,18 +331,18 @@ class TestRequestAcks:
         writer = AsyncMock()
         conn = ClientConnection(writer=writer, reader=AsyncMock())
 
-        asyncio.run(server._handle_chat(ChatMessage(id="t1", text="lock my computer"), conn))
+        asyncio.run(server._handle_chat(ChatMessage(id=TASK_1, text="lock my computer"), conn))
 
         # The ack is sent synchronously, before any worker progress.
         written = writer.write.call_args[0][0].decode("utf-8")
         data = json.loads(written)
         assert data["type"] == "event"
-        assert data["task_id"] == "t1"
+        assert data["task_id"] == TASK_1
         # A dedicated kind, not a progress "log": the client has to be able to
         # tell the submission receipt from a message about the same task.
         assert data["kind"] == "ack"
         assert data["data"]["message"] == "started"
-        assert server._active is not None and server._active.task_id == "t1"
+        assert server._active is not None and server._active.task_id == TASK_1
 
     def test_delivered_confirm_response_sends_an_ack(self) -> None:
         from jarvis.daemon.protocol import ConfirmResponse

@@ -185,6 +185,20 @@ class ClientConnection:
 # ── Task slot ────────────────────────────────────────────────────────────
 
 
+def _task_id(candidate: str = "") -> str:
+    """Return a canonical UUID task id, minting one when needed.
+
+    The task store keys on canonical UUIDs, and the daemon must never let two
+    requests share one.  A well-formed client id is honoured (useful for
+    callers that correlate their own requests); anything else, including the
+    old millisecond timestamp scheme, is replaced with a fresh UUID.
+    """
+    try:
+        return str(uuid.UUID(str(candidate)))
+    except (AttributeError, TypeError, ValueError):
+        return str(uuid.uuid4())
+
+
 @dataclass
 class TaskSlot:
     """Tracks one task's lifecycle: queued → active → (confirming) → done."""
@@ -1610,7 +1624,7 @@ class DaemonServer:
 
     async def _handle_chat(self, msg: ChatMessage, conn: ClientConnection) -> None:
         """Accept a new task or queue it."""
-        task_id = msg.id or f"t{int(time.time() * 1000)}"
+        task_id = _task_id(msg.id)
         slot = TaskSlot(
             task_id=task_id,
             text=msg.text,
@@ -1671,7 +1685,7 @@ class DaemonServer:
         if self._ctx is None:
             logger.warning("voice task rejected: runtime context is not initialised")
             return _VoiceOutcome(error="AI backend is starting — try again")
-        task_id = f"v{int(time.time() * 1000)}"
+        task_id = _task_id()
         slot = TaskSlot(task_id=task_id, text=text, source=source, owner_id=VOICE_OWNER)
 
         with self._lock:

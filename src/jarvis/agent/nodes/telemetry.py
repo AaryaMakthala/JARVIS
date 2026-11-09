@@ -46,17 +46,20 @@ from typing import Any
 from jarvis.agent.context import AppContext
 from jarvis.agent.state import Plan, StepResult
 from jarvis.memory.tasklog import STATUSES
+from jarvis.taskstore import TaskStage, TaskStatus
 
 __all__ = [
     "MAX_PATH_CHARS",
     "MAX_TRACED_TASKS",
     "MAX_TRACE_ENTRIES",
     "NODE_CODES",
+    "NODE_STAGES",
     "discard_trace",
     "format_trace",
     "get_trace",
     "node_code",
     "record_finished",
+    "record_stage",
     "record_started",
     "task_status",
     "trace_node",
@@ -102,6 +105,40 @@ NODE_CODES: dict[str, str] = {
     "specialist_decide": "sd",
     "specialist_observe": "so",
 }
+
+#: Graph node -> closed lifecycle stage written to the independent task store.
+#: ``intake`` is absent on purpose: :func:`record_started` opens the task and
+#: moves it to ``running`` itself, so the entry hook would write a redundant
+#: event.  ``memory_save`` is reached after ``respond`` has already written the
+#: terminal event, so its write is expected to be refused and ignored.
+NODE_STAGES: dict[str, TaskStage] = {
+    "context_resolve": TaskStage.RECALLING,
+    "memory_retrieve": TaskStage.RECALLING,
+    "brain": TaskStage.PLANNING,
+    "validate": TaskStage.VALIDATING,
+    "prepare_readback": TaskStage.AUTHORIZING,
+    "policy_gate": TaskStage.AUTHORIZING,
+    "act": TaskStage.EXECUTING,
+    "verify": TaskStage.VERIFYING,
+    "replan": TaskStage.REPLANNING,
+    "clarify": TaskStage.CLARIFYING,
+    "compose": TaskStage.RESPONDING,
+    "respond": TaskStage.RESPONDING,
+    "memory_save": TaskStage.SAVING,
+    "specialist_decide": TaskStage.PLANNING,
+    "specialist_observe": TaskStage.VERIFYING,
+}
+
+#: Failure code recorded with a terminal status (the stored vocabulary is the
+#: closed :class:`~jarvis.agent.state.FailureCode` set).
+_FAILURE_CODES: dict[TaskStatus, str] = {
+    TaskStatus.FAILED: "failed",
+    TaskStatus.PARTIAL: "partial",
+    TaskStatus.CANCELLED: "cancelled",
+    TaskStatus.HALTED: "halted",
+}
+
+_SOURCES = ("terminal", "voice", "benchmark")
 
 
 class _NodeTraces:
@@ -206,6 +243,71 @@ def format_trace(names: tuple[str, ...] | list[str]) -> str:
     return path[: cut + 1] + "…"
 
 
+def _task_store(ctx: AppContext) -> Any | None:
+    """The independent store, or ``None`` when observability is off."""
+    if bool(getattr(ctx, "dry_run", False)):
+        return None
+    store = getattr(ctx, "tasks", None)
+    if store is None or not getattr(store, "writable", False):
+        return None
+    return store
+
+
+def _safe_source(state: dict[str, Any]) -> str:
+    source = str(state.get("source") or "")
+    return source if source in _SOURCES else "terminal"
+
+
+def record_stage(state: dict[str, Any], ctx: AppContext, node_name: str) -> None:
+    """Record that ``node_name`` was entered for this task.
+
+    Called from :func:`jarvis.agent.nodes.wrap`, the single choke point every
+    node passes through.  It writes only the closed stage vocabulary and the
+    task's own id - no user text, arguments or results.  Every store error is
+    swallowed: observability must never change the task's answer.
+    """
+    store = _task_store(ctx)
+    task_id = str(state.get("task_id") or "")
+    if store is None or not task_id:
+        return
+    stage = NODE_STAGES.get(node_name)
+    if stage is None:
+        return
+    try:
+        store.ensure_task(task_id, source=_safe_source(state))
+        store.update_stage(task_id, stage)
+    except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
+        ctx.logger.debug("task stage not recorded (%s): %s", node_name, exc)
+
+
+def _task_begin(state: dict[str, Any], ctx: AppContext) -> None:
+    """Open the task and move it to ``running`` (from ``intake``)."""
+    store = _task_store(ctx)
+    task_id = str(state.get("task_id") or "")
+    if store is None or not task_id:
+        return
+    try:
+        store.ensure_task(task_id, source=_safe_source(state))
+        store.update_status(task_id, TaskStatus.RUNNING)
+    except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
+        ctx.logger.debug("task start not recorded: %s", exc)
+
+
+def _task_finish(state: dict[str, Any], ctx: AppContext, status: str) -> None:
+    """Write the terminal event with the derived status and failure code."""
+    store = _task_store(ctx)
+    task_id = str(state.get("task_id") or "")
+    if store is None or not task_id:
+        return
+    try:
+        final = TaskStatus(status)
+        code = _FAILURE_CODES.get(final)
+        store.ensure_task(task_id, source=_safe_source(state))
+        store.finish(task_id, final, failure_code=code)
+    except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
+        ctx.logger.debug("task finish not recorded: %s", exc)
+
+
 def record_started(state: dict[str, Any], ctx: AppContext) -> None:
     """Open the ``running`` row for this task (called from ``intake``)."""
     _write(
@@ -217,6 +319,7 @@ def record_started(state: dict[str, Any], ctx: AppContext) -> None:
         steps=0,
         replans=0,
     )
+    _task_begin(state, ctx)
 
 
 def record_finished(state: dict[str, Any], ctx: AppContext) -> None:
@@ -230,11 +333,12 @@ def record_finished(state: dict[str, Any], ctx: AppContext) -> None:
     plan: Plan | None = state.get("plan")
     task_id = str(state.get("task_id") or "")
     path = format_trace(get_trace(task_id)) if task_id else ""
+    status = task_status(state)
     try:
         _write(
             state,
             ctx,
-            status=task_status(state),
+            status=status,
             api_calls=int(state.get("api_calls") or 0),
             tokens=int(state.get("tokens") or 0),
             steps=len(plan.steps) if plan is not None else 0,
@@ -244,6 +348,7 @@ def record_finished(state: dict[str, Any], ctx: AppContext) -> None:
     finally:
         if task_id:
             discard_trace(task_id)
+    _task_finish(state, ctx, status)
 
 
 def task_status(state: dict[str, Any]) -> str:
