@@ -779,3 +779,84 @@ class TestDaemonChatSurvivesInterruption:
         assert ("clarification", {"task_id": "t-asking", "answer": "y"}) in client.sent
         confirms = [payload for kind, payload in client.sent if kind == "confirm"]
         assert [payload["task_id"] for payload in confirms] == ["t-asking"]
+
+
+class TestTasksCommand:
+    """``jarvis tasks`` reads the independent store, never the memory backend."""
+
+    def _wire(self, monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+        from jarvis.config import Settings
+
+        class _Registry:
+            def names(self) -> tuple[str, ...]:
+                return ()
+
+        monkeypatch.setattr("jarvis.config.task_events_db", lambda: path)
+        monkeypatch.setattr("jarvis.config.load_settings", lambda: Settings())
+        monkeypatch.setattr(
+            "jarvis.tools.registry.build_default_registry", lambda settings: _Registry()
+        )
+
+    def test_missing_store_is_not_an_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._wire(monkeypatch, tmp_path / "missing.db")
+
+        result = runner.invoke(cli.app, ["tasks"])
+
+        assert result.exit_code == 0
+        assert "no tasks" in result.output
+
+    def test_rows_come_from_the_task_store(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from jarvis.config import Settings
+        from jarvis.taskstore import TaskStage, TaskStatus, open_task_store
+        from jarvis.taskstore.runtime import build_task_vocabulary
+
+        path = tmp_path / "task_events.db"
+        done = "a0000000-0000-4000-8000-0000000000a1"
+        failed = "b0000000-0000-4000-8000-0000000000a2"
+        store = open_task_store(
+            path, create=True, vocabulary=build_task_vocabulary(Settings())
+        )
+        try:
+            store.ensure_task(done, source="terminal")
+            store.update_status(done, TaskStatus.RUNNING)
+            store.update_stage(done, TaskStage.EXECUTING)
+            store.finish(done, TaskStatus.COMPLETED)
+
+            store.ensure_task(failed, source="voice")
+            store.update_status(failed, TaskStatus.RUNNING)
+            store.finish(
+                failed,
+                TaskStatus.FAILED,
+                failure_code="failed",
+                failure_category="tool",
+            )
+        finally:
+            store.close()
+        self._wire(monkeypatch, path)
+
+        result = runner.invoke(
+            cli.app, ["tasks", "--n", "5"], env={"COLUMNS": "200", "TERM": "dumb"}
+        )
+
+        assert result.exit_code == 0, result.output
+        assert done[:12] in result.output
+        assert failed[:12] in result.output
+        assert "completed" in result.output
+        assert "done" in result.output
+        assert "failed/tool" in result.output
+
+    def test_unreadable_store_degrades_without_a_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "task_events.db"
+        path.write_bytes(b"this is not a sqlite database")
+        self._wire(monkeypatch, path)
+
+        result = runner.invoke(cli.app, ["tasks"])
+
+        assert result.exit_code == 0
+        assert "task history unavailable" in result.output

@@ -2406,55 +2406,83 @@ def voice_doctor(
 def tasks(
     n: Annotated[int, typer.Option("--n", help="Number of recent tasks to show.")] = 20,
 ) -> None:
-    """Show recent tasks from the task log (with failure telemetry)."""
+    """Show recent tasks from the independent task-event store."""
     from jarvis import config
-    from jarvis.memory import store as memory_store
+    from jarvis.taskstore.runtime import open_runtime_task_store
+    from jarvis.tools.registry import build_default_registry
 
     settings = config.load_settings()
-    memory = memory_store.open_memory(settings)
+    path = config.task_events_db()
+    if not path.is_file():
+        console.print("[dim]no tasks[/dim]")
+        return
+
+    registry = build_default_registry(settings)
+    store = open_runtime_task_store(
+        settings, registry, path=path, create=False, read_only=True
+    )
     try:
-        rows = memory.task_log.recent(limit=int(n))
+        if not store.available:
+            reason = store.status().reason or "task store unavailable"
+            console.print(f"[yellow]task history unavailable: {reason}[/yellow]")
+            return
+        rows = store.recent(limit=int(n))
     except Exception as exc:
-        console.print(f"[red]could not read task log: {exc}[/red]")
+        console.print(f"[red]could not read task history: {exc}[/red]")
         raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
     if not rows:
         console.print("[dim]no tasks[/dim]")
         return
     table = Table(show_header=True, box=None)
     table.add_column("task_id", style="dim")
     table.add_column("status")
+    table.add_column("stage")
     table.add_column("source")
-    table.add_column("api_calls")
-    table.add_column("tokens")
-    table.add_column("steps")
-    table.add_column("halt_reason")
-    table.add_column("failure_code")
-    table.add_column("first_failing_step")
-    table.add_column("tools_used")
-    table.add_column("error_text")
-    table.add_column("llm_ms")
-    table.add_column("llm_calls")
-    table.add_column("provider_chain")
-    table.add_column("tool_ms")
-    for r in rows:
+    table.add_column("started")
+    table.add_column("elapsed")
+    table.add_column("retries")
+    table.add_column("failure")
+    table.add_column("tool")
+    table.add_column("approval")
+    table.add_column("events")
+    for row in rows:
         table.add_row(
-            r.task_id[:12],
-            r.status,
-            r.source or "",
-            str(r.api_calls),
-            str(r.tokens),
-            str(r.steps),
-            r.halt_reason or "",
-            r.failure_code or "",
-            r.first_failing_step or "",
-            r.tools_used or "",
-            (r.error_text or "")[:60],
-            str(r.llm_ms) if r.llm_ms is not None else "",
-            str(r.llm_calls) if r.llm_calls is not None else "",
-            r.provider_chain or "",
-            str(r.tool_ms) if r.tool_ms is not None else "",
+            row.task_id[:12],
+            row.status.value,
+            row.stage.value,
+            row.source,
+            _task_started(row),
+            _task_elapsed(row),
+            str(row.retry_count),
+            _task_failure(row),
+            row.active_tool or "",
+            row.approval_state or "",
+            str(row.event_count),
         )
     console.print(table)
+
+
+def _task_started(row: Any) -> str:
+    when = row.started_at or row.created_at
+    return when.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _task_elapsed(row: Any) -> str:
+    start = row.started_at or row.created_at
+    end = row.finished_at or row.updated_at
+    seconds = max((end - start).total_seconds(), 0.0)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, seconds = divmod(int(seconds), 60)
+    return f"{minutes}m{seconds:02d}s"
+
+
+def _task_failure(row: Any) -> str:
+    values = [value for value in (row.failure_code, row.failure_category) if value]
+    return "/".join(values)
 
 
 # ── benchmark (Phase 9) ───────────────────────────────────────────────────
