@@ -23,87 +23,22 @@ from jarvis.agent.schemas import UserRequest
 
 _CANCEL_RE = re.compile(r"^(cancel|stop|abort|never mind|no thanks|wait)$", re.IGNORECASE)
 
+_ALLOWED_SOURCES = ("terminal", "voice", "benchmark")
 
-def intake(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
-    """Prepare the state for one task run."""
-    user_input = (state.get("user_input") or "").strip()
-    source = state.get("source", "terminal")
-    if not user_input:
-        task_id = state.get("task_id") or new_task_id()
-        update: dict[str, Any] = {
-            "task_id": task_id,
-            "conversation_id": state.get("conversation_id") or "local",
-            "source": source if source in ("terminal", "voice", "benchmark") else "terminal",
-            "user_input": "",
-            "cancelled": False,
-            "request_kind": "",
-            "clarification_question": None,
-            "clarification_answer": None,
-            "clarification_count": 0,
-            "clarification_history": [],
-            "step_index": 0,
-            "retry_count": 0,
-            "retry_now": False,
-            "replan_now": False,
-            "replan_count": 0,
-            "pending_replan": False,
-            "replan_decision": None,
-            "validate_attempts": 0,
-            "api_calls": 0,
-            "tokens": 0,
-            "plan": None,
-            "decisions": {},
-            "approved_hashes": [],
-            "results": [],
-            "memory_context": [],
-            "halted_reason": "No input received. Tell me what to do.",
-        }
-        record_started(update, ctx)
-        return update
-    try:
-        request = UserRequest(
-            text=user_input,
-            source=source if source in ("terminal", "voice", "benchmark") else "terminal",
-        )
-    except Exception:
-        task_id = state.get("task_id") or new_task_id()
-        update = {
-            "task_id": task_id,
-            "conversation_id": state.get("conversation_id") or "local",
-            "source": source if source in ("terminal", "voice", "benchmark") else "terminal",
-            "user_input": user_input,
-            "cancelled": False,
-            "request_kind": "",
-            "clarification_question": None,
-            "clarification_answer": None,
-            "clarification_count": 0,
-            "clarification_history": [],
-            "step_index": 0,
-            "retry_count": 0,
-            "retry_now": False,
-            "replan_now": False,
-            "replan_count": 0,
-            "pending_replan": False,
-            "replan_decision": None,
-            "validate_attempts": 0,
-            "api_calls": 0,
-            "tokens": 0,
-            "plan": None,
-            "decisions": {},
-            "approved_hashes": [],
-            "results": [],
-            "memory_context": [],
-            "halted_reason": "No input received. Tell me what to do.",
-        }
-        record_started(update, ctx)
-        return update
-    cancelled = bool(_CANCEL_RE.match(request.text))
 
-    update = {
+def _fresh_update(
+    state: dict[str, Any],
+    *,
+    source: Any,
+    user_input: str,
+    cancelled: bool,
+) -> dict[str, Any]:
+    """Every per-task key, explicitly reset (a reused thread must not leak)."""
+    return {
         "task_id": state.get("task_id") or new_task_id(),
         "conversation_id": state.get("conversation_id") or "local",
-        "source": request.source,
-        "user_input": request.text,
+        "source": source if source in _ALLOWED_SOURCES else "terminal",
+        "user_input": user_input,
         "cancelled": cancelled,
         "request_kind": "",
         "clarification_question": None,
@@ -125,11 +60,47 @@ def intake(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         "approved_hashes": [],
         "results": [],
         "memory_context": [],
+        "final_answer": None,
+        "spoken_answer": None,
+        "screen_answer": None,
+        "error": None,
+        "resolved_refs": {},
+        "gated_resolved_paths": {},
+        "gated_content_hashes": {},
+        "gated_browser_readback_hashes": {},
+        "pending_readback": None,
+        "specialist_goal": None,
+        "specialist_calls": 0,
+        "specialist_history": [],
+        "specialist_phase": "idle",
+        "memory_saved": False,
+        "memory_saved_reason": None,
+        "memory_failure_logged": False,
     }
-    if cancelled:
-        update["halted_reason"] = "Cancelled by the user."
-    else:
-        update["halted_reason"] = None
+
+
+def intake(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
+    """Prepare the state for one task run."""
+    user_input = (state.get("user_input") or "").strip()
+    source = state.get("source", "terminal")
+    if not user_input:
+        update = _fresh_update(state, source=source, user_input="", cancelled=False)
+        update["halted_reason"] = "No input received. Tell me what to do."
+        record_started(update, ctx)
+        return update
+    try:
+        request = UserRequest(text=user_input, source=source)
+    except ValueError:
+        update = _fresh_update(state, source=source, user_input=user_input, cancelled=False)
+        update["halted_reason"] = "No input received. Tell me what to do."
+        record_started(update, ctx)
+        return update
+    cancelled = bool(_CANCEL_RE.match(request.text))
+
+    update = _fresh_update(
+        state, source=request.source, user_input=request.text, cancelled=cancelled
+    )
+    update["halted_reason"] = "Cancelled by the user." if cancelled else None
     # Read from ``update`` (not ``state``): on a first run the task_id is
     # assigned here, so the caller would otherwise have no id to log under.
     record_started(update, ctx)

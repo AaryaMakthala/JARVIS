@@ -25,6 +25,14 @@ Maintained by the coding agent. Condensed from historical log.
 - **Known B1 limits**: task rows intentionally do not store the user request (privacy allow-list), so `jarvis tasks` cannot show a request column. Queued tasks cancelled before the graph starts have no row yet. No live/progress streaming beyond the status snapshot.
 - **Known B2 limits**: routing is heuristic (closed word sets), not learned; vision routing itself already existed in `describe_image`/`screen` and was not changed; the fast model still returns the structured `BrainDecision` schema; arithmetic and other deterministic computations remain the planner's job by design.
 
+## Backend roadmap B3 (2026-11-09, in progress)
+
+- **Per-task state reset**: `intake` now builds one canonical fresh update with *every* per-task key reset (answer/error, gated paths/content hashes/readbacks, referents, specialist fields, memory-save flags) so a reused `thread_id` cannot inherit a stale answer, refusal, or specialist phase. Existing task id/conversation id are preserved.
+- **Honest compose for observations**: successful read-only tools (`get_time`, `system_info`, `process_list`, `list_windows`, `read_screen`, `describe_screen`) no longer classify as `partial`; the voice channel says the factual answer instead of "I could not verify it". Unverified side-effect actions still report `partial`.
+- **Cancellation race**: a late `CancelMessage` for a task already marked done now acks "already finished" and leaves `result_text`/`error` untouched, so a successful answer cannot be replaced by "cancelled by user".
+- **Checkpointer cleanup**: `_worker_run` closes its per-task `SqliteSaver` connection in `finally` on success, error, and cancellation; a leaked SQLite handle can no longer block checkpoint maintenance/file operations on Windows.
+- **Verification**: new compose/intake/cancel/cleanup tests plus affected suites: 102 passed (intake, compose, daemon, fastpath, task log, agent). Targeted Ruff clean. Remaining B3: startup reconciliation of orphaned running/awaiting rows and interrupted checkpoints; terminal-priority agreement between `respond`, `compose`, and `task_status`. Known pre-existing failure: `test_name_preference.py::test_learn_name_can_be_switched_off` calls `_ctx(memory, memory=...)` and raises TypeError (not caused by this work).
+
 ## Safety invariants and non-negotiable decisions
 
 - **LLM proposes, policy decides**: No LLM output can lower a tier.

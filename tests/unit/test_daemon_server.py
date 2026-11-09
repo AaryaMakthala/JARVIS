@@ -413,6 +413,59 @@ class TestRequestAcks:
         assert data["kind"] == "ack"
         assert data["data"]["message"] == "cancelled"
 
+    def test_late_cancel_does_not_overwrite_a_finished_result(self) -> None:
+        from jarvis.daemon.protocol import CancelMessage
+
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="setup", source="chat", owner_id="oid")
+        slot.done = True
+        slot.result_text = "done"
+        server._active = slot
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+
+        asyncio.run(server._handle_cancel(CancelMessage(task_id="t1"), conn))
+        data = json.loads(writer.write.call_args[0][0].decode("utf-8"))
+        assert data["data"]["message"] == "already finished"
+        assert slot.result_text == "done"
+        assert slot.error is None
+        assert slot.cancelled is False
+
+
+class TestWorkerCheckpointerCleanup:
+    def test_success_closes_the_per_task_saver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from types import SimpleNamespace
+
+        import jarvis.agent
+        import jarvis.config
+
+        closed: list[bool] = []
+
+        class _Conn:
+            def close(self) -> None:
+                closed.append(True)
+
+        class _Saver:
+            conn = _Conn()
+
+        monkeypatch.setattr(jarvis.agent, "open_sqlite_checkpointer", lambda path: _Saver())
+        monkeypatch.setattr(jarvis.config, "checkpoints_db", lambda: "/tmp/cp.db")
+        monkeypatch.setattr(
+            jarvis.agent,
+            "run_task",
+            lambda *args, **kwargs: SimpleNamespace(
+                final_answer="ok", spoken_answer=None, confirmation=None, error=None
+            ),
+        )
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="hello", source="chat", owner_id="oid")
+
+        server._worker_run(slot)
+
+        assert slot.done is True
+        assert slot.result_text == "ok"
+        assert closed == [True]
+
 
 class TestAckPrecedesTheWorkerWakeup:
     """The ack must be on the wire *before* the worker thread is released.

@@ -2027,6 +2027,7 @@ class DaemonServer:
         from jarvis.config import checkpoints_db
 
         task_id = slot.task_id
+        saver = None
 
         try:
             saver = open_sqlite_checkpointer(str(checkpoints_db()))
@@ -2149,6 +2150,14 @@ class DaemonServer:
                 slot.event.set()
             logger.error("worker for %s failed: %s", task_id, slot.error)
         finally:
+            # Release this task's SQLite handle before dropping its runtime
+            # state.  A leaked connection (worker exception/cancel) can block
+            # checkpoint maintenance and file operations on Windows.
+            if saver is not None:
+                try:
+                    saver.conn.close()
+                except Exception:
+                    logger.debug("checkpointer close for %s failed", task_id, exc_info=True)
             # The task is finished - success, error or cancellation - so its
             # in-memory transient runtime state (scope grant and target
             # bindings) must not outlive it: a later task, even one re-asking
@@ -2327,6 +2336,15 @@ class DaemonServer:
         """Cancel a running or queued task."""
         with self._lock:
             if self._active and self._active.task_id == msg.task_id:
+                if self._active.done:
+                    await conn.send(
+                        EventMessage(
+                            task_id=msg.task_id,
+                            kind="ack",
+                            data={"message": "already finished"},
+                        )
+                    )
+                    return
                 # Cancel this task's own token: the graph stops at its next node
                 # boundary, so the remaining steps of the plan never execute.
                 self._active.cancel.cancel()

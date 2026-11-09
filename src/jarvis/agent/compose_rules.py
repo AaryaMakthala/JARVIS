@@ -63,6 +63,12 @@ OUTCOMES = (
 
 SUCCESS = "success"
 
+#: Read-only observation tools have no post-condition to verify: a successful
+#: result is the observation itself, so ``verified is None`` is not a shortfall.
+_OBSERVATION_TOOLS = frozenset(
+    {"get_time", "system_info", "process_list", "list_windows", "read_screen", "describe_screen"}
+)
+
 #: A spoken answer is at most this many sentences / characters.
 MAX_SENTENCES = 2
 MAX_SPOKEN_CHARS = 220
@@ -146,11 +152,29 @@ def classify_outcome(state: dict[str, Any]) -> str:
     if any(not r.ok or r.verified is False for r in results):
         return "failed"
     if any(r.verified is None for r in results):
+        if _only_unverified_observations(state, results):
+            return SUCCESS
         return "partial"
     if results:
         return SUCCESS
     # Nothing ran and nothing refused: ``respond`` says "No task performed."
     return "failed"
+
+
+def _only_unverified_observations(state: dict[str, Any], results: list[Any]) -> bool:
+    """True when every unverified result came from a read-only observation."""
+    plan = state.get("plan")
+    steps = getattr(plan, "steps", None) if plan is not None else None
+    if not isinstance(steps, list):
+        return False
+    tools = {
+        str(getattr(step, "id", "") or ""): str(getattr(step, "tool", "") or "")
+        for step in steps
+    }
+    unverified = [r for r in results if r.verified is None]
+    return bool(unverified) and all(
+        tools.get(str(r.step_id or "")) in _OBSERVATION_TOOLS for r in unverified
+    )
 
 
 def _halt_outcome(halt: str) -> str:
