@@ -980,6 +980,11 @@ def memory_db() -> Path:
     return user_data_dir("memory.db")
 
 
+def task_events_db() -> Path:
+    """Path to the independent task projection/event SQLite database."""
+    return user_data_dir("task_events.db")
+
+
 def checkpoints_db() -> Path:
     """Path to the LangGraph checkpoint SQLite database."""
     return user_data_dir("checkpoints.db")
