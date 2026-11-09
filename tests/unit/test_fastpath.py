@@ -50,6 +50,22 @@ def test_windows_phrases_hit_list_windows() -> None:
         assert args == {}
 
 
+def test_system_phrases_hit_read_only_system_info() -> None:
+    cases = {
+        "battery level": "battery",
+        "what is my cpu usage": "cpu",
+        "how much memory is used": "ram",
+        "disk usage": "disk",
+        "system uptime": "uptime",
+    }
+    for text, expected in cases.items():
+        hit = fastpath.match(text, Settings())
+        assert hit is not None, text
+        tool, args, _phrase = hit
+        assert tool == "system_info"
+        assert args == {"what": expected}
+
+
 def test_open_variants_hit_open_app_case_insensitive() -> None:
     cases = {
         "open notepad": "notepad",

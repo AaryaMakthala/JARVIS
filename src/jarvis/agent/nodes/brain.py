@@ -35,6 +35,7 @@ from jarvis.agent.session_context import (
 from jarvis.agent.state import Plan, RequestKind, Step
 from jarvis.agent.tool_groups import select_catalogue, trim_site_catalogue
 from jarvis.browser.sites import render_site_catalogue, sites_from_settings
+from jarvis.llm.routing import classify_request, model_role_for
 from jarvis.messaging.grounding import ground_brain_update
 
 #: Deterministic, user-facing halt reasons.  The LLM output never reaches the
@@ -80,6 +81,18 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         return {"halted_reason": LLM_NOT_CONFIGURED}
 
     ctx.logger.info("agent event=llm_start task_id=%s", task_id)
+
+    task_class = classify_request(
+        state.get("user_input") or "", has_image=bool(state.get("has_image"))
+    )
+    model_role = model_role_for(task_class)
+    ctx.logger.info(
+        "agent event=llm_route task_id=%s class=%s role=%s",
+        task_id,
+        task_class.value,
+        model_role,
+    )
+
 
     previous_error = state.get("error") if int(state.get("validate_attempts") or 0) > 0 else None
     source = state.get("source") or "terminal"
@@ -158,7 +171,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             system=system,
             user=user,
             schema=BrainDecision,
-            model_role="planner",
+            model_role=model_role,
             temperature=0.0,
             **llm_budget,
         )

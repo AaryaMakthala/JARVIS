@@ -48,6 +48,30 @@ _WINDOWS_PHRASES = frozenset(
     }
 )
 
+#: Whole-utterance phrases (normalised) that map to ``system_info`` reads.
+_SYSTEM_PHRASES: dict[str, tuple[str, str]] = {
+    "how much battery is left": ("system_info", "battery"),
+    "what is my battery level": ("system_info", "battery"),
+    "whats my battery level": ("system_info", "battery"),
+    "battery level": ("system_info", "battery"),
+    "battery percentage": ("system_info", "battery"),
+    "what is my cpu usage": ("system_info", "cpu"),
+    "whats my cpu usage": ("system_info", "cpu"),
+    "cpu usage": ("system_info", "cpu"),
+    "how busy is the cpu": ("system_info", "cpu"),
+    "how much ram is used": ("system_info", "ram"),
+    "how much memory is used": ("system_info", "ram"),
+    "ram usage": ("system_info", "ram"),
+    "memory usage": ("system_info", "ram"),
+    "how much disk space is left": ("system_info", "disk"),
+    "how much disk space is used": ("system_info", "disk"),
+    "disk usage": ("system_info", "disk"),
+    "system uptime": ("system_info", "uptime"),
+    "how long has this computer been on": ("system_info", "uptime"),
+    "uptime": ("system_info", "uptime"),
+}
+
+
 #: Leading verbs for the allowlisted-app pattern (checked AFTER the phrases).
 _OPEN_VERBS = frozenset({"open", "launch", "start"})
 
@@ -93,6 +117,10 @@ def match(raw: str, settings: Settings) -> tuple[str, dict[str, Any], str] | Non
         return "get_time", {}, text
     if text in _WINDOWS_PHRASES:
         return "list_windows", {}, text
+    system = _SYSTEM_PHRASES.get(text)
+    if system is not None:
+        tool, what = system
+        return tool, {"what": what}, text
     tokens = text.split()
     if len(tokens) >= 2 and tokens[0] in _OPEN_VERBS:
         name = " ".join(tokens[1:])
