@@ -2359,6 +2359,35 @@ class DaemonServer:
 
     # ── status ─────────────────────────────────────────────────────────
 
+    def _active_progress(self, task_id: str | None) -> dict[str, Any]:
+        """Project the live task's stage/status from the task store.
+
+        Observability is best-effort: a missing or broken store must never
+        stop ``status`` from answering.
+        """
+        if not task_id or self._tasks is None:
+            return {}
+        try:
+            snapshot = self._tasks.get(task_id)
+        except Exception:
+            logger.debug("active task progress unavailable", exc_info=True)
+            return {}
+        if snapshot is None:
+            return {}
+        start = snapshot.started_at or snapshot.created_at
+        end = snapshot.finished_at
+        if end is None:
+            from datetime import UTC, datetime
+
+            end = datetime.now(UTC)
+        elapsed = max((end - start).total_seconds(), 0.0)
+        return {
+            "active_stage": snapshot.stage.value,
+            "active_status": snapshot.status.value,
+            "active_source": snapshot.source,
+            "active_elapsed_s": round(elapsed, 1),
+        }
+
     async def _handle_status(self, conn: ClientConnection) -> None:
         with self._lock:
             queue_len = len(self._queue)
@@ -2396,6 +2425,7 @@ class DaemonServer:
             else:
                 if isinstance(rows, list):
                     llm_health = [row for row in rows if isinstance(row, dict)]
+        progress = self._active_progress(active_id)
         await conn.send(
             StatusResponse(
                 daemon="running",
@@ -2406,6 +2436,7 @@ class DaemonServer:
                 queue=queue_len,
                 active_task=active_id,
                 llm_health=llm_health,
+                **progress,
             )
         )
 

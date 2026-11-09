@@ -965,6 +965,12 @@ def status() -> None:
             console.print(f"[green]queue:[/green] {resp.queue}")
             if resp.active_task:
                 console.print(f"[green]active task:[/green] {resp.active_task}")
+                if resp.active_status:
+                    console.print(f"[green]active status:[/green] {resp.active_status}")
+                if resp.active_stage:
+                    console.print(f"[green]active stage:[/green] {resp.active_stage}")
+                if resp.active_elapsed_s is not None:
+                    console.print(f"[green]active elapsed:[/green] {resp.active_elapsed_s:.1f}s")
             console.print(f"[green]version:[/green] {resp.version}")
         finally:
             client.close()

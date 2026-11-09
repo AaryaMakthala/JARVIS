@@ -556,3 +556,70 @@ class TestHandleStatusLlmHealth:
         data = self._status_payload(server)
         assert data["llm_health"] == []
         assert data["daemon"] == "running"
+
+
+class TestHandleStatusProgress:
+    @staticmethod
+    def _payload(server: DaemonServer) -> dict:
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+        asyncio.run(server._handle_status(conn))
+        return json.loads(writer.write.call_args[0][0].decode("utf-8"))
+
+    def test_projects_the_active_task_lifecycle(self) -> None:
+        from datetime import UTC, datetime, timedelta
+        from types import SimpleNamespace
+
+        class _Tasks:
+            def get(self, task_id: str) -> object:
+                assert task_id == TASK_1
+                start = datetime.now(UTC) - timedelta(seconds=3)
+                return SimpleNamespace(
+                    stage=SimpleNamespace(value="executing"),
+                    status=SimpleNamespace(value="running"),
+                    source="terminal",
+                    started_at=start,
+                    created_at=start,
+                    finished_at=None,
+                )
+
+        server = _server()
+        server._active = TaskSlot(task_id=TASK_1, text="go", source="terminal")
+        server._tasks = _Tasks()
+        data = self._payload(server)
+
+        assert data["active_task"] == TASK_1
+        assert data["active_stage"] == "executing"
+        assert data["active_status"] == "running"
+        assert data["active_source"] == "terminal"
+        assert data["active_elapsed_s"] >= 3.0
+
+    def test_missing_snapshot_stays_empty(self) -> None:
+        class _Tasks:
+            def get(self, task_id: str) -> None:
+                del task_id
+
+        server = _server()
+        server._active = TaskSlot(task_id=TASK_1, text="go", source="terminal")
+        server._tasks = _Tasks()
+        data = self._payload(server)
+
+        assert data["active_task"] == TASK_1
+        assert data["active_stage"] is None
+        assert data["active_status"] is None
+        assert data["active_elapsed_s"] is None
+
+    def test_a_broken_store_does_not_break_status(self) -> None:
+        class _Tasks:
+            def get(self, task_id: str) -> None:
+                del task_id
+                raise RuntimeError("boom")
+
+        server = _server()
+        server._active = TaskSlot(task_id=TASK_1, text="go", source="terminal")
+        server._tasks = _Tasks()
+        data = self._payload(server)
+
+        assert data["daemon"] == "running"
+        assert data["active_task"] == TASK_1
+        assert data["active_stage"] is None

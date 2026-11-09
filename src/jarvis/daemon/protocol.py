@@ -227,6 +227,9 @@ class StatusResponse(BaseModel):
     the last failure category only - never prompts, latencies or key
     material.  It defaults to empty so older clients and status tests keep
     validating unchanged; the daemon fills it in when an LLM context exists.
+    ``active_stage``/``active_status``/``active_source``/``active_elapsed_s``
+    project the live task's lifecycle from the independent task store.  They
+    stay ``None`` when no task is active or task history is unavailable.
     """
 
     type: Literal["status_response"] = "status_response"
@@ -237,6 +240,10 @@ class StatusResponse(BaseModel):
     unlocked: bool = False
     queue: int = 0
     active_task: str | None = None
+    active_stage: str | None = None
+    active_status: str | None = None
+    active_source: str | None = None
+    active_elapsed_s: float | None = None
     version: str = PROTOCOL_VERSION
     llm_health: list[dict[str, Any]] = Field(default_factory=list)
 

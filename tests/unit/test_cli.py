@@ -860,3 +860,33 @@ class TestTasksCommand:
 
         assert result.exit_code == 0
         assert "task history unavailable" in result.output
+
+
+def test_status_shows_live_task_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    from jarvis.daemon.protocol import StatusResponse
+
+    class _Client:
+        def connect(self) -> None:
+            pass
+
+        def get_status(self) -> StatusResponse:
+            return StatusResponse(
+                active_task="a0000000-0000-4000-8000-0000000000a1",
+                active_stage="executing",
+                active_status="running",
+                active_source="terminal",
+                active_elapsed_s=2.5,
+            )
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("jarvis.daemon.client.DaemonClient", _Client)
+
+    result = runner.invoke(cli.app, ["status"])
+
+    assert result.exit_code == 0
+    assert "active task" in result.output
+    assert "executing" in result.output
+    assert "running" in result.output
+    assert "2.5s" in result.output
