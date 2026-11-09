@@ -46,7 +46,7 @@ from typing import Any
 from jarvis.agent.context import AppContext
 from jarvis.agent.state import Plan, StepResult
 from jarvis.memory.tasklog import STATUSES
-from jarvis.taskstore import TaskStage, TaskStatus
+from jarvis.taskstore import TaskEventType, TaskStage, TaskStatus
 
 __all__ = [
     "MAX_PATH_CHARS",
@@ -302,7 +302,14 @@ def _task_finish(state: dict[str, Any], ctx: AppContext, status: str) -> None:
     try:
         final = TaskStatus(status)
         code = _FAILURE_CODES.get(final)
+        replans = int(state.get("replan_count") or 0)
         store.ensure_task(task_id, source=_safe_source(state))
+        if replans > 0:
+            store.append_event(
+                task_id,
+                TaskEventType.NOTE,
+                detail={"event_code": "replan", "retry_count": replans},
+            )
         store.finish(task_id, final, failure_code=code)
     except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
         ctx.logger.debug("task finish not recorded: %s", exc)

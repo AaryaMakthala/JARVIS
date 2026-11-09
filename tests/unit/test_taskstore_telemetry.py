@@ -113,6 +113,7 @@ def test_finish_records_honest_status_and_failure_code(tmp_path: Path) -> None:
                 "source": "terminal",
                 "results": [_failed()],
                 "halted_reason": "gave up",
+                "replan_count": 2,
             },
             ctx,
         )
@@ -124,6 +125,7 @@ def test_finish_records_honest_status_and_failure_code(tmp_path: Path) -> None:
     assert snapshot is not None
     assert snapshot.status is TaskStatus.FAILED
     assert snapshot.stage is TaskStage.DONE
+    assert snapshot.retry_count == 2
     finished = events[-1]
     assert finished.event_type is TaskEventType.FINISHED
     assert finished.detail.get("failure_code") == "failed"
