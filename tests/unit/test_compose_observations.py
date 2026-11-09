@@ -32,3 +32,16 @@ def test_unverified_side_effect_still_reports_partial():
 
 def test_verified_observation_is_success():
     assert classify_outcome(_state("get_time", verified=True)) == "success"
+
+
+def test_failed_result_is_failed_even_with_a_brain_final_answer():
+    from jarvis.agent.nodes.telemetry import task_status
+
+    state = {
+        "task_id": "t1",
+        "plan": Plan(goal="x", steps=[Step(id="s1", tool="fake", args={}, rationale="r")]),
+        "results": [StepResult(step_id="s1", ok=False, error="boom")],
+        "final_answer": "Done.",
+    }
+    assert classify_outcome(state) == "failed"
+    assert task_status(state) == "failed"

@@ -137,6 +137,16 @@ def classify_outcome(state: dict[str, Any]) -> str:
     if str(state.get("request_kind") or "") == "unsupported":
         return "unsupported"
 
+    # Concrete results outrank a later halt/final answer, matching
+    # ``task_status``: a failed step cannot be spoken or logged as done.
+    results = _results(state)
+    if any(not r.ok or r.verified is False for r in results):
+        return "failed"
+    if any(r.verified is None for r in results):
+        if _only_unverified_observations(state, results):
+            return SUCCESS
+        return "partial"
+
     halt = str(state.get("halted_reason") or "").strip()
     if halt:
         return _halt_outcome(halt)
@@ -148,13 +158,6 @@ def classify_outcome(state: dict[str, Any]) -> str:
     ):
         return "conversation"
 
-    results = _results(state)
-    if any(not r.ok or r.verified is False for r in results):
-        return "failed"
-    if any(r.verified is None for r in results):
-        if _only_unverified_observations(state, results):
-            return SUCCESS
-        return "partial"
     if results:
         return SUCCESS
     # Nothing ran and nothing refused: ``respond`` says "No task performed."
