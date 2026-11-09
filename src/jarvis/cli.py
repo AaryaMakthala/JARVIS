@@ -559,6 +559,27 @@ def _vision_check(
     return _check("vision", "WARN", f"no vision model configured - {note}")
 
 
+def _task_store_check(settings: config.Settings) -> Check:
+    """Doctor row for the independent task lifecycle store (B1).
+
+    Read-only: ``doctor`` never creates or migrates the database.  A missing
+    file is expected before the first task, so it is a WARN, not a failure.
+    """
+    path = config.task_events_db()
+    if not path.is_file():
+        return _check("task_store", "WARN", "not initialized yet; created on the first task")
+    from jarvis.taskstore.runtime import open_runtime_task_store
+
+    store = open_runtime_task_store(settings, path=path, create=False, read_only=True)
+    try:
+        status = store.status()
+    finally:
+        store.close()
+    if status.available:
+        return _check("task_store", "PASS", f"readable (schema v{status.schema_version})")
+    return _check("task_store", "WARN", f"unavailable ({status.reason})")
+
+
 def run_doctor(
     *,
     settings: config.Settings | None = None,
@@ -696,6 +717,7 @@ def run_doctor(
         checks.append(_check("llm_provider", "FAIL", "No free LLM provider configured"))
 
     checks.append(_vision_check(settings, store, providers))
+    checks.append(_task_store_check(settings))
     checks.extend(optional_backend_checks())
     checks.extend(_health_checks(_daemon_llm_health()))
 
@@ -1517,6 +1539,8 @@ def _task_context(
 
     log = logging.getLogger("jarvis.cli")
     registry = build_default_registry(settings)
+    from jarvis.taskstore.runtime import open_runtime_task_store
+
     return make_app_context(
         settings,
         llm=llm,
@@ -1525,6 +1549,7 @@ def _task_context(
         unlock=UnlockManager(store, settings=settings),
         dry_run=dry_run,
         memory=open_memory(settings=settings, logger=log, dry_run=dry_run),
+        tasks=open_runtime_task_store(settings, registry, logger=log),
     )
 
 
@@ -1553,6 +1578,7 @@ def _run_no_daemon(command: str, *, dry_run: bool = False) -> None:
             raise typer.Exit(code=1)
     finally:
         _close_memory_backend(ctx)
+        _close_task_store(ctx)
         _close_checkpointer(saver)
 
 
@@ -1625,6 +1651,7 @@ def _chat_no_daemon() -> None:
         chat_loop(ctx, saver)
     finally:
         _close_memory_backend(ctx)
+        _close_task_store(ctx)
 
 
 def _chat_with_daemon() -> None:
@@ -2117,6 +2144,11 @@ def _memory_store() -> Any:
 def _close_memory_backend(ctx: Any) -> None:
     """Release a context's memory connection, ignoring an absent backend."""
     _close_store(getattr(ctx, "memory", None))
+
+
+def _close_task_store(ctx: Any) -> None:
+    """Release a context's independent task store, ignoring an absent one."""
+    _close_store(getattr(ctx, "tasks", None))
 
 
 def _quarantined_failures(memory: Any) -> int:

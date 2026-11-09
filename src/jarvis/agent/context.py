@@ -21,6 +21,7 @@ from jarvis.memory import MemoryBackend
 from jarvis.policy.browse_grant import BrowseGrantRegistry
 from jarvis.policy.engine import PolicyContext, PolicyEngine, RiskClassifier, UnlockManager
 from jarvis.policy.scope import ScopeRegistry
+from jarvis.taskstore import TaskStore
 from jarvis.tools.base import CancelToken, ToolContext
 from jarvis.tools.registry import ToolRegistry, build_default_registry
 
@@ -68,6 +69,11 @@ class AppContext:
     undo_log: Path | None = None  # override for the undo log path (tests)
     voice: VoiceToolsFacade | None = None  # live voice loop for dictation tools
     memory: MemoryBackend | None = None  # bounded, secret-free memory store
+    #: Independent durable task lifecycle store (B1).  ``None`` means the
+    #: caller did not wire observability; a :class:`NullTaskEventStore` is used
+    #: by the composition layer when the database cannot be opened.  It is
+    #: deliberately not part of ``ToolContext``: tools cannot read or write it.
+    tasks: TaskStore | None = None
     #: Managed Chrome session (Stage 7).  A passed-in ``BrowserSession`` is
     #: owned by the daemon and threaded to tools; construction never starts a
     #: browser, and tool calls fail cleanly when it is ``None``.
@@ -141,6 +147,7 @@ def make_app_context(
     undo_log: Path | None = None,
     voice: VoiceToolsFacade | None = None,
     memory: MemoryBackend | None = None,
+    tasks: TaskStore | None = None,
     target_bindings: TargetBindingStore | None = None,
     browser: Any | None = None,
     whatsapp_browser: Any | None = None,
@@ -177,6 +184,7 @@ def make_app_context(
         undo_log=undo_log,
         voice=voice,
         memory=memory,
+        tasks=tasks,
         target_bindings=target_bindings or TargetBindingStore(),
         browser=browser,
         whatsapp_browser=whatsapp_browser,

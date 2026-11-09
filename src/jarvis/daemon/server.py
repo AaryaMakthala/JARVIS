@@ -661,6 +661,10 @@ class DaemonServer:
         self._startup_refusal_reason: str | None = None
         self._voice_service: Any = None  # VoiceService | None
         self._memory: Any = None  # SqliteMemory | None (Phase 8, opened lazily)
+        #: Independent task lifecycle store (B1).  Opened lazily with the first
+        #: context and closed at shutdown; a probe failure yields the no-op
+        #: store so task history never blocks the daemon.
+        self._tasks: Any = None  # TaskStore | None (opened lazily)
         self._app_registry: Any = None  # ToolRegistry | None (built with the context)
         #: The managed browser session (Stage 7, Slice 10).  Started lazily on
         #: the first call that needs a page, shared by every task, closed once
@@ -731,6 +735,7 @@ class DaemonServer:
                 raise
             finally:
                 self._close_memory()
+                self._close_tasks()
                 self._close_browser()
                 self._close_whatsapp_browser()
                 self._cleanup_pid_file()
@@ -1052,6 +1057,7 @@ class DaemonServer:
             llm=llm,
             registry=self._registry(),
             memory=self._open_memory(),
+            tasks=self._open_tasks(),
             unlock=self._unlock,
             classifier=build_classifier(self._settings, self._registry(), logger=logger),
             voice=VoiceToolsFacade(service=self._voice_service),
@@ -1100,6 +1106,32 @@ class DaemonServer:
                 close()
         except Exception:
             logger.debug("closing the memory store failed", exc_info=True)
+
+    def _open_tasks(self) -> Any:
+        """Open the independent task store once, for the daemon's lifetime."""
+        if self._tasks is None:
+            from jarvis.taskstore.runtime import open_runtime_task_store
+
+            try:
+                self._tasks = open_runtime_task_store(
+                    self._settings,
+                    self._registry(),
+                    logger=logger,
+                )
+            except Exception:
+                logger.warning("could not build the task store", exc_info=True)
+                self._tasks = None
+        return self._tasks
+
+    def _close_tasks(self) -> None:
+        """Close the task store if one was opened."""
+        tasks, self._tasks = self._tasks, None
+        if tasks is None:
+            return
+        try:
+            tasks.close()
+        except Exception:
+            logger.debug("closing the task store failed", exc_info=True)
 
     def _browser_start(self) -> Any | None:
         """Return the started managed-browser session, starting one on first use.

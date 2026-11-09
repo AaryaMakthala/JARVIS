@@ -77,7 +77,36 @@ from jarvis.agent.nodes import (
 )
 from jarvis.agent.state import AgentState
 
-__all__ = ["build_graph", "build_secure_serde", "open_sqlite_checkpointer"]
+__all__ = [
+    "GRAPH_NODE_NAMES",
+    "build_graph",
+    "build_secure_serde",
+    "open_sqlite_checkpointer",
+]
+
+#: Every node name the graph can contain.  Used to build the trusted task-store
+#: vocabulary; the set is fixed even when the optional specialist nodes are
+#: disabled, so a stored detail naming either specialist node stays valid.
+GRAPH_NODE_NAMES: frozenset[str] = frozenset(
+    {
+        "intake",
+        "context_resolve",
+        "memory_retrieve",
+        "brain",
+        "clarify",
+        "validate",
+        "prepare_readback",
+        "policy_gate",
+        "act",
+        "verify",
+        "replan",
+        "compose",
+        "respond",
+        "memory_save",
+        "specialist_decide",
+        "specialist_observe",
+    }
+)
 
 #: The ONLY first-party types the checkpoint serializer is allowed to revive.
 #: Everything else in a checkpoint is refused at the msgpack layer (returned as
