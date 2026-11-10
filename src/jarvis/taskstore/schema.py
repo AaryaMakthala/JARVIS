@@ -5,13 +5,14 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 REQUIRED_TABLES = frozenset({"tasks", "task_events"})
 REQUIRED_INDEXES = frozenset(
     {
         "idx_task_events_one_created",
         "idx_task_events_task_seq",
+        "idx_tasks_owner_status",
         "idx_tasks_status_updated",
         "idx_tasks_updated",
     }
@@ -35,6 +36,9 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
             "approval_state",
             "failure_category",
             "failure_code",
+            "owner_instance",
+            "owner_pid",
+            "owner_process_create_time",
         }
     ),
     "task_events": frozenset(
@@ -67,7 +71,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   active_step_id TEXT,
   approval_state TEXT,
   failure_category TEXT,
-  failure_code TEXT
+  failure_code TEXT,
+  owner_instance TEXT,
+  owner_pid INTEGER,
+  owner_process_create_time REAL
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -90,6 +97,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_updated
   ON tasks (updated_at DESC, task_id DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_updated
   ON tasks (status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_owner_status
+  ON tasks (owner_instance, status);
 """
 
 
@@ -201,6 +210,31 @@ def initialize(conn: sqlite3.Connection) -> None:
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
+def migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """Add task ownership metadata transactionally to a v2 database."""
+    existing = columns(conn, "tasks")
+    additions = (
+        ("owner_instance", "TEXT"),
+        ("owner_pid", "INTEGER"),
+        ("owner_process_create_time", "REAL"),
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for name, kind in additions:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {kind}")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_owner_status "
+            "ON tasks (owner_instance, status)"
+        )
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
 def validate(conn: sqlite3.Connection, *, read_only: bool) -> None:
     """Verify the schema and apply the version marker when writable."""
     version = user_version(conn)
@@ -214,18 +248,22 @@ def validate(conn: sqlite3.Connection, *, read_only: bool) -> None:
         names = ", ".join(sorted(missing_tables))
         raise SchemaError(f"task store schema is not initialized (missing {names})")
 
+    if version < 2:
+        raise SchemaError(
+            f"task store schema version {version} is older than supported {SCHEMA_VERSION}"
+        )
+    if version == 2:
+        if read_only:
+            raise SchemaError(
+                f"task store schema version {version} is older than supported {SCHEMA_VERSION}"
+            )
+        migrate_v2_to_v3(conn)
+
     for table, required in REQUIRED_COLUMNS.items():
         missing_columns = required - columns(conn, table)
         if missing_columns:
             names = ", ".join(sorted(missing_columns))
             raise SchemaError(f"task store table {table} is missing columns: {names}")
-
-    if version < SCHEMA_VERSION:
-        if read_only:
-            raise SchemaError(
-                f"task store schema version {version} is older than supported {SCHEMA_VERSION}"
-            )
-        initialize(conn)
 
     missing_indexes = REQUIRED_INDEXES - index_names(conn)
     if missing_indexes:

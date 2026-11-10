@@ -679,6 +679,9 @@ class DaemonServer:
         #: context and closed at shutdown; a probe failure yields the no-op
         #: store so task history never blocks the daemon.
         self._tasks: Any = None  # TaskStore | None (opened lazily)
+        #: Identity for this serving process.  It is recorded on new task rows
+        #: so a later daemon can distinguish live work from abandoned work.
+        self._task_owner: Any = None  # TaskOwner | None
         self._app_registry: Any = None  # ToolRegistry | None (built with the context)
         #: The managed browser session (Stage 7, Slice 10).  Started lazily on
         #: the first call that needs a page, shared by every task, closed once
@@ -739,6 +742,7 @@ class DaemonServer:
                 return False
             self._pid_file = daemon_runtime_file()
             self._pid_file.parent.mkdir(parents=True, exist_ok=True)
+            self._prepare_task_lifecycle()
             try:
                 asyncio.run(self._serve())
             except KeyboardInterrupt:
@@ -928,6 +932,8 @@ class DaemonServer:
         }
         if create_time is not None:
             data["process_create_time"] = create_time
+        if self._task_owner is not None:
+            data["instance_id"] = self._task_owner.instance_id
         _atomic_write_json(self._pid_file, data)
 
     def _cleanup_pid_file(self) -> None:
@@ -1009,6 +1015,14 @@ class DaemonServer:
                 conn.close()
             self._stop_voice()
             logger.info("daemon shut down cleanly")
+
+    def _prepare_task_lifecycle(self) -> None:
+        """Establish instance ownership and expire abandoned tasks before serving."""
+        from jarvis.daemon.recovery import new_task_owner, reconcile_task_store
+
+        if self._task_owner is None:
+            self._task_owner = new_task_owner()
+        reconcile_task_store(self._open_tasks(), self._task_owner, logger=logger)
 
     def _initialize_runtime(self) -> None:
         """Build the agent context and wire the voice service safely."""
@@ -1130,6 +1144,7 @@ class DaemonServer:
                 self._tasks = open_runtime_task_store(
                     self._settings,
                     self._registry(),
+                    owner=self._task_owner,
                     logger=logger,
                 )
             except Exception:

@@ -7,7 +7,7 @@ import logging
 import re
 import sqlite3
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,7 +27,9 @@ from .models import (
     TaskEvent,
     TaskEventType,
     TaskNotFound,
+    TaskOwner,
     TaskPruneResult,
+    TaskReconcileResult,
     TaskSnapshot,
     TaskStage,
     TaskStatus,
@@ -53,9 +55,12 @@ from .vocabulary import TaskOutcome, TaskStoreVocabulary
 
 __all__ = [
     "NullTaskEventStore",
+    "OwnerLiveness",
     "TaskStore",
     "open_task_store",
 ]
+
+OwnerLiveness = Callable[[TaskOwner], bool | None]
 
 _LOG = logging.getLogger(__name__)
 
@@ -153,6 +158,12 @@ class TaskStore(Protocol):
 
     def summary(self) -> TaskStoreSummary: ...
 
+    def reconcile_stale_tasks(
+        self,
+        owner: TaskOwner,
+        is_owner_alive: OwnerLiveness,
+    ) -> TaskReconcileResult: ...
+
     def prune(
         self,
         *,
@@ -171,11 +182,13 @@ class _SqliteTaskEventStore:
         *,
         writable: bool,
         vocabulary: TaskStoreVocabulary,
+        owner: TaskOwner | None = None,
     ) -> None:
         self._conn = conn
         self._path = str(path)
         self._writable = writable
         self._vocabulary = vocabulary
+        self._owner = owner
         self._lock = threading.RLock()
         self._closed = False
         self._broken = False
@@ -336,6 +349,9 @@ class _SqliteTaskEventStore:
                     "approval_state": row["approval_state"],
                     "failure_category": row["failure_category"],
                     "failure_code": row["failure_code"],
+                    "owner_instance_id": row["owner_instance"],
+                    "owner_pid": row["owner_pid"],
+                    "owner_process_create_time": row["owner_process_create_time"],
                 },
                 context={"vocabulary": self._vocabulary},
             )
@@ -501,6 +517,7 @@ class _SqliteTaskEventStore:
         elif event_type is TaskEventType.FINISHED:
             active_tool = None
             active_step_id = None
+            approval_state = None
             failure_category = clean_detail.get("failure_category")
             failure_code = clean_detail.get("failure_code")
 
@@ -587,13 +604,16 @@ class _SqliteTaskEventStore:
             existing = self._get_locked(safe_id)
             if existing is not None:
                 return TaskStoreWriteResult(persisted=True, value=existing)
+            owner = self._owner
             self._conn.execute(
                 """
                 INSERT INTO tasks (
                   task_id, source, stage, status, created_at, started_at, finished_at,
                   updated_at, version, retry_count, active_tool, active_step_id,
-                  approval_state, failure_category, failure_code
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, 0, 0, NULL, NULL, NULL, NULL, NULL)
+                  approval_state, failure_category, failure_code,
+                  owner_instance, owner_pid, owner_process_create_time
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, 0, 0, NULL, NULL, NULL, NULL, NULL,
+                          ?, ?, ?)
                 """,
                 (
                     safe_id,
@@ -602,6 +622,9 @@ class _SqliteTaskEventStore:
                     TaskStatus.QUEUED.value,
                     _iso(when),
                     _iso(when),
+                    None if owner is None else owner.instance_id,
+                    None if owner is None else owner.pid,
+                    None if owner is None else owner.process_create_time,
                 ),
             )
             current = self._get_locked(safe_id)
@@ -752,6 +775,89 @@ class _SqliteTaskEventStore:
             if finished is None:
                 raise TaskStoreError("task finish did not persist")
             return TaskStoreWriteResult(persisted=True, value=finished)
+
+    def reconcile_stale_tasks(
+        self,
+        owner: TaskOwner,
+        is_owner_alive: OwnerLiveness,
+    ) -> TaskReconcileResult:
+        """Expire non-terminal rows whose owning process is proven gone.
+
+        Rows without ownership metadata (older schemas or non-daemon writers)
+        are intentionally left alone: absence of proof is not proof of death.
+        """
+        self._require_writable()
+        if not isinstance(owner, TaskOwner):
+            raise TypeError("owner must be a TaskOwner")
+        if not callable(is_owner_alive):
+            raise TypeError("is_owner_alive must be callable")
+        terminals = _terminal_values()
+        placeholders = ", ".join("?" for _ in terminals)
+        with self._lock:
+            self._require_open()
+            rows = self._conn.execute(
+                f"""
+                SELECT task_id FROM tasks
+                WHERE status NOT IN ({placeholders})
+                ORDER BY updated_at ASC, task_id ASC
+                """,
+                terminals,
+            ).fetchall()
+            candidates = [str(row["task_id"]) for row in rows]
+
+        expired: list[str] = []
+        skipped_active = 0
+        skipped_unknown = 0
+        skipped_legacy = 0
+        for task_id in candidates:
+            current = self.get(task_id)
+            if current is None or current.status in TERMINAL_STATUSES:
+                continue
+            row_owner = current.owner_identity
+            if row_owner is None:
+                skipped_legacy += 1
+                continue
+            if row_owner.instance_id == owner.instance_id or (
+                row_owner.pid == owner.pid
+                and row_owner.process_create_time is not None
+                and owner.process_create_time is not None
+                and abs(row_owner.process_create_time - owner.process_create_time) <= 1.0
+            ):
+                skipped_active += 1
+                continue
+            try:
+                alive = is_owner_alive(row_owner)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                alive = None
+                _LOG.debug("taskstore: owner liveness probe failed", exc_info=True)
+            if alive is True:
+                skipped_active += 1
+                continue
+            if alive is None:
+                skipped_unknown += 1
+                continue
+            latest = self.get(task_id)
+            if latest is None or latest.status in TERMINAL_STATUSES:
+                continue
+            if latest.owner_identity != row_owner:
+                skipped_unknown += 1
+                continue
+            try:
+                self.finish(
+                    task_id,
+                    TaskStatus.EXPIRED,
+                    failure_category="timeout",
+                    failure_code="expired",
+                )
+            except InvalidTaskTransition:
+                continue
+            expired.append(task_id)
+        return TaskReconcileResult(
+            expired_task_ids=tuple(expired),
+            skipped_active=skipped_active,
+            skipped_unknown=skipped_unknown,
+            skipped_legacy=skipped_legacy,
+        )
 
     def get(self, task_id: str) -> TaskSnapshot | None:
         """Return one task projection, or ``None`` when it does not exist."""
@@ -1025,6 +1131,15 @@ class NullTaskEventStore:
         """Raise: an unavailable store must not look empty."""
         raise self._unavailable()
 
+    def reconcile_stale_tasks(
+        self,
+        owner: TaskOwner,
+        is_owner_alive: OwnerLiveness,
+    ) -> TaskReconcileResult:
+        """Report an empty reconciliation; an unavailable store owns no rows."""
+        del owner, is_owner_alive
+        return TaskReconcileResult()
+
     def prune(
         self,
         *,
@@ -1097,6 +1212,7 @@ def open_task_store(
     create: bool = False,
     read_only: bool = False,
     vocabulary: TaskStoreVocabulary | None = None,
+    owner: TaskOwner | None = None,
 ) -> TaskStore:
     """Open the task event store without ever creating it implicitly.
 
@@ -1143,6 +1259,7 @@ def open_task_store(
             resolved,
             writable=not read_only,
             vocabulary=vocabulary,
+            owner=owner,
         )
     except (sqlite3.Error, schema.SchemaError, OSError) as exc:
         if conn is not None:

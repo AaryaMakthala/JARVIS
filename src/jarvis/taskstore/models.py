@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -271,6 +272,49 @@ class TaskEvent(BaseModel):
         return self
 
 
+class TaskOwner(BaseModel):
+    """Process identity that owns a non-terminal task row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    instance_id: str
+    pid: int = Field(ge=1, le=2_147_483_647)
+    process_create_time: float | None = Field(default=None, gt=0)
+
+    @field_validator("instance_id")
+    @classmethod
+    def _safe_instance_id(cls, value: str) -> str:
+        from .privacy import safe_owner_instance
+
+        instance = safe_owner_instance(value)
+        if instance is None:
+            raise ValueError("instance_id must be 32 lowercase hex characters")
+        return instance
+
+    @field_validator("process_create_time")
+    @classmethod
+    def _finite_create_time(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("process_create_time must be finite")
+        return value
+
+
+class TaskReconcileResult(BaseModel):
+    """Outcome of one bounded stale-task reconciliation pass."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expired_task_ids: tuple[str, ...] = ()
+    skipped_active: int = Field(default=0, ge=0)
+    skipped_unknown: int = Field(default=0, ge=0)
+    skipped_legacy: int = Field(default=0, ge=0)
+
+    @property
+    def expired_count(self) -> int:
+        """Number of tasks moved to the expired terminal state."""
+        return len(self.expired_task_ids)
+
+
 class TaskSnapshot(BaseModel):
     """Current projection of one task."""
 
@@ -291,11 +335,44 @@ class TaskSnapshot(BaseModel):
     approval_state: str | None = None
     failure_category: str | None = None
     failure_code: str | None = None
+    owner_instance_id: str | None = None
+    owner_pid: int | None = Field(default=None, ge=1, le=2_147_483_647)
+    owner_process_create_time: float | None = Field(default=None, gt=0)
 
     @field_validator("task_id")
     @classmethod
     def _safe_task_id(cls, value: str) -> str:
         return safe_task_id(value)
+
+    @field_validator("owner_instance_id")
+    @classmethod
+    def _safe_owner_instance_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        from .privacy import safe_owner_instance
+
+        instance = safe_owner_instance(value)
+        if instance is None:
+            raise ValueError("owner_instance_id must be 32 lowercase hex characters")
+        return instance
+
+    @field_validator("owner_process_create_time")
+    @classmethod
+    def _finite_owner_create_time(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("owner_process_create_time must be finite")
+        return value
+
+    @property
+    def owner_identity(self) -> TaskOwner | None:
+        """Return the persisted process identity, if this row has one."""
+        if self.owner_instance_id is None or self.owner_pid is None:
+            return None
+        return TaskOwner(
+            instance_id=self.owner_instance_id,
+            pid=self.owner_pid,
+            process_create_time=self.owner_process_create_time,
+        )
 
     @field_validator("source")
     @classmethod
@@ -377,6 +454,8 @@ class TaskSnapshot(BaseModel):
             raise ValueError("queued task must not have started_at")
         if self.status in WORK_STARTED_STATUSES and self.started_at is None:
             raise ValueError("started task must have started_at")
+        if (self.owner_instance_id is None) != (self.owner_pid is None):
+            raise ValueError("task owner instance and pid must be set together")
         return self
 
 

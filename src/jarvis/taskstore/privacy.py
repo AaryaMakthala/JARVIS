@@ -44,6 +44,7 @@ _PROVIDER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,127}$")
 _TOOL_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _FAILURE_CODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+_OWNER_INSTANCE_RE = re.compile(r"^[a-f0-9]{32}$")
 _DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:")
 _TRAVERSAL_RE = re.compile(r"(?:^|[\\/])\.\.(?:[\\/]|$)")
 _URI_PATH_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
@@ -400,6 +401,14 @@ def safe_tool(value: Any, vocabulary: TaskStoreVocabulary) -> str | None:
     if not _TOOL_RE.fullmatch(text) or _unsafe_value(text):
         return None
     return text if text in vocabulary.tools else None
+
+
+def safe_owner_instance(value: Any) -> str | None:
+    """Return a generated daemon-instance identifier, or ``None``."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if _OWNER_INSTANCE_RE.fullmatch(text) else None
 
 
 def safe_failure_code(value: Any, vocabulary: TaskStoreVocabulary) -> str | None:

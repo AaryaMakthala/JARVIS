@@ -15,7 +15,7 @@ import sqlite3
 from pathlib import Path
 
 from jarvis import config
-from jarvis.taskstore.models import TaskStoreError
+from jarvis.taskstore.models import TaskOwner, TaskStoreError
 from jarvis.taskstore.schema import SchemaError
 from jarvis.taskstore.store import NullTaskEventStore, TaskStore, open_task_store
 from jarvis.taskstore.vocabulary import TaskFailureCategory, TaskStoreVocabulary
@@ -72,6 +72,7 @@ def open_runtime_task_store(
     path: str | Path | None = None,
     create: bool = True,
     read_only: bool = False,
+    owner: TaskOwner | None = None,
     logger: logging.Logger | None = None,
 ) -> TaskStore:
     """Open the task store, falling back to a no-op store on any failure.
@@ -89,6 +90,7 @@ def open_runtime_task_store(
             create=create,
             read_only=read_only,
             vocabulary=vocabulary,
+            owner=owner,
         )
     except (TaskStoreError, SchemaError, sqlite3.Error, OSError) as exc:
         log.warning("task store unavailable: %s", exc)

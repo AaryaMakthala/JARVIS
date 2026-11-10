@@ -7,6 +7,7 @@ the user's answer.  No daemon/IPC yet (Phase 3); this is what the CLI drives.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -17,6 +18,7 @@ from jarvis.agent.context import AppContext
 from jarvis.agent.graph import build_graph
 from jarvis.agent.schemas import AgentResponse
 from jarvis.agent.state import Decision, StepResult
+from jarvis.taskstore.models import TERMINAL_STATUSES, TaskStoreError
 from jarvis.tools.base import CancelToken
 
 __all__ = ["TaskOutcome", "extract_interrupt", "resume_task", "run_task"]
@@ -114,10 +116,51 @@ def resume_task(
     cancel: CancelToken | None = None,
 ) -> TaskOutcome:
     """Resume a task at its interruption point with the user's answer."""
-    graph = build_graph(ctx, checkpointer, cancel)
     config = {"configurable": {"thread_id": thread_id}}
+    refusal = _resume_refusal(ctx, checkpointer, config)
+    if refusal is not None:
+        return TaskOutcome(
+            task_id=thread_id,
+            interrupted=False,
+            confirmation=None,
+            final_answer=None,
+            error=refusal,
+            halted_reason=refusal,
+            decisions={},
+            results=[],
+        )
+    graph = build_graph(ctx, checkpointer, cancel)
     values = graph.invoke(Command(resume=answer), config)
     return _outcome(thread_id, config, checkpointer, graph, values)
+
+
+def _resume_refusal(
+    ctx: AppContext,
+    checkpointer: Any,
+    config: dict[str, Any],
+) -> str | None:
+    """Refuse to resume when durable task state and the checkpoint disagree."""
+    tasks = getattr(ctx, "tasks", None)
+    if tasks is None or not getattr(tasks, "available", False):
+        return None
+    thread_id = config["configurable"]["thread_id"]
+    try:
+        snapshot = tasks.get(thread_id)
+    except TaskStoreError:
+        return "task lifecycle store is unavailable; refusing to resume"
+    if snapshot is None:
+        return "no durable task record matches this checkpoint; refusing to resume"
+    if snapshot.status in TERMINAL_STATUSES:
+        return f"task is already {snapshot.status.value}; refusing to resume"
+    if checkpointer is None:
+        return "task checkpoint is not available; refusing to resume"
+    try:
+        checkpoint = checkpointer.get_tuple(config)
+    except (sqlite3.Error, KeyError, ValueError, RuntimeError):
+        return "task checkpoint cannot be read; refusing to resume"
+    if checkpoint is None:
+        return "task checkpoint is missing; refusing to resume"
+    return None
 
 
 def extract_interrupt(values: dict[str, Any]) -> dict[str, Any] | None:
