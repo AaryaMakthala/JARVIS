@@ -45,6 +45,33 @@ Maintained by the coding agent. Condensed from historical log.
 - **Verification**: new `tests/unit/test_memory_b4.py` 13 passed; affected memory/name suites (`test_memory.py`, `test_memory_graph.py`, `test_memory_save_node.py`, `test_name_preference.py`, `test_memory_b4.py`) = 233 passed; broader brain/agent/compose/fastpath run = 307 passed; `test_invariants.py` 37 passed. Targeted Ruff clean. Two stale test bugs were fixed: `test_memory.py` expected the old `"memory write failed"` reason instead of the closed `"error"` code, and `test_name_preference.py` passed `memory=` into a helper whose first parameter had the same name.
 - **Known B4 limits**: recognition is deliberately narrow - only the listed imperative phrasings, not "don't forget ...", "remind me ...", or arbitrary natural language. Retrieval reserves a fact slot but does not semantically rank facts against the query, so with several facts the newest/updated ones are shown; the B4 acceptance pair works through the reserve, not a query-specific match. "Forget" must describe the same subject phrasing used to store the fact. There is no dedicated `jarvis` CLI for listing/searching facts; they remain inspectable through the existing preferences/memory view. No fact is ever treated as authority or executed.
 
+## Backend roadmap B5-B7 (2026-11-10, complete)
+
+### B5 — unified conversation manager (commit `6d5e1ed`)
+
+- **One identity for text and voice**: `src/jarvis/agent/conversation.py` adds `ConversationManager` (thread-safe, in-memory, LRU across 16 conversations, 12 turns each, 400 chars per field, 6 rendered). A conversation is one CLI chat session, one `jarvis run`, or the daemon's live voice pipeline; a task is one request inside it.
+- **Wiring**: `AppContext.conversations` + `make_app_context(conversations=...)`; `run_task(..., conversation_id=...)` seeds `state["conversation_id"]`; `brain_user_prompt(..., conversation_history=...)`; the brain node renders only its own conversation's history. `ChatMessage.conversation` is optional and validated (`[A-Za-z0-9_-]{1,64}`); otherwise the daemon mints one id per connection. Acks report the conversation id ("started"/"queued").
+- **Single writer per channel**: the daemon worker records the finished turn (success, error, or cancellation) and the CLI records after `run_task` returns, both with `telemetry.task_status` so a failed/cancelled turn is never logged as "completed". Error text is never recorded; the voice pipeline's id is cleared in `_stop_voice`.
+- **Untrusted rendering**: history is JSON wrapped in `<untrusted_data>` with `<`/`>` escaped. It can never close the block, be read as a plan/approval, or lower a tier (proved in B6 tests). Not written to state (except the opaque id), checkpoints, task events, memory or logs.
+- **Verification**: `test_conversation.py` 25 passed; daemon server/client/protocol + CLI 0 failures; agent/brain/memory-B4/invariants 0 failures; targeted Ruff/format clean apart from pre-existing `except Exception: pass` findings.
+- **Known limits**: history does not survive a restart (deliberate; B4 facts are the durable path); no semantic ranking, only recent turns; a queued task cancelled before it starts records no turn (it has no task row yet either); supplied conversation ids are bookkeeping keys, never authorization; no GUI front-end.
+
+### B6 — voice as a channel on the same pipeline (commit `cdbfcc8`)
+
+- No new orchestration path was needed: voice already runs the same slot/worker/graph. The B5 wiring gives it one conversation per pipeline lifetime, and the worker remains the single writer (a spoken "stop" records exactly one `cancelled` turn; a timed-out task records none because it is still running).
+- Persona/presentation is pinned as non-authoritative: `compose` writes only `spoken_answer`/`screen_answer`, and a conversation history claiming "Approved: ..." still yields a Tier-2 confirmation requiring a real approval with nothing executed.
+- Voice limitations remain as documented (`docs/03` §7.1/§7.4): Tier 1 by voice; Tier 2 only by explicit opt-in; never a typed-name confirmation; never a password.
+- **Verification**: `test_voice_conversation.py` 7 passed; daemon-voice/tier2-voice/voice-contracts/compose-observations/agent-architecture suites 0 failures.
+- **Known limits**: voice has no IPC channel to display "queued" (it logs and blocks); the Timeout keeps the task running by design (un-wedging the loop), so history records it only when it actually finishes; real microphone/TTS behaviour is unchanged and not exercised here.
+
+### B7 — backend acceptance (commits `68e5f41`, `7d3cf3d`)
+
+- **Lifecycle honesty fix**: an interrupted task used to stay `running` in `task_events.db` while waiting for a human. The runner now writes `awaiting_confirmation`/`awaiting_clarification` on pause and back to `running` on resume, so `jarvis status`/`jarvis tasks` show the real wait. Best-effort; never changes the answer.
+- **Acceptance tests** (`tests/unit/test_backend_acceptance.py`, 3 passed): a Tier-1 task is observable from `awaiting_confirmation` to `completed` in a real task store with a real SqliteSaver, executes only after approval, and stores no request text; conversation history is per-conversation and empty after a restart; the brain prompt for one conversation contains only its own history (two conversations, same wording, different content).
+- Existing acceptance suites remain the evidence for the rest: routing/classifier, math fast path, B4 memory, taskstore privacy, daemon ack/queue/cancel, recovery, and `test_invariants.py` (37).
+- **Verification**: acceptance 3 passed; agent/recovery/taskstore(telemetry/runtime/privacy)/daemon/invariants suites 0 failures; targeted Ruff/format clean apart from pre-existing findings.
+- **Known limits**: acceptance is unit-level with fakes (no live Groq/Gemini, no real desktop tools, no microphone); benchmark suite and Windows-only markers are unchanged. `docs/JARVIS_BACKEND_AUDIT.md` stays untracked (working notes).
+
 ## Local OCR migration (2026-11-10, complete)
 
 - **Engine**: `src/jarvis/perception/ocr.py` now wraps PaddleOCR 3.7 with the exact PP-OCRv6 small models (`PP-OCRv6_small_det`, `PP-OCRv6_small_rec`). It uses `engine="paddle"`, `device="cpu"`, explicit `text_detection_model_dir`/`text_recognition_model_dir`, and sets `PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True` before import so a missing model is an honest error, never a download. No cloud vision, Tesseract, EasyOCR or runtime network fallback exists.
