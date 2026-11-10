@@ -90,11 +90,16 @@ def run_task(
     source: str = "terminal",
     thread_id: str | None = None,
     cancel: CancelToken | None = None,
+    conversation_id: str | None = None,
 ) -> TaskOutcome:
     """Start a new task; returns a TaskOutcome, possibly awaiting confirmation.
 
     ``cancel`` is the caller's per-task :class:`CancelToken`; the graph checks it
     before entering every node, so a cancelled run stops at the next step.
+    ``conversation_id`` (B5) is the stable identity of the conversation this
+    request belongs to; it is stored in state (and therefore the checkpoint)
+    so a resumed task keeps it, while the *turns* themselves stay in the
+    caller's in-memory :class:`~jarvis.agent.conversation.ConversationManager`.
     """
     task_id = thread_id or str(uuid4())
     graph = build_graph(ctx, checkpointer, cancel)
@@ -103,7 +108,14 @@ def run_task(
     # Left to itself ``intake`` would mint a second, unrelated id, and the
     # per-task ``task_log`` row (and every ``agent event=... task_id=`` log
     # line) would be keyed on an id the caller never sees.
-    values = graph.invoke({"user_input": user_input, "source": source, "task_id": task_id}, config)
+    values: dict[str, Any] = {
+        "user_input": user_input,
+        "source": source,
+        "task_id": task_id,
+    }
+    if conversation_id:
+        values["conversation_id"] = conversation_id
+    values = graph.invoke(values, config)
     return _outcome(task_id, config, checkpointer, graph, values)
 
 

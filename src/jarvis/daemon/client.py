@@ -154,7 +154,14 @@ class DaemonClient:
 
     # ── send helpers ───────────────────────────────────────────────────
 
-    def send_chat(self, text: str, *, source: str = "terminal", task_id: str = "") -> str:
+    def send_chat(
+        self,
+        text: str,
+        *,
+        source: str = "terminal",
+        task_id: str = "",
+        conversation: str = "",
+    ) -> str:
         """Submit a chat message.  Returns the task_id assigned by the server.
 
         The ack is read with :meth:`_send_recv_ack`, so a ``ConfirmRequest``
@@ -162,10 +169,17 @@ class DaemonClient:
         buffered and replayed by :meth:`wait_for_event` instead of being
         consumed and dropped here.  The ack's text ("started" / "queued") is
         kept in :attr:`last_ack_message` so the terminal can show it: a request
-        that is *queued* is why a second command appears to do nothing, and that
-        used to be invisible.
+        that is *queued* is why a second command appears to do nothing, and
+        that used to be invisible.
+
+        ``conversation`` (B5) is the caller's stable conversation id: sending
+        the same id on several messages keeps them in one conversation.  The
+        server validates the shape; an invalid or absent id falls back to one
+        id per connection.
         """
-        ack = self._send_recv_ack(ChatMessage(id=task_id, text=text, source=source))
+        ack = self._send_recv_ack(
+            ChatMessage(id=task_id, text=text, source=source, conversation=conversation)
+        )
         self.last_ack_message = str(ack.data.get("message") or "")
         return ack.task_id
 

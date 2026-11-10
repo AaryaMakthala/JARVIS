@@ -18,7 +18,13 @@ import json
 from jarvis.agent.nodes.clarify import MAX_CLARIFICATIONS
 from jarvis.agent.state import clarification_rounds
 
-__all__ = ["VOICE_SOURCE_LINE", "brain_system_prompt", "brain_user_prompt", "specialist_system_prompt", "specialist_user_prompt"]
+__all__ = [
+    "VOICE_SOURCE_LINE",
+    "brain_system_prompt",
+    "brain_user_prompt",
+    "specialist_system_prompt",
+    "specialist_user_prompt",
+]
 
 _MIN_STEPS = 1
 _MAX_STEPS = 12
@@ -112,6 +118,7 @@ def brain_user_prompt(
     clarification_history: list[dict[str, str]] | None = None,
     sites: str | None = None,
     referent_summary: str | None = None,
+    conversation_history: str | None = None,
 ) -> str:
     """Build the user prompt for one brain call.
 
@@ -133,6 +140,10 @@ def brain_user_prompt(
     ``sites`` (Stage 8.6) is the pre-rendered site directory: the model picks a
     *name* and the code supplies the URL, so no URL is ever copied out of the
     prompt.
+    ``conversation_history`` (B5) is the pre-rendered recent-turn block from
+    :meth:`jarvis.agent.conversation.ConversationManager.render_history`:
+    earlier finished requests/answers in this conversation, already wrapped
+    in ``<untrusted_data>`` so they can never act as instructions.
     """
     parts = [f"The user said:\n{user_input!r}"]
     rounds = clarification_rounds(clarification_history)
@@ -157,6 +168,12 @@ def brain_user_prompt(
             "Use that answer to decide now. Only ask another question if it is "
             "truly still ambiguous."
         )
+    if conversation_history:
+        # B5: the bounded recent-turn block for this conversation.  Like
+        # memory and tool output, the earlier answers can quote untrusted
+        # text, so the block arrives pre-wrapped in <untrusted_data> with
+        # < and > escaped by the caller and is data, never instructions.
+        parts.append(conversation_history)
     if repair_error:
         parts.append(
             "The previous plan was rejected for the following reason. Fix it "

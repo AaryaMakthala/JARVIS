@@ -19,6 +19,7 @@ import getpass
 import logging
 import traceback
 import unicodedata
+import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
@@ -1240,8 +1241,36 @@ def _tier2_unlock_or_refuse(ctx: AppContext, req: dict[str, Any]) -> tuple[bool,
     return False, None
 
 
+def _record_conversation_turn(
+    ctx: AppContext, conversation_id: str, request: str, outcome: Any
+) -> None:
+    """Record one finished in-process turn in its conversation (B5).
+
+    The daemon records turns in its worker; this is the identical path for
+    the in-process REPL/one-shot so both channels behave the same.  Status is
+    the same closed ``task_status`` vocabulary, and recording never raises.
+    """
+    from jarvis.agent.nodes.telemetry import task_status
+
+    manager = getattr(ctx, "conversations", None)
+    record = getattr(manager, "record", None)
+    if not callable(record) or not conversation_id:
+        return
+    try:
+        record(
+            conversation_id,
+            getattr(outcome, "task_id", ""),
+            request,
+            getattr(outcome, "spoken_answer", None) or getattr(outcome, "final_answer", None) or "",
+            task_status(getattr(outcome, "state", {}) or {}),
+        )
+    except Exception:
+        logging.getLogger("jarvis.cli").debug("conversation turn not recorded", exc_info=True)
+
+
 def chat_loop(ctx: AppContext, saver: SqliteSaver) -> None:
     """One interactive session over the Phase 1 agent (no daemon)."""
+    conversation_id = ctx.conversations.new_conversation()
     while True:
         try:
             line = _chat_prompt("[bold cyan]you>[/]")
@@ -1252,9 +1281,10 @@ def chat_loop(ctx: AppContext, saver: SqliteSaver) -> None:
         if not line:
             continue
 
-        outcome = run_task(ctx, saver, line)
+        outcome = run_task(ctx, saver, line, conversation_id=conversation_id)
         outcome = resolve_interrupts(outcome, ctx, saver)
         _print_outcome(outcome)
+        _record_conversation_turn(ctx, conversation_id, line, outcome)
 
 
 def resolve_interrupts(outcome: Any, ctx: AppContext, saver: SqliteSaver) -> Any:
@@ -1344,6 +1374,7 @@ _ABANDON_ACK_TIMEOUT = 2.0
 def _daemon_chat_loop(client: Any) -> None:
     """Interactive REPL that talks to the daemon over IPC."""
     console.print("[dim]JARVIS chat via daemon (Ctrl+C to exit)[/dim]")
+    conversation = uuid.uuid4().hex
     while True:
         try:
             line = _chat_prompt("[bold cyan]you>[/]")
@@ -1353,10 +1384,10 @@ def _daemon_chat_loop(client: Any) -> None:
         line = (line or "").strip()
         if not line:
             continue
-        _daemon_one_shot(client, line)
+        _daemon_one_shot(client, line, conversation=conversation)
 
 
-def _daemon_one_shot(client: Any, line: str) -> str:
+def _daemon_one_shot(client: Any, line: str, *, conversation: str = "") -> str:
     """Send one command to the daemon and print events until it finishes.
 
     Returns the final text (empty when the daemon reported an error, the wait
@@ -1364,6 +1395,10 @@ def _daemon_one_shot(client: Any, line: str) -> str:
     ``jarvis run`` so the one-shot command cannot be more permissive than the
     interactive session: both go through the same ``ConfirmRequest`` /
     ``ClarificationRequest`` handling and the same password prompt.
+
+    ``conversation`` (B5) is the caller's stable conversation id: the REPL
+    passes one id for the whole session; a one-shot ``run`` passes a fresh id
+    per invocation.  The daemon keeps the bounded recent-turn context per id.
 
     ``Ctrl+C`` anywhere in here - at a prompt, or while the daemon re-plans
     after an answer - returns to the caller instead of unwinding out of
@@ -1375,7 +1410,7 @@ def _daemon_one_shot(client: Any, line: str) -> str:
     from jarvis.daemon.client import DaemonError
 
     try:
-        task_id = client.send_chat(line)
+        task_id = client.send_chat(line, conversation=conversation)
     except DaemonError as exc:
         console.print(f"[red]{exc.message}[/red]")
         return ""
@@ -1570,6 +1605,7 @@ def _run_no_daemon(command: str, *, dry_run: bool = False) -> None:
         raise typer.Exit(code=1)
 
     try:
+        conversation = uuid.uuid4().hex
         ctx = _task_context(settings, store, selection.client, dry_run=dry_run)
         saver = open_sqlite_checkpointer(str(config.checkpoints_db()))
     except LLMError as exc:
@@ -1577,9 +1613,10 @@ def _run_no_daemon(command: str, *, dry_run: bool = False) -> None:
         raise typer.Exit(code=1)
 
     try:
-        outcome = run_task(ctx, saver, command)
+        outcome = run_task(ctx, saver, command, conversation_id=conversation)
         outcome = resolve_interrupts(outcome, ctx, saver)
         _print_outcome(outcome)
+        _record_conversation_turn(ctx, conversation, command, outcome)
         if outcome.error or not outcome.final_answer:
             raise typer.Exit(code=1)
     finally:
@@ -1610,7 +1647,10 @@ def _run_with_daemon(command: str) -> None:
         console.print("[dim]start it with `jarvis daemon --foreground`, or use --no-daemon[/dim]")
         raise typer.Exit(code=1) from exc
     try:
-        if not _daemon_one_shot(client, command):
+        # One ``run`` invocation is one conversation (B5): a fresh id per
+        # invocation, so a follow-up typed as a new command does not inherit
+        # the previous request's context.  Only ``jarvis chat`` keeps a session.
+        if not _daemon_one_shot(client, command, conversation=uuid.uuid4().hex):
             raise typer.Exit(code=1)
     finally:
         try:

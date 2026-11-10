@@ -20,6 +20,7 @@ import asyncio
 import hmac
 import json
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -77,6 +78,11 @@ logger = get_logger("daemon.server")
 
 #: Maximum tasks waiting in the queue (not counting the active one).
 MAX_QUEUE_SIZE = 5
+
+#: Conversation ids (B5) are opaque bookkeeping keys: hex (a UUID minted by
+#: this daemon) or any client-supplied token of the same shape.  The charset
+#: is deliberately conservative so an id can never carry meaningful text.
+_CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 #: How often to check for stale confirmations (seconds).  The timeout value
 #: itself is owned by ``jarvis.daemon.task_runtime`` (D1): the worker and this
@@ -145,6 +151,10 @@ class ClientConnection:
     conn_id: str = ""  # stable identity used for task ownership
     authenticated: bool = False
     active_task: str | None = None  # task_id this client owns
+    #: Conversation id for this connection's requests (B5).  Minted lazily on
+    #: the first chat message that does not carry one, so one CLI session is
+    #: exactly one conversation even across reconnects that pass their own id.
+    conversation_id: str = ""
     closed: bool = False
 
     async def send(self, msg: Any) -> None:
@@ -206,6 +216,10 @@ class TaskSlot:
     task_id: str
     text: str
     source: str
+    #: Stable conversation identity (B5): one CLI session, one ``jarvis run``
+    #: invocation, or the daemon's live voice pipeline.  Empty means the task
+    #: runs without conversation history (legacy callers).
+    conversation_id: str = ""
     # conn_id of the client that submitted the task (set at acceptance so it
     # survives queueing and promotion — the dispatch loop uses it to route
     # confirm requests and final results back to the right client).
@@ -674,6 +688,10 @@ class DaemonServer:
         #: Human-readable reason the last :meth:`run` refused to start.
         self._startup_refusal_reason: str | None = None
         self._voice_service: Any = None  # VoiceService | None
+        #: Stable conversation id for the voice pipeline (B5).  Minted lazily
+        #: by :meth:`_voice_conversation_id` and reset when the pipeline stops,
+        #: so a restarted voice session starts with no stale request context.
+        self._voice_conversation = ""
         self._memory: Any = None  # SqliteMemory | None (Phase 8, opened lazily)
         #: Independent task lifecycle store (B1).  Opened lazily with the first
         #: context and closed at shutdown; a probe failure yields the no-op
@@ -1342,6 +1360,11 @@ class DaemonServer:
         only unwinds once it can see the pipeline is going down.
         """
         self._voice_stopping.set()
+        # B5: the voice pipeline's conversation ends with it.  A restarted
+        # pipeline mints a fresh id, so no request context survives a voice
+        # stop/start round trip (fail closed, like every other transient).
+        with self._lock:
+            self._voice_conversation = ""
         if self._voice_service is None:
             return
         try:
@@ -1640,10 +1663,12 @@ class DaemonServer:
     async def _handle_chat(self, msg: ChatMessage, conn: ClientConnection) -> None:
         """Accept a new task or queue it."""
         task_id = _task_id(msg.id)
+        conversation_id = self._resolve_conversation(msg.conversation, conn)
         slot = TaskSlot(
             task_id=task_id,
             text=msg.text,
             source=msg.source,
+            conversation_id=conversation_id,
         )
 
         with self._lock:
@@ -1662,7 +1687,11 @@ class DaemonServer:
                     EventMessage(
                         task_id=task_id,
                         kind="ack",
-                        data={"message": "queued", "position": len(self._queue)},
+                        data={
+                            "message": "queued",
+                            "position": len(self._queue),
+                            "conversation": conversation_id,
+                        },
                     )
                 )
             else:
@@ -1682,11 +1711,51 @@ class DaemonServer:
                     EventMessage(
                         task_id=task_id,
                         kind="ack",
-                        data={"message": "started"},
+                        data={"message": "started", "conversation": conversation_id},
                     )
                 )
 
+    def _resolve_conversation(self, requested: str, conn: ClientConnection) -> str:
+        """One conversation id for a chat message (B5).
+
+        A well-formed client-supplied id wins (it survives reconnects and is
+        how one CLI session stays one conversation); otherwise the
+        connection's id is used, minting it on first use.  Bounded length and
+        a conservative charset keep the id opaque - it is only ever a
+        bookkeeping key for in-memory history, never an authorization.
+        """
+        candidate = (requested or "").strip()
+        if candidate and len(candidate) <= 64 and _CONVERSATION_ID_RE.match(candidate):
+            return candidate
+        if not conn.conversation_id:
+            manager = self._conversations()
+            conn.conversation_id = (
+                manager.new_conversation() if manager is not None else uuid.uuid4().hex
+            )
+        return conn.conversation_id
+
+    def _conversations(self) -> Any:
+        """The shared conversation manager, or ``None`` when ctx is missing."""
+        ctx = self._ctx
+        return getattr(ctx, "conversations", None) if ctx is not None else None
+
     # ── voice task submission (runs in the voice loop thread) ──────────
+
+    def _voice_conversation_id(self) -> str:
+        """The stable conversation id for the voice pipeline (B5).
+
+        One id per daemon voice pipeline: spoken requests share the same
+        bounded recent-turn context as each other, while staying separate
+        from every terminal conversation.  Minted lazily so importing or
+        running the daemon without voice allocates nothing.
+        """
+        with self._lock:
+            if not self._voice_conversation:
+                manager = self._conversations()
+                self._voice_conversation = (
+                    manager.new_conversation() if manager is not None else uuid.uuid4().hex
+                )
+            return self._voice_conversation
 
     def _voice_submit(self, text: str, source: str = "voice") -> Any:
         """Submit a task from the voice-loop thread and block until it finishes.
@@ -1701,7 +1770,14 @@ class DaemonServer:
             logger.warning("voice task rejected: runtime context is not initialised")
             return _VoiceOutcome(error="AI backend is starting — try again")
         task_id = _task_id()
-        slot = TaskSlot(task_id=task_id, text=text, source=source, owner_id=VOICE_OWNER)
+        conversation_id = self._voice_conversation_id()
+        slot = TaskSlot(
+            task_id=task_id,
+            text=text,
+            source=source,
+            owner_id=VOICE_OWNER,
+            conversation_id=conversation_id,
+        )
 
         with self._lock:
             if self._active is not None and not self._active.done:
@@ -2053,6 +2129,7 @@ class DaemonServer:
                 source=slot.source,
                 thread_id=task_id,
                 cancel=slot.cancel,
+                conversation_id=slot.conversation_id or None,
             )
 
             while True:
@@ -2062,6 +2139,7 @@ class DaemonServer:
                 if outcome.error:
                     slot.error = outcome.error
                     slot.done = True
+                    self._record_turn(slot, outcome.state, answer="")
                     self._wake_dispatch()
                     if slot.owner_id == VOICE_OWNER:
                         slot.event.set()
@@ -2074,6 +2152,7 @@ class DaemonServer:
                 if spoken and not outcome.confirmation:
                     slot.result_text = spoken
                     slot.done = True
+                    self._record_turn(slot, outcome.state, answer=spoken)
                     self._wake_dispatch()
                     if slot.owner_id == VOICE_OWNER:
                         slot.event.set()
@@ -2160,6 +2239,7 @@ class DaemonServer:
         except Exception as exc:  # noqa: BLE001
             slot.error = f"{type(exc).__name__}: {exc}"
             slot.done = True
+            self._record_turn(slot, None, answer="")
             self._wake_dispatch()
             if slot.owner_id == VOICE_OWNER:
                 slot.event.set()
@@ -2178,6 +2258,51 @@ class DaemonServer:
             # bindings) must not outlive it: a later task, even one re-asking
             # the same goal, has to earn a fresh authorization (docs/03 §7).
             self._end_task_runtime(task_id)
+
+    def _record_turn(
+        self,
+        slot: TaskSlot,
+        state: Any,
+        *,
+        answer: str,
+        status: str | None = None,
+    ) -> None:
+        """Record one finished turn in its conversation (B5, best-effort).
+
+        The status is the same closed vocabulary as the task-event store
+        (:func:`jarvis.agent.nodes.telemetry.task_status`), so the in-memory
+        conversation history can never claim a failed request succeeded.  An
+        explicit ``status`` (the cancellation path) wins over derivation; no
+        state at all records ``failed``.  Recording never raises: history is
+        prompt context, not bookkeeping the task depends on.
+        """
+        manager = self._conversations()
+        record = getattr(manager, "record", None)
+        if not callable(record) or not slot.conversation_id:
+            return
+        resolved = status
+        if resolved is None:
+            # A failure path with no state at all (the graph raised before
+            # producing one) must not be derived as "completed": the closed
+            # vocabulary has an honest word for it.
+            resolved = "failed"
+            if isinstance(state, dict) and state:
+                try:
+                    from jarvis.agent.nodes.telemetry import task_status
+
+                    resolved = task_status(state)
+                except Exception:  # history must never fail a task
+                    logger.debug("conversation turn status unavailable", exc_info=True)
+        try:
+            record(
+                slot.conversation_id,
+                slot.task_id,
+                slot.text,
+                answer,
+                resolved,
+            )
+        except Exception:
+            logger.debug("conversation turn not recorded", exc_info=True)
 
     def _end_task_runtime(self, task_id: str) -> None:
         """Drop a finished task's scope grant and target bindings.
@@ -2217,7 +2342,10 @@ class DaemonServer:
         Deliberately does not touch ``slot.error`` / ``slot.result_text``: the
         canceller already decided the wording (the voice path answers with its
         own fixed acknowledgement, the IPC path with "cancelled by user").
+        The turn is still recorded in its conversation as ``cancelled`` so the
+        history stays honest about what happened.
         """
+        self._record_turn(slot, None, answer="", status="cancelled")
         slot.cancelled = True
         slot.done = True
         self._wake_dispatch()

@@ -117,8 +117,12 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         catalogue = ctx.registry.catalogue_for_llm()
     system = brain_system_prompt(catalogue)
     if getattr(agent_settings, "use_specialists", False):
-        system = system + "\n12b. If the task needs several browser steps that depend on what the page shows (searching, opening a result, reading a page, playing a video), return request_type 'browse' with a goal and no actions. Simple single actions stay 'action'."
+        system = (
+            system
+            + "\n12b. If the task needs several browser steps that depend on what the page shows (searching, opening a result, reading a page, playing a video), return request_type 'browse' with a goal and no actions. Simple single actions stay 'action'."
+        )
     session_block = _session_reference_block(state, ctx)
+    conversation_block = _conversation_history_block(state, ctx)
     site_directory = sites_from_settings(ctx.settings)
     sites_block = (
         trim_site_catalogue(site_directory, state)
@@ -132,9 +136,14 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         if isinstance(rr, dict):
             parts = []
             if rr.get("has_result_set") and rr.get("result_set_positions"):
-                parts.append("REFERENTS: result set positions: " + ",".join(str(x) for x in rr.get("result_set_positions", [])))
+                parts.append(
+                    "REFERENTS: result set positions: "
+                    + ",".join(str(x) for x in rr.get("result_set_positions", []))
+                )
             if rr.get("has_page") and rr.get("page_url"):
-                parts.append(f"REFERENTS: current page: <untrusted_data>{rr['page_url']}</untrusted_data>")
+                parts.append(
+                    f"REFERENTS: current page: <untrusted_data>{rr['page_url']}</untrusted_data>"
+                )
             if rr.get("has_photo") and rr.get("photo_path"):
                 parts.append(f"REFERENTS: last photo: {rr['photo_path']}")
             elif rr.get("has_file") and rr.get("file_path"):
@@ -159,6 +168,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         clarification_history=state.get("clarification_history"),
         sites=sites_block,
         referent_summary=referent_summary,
+        conversation_history=conversation_block,
     )
 
     llm_budget: dict[str, Any] = {}
@@ -166,10 +176,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         # No retry, and a per-call timeout the composite client recognises as
         # latency-sensitive: it then bounds the WHOLE walk by
         # llm.voice_deadline_seconds instead of the total deadline.
-        voice_deadline = float(
-            getattr(ctx.settings.llm, "voice_deadline_seconds", 12.0)
-            or 12.0
-        )
+        voice_deadline = float(getattr(ctx.settings.llm, "voice_deadline_seconds", 12.0) or 12.0)
         llm_budget = {
             "max_retries": 0,
             "timeout_s": min(float(ctx.settings.llm.timeout_seconds), voice_deadline, 10.0),
@@ -305,6 +312,29 @@ def _memory_answer(answer: str, goal: str) -> dict[str, Any]:
     }
 
 
+def _conversation_history_block(state: dict[str, Any], ctx: AppContext) -> str | None:
+    """The bounded recent-turn block for this conversation (B5), or ``None``.
+
+    History is read-only prompt context from the caller's in-memory
+    :class:`~jarvis.agent.conversation.ConversationManager`; a missing manager,
+    an unknown conversation or a rendering failure must never break the task,
+    so every failure degrades to "no history".  The block itself is already
+    wrapped in ``<untrusted_data>`` by the manager.
+    """
+    manager = getattr(ctx, "conversations", None)
+    render = getattr(manager, "render_history", None)
+    if not callable(render):
+        return None
+    conversation_id = state.get("conversation_id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        return None
+    try:
+        return render(conversation_id)
+    except Exception:  # history must never break the brain
+        ctx.logger.debug("conversation history unavailable", exc_info=True)
+        return None
+
+
 def _session_reference_block(state: dict[str, Any], ctx: AppContext) -> str | None:
     """Resolve a deictic reference ("it", "that photo") to a prompt block.
 
@@ -321,7 +351,9 @@ def _session_reference_block(state: dict[str, Any], ctx: AppContext) -> str | No
     return render_resolution(ctx.session_context.reference_resolution(SESSION_THREAD, text))
 
 
-def _project(decision: BrainDecision, state: dict[str, Any], usage: Any, ctx: AppContext | None = None) -> dict[str, Any]:
+def _project(
+    decision: BrainDecision, state: dict[str, Any], usage: Any, ctx: AppContext | None = None
+) -> dict[str, Any]:
     """Map the transient BrainDecision onto checkpointable state updates."""
     update: dict[str, Any] = {
         "api_calls": int(state.get("api_calls") or 0) + usage.calls,

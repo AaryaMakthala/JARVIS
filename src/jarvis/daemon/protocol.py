@@ -60,12 +60,21 @@ class AuthMessage(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    """Submit a new task to the daemon's queue."""
+    """Submit a new task to the daemon's queue.
+
+    ``id`` is the client-generated correlation id (honoured when it is a valid
+    UUID, else the daemon mints one).  ``conversation`` (B5) is the stable
+    conversation identity: a client that sends the same opaque id on several
+    messages keeps them in one conversation, so follow-ups can use the bounded
+    recent-turn context.  Blank/unset mints one per connection, and the
+    daemon never trusts it for anything but history grouping.
+    """
 
     type: Literal["chat"] = "chat"
     id: str = ""  # client-generated correlation id
     text: str = Field(min_length=1, max_length=4096)
     source: Literal["terminal", "voice", "benchmark"] = "terminal"
+    conversation: str = Field(default="", max_length=64)
 
 
 class ConfirmResponse(BaseModel):
