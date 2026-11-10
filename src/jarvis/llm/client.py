@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+import httpx
 from pydantic import BaseModel, ValidationError
 
 from jarvis import config
@@ -176,6 +177,58 @@ def _is_schema_rejection(exc: BaseException) -> bool:
         return int(status) in (400, 422) if status is not None else False
     except (TypeError, ValueError):
         return False
+
+
+def bounded_http_timeout(seconds: float) -> httpx.Timeout:
+    """Explicit per-operation timeout: connect, read, write **and** pool.
+
+    Passing a bare number to httpx already applies to all four phases, but
+    naming them makes the guarantee auditable: no LLM exchange can block on an
+    unbounded DNS/TLS handshake, an idle socket read, an upload, or a full
+    connection pool.
+    """
+    budget = max(float(seconds), 0.001)
+    return httpx.Timeout(budget, connect=budget, read=budget, write=budget, pool=budget)
+
+
+def post_with_deadline(
+    http: httpx.Client,
+    url: str,
+    *,
+    body: Any,
+    timeout_s: float,
+    deadline_at: float | None,
+    params: dict[str, Any] | None = None,
+) -> tuple[int, bytes]:
+    """POST JSON and read the reply under one wall-clock bound.
+
+    httpx's read timeout applies *per read*, so a provider that trickles bytes
+    (or sends headers and then stalls the body) can keep a request alive far
+    past any per-read budget.  Reading the body chunk by chunk and checking a
+    monotonic clock between chunks bounds the whole exchange, and gives a
+    cancelled task a point to stop at instead of waiting for the provider.
+
+    Raises :class:`httpx.TimeoutException` when the overall budget is exceeded,
+    so callers keep their existing transient/timeout classification.
+    """
+    budget = max(float(timeout_s), 0.001)
+    overall = time.monotonic() + budget
+    if deadline_at is not None:
+        overall = min(overall, deadline_at)
+    abort_if_cancelled()
+    chunks: list[bytes] = []
+    with http.stream(
+        "POST", url, json=body, params=params, timeout=bounded_http_timeout(budget)
+    ) as resp:
+        status = resp.status_code
+        for chunk in resp.iter_bytes():
+            abort_if_cancelled()
+            chunks.append(chunk)
+            if time.monotonic() > overall:
+                raise httpx.ReadTimeout(
+                    "LLM response exceeded the overall deadline while streaming"
+                )
+    return status, b"".join(chunks)
 
 
 def sleep_within_deadline(

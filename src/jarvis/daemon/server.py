@@ -1470,7 +1470,12 @@ class DaemonServer:
             slot.confirm_payload = None  # consumed
 
         elif slot.done:
-            if slot.error:
+            if slot.cancelled:
+                # The cancel acknowledgement was already the terminal answer;
+                # sending a second "no answer" FinalMessage would leave a stale
+                # message for the client's *next* request.
+                logger.info("task %s finished after cancellation", slot.task_id)
+            elif slot.error:
                 await owner.send(FinalMessage(task_id=slot.task_id, text=f"Error: {slot.error}"))
             elif slot.result_text:
                 await owner.send(FinalMessage(task_id=slot.task_id, text=slot.result_text))
@@ -1889,7 +1894,9 @@ class DaemonServer:
         """
         slot.cancelled = True
         slot.cancel.cancel()
-        slot.done = True
+        # Deliberately *not* ``done``: the slot stays occupied until the worker
+        # actually unwinds (``_finish_cancelled``).  Marking it free here let
+        # the next task start while the cancelled run was still executing.
         slot.event.set()
         self._wake_dispatch()
 
@@ -2497,10 +2504,11 @@ class DaemonServer:
                     return
                 # Cancel this task's own token: the graph stops at its next node
                 # boundary, so the remaining steps of the plan never execute.
+                # The slot is *not* marked done here: it stays occupied until the
+                # worker has actually unwound (``_finish_cancelled``), so the
+                # queue cannot start the next task over a still-running one.
                 self._active.cancel.cancel()
                 self._active.cancelled = True
-                self._active.error = "cancelled by user"
-                self._active.done = True
                 # Ack before waking the worker - see the note in _handle_confirm.
                 await conn.send(
                     EventMessage(task_id=msg.task_id, kind="ack", data={"message": "cancelled"})
