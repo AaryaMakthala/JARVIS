@@ -6,7 +6,13 @@ from jarvis.agent.nodes.brain import brain
 from jarvis.agent.schemas import BrainDecision
 from jarvis.config import Settings
 from jarvis.llm.client import FakeLLM
-from jarvis.llm.routing import TaskClass, classify_request, model_role_for
+from jarvis.llm.routing import (
+    TaskClass,
+    classify_request,
+    model_role_for,
+    route_request,
+)
+from jarvis.taskstore import TaskRouteReason
 from support import brain_action, make_spec, registry_with
 
 TASK = "00000000-0000-4000-8000-0000000000bb"
@@ -23,6 +29,12 @@ TASK = "00000000-0000-4000-8000-0000000000bb"
         ("search for cat videos", TaskClass.ACTION),
         ("send the report to Sam", TaskClass.ACTION),
         ("why does the sky look blue and explain the physics", TaskClass.REASONING),
+        ("summarize this report", TaskClass.SUMMARIZATION),
+        ("write a python function to sort a list", TaskClass.CODING),
+        ("generate the tool arguments as JSON", TaskClass.TOOL_ARGS),
+        ("read the text on my screen", TaskClass.LOCAL_OCR),
+        ("what is on my screen", TaskClass.LOCAL_OCR),
+        ("take a screenshot", TaskClass.ACTION),
         ("x" * 201, TaskClass.REASONING),
     ],
 )
@@ -30,15 +42,30 @@ def test_classify_request(text: str, expected: TaskClass) -> None:
     assert classify_request(text) is expected
 
 
-def test_has_image_routes_to_vision() -> None:
-    assert classify_request("describe this", has_image=True) is TaskClass.VISION
+def test_has_image_routes_to_local_ocr() -> None:
+    route = route_request("describe this", has_image=True)
+
+    assert route.task_class is TaskClass.LOCAL_OCR
+    assert route.model_role == "planner"
+    assert route.reason_code is TaskRouteReason.HAS_IMAGE
+
+
+def test_route_reason_is_deterministic() -> None:
+    assert route_request("open notepad").reason_code is TaskRouteReason.ACTION
+    assert route_request("hello").reason_code is TaskRouteReason.CONVERSATION
+    assert route_request("summarize this").reason_code is TaskRouteReason.SUMMARIZATION
+    assert route_request("write a python script").reason_code is TaskRouteReason.CODING
+    assert route_request("generate tool arguments").reason_code is TaskRouteReason.TOOL_ARGUMENTS
 
 
 def test_role_map_is_closed_and_conservative() -> None:
     assert model_role_for(TaskClass.CONVERSATION) == "fast"
     assert model_role_for(TaskClass.ACTION) == "planner"
     assert model_role_for(TaskClass.REASONING) == "planner"
-    assert model_role_for(TaskClass.VISION) == "vision"
+    assert model_role_for(TaskClass.CODING) == "planner"
+    assert model_role_for(TaskClass.SUMMARIZATION) == "planner"
+    assert model_role_for(TaskClass.TOOL_ARGS) == "planner"
+    assert model_role_for(TaskClass.LOCAL_OCR) == "planner"
 
 
 def _ctx(llm: FakeLLM):

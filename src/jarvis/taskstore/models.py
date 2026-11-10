@@ -72,6 +72,7 @@ class TaskEventType(str, Enum):
     STAGE_CHANGED = "stage_changed"
     STATUS_CHANGED = "status_changed"
     PLAN_CREATED = "plan_created"
+    ROUTE = "route"
     LLM_CALL = "llm_call"
     NOTE = "note"
     WARNING = "warning"

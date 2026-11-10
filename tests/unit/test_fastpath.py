@@ -41,6 +41,23 @@ def test_time_phrases_hit_get_time() -> None:
         assert args == {}
 
 
+def test_date_phrases_hit_get_time_with_date() -> None:
+    for text in ("what is the date", "what day is it", "what's today's date"):
+        hit = fastpath.match(text, Settings())
+        assert hit is not None, text
+        tool, args, _phrase = hit
+        assert tool == "get_time"
+        assert args == {"include_date": True}
+
+
+def test_datetime_phrases_request_both_parts() -> None:
+    hit = fastpath.match("what is the date and time", Settings())
+
+    assert hit is not None
+    assert hit[0] == "get_time"
+    assert hit[1] == {"include_date": True, "include_time": True}
+
+
 def test_windows_phrases_hit_list_windows() -> None:
     for text in ("what windows are open", "list windows", "list the windows"):
         hit = fastpath.match(text, Settings())
@@ -205,6 +222,27 @@ def test_open_chrome_asks_nothing() -> None:
     assert update["plan"].steps[0].args == {"name": "chrome"}
     assert update["api_calls"] == 0
     assert update["tokens"] == 0
+
+
+def test_arithmetic_fastpath_skips_the_llm_and_answers_directly() -> None:
+    ctx = make_app_context(Settings(), llm=_ExplodingLLM())
+
+    update = brain({"user_input": "what is 2 times 2?", "task_id": "t1"}, ctx)
+
+    assert update["plan"].kind == "conversation"
+    assert update["plan"].steps == []
+    assert update["final_answer"] == "4"
+    assert update["request_kind"] == "conversation"
+    assert update["api_calls"] == 0
+    assert update["tokens"] == 0
+
+
+def test_arithmetic_fastpath_fails_closed_for_division_by_zero() -> None:
+    ctx = make_app_context(Settings(), llm=_ExplodingLLM())
+
+    update = fastpath.brain_update({"user_input": "what is 1 / 0", "task_id": "t1"}, ctx)
+
+    assert update is None
 
 
 def test_brain_hit_works_with_no_provider_configured() -> None:

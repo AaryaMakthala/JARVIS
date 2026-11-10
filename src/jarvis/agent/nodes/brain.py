@@ -25,6 +25,7 @@ from typing import Any
 from jarvis.agent import fastpath
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.clarify import MAX_CLARIFICATIONS
+from jarvis.agent.nodes.telemetry import record_route
 from jarvis.agent.prompts import brain_system_prompt, brain_user_prompt
 from jarvis.agent.routing import UNSUPPORTED_ANSWER
 from jarvis.agent.schemas import BrainDecision
@@ -35,7 +36,7 @@ from jarvis.agent.session_context import (
 from jarvis.agent.state import Plan, RequestKind, Step
 from jarvis.agent.tool_groups import select_catalogue, trim_site_catalogue
 from jarvis.browser.sites import render_site_catalogue, sites_from_settings
-from jarvis.llm.routing import classify_request, model_role_for
+from jarvis.llm.routing import route_request
 from jarvis.messaging.grounding import ground_brain_update
 
 #: Deterministic, user-facing halt reasons.  The LLM output never reaches the
@@ -82,17 +83,21 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     ctx.logger.info("agent event=llm_start task_id=%s", task_id)
 
-    task_class = classify_request(
-        state.get("user_input") or "", has_image=bool(state.get("has_image"))
-    )
-    model_role = model_role_for(task_class)
+    route = route_request(state.get("user_input") or "", has_image=bool(state.get("has_image")))
     ctx.logger.info(
-        "agent event=llm_route task_id=%s class=%s role=%s",
+        "agent event=llm_route task_id=%s class=%s role=%s reason=%s",
         task_id,
-        task_class.value,
-        model_role,
+        route.task_class.value,
+        route.model_role,
+        route.reason_code.value,
     )
-
+    record_route(
+        state,
+        ctx,
+        task_class=route.task_class.value,
+        model_role=route.model_role,
+        reason_code=route.reason_code.value,
+    )
 
     previous_error = state.get("error") if int(state.get("validate_attempts") or 0) > 0 else None
     source = state.get("source") or "terminal"
@@ -171,7 +176,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             system=system,
             user=user,
             schema=BrainDecision,
-            model_role=model_role,
+            model_role=route.model_role,
             temperature=0.0,
             **llm_budget,
         )

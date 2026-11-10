@@ -30,7 +30,37 @@ class TaskModelRole(str, Enum):
     USER = "user"
     ASSISTANT = "assistant"
     TOOL = "tool"
+    FAST = "fast"
     PLANNER = "planner"
+    VISION = "vision"
+
+
+class TaskRequestClass(str, Enum):
+    """Allowed deterministic request classes."""
+
+    CONVERSATION = "conversation"
+    ACTION = "action"
+    REASONING = "reasoning"
+    CODING = "coding"
+    SUMMARIZATION = "summarization"
+    TOOL_ARGS = "tool_args"
+    LOCAL_OCR = "local_ocr"
+
+
+class TaskRouteReason(str, Enum):
+    """Allowed reasons for a deterministic model-role route."""
+
+    EMPTY = "empty"
+    HAS_IMAGE = "has_image"
+    SCREEN_TEXT = "screen_text"
+    TOOL_ARGUMENTS = "tool_arguments"
+    SUMMARIZATION = "summarization_keyword"
+    CODING = "coding_keyword"
+    REASONING = "reasoning_keyword"
+    LONG_REQUEST = "long_request"
+    ACTION = "action_keyword"
+    CONVERSATION = "conversation_prefix"
+    FALLBACK = "fallback"
 
 
 class TaskApprovalState(str, Enum):

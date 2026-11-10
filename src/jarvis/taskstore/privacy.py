@@ -23,6 +23,8 @@ from .vocabulary import (
     TaskOutcome,
     TaskOwnerKind,
     TaskReasonCode,
+    TaskRequestClass,
+    TaskRouteReason,
     TaskSeverity,
     TaskSource,
     TaskStoreVocabulary,
@@ -134,6 +136,11 @@ _DETAIL_POLICIES: dict[str, dict[str, str]] = {
     "plan_created": {
         "step_count": "count",
     },
+    "route": {
+        "model_role": "role",
+        "reason_code": "route_reason",
+        "task_class": "request_class",
+    },
     "llm_call": {
         "duration_ms": "duration",
         "failure_category": "failure_category",
@@ -204,6 +211,7 @@ _REQUIRED_DETAIL_KEYS: dict[str, frozenset[str]] = {
     "stage_changed": frozenset({"stage"}),
     "status_changed": frozenset({"status"}),
     "plan_created": frozenset({"step_count"}),
+    "route": frozenset({"task_class", "model_role", "reason_code"}),
     "llm_call": frozenset({"provider", "model", "role"}),
     "note": frozenset({"event_code"}),
     "warning": frozenset({"severity", "reason_code"}),
@@ -343,6 +351,16 @@ def safe_message_kind(value: Any) -> str | None:
 def safe_event_code(value: Any) -> str | None:
     """Return a supported event code, or ``None``."""
     return _enum_value(value, TaskEventCode)
+
+
+def safe_request_class(value: Any) -> str | None:
+    """Return a supported deterministic request class, or ``None``."""
+    return _enum_value(value, TaskRequestClass)
+
+
+def safe_route_reason(value: Any) -> str | None:
+    """Return a supported deterministic routing reason, or ``None``."""
+    return _enum_value(value, TaskRouteReason)
 
 
 def safe_provider(value: Any, vocabulary: TaskStoreVocabulary) -> str | None:
@@ -501,6 +519,10 @@ def _validate_detail_value(
         return safe_message_kind(value)
     if kind == "event_code":
         return safe_event_code(value)
+    if kind == "request_class":
+        return safe_request_class(value)
+    if kind == "route_reason":
+        return safe_route_reason(value)
     if kind == "step_id":
         try:
             return safe_step_id(value)

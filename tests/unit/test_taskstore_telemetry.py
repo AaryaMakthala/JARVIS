@@ -82,6 +82,32 @@ def test_start_creates_task_and_moves_it_to_running(tmp_path: Path) -> None:
     ]
 
 
+def test_route_is_recorded_with_only_closed_metadata(tmp_path: Path) -> None:
+    store = _store(tmp_path, registry_with())
+    ctx = _ctx(store)
+    try:
+        telemetry.record_started(
+            {"task_id": TASK, "source": "terminal", "user_input": "private words"}, ctx
+        )
+        telemetry.record_route(
+            {"task_id": TASK, "source": "terminal"},
+            ctx,
+            task_class="coding",
+            model_role="planner",
+            reason_code="coding_keyword",
+        )
+        event = store.events(TASK)[-1]
+    finally:
+        store.close()
+
+    assert event.event_type is TaskEventType.ROUTE
+    assert event.detail == {
+        "task_class": "coding",
+        "model_role": "planner",
+        "reason_code": "coding_keyword",
+    }
+
+
 def test_stage_is_recorded_from_a_node_name(tmp_path: Path) -> None:
     store = _store(tmp_path, registry_with())
     ctx = _ctx(store)

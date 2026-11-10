@@ -59,6 +59,7 @@ __all__ = [
     "get_trace",
     "node_code",
     "record_finished",
+    "record_route",
     "record_stage",
     "record_started",
     "task_status",
@@ -256,6 +257,39 @@ def _task_store(ctx: AppContext) -> Any | None:
 def _safe_source(state: dict[str, Any]) -> str:
     source = str(state.get("source") or "")
     return source if source in _SOURCES else "terminal"
+
+
+def record_route(
+    state: dict[str, Any],
+    ctx: AppContext,
+    *,
+    task_class: str,
+    model_role: str,
+    reason_code: str,
+) -> None:
+    """Record the closed routing decision, never the user text behind it.
+
+    The task store validates every value against its own closed vocabularies.
+    Like the other telemetry writers, a store failure is swallowed: an
+    unreadable history must not change the task's answer.
+    """
+    store = _task_store(ctx)
+    task_id = str(state.get("task_id") or "")
+    if store is None or not task_id:
+        return
+    try:
+        store.ensure_task(task_id, source=_safe_source(state))
+        store.append_event(
+            task_id,
+            TaskEventType.ROUTE,
+            detail={
+                "task_class": task_class,
+                "model_role": model_role,
+                "reason_code": reason_code,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
+        ctx.logger.debug("task route not recorded: %s", exc)
 
 
 def record_stage(state: dict[str, Any], ctx: AppContext, node_name: str) -> None:
