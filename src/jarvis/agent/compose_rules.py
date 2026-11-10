@@ -39,11 +39,13 @@ __all__ = [
     "MAX_SENTENCES",
     "MAX_SPOKEN_CHARS",
     "OUTCOMES",
+    "STATUS_BY_OUTCOME",
     "SUCCESS",
     "address_phrase",
     "classify_outcome",
     "first_sentences",
     "spoken_answer",
+    "task_status_for",
 ]
 
 #: Closed outcome vocabulary (the compose equivalents of ``task_status``).
@@ -62,6 +64,24 @@ OUTCOMES = (
 )
 
 SUCCESS = "success"
+
+#: The one canonical mapping from a classified outcome to the closed task
+#: status vocabulary.  Compose (wording), telemetry (``task_log`` and the task
+#: event store), conversation history and the CLI all read this table, so they
+#: cannot disagree about what happened.
+STATUS_BY_OUTCOME: dict[str, str] = {
+    "success": "completed",
+    "partial": "partial",
+    "failed": "failed",
+    "cancelled": "cancelled",
+    "clarify": "halted",
+    "unsupported": "halted",
+    "refused": "halted",
+    "policy_blocked": "halted",
+    "timeout": "halted",
+    "llm_down": "halted",
+    "conversation": "answered",
+}
 
 #: Read-only observation tools have no post-condition to verify: a successful
 #: result is the observation itself, so ``verified is None`` is not a shortfall.
@@ -126,19 +146,17 @@ _POLICY_MARKERS = (
 
 
 def classify_outcome(state: dict[str, Any]) -> str:
-    """One of :data:`OUTCOMES` for this terminal state (deterministic)."""
+    """One of :data:`OUTCOMES` for this terminal state (deterministic).
+
+    This is the single classifier: :func:`task_status_for` maps its result to
+    the stored status, and telemetry/history/CLI all use that mapping.  The
+    order is deliberate - concrete results outrank clarification and halt
+    reasons (a failed step cannot be called "awaiting input"), and a
+    read-only observation with no post-condition is a success, not a partial.
+    """
     if state.get("cancelled"):
         return "cancelled"
 
-    plan = state.get("plan")
-    if plan is not None and getattr(plan, "needs_clarification", False):
-        return "clarify"
-
-    if str(state.get("request_kind") or "") == "unsupported":
-        return "unsupported"
-
-    # Concrete results outrank a later halt/final answer, matching
-    # ``task_status``: a failed step cannot be spoken or logged as done.
     results = _results(state)
     if any(not r.ok or r.verified is False for r in results):
         return "failed"
@@ -146,6 +164,13 @@ def classify_outcome(state: dict[str, Any]) -> str:
         if _only_unverified_observations(state, results):
             return SUCCESS
         return "partial"
+
+    plan = state.get("plan")
+    if plan is not None and getattr(plan, "needs_clarification", False):
+        return "clarify"
+
+    if str(state.get("request_kind") or "") == "unsupported":
+        return "unsupported"
 
     halt = str(state.get("halted_reason") or "").strip()
     if halt:
@@ -162,6 +187,11 @@ def classify_outcome(state: dict[str, Any]) -> str:
         return SUCCESS
     # Nothing ran and nothing refused: ``respond`` says "No task performed."
     return "failed"
+
+
+def task_status_for(state: dict[str, Any]) -> str:
+    """The closed stored status for a terminal state (canonical mapping)."""
+    return STATUS_BY_OUTCOME[classify_outcome(state)]
 
 
 def _only_unverified_observations(state: dict[str, Any], results: list[Any]) -> bool:

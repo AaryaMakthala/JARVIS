@@ -44,7 +44,7 @@ from collections import OrderedDict
 from typing import Any
 
 from jarvis.agent.context import AppContext
-from jarvis.agent.state import Plan, StepResult
+from jarvis.agent.state import Plan
 from jarvis.memory.tasklog import STATUSES
 from jarvis.taskstore import TaskEventType, TaskStage, TaskStatus
 
@@ -395,46 +395,15 @@ def record_finished(state: dict[str, Any], ctx: AppContext) -> None:
 def task_status(state: dict[str, Any]) -> str:
     """The closed, honest status for a finished task.
 
-    A recorded ``StepResult`` is concrete evidence, so it is classified before
-    any ``halted_reason``: a task that failed a step and then ran out of replan
-    budget is logged as the failure it was, never as the halt that followed.
-    That ordering is what makes "logged as completed" mean *every* step
-    succeeded and verified.
-
-    ==========================  ==========  ==================================
-    Condition                   Status      Why
-    ==========================  ==========  ==================================
-    ``cancelled``               cancelled   the human stopped it
-    a failed/unverified step    failed      the work did not happen
-    any unproven step           partial     it worked but nothing proved it
-    clarification requested     halted      asked, not answered
-    a conversation answer       answered    an answer, not an action
-    ``halted_reason``           halted      refused / unsupported / no LLM
-    everything else             completed   the plan ran and verified
-    ==========================  ==========  ==================================
+    Delegates to the single classifier in :mod:`jarvis.agent.compose_rules`, so
+    the wording ``compose`` builds and the status the task store records can
+    never disagree.  In particular, a successful read-only observation
+    (``verified is None`` because there is no post-condition) is ``completed``,
+    not ``partial``; an unverified side effect is still ``partial``.
     """
-    if state.get("cancelled"):
-        return "cancelled"
+    from jarvis.agent.compose_rules import task_status_for
 
-    results: list[StepResult] = [
-        r for r in (state.get("results") or []) if isinstance(r, StepResult)
-    ]
-    if any(not r.ok or r.verified is False for r in results):
-        return "failed"
-    if any(r.verified is None for r in results):
-        return "partial"
-
-    plan: Plan | None = state.get("plan")
-    if plan is not None and plan.needs_clarification:
-        return "halted"
-    if state.get("final_answer") or (
-        plan is not None and getattr(plan, "kind", None) == "conversation" and not plan.steps
-    ):
-        return "answered"
-    if state.get("halted_reason"):
-        return "halted"
-    return "completed"
-
+    return task_status_for(state)
 
 def _write(
     state: dict[str, Any],
