@@ -2506,6 +2506,13 @@ def tasks(
     if not rows:
         console.print("[dim]no tasks[/dim]")
         return
+    if not console.is_terminal:
+        # A pipe/file has no usable width: Rich would shrink the table and
+        # truncate the headers ("task\u2026"/"stat\u2026"), losing data the user
+        # redirected on purpose.  Emit the same columns, tab-separated and
+        # untruncated, so ``jarvis tasks > tasks.txt`` is complete.
+        _print_tasks_plain(rows)
+        return
     table = Table(show_header=True, box=None)
     table.add_column("task_id", style="dim")
     table.add_column("status")
@@ -2519,20 +2526,54 @@ def tasks(
     table.add_column("approval")
     table.add_column("events")
     for row in rows:
-        table.add_row(
-            row.task_id[:12],
-            row.status.value,
-            row.stage.value,
-            row.source,
-            _task_started(row),
-            _task_elapsed(row),
-            str(row.retry_count),
-            _task_failure(row),
-            row.active_tool or "",
-            row.approval_state or "",
-            str(row.event_count),
-        )
+        table.add_row(*_task_row_values(row))
     console.print(table)
+
+
+TASK_COLUMNS = (
+    "task_id",
+    "status",
+    "stage",
+    "source",
+    "started",
+    "elapsed",
+    "retries",
+    "failure",
+    "tool",
+    "approval",
+    "events",
+)
+
+
+def _task_row_values(row: Any) -> tuple[str, ...]:
+    """The eleven cells of one task row (terminal table and plain output)."""
+    return (
+        row.task_id[:12],
+        row.status.value,
+        row.stage.value,
+        row.source,
+        _task_started(row),
+        _task_elapsed(row),
+        str(row.retry_count),
+        _task_failure(row),
+        row.active_tool or "",
+        row.approval_state or "",
+        str(row.event_count),
+    )
+
+
+def _print_tasks_plain(rows: list[Any]) -> None:
+    """Print task rows as complete, untruncated tab-separated lines.
+
+    Written straight to the console's stream: Rich re-wraps/expands tabs even
+    with ``soft_wrap``, which is exactly the truncation a redirected run must
+    not have.
+    """
+    lines = ["\t".join(TASK_COLUMNS)]
+    lines.extend("\t".join(_task_row_values(row)) for row in rows)
+    stream = console.file
+    stream.write("\n".join(lines) + "\n")
+    stream.flush()
 
 
 def _task_started(row: Any) -> str:

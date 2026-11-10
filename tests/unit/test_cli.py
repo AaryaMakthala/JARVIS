@@ -817,9 +817,7 @@ class TestTasksCommand:
         path = tmp_path / "task_events.db"
         done = "a0000000-0000-4000-8000-0000000000a1"
         failed = "b0000000-0000-4000-8000-0000000000a2"
-        store = open_task_store(
-            path, create=True, vocabulary=build_task_vocabulary(Settings())
-        )
+        store = open_task_store(path, create=True, vocabulary=build_task_vocabulary(Settings()))
         try:
             store.ensure_task(done, source="terminal")
             store.update_status(done, TaskStatus.RUNNING)
@@ -848,6 +846,35 @@ class TestTasksCommand:
         assert "completed" in result.output
         assert "done" in result.output
         assert "failed/tool" in result.output
+
+    def test_piped_output_keeps_complete_headers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """C6: no terminal means no width, so no header may be truncated."""
+        from jarvis.config import Settings
+        from jarvis.taskstore import TaskStage, TaskStatus, open_task_store
+        from jarvis.taskstore.runtime import build_task_vocabulary
+
+        path = tmp_path / "task_events.db"
+        done = "a0000000-0000-4000-8000-0000000000a1"
+        store = open_task_store(path, create=True, vocabulary=build_task_vocabulary(Settings()))
+        try:
+            store.ensure_task(done, source="terminal")
+            store.update_status(done, TaskStatus.RUNNING)
+            store.update_stage(done, TaskStage.EXECUTING)
+            store.finish(done, TaskStatus.COMPLETED)
+        finally:
+            store.close()
+        self._wire(monkeypatch, path)
+
+        result = runner.invoke(cli.app, ["tasks"], env={"TERM": "dumb", "COLUMNS": "40"})
+
+        assert result.exit_code == 0, result.output
+        header = result.output.splitlines()[0].split("\t")
+        assert list(cli.TASK_COLUMNS) == header
+        assert "\u2026" not in result.output
+        assert done[:12] in result.output
+        assert "completed" in result.output
 
     def test_unreadable_store_degrades_without_a_traceback(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
