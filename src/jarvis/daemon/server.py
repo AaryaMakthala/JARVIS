@@ -35,6 +35,7 @@ from typing import Any
 import psutil
 
 from jarvis import logging_setup
+from jarvis.agent.answer import delivered_answer
 from jarvis.browser.context import BrowserError, PlaywrightBrowser
 from jarvis.browser.lazy import LazyProfileBrowser
 from jarvis.config import Settings, daemon_runtime_file, load_settings, log_file
@@ -2145,14 +2146,20 @@ class DaemonServer:
                         slot.event.set()
                     return
 
-                # The voice channel speaks the composed short answer when the
-                # `compose` node produced one; otherwise it keeps the full
-                # final answer (the pre-compose behaviour).
-                spoken = getattr(outcome, "spoken_answer", None) or outcome.final_answer
-                if spoken and not outcome.confirmation:
-                    slot.result_text = spoken
+                # The channel decides what it receives: the voice device
+                # speaks the composed short answer, while a terminal client
+                # must get the factual final/screen answer ("Today is ..."),
+                # never the spoken courtesy ("Done.").
+                delivered = delivered_answer(
+                    voice=slot.source == "voice",
+                    final_answer=outcome.final_answer,
+                    screen_answer=getattr(outcome, "screen_answer", None),
+                    spoken_answer=getattr(outcome, "spoken_answer", None),
+                )
+                if delivered and not outcome.confirmation:
+                    slot.result_text = delivered
                     slot.done = True
-                    self._record_turn(slot, outcome.state, answer=spoken)
+                    self._record_turn(slot, outcome.state, answer=delivered)
                     self._wake_dispatch()
                     if slot.owner_id == VOICE_OWNER:
                         slot.event.set()
