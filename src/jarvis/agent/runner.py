@@ -18,7 +18,7 @@ from jarvis.agent.context import AppContext
 from jarvis.agent.graph import build_graph
 from jarvis.agent.schemas import AgentResponse
 from jarvis.agent.state import Decision, StepResult
-from jarvis.taskstore.models import TERMINAL_STATUSES, TaskStoreError
+from jarvis.taskstore.models import TERMINAL_STATUSES, TaskStatus, TaskStoreError
 from jarvis.tools.base import CancelToken
 
 __all__ = ["TaskOutcome", "extract_interrupt", "resume_task", "run_task"]
@@ -116,7 +116,9 @@ def run_task(
     if conversation_id:
         values["conversation_id"] = conversation_id
     values = graph.invoke(values, config)
-    return _outcome(task_id, config, checkpointer, graph, values)
+    outcome = _outcome(task_id, config, checkpointer, graph, values)
+    _mark_paused(ctx, outcome)
+    return outcome
 
 
 def resume_task(
@@ -142,8 +144,45 @@ def resume_task(
             results=[],
         )
     graph = build_graph(ctx, checkpointer, cancel)
+    _mark_running(ctx, thread_id)
     values = graph.invoke(Command(resume=answer), config)
-    return _outcome(thread_id, config, checkpointer, graph, values)
+    outcome = _outcome(thread_id, config, checkpointer, graph, values)
+    _mark_paused(ctx, outcome)
+    return outcome
+
+
+def _mark_running(ctx: AppContext, task_id: str) -> None:
+    """Record that a paused task is running again (best-effort, B7)."""
+    _set_status(ctx, task_id, TaskStatus.RUNNING)
+
+
+def _mark_paused(ctx: AppContext, outcome: TaskOutcome) -> None:
+    """Record an honest ``awaiting_*`` status while the graph waits on a human.
+
+    Without this, the store (and therefore ``jarvis status``) called an
+    interrupted task "running" while it was actually waiting for an approval
+    or a clarification.  Best-effort: observability never changes the answer.
+    """
+    if not outcome.confirmation:
+        return
+    from jarvis.taskstore import TaskStatus as Status
+
+    status = (
+        Status.AWAITING_CLARIFICATION
+        if outcome.interrupt_kind == "clarification"
+        else Status.AWAITING_CONFIRMATION
+    )
+    _set_status(ctx, outcome.task_id, status)
+
+
+def _set_status(ctx: AppContext, task_id: str, status: Any) -> None:
+    tasks = getattr(ctx, "tasks", None)
+    if tasks is None or not getattr(tasks, "available", False) or not task_id:
+        return
+    try:
+        tasks.update_status(task_id, status)
+    except Exception:  # observability must never change the task's answer
+        ctx.logger.debug("task status %s not recorded", status, exc_info=True)
 
 
 def _resume_refusal(
