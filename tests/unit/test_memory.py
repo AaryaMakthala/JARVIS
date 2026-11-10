@@ -417,7 +417,7 @@ def test_remember_never_raises_on_a_broken_backend(memory: SqliteMemory) -> None
 
     outcome = _write(Exploding(), MemoryRecord(text="x"), "")
     assert outcome.record is None
-    assert outcome.reason == "memory write failed"
+    assert outcome.reason == "error"
 
 
 # ------------------------------------------------------------------ factory

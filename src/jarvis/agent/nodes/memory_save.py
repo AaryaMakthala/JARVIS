@@ -48,6 +48,7 @@ from jarvis.agent.state import Plan, StepResult
 from jarvis.memory.base import MemoryRecord
 from jarvis.memory.db import looks_secret, safe_value
 from jarvis.memory.failures import failure_category
+from jarvis.memory.intent import detect_memory_intent
 
 __all__ = ["REASONS", "detect_name_statement", "memory_save"]
 
@@ -61,8 +62,12 @@ SKIPPED_CANCELLED = "skipped_cancelled"
 SKIPPED_HALTED = "skipped_halted"
 SKIPPED_UNVERIFIED = "skipped_unverified"
 SKIPPED_SENSITIVE = "skipped_sensitive"
+SKIPPED_TOO_LONG = "skipped_too_long"
 SKIPPED_CONVERSATION = "skipped_conversation"
 NAME_SAVED = "name_saved"
+FACT_SAVED = "fact_saved"
+FACT_FORGOTTEN = "fact_forgotten"
+FACT_NOT_FOUND = "fact_not_found"
 #: Nothing was recorded for a reason outside the task itself: no backend (or a
 #: disabled memory), ``--dry-run``, ``save_skills`` off, or a write that raised.
 ERROR = "error"
@@ -73,8 +78,12 @@ REASONS = (
     SKIPPED_HALTED,
     SKIPPED_UNVERIFIED,
     SKIPPED_SENSITIVE,
+    SKIPPED_TOO_LONG,
     SKIPPED_CONVERSATION,
     NAME_SAVED,
+    FACT_SAVED,
+    FACT_FORGOTTEN,
+    FACT_NOT_FOUND,
     ERROR,
 )
 
@@ -213,14 +222,26 @@ def memory_save(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     Returns three state keys, and **every** return path sets all three:
 
-    * ``memory_saved`` - a **skill** was stored (a failure record does not
-      count: learning from a failure is not the same as learning a skill);
+    * ``memory_saved`` - a **skill** or explicit fact was stored (a failure
+      record does not count: learning from a failure is not the same as
+      learning a skill);
     * ``memory_saved_reason`` - one of :data:`REASONS` (``"saved"``,
       ``"skipped_cancelled"``, ``"skipped_halted"``, ``"skipped_unverified"``,
-      ``"skipped_sensitive"``, ``"skipped_conversation"``, ``"error"``,
-      ``"name_saved"``), never ``None``;
+      ``"skipped_sensitive"``, ``"skipped_too_long"``,
+      ``"skipped_conversation"``, ``"error"``, ``"name_saved"``,
+      ``"fact_saved"``, ``"fact_forgotten"``, ``"fact_not_found"``), never
+      ``None``;
     * ``memory_failure_logged`` - a failure example was written instead.
     """
+    fact = _apply_fact_intent(state, ctx)
+    if fact is not None:
+        reason, saved = fact
+        ctx.logger.debug("memory: %s", reason)
+        return {
+            "memory_saved": saved,
+            "memory_saved_reason": reason,
+            "memory_failure_logged": False,
+        }
     outcome = _outcome(state, ctx)
     if outcome.reason != SAVED:
         ctx.logger.debug("memory: %s", outcome.reason)
@@ -233,6 +254,69 @@ def memory_save(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         "memory_saved_reason": reason,
         "memory_failure_logged": outcome.is_failure,
     }
+
+
+# ------------------------------------------------------------ explicit facts
+
+
+def _apply_fact_intent(state: dict[str, Any], ctx: AppContext) -> tuple[str, bool] | None:
+    """Persist/forget one deterministic explicit-fact command.
+
+    Returns ``(reason, saved)`` when this turn is a memory command, else
+    ``None`` so normal skill/failure/name handling runs.  Only conversation
+    turns qualify: a tool plan is never silently converted into a memory write.
+    """
+    intent = detect_memory_intent(str(state.get("user_input") or ""))
+    if intent is None:
+        return None
+    if state.get("clarification_question") or state.get("clarification_answer") is not None:
+        return None
+    plan: Plan | None = state.get("plan")
+    if plan is None or plan.kind != "conversation" or plan.steps:
+        return None
+    if state.get("cancelled"):
+        return SKIPPED_CANCELLED, False
+    if state.get("halted_reason"):
+        return SKIPPED_HALTED, False
+    if intent.error == "sensitive":
+        ctx.logger.info("memory event=fact_refused reason=sensitive")
+        return SKIPPED_SENSITIVE, False
+    if intent.error == "too_long":
+        ctx.logger.info("memory event=fact_refused reason=too_long")
+        return SKIPPED_TOO_LONG, False
+    if ctx.dry_run or ctx.memory is None:
+        return ERROR, False
+    preferences = getattr(ctx.memory, "preferences", None)
+    if intent.action == "remember":
+        setter = getattr(preferences, "set", None)
+        if not callable(setter):
+            return ERROR, False
+        try:
+            setter(intent.key, intent.content)
+        except ValueError as exc:
+            ctx.logger.info("memory event=fact_refused reason=invalid_value: %s", exc)
+            return SKIPPED_SENSITIVE, False
+        except Exception as exc:  # noqa: BLE001 - memory must never break the turn
+            _LOG.warning("fact not stored: %s", exc)
+            return ERROR, False
+        ctx.logger.info("memory event=fact_saved category=%s", intent.category)
+        return FACT_SAVED, True
+    getter = getattr(preferences, "get", None)
+    deleter = getattr(preferences, "delete", None)
+    if not callable(getter) or not callable(deleter):
+        return ERROR, False
+    try:
+        existing = getter(intent.key)
+        if not existing:
+            return FACT_NOT_FOUND, False
+        removed = bool(deleter(intent.key))
+    except Exception as exc:  # noqa: BLE001 - memory must never break the turn
+        _LOG.warning("fact not forgotten: %s", exc)
+        return ERROR, False
+    if not removed:
+        return FACT_NOT_FOUND, False
+    ctx.logger.info("memory event=fact_forgotten category=%s", intent.category)
+    return FACT_FORGOTTEN, False
 
 
 # --------------------------------------------------------------------- gate

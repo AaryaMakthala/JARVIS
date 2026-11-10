@@ -23,12 +23,38 @@ from dataclasses import dataclass
 
 from jarvis.memory.db import looks_secret, now_iso, prune_preferences, secret_key
 
-__all__ = ["MAX_KEY_CHARS", "MAX_VALUE_CHARS", "Preference", "PreferenceStore", "normalise_key"]
+__all__ = [
+    "FACT_KEY_PREFIX",
+    "MAX_KEY_CHARS",
+    "MAX_VALUE_CHARS",
+    "Preference",
+    "PreferenceStore",
+    "fact_details",
+    "normalise_key",
+]
 
 MAX_KEY_CHARS = 64
 MAX_VALUE_CHARS = 400
 
+#: Prefix for explicit facts remembered in the preferences table.  A fact key
+#: looks like ``fact.<category>.<slug>_<hash>``: the category is for
+#: inspection, and the short hash keeps two subjects with the same slug
+#: distinct.  No schema change is needed; the existing key/value table already
+#: gives atomic overwrite, pruning and deletion.
+FACT_KEY_PREFIX = "fact."
+
 _KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+
+
+def fact_details(key: str) -> tuple[str, str] | None:
+    """Return ``(category, slug)`` for a fact key, or ``None`` for a preference."""
+    if not key.startswith(FACT_KEY_PREFIX):
+        return None
+    rest = key[len(FACT_KEY_PREFIX) :]
+    category, separator, slug = rest.partition(".")
+    if not separator or not category or not slug:
+        return None
+    return category, slug
 
 
 def normalise_key(key: str) -> str:
@@ -60,8 +86,22 @@ class Preference:
     value: str
     updated_at: str = ""
 
+    @property
+    def category(self) -> str:
+        """``preference`` for ordinary settings, else the fact category."""
+        details = fact_details(self.key)
+        return details[0] if details is not None else "preference"
+
+    @property
+    def provenance(self) -> str:
+        """Where the value came from: always the human's explicit words."""
+        return "user_explicit"
+
     def as_memory_text(self) -> str:
         """The form handed to the planner as stable user context."""
+        details = fact_details(self.key)
+        if details is not None:
+            return f"Remembered fact ({details[0]}): {self.value}"
         return f"User preference: {self.key} = {self.value}"
 
 
@@ -71,6 +111,11 @@ class PreferenceStore:
     def __init__(self, conn: sqlite3.Connection, *, max_rows: int = 50) -> None:
         self._conn = conn
         self._max_rows = int(max_rows)
+
+    @property
+    def max_rows(self) -> int:
+        """Maximum number of rows this store retains."""
+        return self._max_rows
 
     def get(self, key: str, default: str | None = None) -> str | None:
         """One value by key, or ``default``."""

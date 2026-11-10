@@ -8,9 +8,10 @@ wipe the rest of memory.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -38,8 +39,8 @@ def memory() -> SqliteMemory:
         store.close()
 
 
-def _ctx(memory: Any, **settings_kwargs: Any):
-    return make_app_context(Settings(**settings_kwargs), memory=memory)
+def _ctx(store: Any, **settings_kwargs: Any):
+    return make_app_context(Settings(**settings_kwargs), memory=store)
 
 
 def _conversation(text: str, **extra: Any) -> dict[str, Any]:

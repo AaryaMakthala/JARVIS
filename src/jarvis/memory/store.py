@@ -29,7 +29,7 @@ from jarvis.memory import embeddings
 from jarvis.memory.base import MemoryRecord, NullMemory
 from jarvis.memory.db import open_db
 from jarvis.memory.failures import FAILURE_SIMILARITY, FailureStore
-from jarvis.memory.prefs import PreferenceStore
+from jarvis.memory.prefs import PreferenceStore, fact_details
 from jarvis.memory.skills import SkillStore
 from jarvis.memory.tasklog import TaskLogStore
 
@@ -77,8 +77,9 @@ class SqliteMemory:
         Ordering is deliberate: a verified earlier *approach* is the most
         useful thing for the planner, a preference is stable context, and a
         failure is a "prefer another approach" hint worth the least prompt
-        space.  The list is capped at ``limit`` here as well as in the node, so
-        no caller can exceed it.
+        space.  One slot is reserved for explicit facts when any exist, so a
+        fact cannot be crowded out by skill matches.  The list is capped at
+        ``limit`` here as well as in the node, so no caller can exceed it.
 
         Every source is *scoped to ``query``**.  Failures used to be the most
         recent N regardless of the request, which meant one remembered failure
@@ -89,8 +90,18 @@ class SqliteMemory:
             return []
         records: list[MemoryRecord] = []
         with self._lock:
-            records.extend(self._skill_records(query, limit))
-            records.extend(self._preference_records(limit - len(records)))
+            # Explicit facts are tiny and were deliberately stored by the
+            # human, so reserve one slot before skills can consume the whole
+            # budget.  Ordinary preferences keep the old behaviour (they may
+            # still use any remaining slot) so a learned name cannot silently
+            # reduce skill retrieval.  Facts go first within the preference
+            # block, ensuring the reserve cannot be taken by a newer setting.
+            preferences = self._preference_records(max(limit, self.preferences.max_rows))
+            facts = [record for record in preferences if record.meta.get("fact")]
+            reserve = 1 if facts else 0
+            records.extend(self._skill_records(query, max(0, limit - reserve)))
+            ordered = facts + [record for record in preferences if not record.meta.get("fact")]
+            records.extend(ordered[: max(0, limit - len(records))])
             records.extend(self._failure_records(query, limit - len(records)))
         return records[:limit]
 
@@ -203,7 +214,16 @@ class SqliteMemory:
             self._log.warning("preference retrieval failed: %s", exc)
             return []
         return [
-            MemoryRecord(kind="preference", text=pref.as_memory_text(), meta={"key": pref.key})
+            MemoryRecord(
+                kind="preference",
+                text=pref.as_memory_text(),
+                meta={
+                    "key": pref.key,
+                    "category": pref.category,
+                    "provenance": pref.provenance,
+                    "fact": fact_details(pref.key) is not None,
+                },
+            )
             for pref in prefs
         ]
 

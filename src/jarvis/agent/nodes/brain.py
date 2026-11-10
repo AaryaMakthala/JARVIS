@@ -37,6 +37,7 @@ from jarvis.agent.state import Plan, RequestKind, Step
 from jarvis.agent.tool_groups import select_catalogue, trim_site_catalogue
 from jarvis.browser.sites import render_site_catalogue, sites_from_settings
 from jarvis.llm.routing import route_request
+from jarvis.memory.intent import detect_memory_intent
 from jarvis.messaging.grounding import ground_brain_update
 
 #: Deterministic, user-facing halt reasons.  The LLM output never reaches the
@@ -66,6 +67,9 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     fp_update = fastpath.brain_update(state, ctx)
     if fp_update is not None:
         return fp_update
+    memory_update = _memory_command(state, ctx)
+    if memory_update is not None:
+        return memory_update
     if ctx.llm is None:
         # Fail immediately: there is nothing to wait for, so no retry, no
         # timeout, no provider probing may happen on this path.
@@ -201,6 +205,104 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     # contact and the approval binds to it.  Deterministic resolution runs
     # first; only an unresolved reference may use the tool-free text model.
     return ground_brain_update(update, state, ctx)
+
+
+def _memory_command(state: dict[str, Any], ctx: AppContext) -> dict[str, Any] | None:
+    """Answer a clear remember/forget command without calling the LLM.
+
+    The deterministic parser only recognises imperative memory commands.  The
+    write itself happens in ``memory_save`` (the single memory-write node), so
+    this function has no side effects and cannot change the policy path.
+    """
+    intent = detect_memory_intent(str(state.get("user_input") or ""))
+    if intent is None:
+        return None
+    # Never hijack the answer to a pending clarification: that turn belongs to
+    # the original task, and a memory-like phrase may be its requested detail.
+    if state.get("clarification_question") or state.get("clarification_answer") is not None:
+        return None
+    task_id = state.get("task_id")
+    if intent.error == "sensitive":
+        ctx.logger.info(
+            "agent event=memory_command task_id=%s action=%s reason=sensitive",
+            task_id,
+            intent.action,
+        )
+        return _memory_answer(
+            "I won't remember that: it looks like a credential or other sensitive information.",
+            "refuse a sensitive memory",
+        )
+    if intent.error == "too_long":
+        ctx.logger.info(
+            "agent event=memory_command task_id=%s action=%s reason=too_long",
+            task_id,
+            intent.action,
+        )
+        return _memory_answer(
+            "I can only remember short facts (up to 400 characters), so I haven't stored that.",
+            "refuse an oversized memory",
+        )
+    if ctx.dry_run:
+        ctx.logger.info(
+            "agent event=memory_command task_id=%s action=%s reason=dry_run",
+            task_id,
+            intent.action,
+        )
+        verb = "store" if intent.action == "remember" else "forget"
+        return _memory_answer(f"This is a dry run, so I won't {verb} that.", "simulate memory")
+    preferences = getattr(ctx.memory, "preferences", None)
+    getter = getattr(preferences, "get", None)
+    setter = getattr(preferences, "set", None)
+    deleter = getattr(preferences, "delete", None)
+    if intent.action == "remember":
+        if not callable(setter):
+            return _memory_answer(
+                "I can't remember that because local memory isn't available.", "memory unavailable"
+            )
+        try:
+            existing = getter(intent.key) if callable(getter) else None
+        except Exception:  # noqa: BLE001 - reading memory must never break the turn
+            existing = None
+        answer = (
+            "I already have that stored, sir."
+            if existing == intent.content
+            else "Noted, sir. I'll remember that."
+        )
+        ctx.logger.info(
+            "agent event=memory_command task_id=%s action=remember reason=accepted",
+            task_id,
+        )
+        return _memory_answer(answer, "remember an explicit fact")
+    if not callable(getter) or not callable(deleter):
+        return _memory_answer(
+            "I can't forget that because local memory isn't available.", "memory unavailable"
+        )
+    try:
+        existing = getter(intent.key)
+    except Exception as exc:  # noqa: BLE001 - report honestly, never raise
+        ctx.logger.warning("memory lookup failed: %s", exc)
+        return _memory_answer(
+            "I couldn't check local memory, so I haven't forgotten anything.",
+            "memory unavailable",
+        )
+    answer = "I'll forget that, sir." if existing else "I don't have that stored, sir."
+    ctx.logger.info(
+        "agent event=memory_command task_id=%s action=forget reason=accepted",
+        task_id,
+    )
+    return _memory_answer(answer, "forget an explicit fact")
+
+
+def _memory_answer(answer: str, goal: str) -> dict[str, Any]:
+    """A conversation update with no tool steps and no LLM usage."""
+    return {
+        "plan": Plan(kind="conversation", goal=goal, steps=[], dialog_answer=answer),
+        "request_kind": "conversation",
+        "final_answer": answer,
+        "clarification_question": None,
+        "clarification_answer": None,
+        "error": None,
+    }
 
 
 def _session_reference_block(state: dict[str, Any], ctx: AppContext) -> str | None:
