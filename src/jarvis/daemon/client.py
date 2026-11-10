@@ -39,6 +39,11 @@ from jarvis.secrets import SecretStore
 
 logger = get_logger("daemon.client")
 
+#: The event loop this module created for the current thread, if any.  Only an
+#: owned loop may be closed on :meth:`DaemonClient.close`; an application or test
+#: loop we merely borrowed must be left alone.
+_OWNED_LOOP: asyncio.AbstractEventLoop | None = None
+
 
 class DaemonError(Exception):
     """Raised when the daemon returns an error or is unreachable."""
@@ -50,27 +55,50 @@ class DaemonError(Exception):
 
 
 def _get_or_create_loop() -> asyncio.AbstractEventLoop:
-    """Get or create an event loop that works on Python 3.10+.
+    """Return the loop this client runs its blocking calls on.
 
-    ``asyncio.get_event_loop()`` raises ``RuntimeError`` when no loop is
-    set in the current thread (Python 3.10+).  This helper creates one
-    lazily and stores it so repeated calls within the same thread reuse it.
+    A loop that is already *running* is borrowed (calling ``run_until_complete``
+    there is the caller's error, not ours).  Otherwise the client creates and
+    remembers its own loop, so :meth:`DaemonClient.close` can shut it down and a
+    short CLI process can exit.  Reusing the process default loop used to make
+    ownership unknowable - and on Windows ``get_event_loop()`` silently creates
+    one - which is why the piped acceptance run never released it.
     """
+    global _OWNED_LOOP
     try:
-        loop = asyncio.get_running_loop()
+        running = asyncio.get_running_loop()
     except RuntimeError:
-        loop = None
-    if loop is not None:
-        return loop
-    # No running loop; create or get a cached one for this thread
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("closed")
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        running = None
+    if running is not None:
+        return running
+    if _OWNED_LOOP is not None and not _OWNED_LOOP.is_closed():
+        return _OWNED_LOOP
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _OWNED_LOOP = loop
     return loop
+
+
+def _close_owned_loop() -> None:
+    """Close the loop this module created, so a short CLI process can exit.
+
+    Without this a finished pipe/REPL left its selector (and, on Windows, the
+    proactor's watcher) open until interpreter teardown.  Closing here is what
+    makes ``jarvis run "..." | cat`` return instead of hanging.  The next call
+    simply creates a fresh loop.
+    """
+    global _OWNED_LOOP
+    loop, _OWNED_LOOP = _OWNED_LOOP, None
+    if loop is None or loop.is_closed():
+        return
+    try:
+        asyncio.set_event_loop(None)
+    except (RuntimeError, ValueError):
+        pass
+    try:
+        loop.close()
+    except (RuntimeError, ValueError):
+        logger.debug("event loop close failed", exc_info=True)
 
 
 class DaemonClient:
@@ -142,7 +170,13 @@ class DaemonClient:
             raise DaemonError(code="auth_failed", message="authentication failed")
 
     def close(self) -> None:
-        """Close the connection."""
+        """Close the connection and any loop this client made.
+
+        ``close`` is safe to call twice and safe when no connection was ever
+        opened (the CLI calls it from ``finally`` on every path).  The loop is
+        closed last, after the socket, so no stream callback can fire into a
+        closed loop.
+        """
         self._pending.clear()
         if self._writer is not None:
             try:
@@ -151,6 +185,7 @@ class DaemonClient:
                 logger.debug("error closing client connection", exc_info=True)
             self._writer = None
             self._reader = None
+        _close_owned_loop()
 
     # ── send helpers ───────────────────────────────────────────────────
 

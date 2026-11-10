@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import getpass
 import logging
+import sys
 import traceback
 import unicodedata
 import uuid
@@ -78,6 +79,26 @@ voice_app = typer.Typer(help="Voice diagnostics and control.", no_args_is_help=T
 app.add_typer(password_app, name="password")
 app.add_typer(autostart_app, name="autostart")
 app.add_typer(voice_app, name="voice")
+
+def _utf8_stdout() -> Any:
+    """Return a stdout that can render any answer on a Windows console/pipe.
+
+    The live acceptance run crashed with ``UnicodeEncodeError: 'charmap' codec``
+    on the non-breaking hyphen in a web answer (U+2011).  Python 3.7+ text
+    streams can be reconfigured in place; ``errors="replace"`` is the final
+    guard for a stream that still cannot represent a character, so printing an
+    answer never kills the session.  When stdout is not reconfigurable (a test
+    capture object, an already-wrapped stream) it is returned unchanged.
+    """
+    stream = sys.stdout
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            logger.debug("stdout could not be switched to UTF-8", exc_info=True)
+    return stream
+
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -757,7 +778,10 @@ def _main(
         ),
     ] = False,
 ) -> None:
-    pass  # option is handled by the eager callback above
+    # Reconfigure the *real* stdout once per process, before any command can
+    # print an answer.  ``console`` itself stays bound to the current
+    # ``sys.stdout`` so Click's/CliRunner's capture keeps working.
+    _utf8_stdout()
 
 
 # ── init ─────────────────────────────────────────────────────────────────
