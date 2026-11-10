@@ -137,6 +137,18 @@ class TaskEventCode(str, Enum):
     CHECKPOINT = "checkpoint"
 
 
+class TaskRecoveryCode(str, Enum):
+    """Failure codes written only by startup reconciliation.
+
+    These are part of the trusted vocabulary even though the graph never emits
+    them: recovery has to record *why* it closed an abandoned row, and a code
+    missing from the allow-list made reconciliation fail closed instead of
+    expiring the row.
+    """
+
+    EXPIRED = "expired"
+
+
 class TaskFailureCategory(str, Enum):
     """Allowed failure categories."""
 

@@ -51,7 +51,7 @@ from .privacy import (
     safe_task_id,
     sanitize_detail,
 )
-from .vocabulary import TaskOutcome, TaskStoreVocabulary
+from .vocabulary import TaskOutcome, TaskRecoveryCode, TaskStoreVocabulary
 
 __all__ = [
     "NullTaskEventStore",
@@ -847,9 +847,18 @@ class _SqliteTaskEventStore:
                     task_id,
                     TaskStatus.EXPIRED,
                     failure_category="timeout",
-                    failure_code="expired",
+                    failure_code=TaskRecoveryCode.EXPIRED.value,
                 )
             except InvalidTaskTransition:
+                continue
+            except (TaskStoreError, ValueError, OSError):
+                # One unreadable row must not block recovery of every other
+                # stale row; leave it non-terminal (unknown, not expired) and
+                # keep going.
+                _LOG.warning(
+                    "taskstore: stale task %s could not be expired", task_id, exc_info=True
+                )
+                skipped_unknown += 1
                 continue
             expired.append(task_id)
         return TaskReconcileResult(

@@ -45,7 +45,17 @@ VOCAB = TaskStoreVocabulary(
     nodes=frozenset({"planner", "respond"}),
     failure_codes=frozenset({"expired", "E_TOOL"}),
     failure_categories=frozenset(
-        {"policy", "validation", "tool", "llm", "timeout", "cancelled", "verification", "internal", "unknown"}
+        {
+            "policy",
+            "validation",
+            "tool",
+            "llm",
+            "timeout",
+            "cancelled",
+            "verification",
+            "internal",
+            "unknown",
+        }
     ),
 )
 
@@ -232,23 +242,30 @@ def test_unknown_liveness_and_legacy_owner_are_not_expired(db_path: Path) -> Non
 
 def test_owner_is_alive_rejects_pid_reuse_and_missing_age() -> None:
     current = psutil.Process()
-    assert owner_is_alive(
-        TaskOwner(
-            instance_id="a" * 32,
-            pid=current.pid,
-            process_create_time=current.create_time(),
+    assert (
+        owner_is_alive(
+            TaskOwner(
+                instance_id="a" * 32,
+                pid=current.pid,
+                process_create_time=current.create_time(),
+            )
         )
-    ) is True
-    assert owner_is_alive(
-        TaskOwner(
-            instance_id="a" * 32,
-            pid=current.pid,
-            process_create_time=current.create_time() - 20.0,
+        is True
+    )
+    assert (
+        owner_is_alive(
+            TaskOwner(
+                instance_id="a" * 32,
+                pid=current.pid,
+                process_create_time=current.create_time() - 20.0,
+            )
         )
-    ) is False
-    assert owner_is_alive(
-        TaskOwner(instance_id="a" * 32, pid=current.pid, process_create_time=None)
-    ) is None
+        is False
+    )
+    assert (
+        owner_is_alive(TaskOwner(instance_id="a" * 32, pid=current.pid, process_create_time=None))
+        is None
+    )
 
 
 def test_owner_fields_round_trip(db_path: Path) -> None:
@@ -300,6 +317,64 @@ def test_v2_schema_migrates_without_losing_rows(db_path: Path) -> None:
         store.close()
 
 
+def test_runtime_vocabulary_contains_the_recovery_code() -> None:
+    """The bug: reconciliation used a code the production vocabulary rejected."""
+    from jarvis.taskstore.runtime import build_task_vocabulary
+
+    assert "expired" in build_task_vocabulary().failure_codes
+
+
+def test_runtime_store_expires_a_dead_row(db_path: Path) -> None:
+    """Reproduce the live startup failure end to end with the real vocabulary."""
+    from jarvis.taskstore.runtime import open_runtime_task_store
+
+    dead = _owner("a" * 32, _dead_pid(), 100.0)
+    store = open_runtime_task_store(path=db_path, owner=dead)
+    try:
+        store.ensure_task(TASK_1, source="voice")
+        store.update_status(TASK_1, TaskStatus.RUNNING)
+    finally:
+        store.close()
+
+    store = open_runtime_task_store(path=db_path)
+    try:
+        result = store.reconcile_stale_tasks(_owner("b" * 32, 999999, 200.0), lambda _: False)
+        snapshot = store.get(TASK_1)
+        assert snapshot is not None and snapshot.status is TaskStatus.EXPIRED
+        assert snapshot.failure_code == "expired"
+        assert result.expired_task_ids == (TASK_1,)
+    finally:
+        store.close()
+
+
+def test_one_unreadable_row_does_not_block_the_rest(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dead = _owner("a" * 32, _dead_pid(), 100.0)
+    for task_id in (TASK_1, TASK_2):
+        _create_task(db_path, task_id, dead)
+        _set_status(db_path, task_id, TaskStatus.RUNNING)
+    store = open_task_store(db_path, vocabulary=VOCAB)
+    original = store.finish
+
+    def broken(task_id: str, *args: Any, **kwargs: Any) -> Any:
+        if task_id == TASK_1:
+            raise ValueError("failure_code is not configured")
+        return original(task_id, *args, **kwargs)
+
+    monkeypatch.setattr(store, "finish", broken)
+    try:
+        result = store.reconcile_stale_tasks(_owner("b" * 32, 999999, 200.0), lambda _: False)
+        first = store.get(TASK_1)
+        second = store.get(TASK_2)
+        assert first is not None and first.status is TaskStatus.RUNNING
+        assert second is not None and second.status is TaskStatus.EXPIRED
+        assert result.expired_task_ids == (TASK_2,)
+        assert result.skipped_unknown == 1
+    finally:
+        store.close()
+
+
 def test_process_crash_reconciles_real_owner(db_path: Path) -> None:
     open_task_store(db_path, create=True, vocabulary=VOCAB).close()
     context = multiprocessing.get_context("spawn")
@@ -316,6 +391,7 @@ def test_process_crash_reconciles_real_owner(db_path: Path) -> None:
         assert result.expired_task_ids == (TASK_1,)
     finally:
         store.close()
+
 
 def test_daemon_prepares_recovery_before_serving(
     db_path: Path, monkeypatch: pytest.MonkeyPatch

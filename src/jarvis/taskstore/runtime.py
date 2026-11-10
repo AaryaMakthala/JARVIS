@@ -18,7 +18,11 @@ from jarvis import config
 from jarvis.taskstore.models import TaskOwner, TaskStoreError
 from jarvis.taskstore.schema import SchemaError
 from jarvis.taskstore.store import NullTaskEventStore, TaskStore, open_task_store
-from jarvis.taskstore.vocabulary import TaskFailureCategory, TaskStoreVocabulary
+from jarvis.taskstore.vocabulary import (
+    TaskFailureCategory,
+    TaskRecoveryCode,
+    TaskStoreVocabulary,
+)
 
 __all__ = ["build_task_vocabulary", "open_runtime_task_store"]
 
@@ -60,7 +64,8 @@ def build_task_vocabulary(
         models=frozenset(_configured_models(settings)),
         tools=frozenset(tools),
         nodes=GRAPH_NODE_NAMES,
-        failure_codes=frozenset(code.value for code in FailureCode),
+        failure_codes=frozenset(code.value for code in FailureCode)
+        | frozenset(code.value for code in TaskRecoveryCode),
         failure_categories=frozenset(category.value for category in TaskFailureCategory),
     )
 
