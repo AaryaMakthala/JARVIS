@@ -718,7 +718,7 @@ def run_doctor(
 
     checks.append(_vision_check(settings, store, providers))
     checks.append(_task_store_check(settings))
-    checks.extend(optional_backend_checks())
+    checks.extend(optional_backend_checks(settings.perception))
     checks.extend(_health_checks(_daemon_llm_health()))
 
     if live:

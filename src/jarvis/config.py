@@ -216,15 +216,27 @@ max_preferences = 50
 [tools]
 max_code_chars = 4000
 
+[perception]
+# Local-only OCR.  PaddleOCR PP-OCRv6-small runs on the CPU; screenshots are
+# never sent to a vision model or alternate OCR service.  Put the two model
+# folders, PP-OCRv6_small_det and PP-OCRv6_small_rec, in this directory.  Leave
+# empty to use `<JARVIS data dir>/models/paddleocr`; nothing is downloaded at
+# runtime.  The image caps bound decode memory, and the engine is unloaded after
+# the idle period (0 disables idle unload).
+ocr_model_dir = ""
+ocr_max_image_bytes = 16777216
+ocr_max_image_side = 4096
+ocr_idle_unload_seconds = 300.0
+# Mean OCR confidence below this is reported as low.
+ocr_low_conf = 0.6
+
 [screen]
 # Stage 6 read-only screen understanding.  Default target is the FOREGROUND
 # window only (D16); `list_windows` already covers "what is open".
 #
-# Cloud vision is OFF.  A screenshot is sent to a vision model only when the
-# owner sets allow_cloud_vision = true AND every other privacy layer passes
-# (D15/I11): a spoken notice alone is never consent, no screenshot is ever
-# written to disk or logged, and local UIA/OCR text is always tried first.
-allow_cloud_vision = false
+# Screen perception is local-only: UI Automation text and local OCR are used,
+# and no screenshot is ever written to disk, logged, sent to a vision model, or
+# sent to an OCR service.
 # Refuse to capture when the foreground window's process name matches any of
 # these case-insensitive fragments (password managers, banking helpers).  This
 # is layer 1 of the privacy model (B5); extend it for your own sensitive apps.
@@ -674,8 +686,32 @@ class ToolsSettings(BaseModel):
 
 
 class PerceptionSettings(BaseModel):
-    """Perception thresholds (``[perception]`` in config.toml)."""
+    """Perception settings (``[perception]`` in config.toml).
 
+    OCR is local-only PaddleOCR PP-OCRv6-small.  ``ocr_model_dir`` is the
+    explicit directory containing ``PP-OCRv6_small_det`` and
+    ``PP-OCRv6_small_rec``; an empty value means
+    ``<JARVIS data dir>/models/paddleocr``.  The image caps bound decoding, and
+    ``ocr_idle_unload_seconds`` releases the model memory after inactivity
+    (``0`` disables idle unload).
+    """
+
+    ocr_model_dir: str = ""
+    ocr_max_image_bytes: int = Field(
+        default=16 * 1024 * 1024,
+        ge=1024,
+        description="Reject screenshots larger than this before decoding them.",
+    )
+    ocr_max_image_side: int = Field(
+        default=4096,
+        ge=256,
+        description="Downscale a screenshot so its longest side does not exceed this.",
+    )
+    ocr_idle_unload_seconds: float = Field(
+        default=300.0,
+        ge=0.0,
+        description="Unload the OCR engine after this idle period; 0 disables it.",
+    )
     ocr_low_conf: float = Field(
         default=0.6,
         ge=0.0,
@@ -687,8 +723,7 @@ class PerceptionSettings(BaseModel):
 class ScreenSettings(BaseModel):
     """Screen-perception settings (``[screen]`` in config.toml, Stage 6).
 
-    Implements the layered privacy model of **B5** and the opt-in cloud rule of
-    **D15/I11**:
+    Implements the layered privacy model of **B5**:
 
     * ``deny_processes`` / ``deny_title_fragments`` are the first layer - a
       match refuses the capture outright (fail closed), before any pixels are
@@ -696,15 +731,13 @@ class ScreenSettings(BaseModel):
     * UIA secure/password controls are never read (layer 2, in
       :mod:`jarvis.perception.ui_text`); extracted text is passed through
       :func:`jarvis.logging_setup.redact` (layer 3).
-    * ``allow_cloud_vision`` is the last layer and defaults to ``False``: a
-      screenshot is sent to a vision model only when this is true *and* the
-      other layers pass.  A spoken notice is never treated as consent.
+    * perception is local-only: UI Automation text and PaddleOCR run on this
+      PC.  Screenshots are never sent to a vision model or OCR service.
 
     ``max_text_chars`` / ``max_ui_elements`` bound the cost and the size of a
     capture so a huge window cannot stall JARVIS or flood the answer.
     """
 
-    allow_cloud_vision: bool = False
     deny_processes: list[str] = [
         "keepass",
         "1password",

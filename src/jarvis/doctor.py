@@ -16,7 +16,8 @@ import importlib.util
 from collections.abc import Iterable
 
 from jarvis.checks import Check, _check
-from jarvis.perception.ocr import backend_name
+from jarvis.config import PerceptionSettings
+from jarvis.perception.ocr import backend_name, unavailable_reason
 
 __all__ = ["optional_backend_checks"]
 
@@ -43,16 +44,19 @@ def _required(
     return _check(name, "WARN", f"missing {', '.join(missing)} - {fix}")
 
 
-def optional_backend_checks() -> list[Check]:
+def optional_backend_checks(
+    perception: PerceptionSettings | None = None,
+) -> list[Check]:
     """Return one row per optional backend, in a stable order."""
-    ocr = backend_name()
-    if ocr:
-        ocr_check = _check("ocr", "PASS", f"ready ({ocr})")
+    current = perception if perception is not None else PerceptionSettings()
+    reason = unavailable_reason(current)
+    if reason is None:
+        ocr_check = _check("ocr", "PASS", f"ready ({backend_name()}, PP-OCRv6-small, local CPU)")
     else:
         ocr_check = _check(
             "ocr",
             "WARN",
-            'not installed - read_screen returns UIA text only; pip install -e ".[vision]"',
+            f'{reason} - read_screen returns UIA text only; pip install -e ".[vision]"',
         )
     return [
         _required(

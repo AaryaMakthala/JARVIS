@@ -80,6 +80,8 @@ gemini  = ["langchain-google-genai"]            # or google-genai; verify the cu
 voice   = ["sounddevice", "openwakeword", "faster-whisper", "piper-tts", "pyttsx3"]
 browser = ["playwright"]                        # then: playwright install chromium
 ml      = ["onnxruntime", "tokenizers", "optimum"]  # inference needs only onnxruntime + tokenizers
+vision  = ["mss", "Pillow", "paddleocr==3.7.0", "paddlepaddle==3.2.0"]
+tools-extra = ["pycaw; sys_platform == 'win32'", "mss", "paddleocr==3.7.0", "paddlepaddle==3.2.0"]
 dev     = ["pytest", "pytest-asyncio", "pytest-cov", "hypothesis", "ruff", "mypy", "types-PyYAML"]
 
 [project.scripts]
@@ -104,7 +106,31 @@ pip install -e ".[dev]"            # Phase 0-4
 pip install -e ".[voice]"          # Phase 5
 pip install -e ".[browser]" ; playwright install chromium   # Phase 6b (optional)
 pip install -e ".[ml]"             # Phase 8
+pip install -e ".[vision]"         # Phase 6 local screen OCR (optional)
 ```
+
+### Local OCR weights (PP-OCRv6-small)
+
+`jarvis` never downloads OCR weights at runtime. Install the `vision` extra once, then place the
+two PP-OCRv6-small model folders in the dedicated directory:
+
+```
+%LOCALAPPDATA%\jarvis\models\paddleocr\
+  PP-OCRv6_small_det\
+  PP-OCRv6_small_rec\
+```
+
+If `perception.ocr_model_dir` is set in `config.toml`, use that absolute directory instead. The
+folders can be fetched once on a connected machine via PaddleOCR's model downloader:
+
+```powershell
+python -c "from paddleocr import PaddleOCR; PaddleOCR(text_detection_model_name='PP-OCRv6_small_det', text_recognition_model_name='PP-OCRv6_small_rec')"
+# Copy the two folders from %USERPROFILE%\.paddlex\official_models\ into the directory above.
+```
+
+At startup `jarvis doctor` checks that PaddleOCR, PaddlePaddle and both model folders exist. If any
+is missing, screen tools keep UI Automation text and report that local OCR is unavailable; there is
+no cloud or alternate-engine fallback.
 
 ### Known install gotchas (record the outcome in `PROGRESS.md`)
 
@@ -116,7 +142,9 @@ pip install -e ".[ml]"             # Phase 8
 - **faster-whisper**: CPU with `compute_type="int8"`; first run downloads the model (needs internet once, then works offline).
 - **pywinauto / pywin32**: install into the same venv; run `python -m pywin32_postinstall -install` only if imports fail.
 - **PyAutoGUI**: keep `FAILSAFE=True`; DPI scaling can affect coordinates (v1 avoids coordinate clicking).
+- **OpenCV camera** (`[camera]` extra): used by Stage 8 `take_photo`; a missing extra is reported by the tool and `jarvis doctor`.
 - **fastembed**: downloads a small ONNX embedding model on first use.
+- **PaddleOCR**: pin both `paddleocr==3.7.0` and `paddlepaddle==3.2.0`. PaddleOCR 3.7 no longer bundles an inference runtime, and an unpinned `paddlepaddle` can resolve to 3.3.1, whose oneDNN path crashes the default CPU pipeline. Use `PP-OCRv6_small_det` and `PP-OCRv6_small_rec` explicitly; `lang`/`ocr_version` select only the medium tier. Keep the weights local as described above.
 
 ## 6. Verify the install (Phase 0 acceptance)
 

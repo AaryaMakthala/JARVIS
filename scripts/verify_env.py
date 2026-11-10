@@ -87,11 +87,13 @@ PACKAGES: list[tuple[str, str, int, bool]] = [
     ("piper-tts", "piper", 5, False),
     ("pyttsx3", "pyttsx3", 5, False),
     # Stage 6 screen perception (optional [vision] extra): in-memory capture and
-    # local OCR.  Missing is WARN - the tools then keep UIA text and report that
-    # local OCR is unavailable (never a cloud OCR fallback).
+    # local PaddleOCR PP-OCRv6-small on the CPU.  Missing is WARN - the tools then
+    # keep UIA text and report that local OCR is unavailable (never a cloud or
+    # alternate-engine fallback).
     ("mss", "mss", 6, False),
     ("Pillow", "PIL", 6, False),
-    ("rapidocr-onnxruntime", "rapidocr_onnxruntime", 6, False),
+    ("paddleocr", "paddleocr", 6, False),
+    ("paddlepaddle", "paddle", 6, False),
     # Stage 7 owns the browser (Playwright); it is not needed for Stage 6.
     ("playwright", "playwright", 7, False),
     # Stage 7 wider system tools (optional [tools-extra] extra).  Missing is WARN -
@@ -117,7 +119,8 @@ OPTIONAL = {
     "fastembed",
     "mss",
     "Pillow",
-    "rapidocr-onnxruntime",
+    "paddleocr",
+    "paddlepaddle",
     "opencv-python",
     "pycaw",
 }
