@@ -196,3 +196,24 @@ tests; the earlier report's main understatement (telemetry "brain only") is reso
 inventory omission (contact grounding) is now recorded. The only outstanding items are live
 verification, which needs a configured zero-cost provider key and a real browser/WhatsApp session,
 and the unchanged prompt-budget/shortlisting scope. No concrete blocker remains in the backend code.
+
+## 8. Contract closure (2026-11-11)
+
+* **Plain-text completion is an enforced capability, not a side effect of registration.**
+  `Capabilities.supports_text` is declared `True` on every registry entry (via `_cap`) and
+  `TEXT_REQUIREMENT` is checked by `MultiProviderClient.text()` through `satisfies()`, exactly
+  like the structured/tools/vision gates. A candidate that does not declare it is skipped with a
+  reason and never called, so fallback cannot drop into a model that only *looks* usable because it
+  is priced. Pricing, provider order, configured preferences and the specialised role requirements
+  are unchanged.
+* **Every production client on a task path is telemetry-aware.** `build_llm_client()` always
+  returns `MultiProviderClient` (one provider included) - that is the single class advertising
+  `supports_attempt_meta`, and emission happens once per attempt inside the walk. The direct
+  `build_provider_client()` path (the `jarvis doctor` probe) remains deliberately outside task
+  telemetry because it has no task to attribute.
+* New focused tests: `tests/unit/test_b8_contracts.py` (7) - registry-wide text capability, a
+  non-text candidate skipped even as a fallback, exactly one event per attempt through the real
+  factory, fallback attempts recorded at indexes 0 and 1 with no duplicates, no attribution without
+  a task context, and the doctor client staying non-telemetry.
+* Combined focused regression: `` (pytest exit status `0`, wall time 24s). The
+  verdict above is unchanged: **B8 complete with limitations** - still no live verification.
