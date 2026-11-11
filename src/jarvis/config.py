@@ -97,10 +97,18 @@ max_steps = 12
 max_retries_per_step = 2
 max_replans = 2
 step_timeout_seconds = 30
-# Send only the tool groups a request plausibly needs (and a trimmed site
-# catalogue) instead of the whole tool catalogue.  Prompt shaping only: the
-# registry, tiers and policy are untouched.  Off until it has been verified.
-prompt_trim_enabled = false
+# B9: describe every capability compactly and send full JSON schemas only
+# for the most relevant candidates.  Prompt shaping only: the registry, tiers
+# and policy are untouched.
+prompt_trim_enabled = true
+# Conservative application-level input budget (NOT a claim about any model's
+# context window).  Output reserve and safety margin are applied on top.
+context_budget_tokens = 24000
+context_reserved_output_tokens = 1024
+context_safety_margin = 0.15
+# Candidate discovery limits (3-5 relevant tools, measured in the B9 report).
+tool_candidate_limit = 5
+tool_schema_limit = 4
 
 [compose]
 # Write a short spoken answer and a screen answer before respond.  false falls
@@ -392,13 +400,19 @@ class AgentSettings(BaseModel):
     untouched by either flag, so an ablated run is still safe to execute
     (docs/07 section 3.4 keeps the policy engine on in every profile).
 
-    ``prompt_trim_enabled`` (default **false**) switches the brain prompt to the
-    tool-group selector (:mod:`jarvis.agent.tool_groups`): only the groups the
-    request plausibly needs are described, and the site catalogue is trimmed to
-    the sites that were named plus a short default list.  It is prompt shaping
-    only - the registry stays closed and every step is still judged by
-    ``validate`` / ``policy_gate`` / ``act``.  Off by default so the prompt is
-    byte-identical to the untrimmed one until it has been verified.
+    ``prompt_trim_enabled`` (default **true** in B9) switches the brain and
+    replanner prompts to the compact capability index: every registered
+    capability is described in one short line, complete JSON schemas are sent
+    only for the most relevant candidates, and the site catalogue is trimmed.
+    It is prompt shaping only - the registry stays closed and every step is
+    still judged by ``validate`` / ``policy_gate`` / ``act``.  Set it to false
+    to reproduce the legacy full-catalogue prompt byte for byte.
+
+    ``context_budget_tokens`` is an explicit, application-level input budget,
+    not an assumed model context window.  ``context_reserved_output_tokens``
+    and ``context_safety_margin`` are subtracted before trimming.  Unknown
+    provider limits remain unknown.  ``tool_candidate_limit`` and
+    ``tool_schema_limit`` bound candidate discovery and full-schema injection.
     """
 
     max_steps: int = 12
@@ -410,7 +424,12 @@ class AgentSettings(BaseModel):
     use_specialists: bool = False
     specialist_max_calls: int = 12
     specialist_call_timeout_s: float = 12.0
-    prompt_trim_enabled: bool = False
+    prompt_trim_enabled: bool = True
+    context_budget_tokens: int = 24000
+    context_reserved_output_tokens: int = 1024
+    context_safety_margin: float = 0.15
+    tool_candidate_limit: int = 5
+    tool_schema_limit: int = 4
 
 
 class ComposeSettings(BaseModel):

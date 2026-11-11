@@ -108,16 +108,40 @@ def converse_user_prompt(user_input: str, memory_context: list[dict] | None = No
     return "\n\n".join(parts)
 
 
-def replan_system_prompt(catalogue: list[dict[str, object]]) -> str:
-    """System prompt for the replanner (same tool catalogue, no tiers)."""
+def replan_system_prompt(
+    catalogue: list[dict[str, object]],
+    *,
+    capability_directory: str | None = None,
+) -> str:
+    """System prompt for the replanner (same closed registry, no tiers).
+
+    ``capability_directory`` is the B9 compact index.  When supplied,
+    ``catalogue`` holds only the shortlisted canonical schemas and the prompt
+    tells the model that unlisted schemas are available by name but must not be
+    guessed.  Omitting it preserves the legacy full-catalogue wording.
+    """
     entries = json.dumps(catalogue, indent=2)
+    if capability_directory:
+        catalogue_block = (
+            "Capability directory (names and short descriptions only):\n"
+            f"{capability_directory}\n\n"
+            "Full tool definitions for the most relevant candidates:\n"
+            f"{entries}"
+        )
+        discovery_rule = (
+            "9. Use only names from the directory. If the corrected plan needs a listed\n"
+            "   capability whose schema is not shown, prefer an approach with a shown\n"
+            "   schema; never invent arguments for an unseen tool.\n"
+        )
+    else:
+        catalogue_block = f"Tool catalogue (name, description, JSON args schema):\n{entries}"
+        discovery_rule = ""
     return f"""You are the replanner for "JARVIS", a safe desktop assistant.
 
 Some earlier steps failed. You decide whether to continue with a corrected
 plan of tool calls (ALLOWED tools only, listed below) or to stop.
 
-Tool catalogue (name, description, JSON args schema):
-{entries}
+{catalogue_block}
 
 Replanning rules:
 1. Return "action": "continue" ONLY with a replacement plan ("plan") for the
@@ -136,7 +160,7 @@ Replanning rules:
    where Plan is {{"kind", "goal", "steps": [{{"id", "tool", "args",
    "rationale", "expect"}}], "needs_clarification", "clarification_question",
    "dialog_answer"}}.
-"""
+{discovery_rule}"""
 
 
 def _untrusted_json(value: object) -> str:

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from jarvis.agent.capability_index import CapabilityIndex, build_capability_index
 from jarvis.agent.conversation import ConversationManager
 from jarvis.agent.session_context import SessionContext
 from jarvis.agent.target_binding import TargetBindingStore
@@ -123,6 +124,9 @@ class AppContext:
     #: itself - the daemon/CLI record finished turns, and the brain only
     #: renders the untrusted-data history block.
     conversations: ConversationManager = field(default_factory=ConversationManager)
+    #: B9 compact view of the canonical registry.  Built once per context; it
+    #: holds no authorization state and never replaces the registry.
+    capability_index: CapabilityIndex | None = None
 
     def tool_context(self, *, attempt_meta: Any | None = None) -> ToolContext:
         """Build a ToolContext for the current step (no secret leaks).
@@ -222,4 +226,5 @@ def make_app_context(
         ),
         browser_results=browser_results if browser_results is not None else BrowserResultStore(),
         conversations=conversations if conversations is not None else ConversationManager(),
+        capability_index=build_capability_index(registry),
     )
