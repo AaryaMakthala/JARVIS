@@ -229,11 +229,16 @@ def _run_web_answer(args: WebAnswerArgs, ctx: ToolContext) -> ToolResult:
         'Wrap your answer in <untrusted_data source="web"> tags.\n\n'
         f"Search results:\n{numbered}"
     )
+    # Imported here: ``jarvis.llm.telemetry`` pulls in the task-store package,
+    # which the tool registry must not need merely to import a tool module.
+    from jarvis.llm.telemetry import attempt_kwargs
+
     try:
         answer, _usage = ctx.llm.text(
             system=system,
             user=args.question,
             model_role="fast",
+            **attempt_kwargs(ctx.llm, ctx.attempt_meta),
         )
     except Exception as exc:  # noqa: BLE001
         return ToolResult(ok=False, error=f"LLM answer generation failed: {exc}")

@@ -38,6 +38,8 @@ __all__ = [
     "LLMAttemptMeta",
     "LLMAttemptRecord",
     "TaskStoreAttemptSink",
+    "attempt_kwargs",
+    "build_attempt_meta",
     "new_attempt_id",
 ]
 
@@ -128,6 +130,37 @@ class LLMAttemptMeta:
             self.sink.record(attempt)
         except Exception as exc:  # noqa: BLE001 - telemetry must never break a call
             _LOG.debug("llm attempt not recorded: %s", exc)
+
+
+def build_attempt_meta(
+    client: Any, task_id: str, task_class: str, store: Any
+) -> LLMAttemptMeta | None:
+    """Per-request attempt metadata, or ``None`` when nothing can be recorded.
+
+    Shared by the graph nodes (brain/replan/specialist) and the tool layer
+    (``web_answer``, the WhatsApp summariser, contact grounding) so every real
+    provider attempt is attributed to the same explicit task id.  ``None`` is
+    returned - never an empty id - when the client does not advertise
+    ``supports_attempt_meta`` (a test double), when there is no task store, or
+    when the task id is missing; the caller then invokes the model exactly as
+    before.
+    """
+    if store is None or not task_id:
+        return None
+    if not getattr(client, "supports_attempt_meta", False):
+        return None
+    return LLMAttemptMeta(
+        task_id=str(task_id),
+        task_class=str(task_class or ""),
+        sink=TaskStoreAttemptSink(store),
+    )
+
+
+def attempt_kwargs(client: Any, meta: LLMAttemptMeta | None) -> dict[str, Any]:
+    """The ``attempt_meta`` keyword, only for clients that advertise support."""
+    if meta is None or not getattr(client, "supports_attempt_meta", False):
+        return {}
+    return {"attempt_meta": meta}
 
 
 class TaskStoreAttemptSink:

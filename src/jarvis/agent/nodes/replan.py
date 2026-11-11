@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from jarvis.agent.context import AppContext
+from jarvis.agent.nodes.telemetry import llm_attempt_meta
 from jarvis.agent.nodes.util import truncate
 from jarvis.agent.schemas import ReplanDecision, ToolCall
 from jarvis.agent.state import StepResult
@@ -46,6 +47,11 @@ def replan(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             "max_retries": 0,
             "timeout_s": min(float(ctx.settings.llm.timeout_seconds), 10.0),
         }
+    # B8.5: the replanner's provider attempts belong to this task too, so a
+    # fallback during replanning is visible in the task history.
+    attempt_meta = llm_attempt_meta(state, ctx, "action")
+    if attempt_meta is not None:
+        llm_budget["attempt_meta"] = attempt_meta
     try:
         model, usage = ctx.llm.structured(
             system=replan_system_prompt(catalogue),

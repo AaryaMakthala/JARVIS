@@ -115,6 +115,12 @@ class ToolContext:
     #: duplicate-send guard can distinguish a retry from a new approval.  A tool
     #: that needs it must treat ``""`` as "no approved operation" and refuse.
     operation_id: str = ""
+    #: Per-request LLM attempt metadata (B8.5), set by ``act`` for this
+    #: dispatch so a tool that calls the model (``web_answer``, the WhatsApp
+    #: summariser, contact grounding) records its provider attempts against
+    #: *this* task.  ``None`` means "nothing to attribute to"; the tool then
+    #: calls the model exactly as before, with no attempt event.
+    attempt_meta: Any | None = None
 
 
 ArgsModel = type[BaseModel]

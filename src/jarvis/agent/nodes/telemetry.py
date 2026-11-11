@@ -302,19 +302,13 @@ def llm_attempt_meta(state: dict[str, Any], ctx: AppContext, task_class: str) ->
     embedding without the composite client) or when observability is off, in
     which case the caller makes an ordinary call with no extra keyword.
     """
-    client = getattr(ctx, "llm", None)
-    if not getattr(client, "supports_attempt_meta", False):
-        return None
-    store = _task_store(ctx)
-    task_id = str(state.get("task_id") or "")
-    if store is None or not task_id:
-        return None
-    from jarvis.llm.telemetry import LLMAttemptMeta, TaskStoreAttemptSink
+    from jarvis.llm.telemetry import build_attempt_meta
 
-    return LLMAttemptMeta(
-        task_id=task_id,
-        task_class=str(task_class or ""),
-        sink=TaskStoreAttemptSink(store, logger=ctx.logger),
+    return build_attempt_meta(
+        getattr(ctx, "llm", None),
+        str(state.get("task_id") or ""),
+        str(task_class or ""),
+        _task_store(ctx),
     )
 
 

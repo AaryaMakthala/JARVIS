@@ -80,13 +80,9 @@ _CANDIDATE_ID_RE = re.compile(r"^C([1-9][0-9]*)$")
 #: contact like that" from "I could not use the interpretation safely".  Neither
 #: text ever contains a phone number, a message body or raw model output.
 _NO_MATCH = (
-    "I couldn't find a matching saved contact. "
-    "Please check the name or specify the saved contact."
+    "I couldn't find a matching saved contact. Please check the name or specify the saved contact."
 )
-_INVALID = (
-    "I couldn't reliably identify that contact. "
-    "Please specify the saved contact name."
-)
+_INVALID = "I couldn't reliably identify that contact. Please specify the saved contact name."
 
 #: Classification of one model answer (see :func:`_parse_choice`).
 _PICK_CHOICE = "choice"
@@ -127,8 +123,7 @@ def _ambiguous_question(query: str, names: tuple[str, ...]) -> str:
     """A visible question naming the competing saved contacts."""
     listed = ", ".join(names[:5])
     return (
-        f"I found multiple possible contacts matching {query!r}: {listed}. "
-        "Which one should I use?"
+        f"I found multiple possible contacts matching {query!r}: {listed}. Which one should I use?"
     )
 
 
@@ -179,6 +174,7 @@ def _interpret(
     llm: Any,
     *,
     clarification_answer: str = "",
+    attempt_meta: Any | None = None,
 ) -> tuple[Contact | None, str | None, tuple[str, ...], int, int]:
     """Ask the tool-free text model to pick one in-set candidate.
 
@@ -209,6 +205,8 @@ def _interpret(
         "Which single candidate is the requested contact? "
         "Answer with one candidate id, NONE, or UNCERTAIN."
     )
+    from jarvis.llm.telemetry import attempt_kwargs
+
     try:
         raw, usage = llm.text(
             system=_GROUNDING_SYSTEM,
@@ -216,6 +214,7 @@ def _interpret(
             model_role="fast",
             temperature=0.0,
             max_tokens=16,
+            **attempt_kwargs(llm, attempt_meta),
         )
     except Exception as exc:  # noqa: BLE001 - interpretation must never raise to the graph
         logger.warning("contact grounding model call failed: %s", type(exc).__name__)
@@ -251,6 +250,7 @@ def ground_contacts(
     store: ContactStore,
     llm: Any = None,
     clarification_answer: str = "",
+    attempt_meta: Any | None = None,
 ) -> GroundingOutcome:
     """Ground every WhatsApp ``contact`` argument before validation.
 
@@ -283,11 +283,13 @@ def ground_contacts(
             )
 
         if llm is None:
-            return GroundingOutcome(
-                halted_reason=_NO_MATCH, api_calls=api_calls, tokens=tokens
-            )
+            return GroundingOutcome(halted_reason=_NO_MATCH, api_calls=api_calls, tokens=tokens)
         contact, refusal, ambiguous_names, calls, used = _interpret(
-            store, query, llm, clarification_answer=clarification_answer
+            store,
+            query,
+            llm,
+            clarification_answer=clarification_answer,
+            attempt_meta=attempt_meta,
         )
         api_calls += calls
         tokens += used
@@ -328,12 +330,24 @@ def ground_brain_update(
     if not steps:
         return update
 
+    from jarvis.llm.telemetry import build_attempt_meta
+
     store = ContactStore(config.contacts_file())
+    llm = getattr(ctx, "llm", None)
+    # The grounding completion is a real provider attempt during an action, so
+    # it is attributed to this task exactly like the brain call (B8.5).
+    attempt_meta = build_attempt_meta(
+        llm,
+        str(state.get("task_id") or ""),
+        "action",
+        getattr(ctx, "tasks", None),
+    )
     outcome = ground_contacts(
         steps,
         store=store,
-        llm=getattr(ctx, "llm", None),
+        llm=llm,
         clarification_answer=str(state.get("clarification_answer") or ""),
+        attempt_meta=attempt_meta,
     )
     update["api_calls"] = int(update.get("api_calls") or 0) + outcome.api_calls
     update["tokens"] = int(update.get("tokens") or 0) + outcome.tokens

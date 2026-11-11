@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.brain import _llm_halted_reason
+from jarvis.agent.nodes.telemetry import llm_attempt_meta
 from jarvis.agent.prompts import specialist_system_prompt, specialist_user_prompt
 from jarvis.agent.schemas import SpecialistDecision
 from jarvis.agent.state import AgentState, Plan, Step
@@ -118,17 +119,33 @@ def _trim_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def decide(state: AgentState, ctx: AppContext) -> dict[str, Any]:
     goal = state.get("specialist_goal") or state.get("goal") or ""
-    max_calls = getattr(getattr(ctx, "settings", None).agent, "specialist_max_calls", 12) if hasattr(getattr(ctx, "settings", None), "agent") else 12
+    max_calls = (
+        getattr(getattr(ctx, "settings", None).agent, "specialist_max_calls", 12)
+        if hasattr(getattr(ctx, "settings", None), "agent")
+        else 12
+    )
     calls = int(state.get("specialist_calls") or 0)
     if calls >= max_calls:
-        return {"halted_reason": "Specialist call limit reached.", "final_answer": "I couldn't complete the browser task within the step limit.", "specialist_phase": "idle"}
+        return {
+            "halted_reason": "Specialist call limit reached.",
+            "final_answer": "I couldn't complete the browser task within the step limit.",
+            "specialist_phase": "idle",
+        }
     history = _trim_history(list(state.get("specialist_history") or []))
     if history:
         # repeat guard: same (tool,args-summary) twice in a row
         last = history[-1]
         prev = history[-2] if len(history) >= 2 else None
-        if prev is not None and prev.get("tool") == last.get("tool") and prev.get("args-summary") == last.get("args-summary"):
-            return {"halted_reason": "Specialist stuck in a loop.", "final_answer": "I got stuck repeating the same action.", "specialist_phase": "idle"}
+        if (
+            prev is not None
+            and prev.get("tool") == last.get("tool")
+            and prev.get("args-summary") == last.get("args-summary")
+        ):
+            return {
+                "halted_reason": "Specialist stuck in a loop.",
+                "final_answer": "I got stuck repeating the same action.",
+                "specialist_phase": "idle",
+            }
     digest = _build_digest(state, ctx)
     # build allowed tools list (browser only)
     allowed = []
@@ -138,13 +155,27 @@ def decide(state: AgentState, ctx: AppContext) -> dict[str, Any]:
             spec = reg.get(name)
             if spec is None:
                 continue
-            allowed.append({"name": name, "description": spec.description[:160], "args_schema": spec.args_model.model_json_schema() if hasattr(spec.args_model, "model_json_schema") else {}})
+            allowed.append(
+                {
+                    "name": name,
+                    "description": spec.description[:160],
+                    "args_schema": spec.args_model.model_json_schema()
+                    if hasattr(spec.args_model, "model_json_schema")
+                    else {},
+                }
+            )
     except Exception:  # noqa: BLE001 - fall back to a bare tool list
         for name in sorted(BROWSER_TOOL_NAMES):
             allowed.append({"name": name, "description": "", "args_schema": {}})
     system = specialist_system_prompt(allowed)
     user = specialist_user_prompt(goal, history, digest)
-    timeout_s = min(getattr(getattr(ctx, "settings", None).llm, "timeout_seconds", 30.0), getattr(getattr(ctx, "settings", None).agent, "specialist_call_timeout_s", 12.0))
+    timeout_s = min(
+        getattr(getattr(ctx, "settings", None).llm, "timeout_seconds", 30.0),
+        getattr(getattr(ctx, "settings", None).agent, "specialist_call_timeout_s", 12.0),
+    )
+    # B8.5: every specialist turn is one real provider attempt on this task.
+    attempt_meta = llm_attempt_meta(state, ctx, "action")
+    attempt_budget = {"attempt_meta": attempt_meta} if attempt_meta is not None else {}
     try:
         decision, _usage = ctx.llm.structured(
             system=system,
@@ -154,25 +185,44 @@ def decide(state: AgentState, ctx: AppContext) -> dict[str, Any]:
             temperature=0.0,
             max_retries=0,
             timeout_s=timeout_s,
+            **attempt_budget,
         )
     except Exception as exc:  # noqa: BLE001 - an LLM failure stops this task only
         reason = _llm_halted_reason(exc)
-        return {"halted_reason": reason, "final_answer": "I couldn't proceed with the browser task.", "specialist_phase": "idle"}
+        return {
+            "halted_reason": reason,
+            "final_answer": "I couldn't proceed with the browser task.",
+            "specialist_phase": "idle",
+        }
     if decision.kind == "done":
         summary = (decision.summary or "").strip() or "Done."
         return {"final_answer": summary, "specialist_phase": "idle", "halted_reason": None}
     if decision.kind == "give_up":
         reason = (decision.summary or "").strip() or "Unable to proceed."
-        return {"final_answer": f"I couldn't complete that: {reason}", "specialist_phase": "idle", "halted_reason": None}
+        return {
+            "final_answer": f"I couldn't complete that: {reason}",
+            "specialist_phase": "idle",
+            "halted_reason": None,
+        }
     if decision.kind == "act":
         tool = (decision.tool or "").strip()
         if tool not in BROWSER_TOOL_NAMES:
-            return {"halted_reason": "Specialist proposed non-browser tool.", "final_answer": "I can only use browser tools for this task.", "specialist_phase": "idle"}
+            return {
+                "halted_reason": "Specialist proposed non-browser tool.",
+                "final_answer": "I can only use browser tools for this task.",
+                "specialist_phase": "idle",
+            }
         args = decision.args or {}
         # One step id per executed decision: ids must stay unique for the whole
         # task, because act's exactly-once guard skips a step whose id already
         # has a successful result.  ``calls`` increments once per act decision.
-        step = Step(id=f"s{calls}", tool=tool, args=args, rationale=(decision.rationale or "")[:200], expect=(decision.expect or "")[:200])
+        step = Step(
+            id=f"s{calls}",
+            tool=tool,
+            args=args,
+            rationale=(decision.rationale or "")[:200],
+            expect=(decision.expect or "")[:200],
+        )
         plan = Plan(kind="tool", goal=goal or decision.rationale or "Browse", steps=[step])
         return {
             "plan": plan,
@@ -181,7 +231,11 @@ def decide(state: AgentState, ctx: AppContext) -> dict[str, Any]:
             "specialist_phase": "observe",
             "specialist_calls": calls + 1,
         }
-    return {"halted_reason": "Invalid specialist decision.", "final_answer": "I couldn't proceed.", "specialist_phase": "idle"}
+    return {
+        "halted_reason": "Invalid specialist decision.",
+        "final_answer": "I couldn't proceed.",
+        "specialist_phase": "idle",
+    }
 
 
 def _record_history(state: AgentState) -> list[dict[str, Any]]:
@@ -273,9 +327,7 @@ def observe(state: AgentState, ctx: AppContext) -> dict[str, Any]:
         steps = plan.steps if hasattr(plan, "steps") else plan.get("steps", [])
         if steps:
             last = steps[-1]
-            last_tool = (
-                last.get("tool") if isinstance(last, dict) else getattr(last, "tool", None)
-            )
+            last_tool = last.get("tool") if isinstance(last, dict) else getattr(last, "tool", None)
             if last_tool in {"browser_read", "browser_find", "browser_search"}:
                 return {"specialist_phase": "decide", "specialist_history": history}
     except Exception:  # a malformed plan must not break the loop
@@ -283,8 +335,18 @@ def observe(state: AgentState, ctx: AppContext) -> dict[str, Any]:
     # Build a page-refresh step for act.  The phase deliberately stays
     # "observe" so verify routes the refresh back here; ``r<calls>`` keeps the
     # id out of the decision ids (``s<calls>``) and unique per iteration.
-    step = Step(id=f"r{calls}", tool="browser_read", args={}, rationale="Refresh page", expect="See current page")
-    new_plan = Plan(kind="tool", goal=state.get("specialist_goal") or state.get("goal") or "Browse", steps=[step])
+    step = Step(
+        id=f"r{calls}",
+        tool="browser_read",
+        args={},
+        rationale="Refresh page",
+        expect="See current page",
+    )
+    new_plan = Plan(
+        kind="tool",
+        goal=state.get("specialist_goal") or state.get("goal") or "Browse",
+        steps=[step],
+    )
     return {
         "plan": new_plan,
         "step_index": 0,

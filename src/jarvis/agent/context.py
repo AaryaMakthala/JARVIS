@@ -124,8 +124,14 @@ class AppContext:
     #: renders the untrusted-data history block.
     conversations: ConversationManager = field(default_factory=ConversationManager)
 
-    def tool_context(self) -> ToolContext:
-        """Build a ToolContext for the current step (no secret leaks)."""
+    def tool_context(self, *, attempt_meta: Any | None = None) -> ToolContext:
+        """Build a ToolContext for the current step (no secret leaks).
+
+        ``attempt_meta`` is the explicit per-request LLM attempt metadata
+        (B8.5) that ``act`` attaches so a tool-layer model call records its
+        provider attempts against this task.  It carries a task id and a sink
+        only - never arguments, prompts or results.
+        """
         return ToolContext(
             settings=self.settings,
             dry_run=self.dry_run,
@@ -140,6 +146,7 @@ class AppContext:
             browser=self.browser,
             whatsapp_browser=self.whatsapp_browser,
             browser_results=self.browser_results,
+            attempt_meta=attempt_meta,
         )
 
 
