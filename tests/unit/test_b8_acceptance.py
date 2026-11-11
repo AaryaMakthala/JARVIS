@@ -121,6 +121,7 @@ def test_date_request_is_answered_locally_without_an_llm_call(tmp_path: Path) ->
 def test_arithmetic_uses_the_safe_local_route(tmp_path: Path) -> None:
     outcome, client, _ctx = _run(tmp_path, "what is 12 times 4", decision=_conversation("unused"))
     assert client.structured_calls == 0
+    assert client.text_calls == 0
     assert "48" in (outcome.final_answer or "")
 
 

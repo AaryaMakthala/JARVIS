@@ -374,16 +374,20 @@ def test_langgraph_uses_four_provider_multi_client(tmp_path: Path) -> None:
     clients["groq"].error = LLMTransientError("rate limited")
     clients["openrouter"].error = LLMAuthError("rejected")
     clients["nvidia"].error = LLMModelError("model unavailable")
-    clients["gemini"].response = "Four."
-    clients["gemini"].structured_response = brain_conversation("Four.")
+    clients["gemini"].response = "Hello, sir."
+    clients["gemini"].structured_response = brain_conversation("Hello, sir.")
     multi = _four_multi(clients)
     ctx = make_app_context(
         _settings("groq", "openrouter", "nvidia", "gemini", strict_zero_cost=False),
         llm=multi,
     )
     saver = open_sqlite_checkpointer(str(tmp_path / "four-provider.db"))
-    outcome = run_task(ctx, saver, "What is 2 plus 2?", thread_id="four-provider")
-    assert outcome.final_answer == "Four."
+    # A conversational request, not arithmetic: the deterministic arithmetic
+    # fast path answers "2 plus 2" without a provider call, which is covered by
+    # ``test_arithmetic_uses_the_safe_local_route`` instead.  This test is about
+    # the four-provider composite client, so it needs a request that reaches it.
+    outcome = run_task(ctx, saver, "hello there", thread_id="four-provider")
+    assert outcome.final_answer == "Hello, sir."
     assert all(client.structured_calls == 1 for client in clients.values())
     assert all(client.text_calls == 0 for client in clients.values())
 
