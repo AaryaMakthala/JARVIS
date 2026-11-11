@@ -303,3 +303,197 @@ paths, bounded planning/execution, memory relevance, schema-miss handling, expli
 telemetry and unchanged policy authority. The limitations are the absence of live provider/desktop/
 browser/WhatsApp verification, the still-conservative lexical discovery, unknown model context
 windows, and the pre-existing repository-wide lint/provider-test issues listed above.
+
+---
+
+## B9 Final Release Verification Addendum
+
+Verification date: 2026-11-11. The historical sections above are preserved unchanged.
+
+### 1. Repository state at verification start
+
+- Branch: `feature/b1-task-event-store`
+- HEAD: `d2ede3a6445c5eda6f9079af81a682a71924a352` (`d2ede3a`)
+- Staged changes: none.
+- Unstaged changes: none.
+- Untracked files: `docs/JARVIS_BACKEND_AUDIT.md`, `docs/PYTHON_PREFERENCE_LIVE_VERIFICATION.md` (preserved, never staged).
+- B8 starting commit `506c4e4` and all five B9 commits were present and unchanged.
+- Python: existing Windows venv, `.venv/Scripts/python.exe`, Python 3.11.15. No new environment or dependency was created.
+
+### 2. Final repository state
+
+- Branch: `feature/b1-task-event-store`
+- Final implementation/verification HEAD before the documentation commit: `0211c93`.
+- The documentation commit containing this addendum is the next commit; `git log -1` is authoritative for its hash.
+- Final dirty state after this addendum: only the two preserved, unrelated untracked docs above. No user file was deleted, renamed, staged, reset, cleaned or rewritten.
+- Nothing was pushed.
+
+### 3. B8 provider-test comparison
+
+The exact test was run against both commits using an isolated `git archive` checkout of B8; the main working tree was never checked out, reset or modified for the comparison.
+
+```text
+B8 506c4e4: FAILED
+current B9 head: FAILED
+test: tests/unit/test_provider.py::test_registered_vision_model_allows_build
+reason: groq vision model: groq/openai/gpt-oss-120b lacks vision (role needs vision)
+```
+
+Classification: **pre-existing test/spec inconsistency, not a B9 regression**. The test configured Groq's non-vision planner model as the `vision` role. `_guard_capability`, `VISION_REQUIREMENT`, the model capability registry and provider selection were left unchanged. Only the stale test was corrected: the non-vision Groq case now asserts the refusal, and the positive build case uses the registered Gemini vision model. Vision roles still require a declared `supports_vision=True` capability; unknown capabilities remain refused.
+
+### 4. Live provider verification
+
+Configuration was read from the existing `config.toml`: `free_only=true`, `strict_zero_cost=false`, provider order `groq, openrouter, nvidia, gemini`, keys present. `jarvis doctor` reported all four provider keys present and `task_store readable (schema v3)`. Credentials were never printed or logged.
+
+All live work used temporary task/memory databases. No production preference, memory row, task row or config value was changed. Notepad and browser scenarios were **decision-only**: `brain` + `validate` + `PolicyEngine.decide`; `act` was never called, so no application or externally visible browser action ran.
+
+| Scenario | Attempts observed | Provider/model actually used | Provider-reported input/output tokens | Duration | Outcome |
+|---|---|---|---:|---:|---|
+| Conversation: “Explain Python decorators in simple language.” | 1 | groq / `openai/gpt-oss-120b` | 3,073 / 294 | 1,609 ms | conversation answer produced, no tool schema, no tool execution |
+| Preference recall: “What is my preferred coding language?” | 2 in the fallback run; 1 in a later run | groq / `openai/gpt-oss-120b` failed without usage; openrouter / `openrouter/free` succeeded | 3,310 / 154 (success); failed Groq attempt reported none | 7,420 ms failed + 2,907 ms success | answer contained “Python”; only the relevant fact entered the prompt |
+| Notepad: “Please open Notepad for me.” | 2 | groq / `openai/gpt-oss-120b` failed without usage; openrouter / `openrouter/free` succeeded | 3,532 / 500 (success) | 7,437 ms failed + 6,609 ms success | selected `open_app`, canonical schema supplied, Tier 0, allowed, no execution |
+| Browser: “Search the web for recent AI research.” | 1 successful run; 1 separate timeout run | openrouter / `openrouter/free` succeeded once; openrouter / `openrouter/free` timed out on the rerun | 7,017 / 676 (success); timeout reported none | 4,390 ms; timeout 30,000 ms | `web_answer` selected, only web schemas supplied, Tier 0 allowed, no browser action |
+
+A plain “Open Notepad.” request also hit the deterministic app fast path: **zero LLM calls**, zero provider tokens, no execution. This is existing behavior, not a missing Brain call.
+
+Live browser verification is therefore **partial**: one provider decision succeeded, a later identical live request hit the overall provider deadline. It is not evidence that browser execution succeeded.
+
+### 5. Before/after prompt measurements
+
+Reproduced from the current implementation on the real 57-tool registry, terminal source, no history, no memory unless stated. Before uses the same composer with `prompt_trim_enabled=false`; after uses the default.
+
+| Request | Before chars / est. tokens | After system / user / total chars | After est. tokens | Candidates / schemas |
+|---|---:|---:|---:|---:|
+| Explain Python decorators | 48,700 / 12,176 | 12,717 / 519 / 13,236 | 3,310 | 0 / 0 |
+| Open Notepad | 48,668 / 12,168 | 15,288 / 456 / 15,744 | 3,936 | 5 / 4 |
+| Search the web for recent AI research | 48,693 / 12,174 | 15,949 / 481 / 16,430 | 4,109 | 5 / 4 |
+| Preferred coding language | 48,692 / 12,174 | 12,717 / 480 / 13,197 | 3,300 | 0 / 0 |
+| Open Notepad and write/save a file | 48,847 / 12,213 | 16,100 / 635 / 16,735 | 4,184 | 5 / 4 |
+
+The earlier report listed 48,711 / 12,178 for the last request; this reproduction finds 48,847 / 12,213 because the measured user text differs from that historical entry. The after values match the historical after values. The compact directory is 8,714 chars / 2,179 estimated tokens; full legacy catalogue is 33,959 chars / 8,490 estimated tokens.
+
+**Estimated tokens are not provider tokens.** The live examples show why: conversation estimated 3,310 but Groq reported 3,073; browser estimated 4,109 but OpenRouter reported 7,017; preference recall estimated 3,300 and OpenRouter reported 3,310. No estimate was replaced with a provider count, and no tokenizer-equivalence claim is made.
+
+### 6. Tool-discovery recall
+
+Real registry: 57 tools, 57 compact descriptors, candidate limit 5, schema limit 4 (53 schemas excluded). Candidate recall was 10/10 for the representative matrix:
+
+| Request | Expected registered tool | In candidates | In schemas |
+|---|---|---|---|
+| Open Notepad. | `open_app` | yes | yes |
+| Search the web for recent AI research. | `browser_search` | yes | yes |
+| Read the file notes.txt. | `read_file` | yes | yes |
+| Create a new file called notes.txt. | `create_file` | yes | yes |
+| Send a WhatsApp message to mom. | `whatsapp_send_message` | yes | yes |
+| What is my CPU and RAM usage? | `system_info` | yes | yes |
+| Take a screenshot. | `take_screenshot` | yes | yes |
+| Set the volume to 50 percent. | `volume_control` | yes | yes |
+| List my open windows. | `list_windows` | yes | yes |
+| Read what is on my screen. | `read_screen` | yes | yes |
+
+Persistent memory has no registered tool: retrieval is the deterministic `memory_retrieve` node, tested separately with the real SQLite memory store. No candidate limit was raised and no embedding/model router was added.
+
+### 7. Canonical schemas and security contracts
+
+- A registered tool named without its supplied schema triggers exactly **one** canonical schema-resolution retry. A second miss becomes clarification; an unknown name halts without execution.
+- A fabricated model-provided argument schema cannot replace the canonical Pydantic model: the test submits an invalid argument shape, gets zero executions, a validation error, and the registered schema is authoritative. `ActionIntent`/`Step` cannot carry an `args_schema`, tier or action hash.
+- Unknown names `no_such_tool` and `execute_arbitrary_command` are rejected before execution; no arbitrary schema is accepted.
+- Ambiguous lexical candidates remain a shortlist: `browser_find` and `file_search` can both appear, but the Brain must decide and a clarification executes nothing.
+- PolicyEngine remains the sole authorization authority. Tier 0, 1 and 2 tests derive tier/confirmation/unlock/hash from registered specs and engine rules; changing args changes the hash; decisions have no tool side effects. Action hashes, target binding, confirmation and Tier 3 blocking remain in the existing focused suites.
+
+### 8. Single-tool and multi-step call counts
+
+Mocked call-count evidence:
+
+| Request type | Result |
+|---|---|
+| Ordinary conversation | 1 Brain provider call, 0 schemas |
+| Clear single-tool request | 1 Brain call, no executor LLM call |
+| Supported arithmetic | 0 LLM calls, deterministic answer |
+| Supported date/time | 0 LLM calls |
+| Python preference recall | local retrieval + 1 response call |
+| Registered tool needing schema expansion | exactly 2 calls total (initial + one bounded expansion) |
+| Two-step task | 1 Brain call, both tools execute in order |
+| First execution failure requiring replan | existing replan/agent-architecture suites pass; bounded replan, no extra executor model call |
+
+No separate mandatory router call or unnecessary executor call was introduced.
+
+### 9. Context budget, trimming and overflow
+
+The application budget remains explicit (`24000 × 0.85 − 1024 = 19,376` estimated tokens), not a model context window. `ModelSpec.context_tokens` remains `None` for the tested Groq model; the composer does not pretend to know it. The 47-test B9 suite proves history → memory → schemas → observations trimming, complete request/safety text preservation, complete JSON schemas (never cut mid-schema), fail-closed `CONTEXT_BUDGET_EXCEEDED` when the minimum cannot fit, and no identical retry loop after a context-length provider failure. `prompt_trim_enabled=true` is the default; no second trimming implementation exists. Existing fallback tests prove one telemetry event per real attempt, with fallback attempts counted separately.
+
+### 10. Telemetry and privacy
+
+Live preference recall produced **two** `LLM_CALL` events for two real attempts: failed Groq fallback index 0 and successful OpenRouter fallback index 1. A successful single attempt produced exactly one event. Event fields contained provider, actual model, role, outcome, duration, fallback index and provider-reported tokens only when supplied. The allow-list still excludes prompts, responses, conversation text, memory contents, tool arguments/results, browser/OCR text, screenshots and message bodies. No schema migration or new database was added; existing task-store schema v3 remained readable.
+
+Dry-run deliberately suppresses task-store writes; an initial harness run with `dry_run=true` therefore showed zero attempt rows. That was harness behavior, not a telemetry defect, and the verification was rerun without dry-run while still never calling `act`.
+
+### 11. Exact commands, counts and runtimes
+
+```text
+.venv/Scripts/python.exe -m pytest tests/unit/test_b9_context_discovery.py
+47 passed in 5.40s (9s wall including startup)
+
+.venv/Scripts/python.exe -m pytest <24-file focused batch: B9, B8 capability/telemetry/acceptance, provider, taskstore privacy, brain prompt, agent architecture/agent, act, tool resolver, validate paths, memory B4, browser tools, WhatsApp send/denylist, confirmation correlation, policy gate batch, target binding, voice conversation, daemon voice, replan>
+473 passed in 40s
+
+.venv/Scripts/python.exe -m pytest tests/unit/test_provider.py tests/unit/test_b8_capability.py
+43 passed
+
+.venv/Scripts/ruff.exe check tests/unit/test_b9_context_discovery.py tests/unit/test_provider.py
+clean
+
+.venv/Scripts/ruff.exe format --check tests/unit/test_b9_context_discovery.py tests/unit/test_provider.py
+2 files already formatted
+
+.venv/Scripts/mypy.exe src/jarvis/policy
+Success: no issues found in 11 source files (2s)
+```
+
+Live checks: `.verify_live.py` completed in 23s and 52s across two bounded runs; `jarvis daemon --foreground` started, `jarvis status` reported running, `jarvis stop` sent shutdown, and the process/daemon were gone afterward. `jarvis doctor` remained healthy; task store readable.
+
+Repository-wide `ruff check .` and `ruff format --check .` still have **pre-existing** findings outside the changed files (68 files would be reformatted). The full repository suite was not run. The previously reported provider test failure is now a corrected test and the provider/capability suites pass.
+
+### 12. Changes made and reasons
+
+1. `tests/unit/test_provider.py`: corrected a stale positive test and added the explicit non-vision rejection assertion. Production provider/capability/model code was not changed.
+2. `tests/unit/test_b9_context_discovery.py`: added 21 focused tests for release gaps (47 total, up from 26): unknown forbidden names, fabricated schema precedence, ambiguity, Tier 0/1/2 ownership, arithmetic zero-call behavior, preference recall call count, 10-request discovery recall, and five before/after prompt-reduction cases.
+3. This addendum and the `PROGRESS.md` release-verification entry.
+
+No B9 architecture, policy rule, registry tool, provider order, model preference, context limit or dependency was changed.
+
+### 13. Remaining unverified behavior
+
+- Actual Notepad launch, browser navigation/click, WhatsApp send/read and desktop UIA execution were **not** performed. Notepad/browser were decision-only.
+- One live browser decision succeeded; a later identical request hit the provider deadline. Live browser behavior is therefore not consistently reproducible.
+- No live microphone, wake-word, STT or TTS test was performed. The daemon’s voice service started and stopped, but no audio was exercised.
+- Provider-reported tokens were unavailable for some failed attempts; they are reported as “not provided”, never estimated.
+- Discovery remains lexical; a legitimate tool can still be missed, handled only by the bounded one-time schema expansion.
+- Model context windows remain unknown; the application budget is not a provider limit. The compact directory is still about 8.7 KB per request.
+- The full repository suite and repository-wide formatting were not run.
+
+### 14. Mocked versus live
+
+| Area | Mocked | Live |
+|---|---|---|
+| Provider selection/calls | Scripted clients for B9/B8 tests | Groq and OpenRouter real attempts |
+| Brain routing | Scripted `BrainDecision` | Real structured decisions for conversation, preference, Notepad, browser |
+| Tool execution | Fake tools and canonical registry metadata | None (decision-only; no `act`) |
+| PolicyEngine | Real engine in tests | Real engine on live Notepad/browser proposals |
+| Memory | Real in-memory SQLite | Temporary SQLite with the Python fact |
+| Task/event store | Temporary/mocked stores | Temporary runtime store; production schema v3 read-only check |
+| Daemon | Unit tests | Started and stopped cleanly |
+| Browser/WhatsApp/voice actions | Focused suites | Not executed |
+
+### 15. New commits
+
+```text
+907b29d  test(llm): require declared vision capability for vision roles
+0211c93  test(agent): close B9 release verification gaps
+```
+
+The documentation commit containing this addendum is the next commit. The five original B9 implementation commits (`8845b95`, `d213a21`, `9dc7b57`, `1a665b5`, `d2ede3a`) remain unchanged.
+
+### 16. Addendum verdict
+
+**B9 RELEASE-READY WITH DOCUMENTED LIMITATIONS** — the architecture, security contracts, canonical schema validation, bounded discovery, prompt budgeting, call-count behavior and focused regressions pass. The remaining limitations are environment-dependent live execution (desktop/browser/WhatsApp/voice), one live browser timeout, unknown model context windows, lexical discovery, and the intentionally unrun full repository suite/repository-wide formatting.
