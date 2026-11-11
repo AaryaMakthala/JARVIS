@@ -452,7 +452,7 @@ Success: no issues found in 11 source files (2s)
 
 Live checks: `.verify_live.py` completed in 23s and 52s across two bounded runs; `jarvis daemon --foreground` started, `jarvis status` reported running, `jarvis stop` sent shutdown, and the process/daemon were gone afterward. `jarvis doctor` remained healthy; task store readable.
 
-Repository-wide `ruff check .` and `ruff format --check .` still have **pre-existing** findings outside the changed files (68 files would be reformatted). The full repository suite was not run. The previously reported provider test failure is now a corrected test and the provider/capability suites pass.
+Repository-wide `ruff check .` and `ruff format --check .` were **not rerun** in this verification pass. The historical B9 run found pre-existing findings outside B9 and 68 files needing formatting; the files changed here are clean. The full repository suite was not run. The previously reported provider test failure is now a corrected test and the provider/capability suites pass.
 
 ### 12. Changes made and reasons
 
