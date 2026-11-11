@@ -242,7 +242,10 @@ def test_retrieval_reserves_a_slot_for_an_explicit_fact(store: SqliteMemory) -> 
             plan={"kind": "tool", "goal": f"echo hello {i}", "steps": []},
         )
 
-    records = store.retrieve("echo hello", limit=3)
+    # B9: an explicit fact is still reserved, but only for a query that is
+    # actually about it.  The skills match the same query, so the reservation
+    # is what keeps the fact in the bounded result.
+    records = store.retrieve("echo hello and my preferred coding language", limit=3)
     facts = [record for record in records if record.meta.get("fact")]
     assert len(facts) == 1
     assert facts[0].text == "Remembered fact (preference): my preferred coding language is Python"
