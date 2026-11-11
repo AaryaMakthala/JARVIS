@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from jarvis.config import Settings
+from jarvis.llm import capability as llm_capability
 from jarvis.llm import models as llm_models
 from jarvis.secrets import SECRET_ENV_VARS, SecretStoreError, slot_secret_name
 
@@ -178,6 +179,28 @@ def _guard_free(settings: Settings, name: str, planner: str, fast: str) -> None:
             raise LLMConfigError(f"{name} {label} model: {reason}")
 
 
+def _guard_capability(settings: Settings, name: str) -> None:
+    """Refuse a configured model that cannot do its role's job.
+
+    Pricing (:func:`_guard_free`) decides whether a model may be billed;
+    this decides whether it can do the work at all.  Both are enforced before
+    any client is constructed, so a model with unknown or missing capabilities
+    (no structured output for conversation/planning, no vision support for the
+    vision role) fails the provider build closed instead of failing later
+    inside a task.  Nothing is inferred from a model's name.
+    """
+    for role in ("planner", "fast", "vision"):
+        model = settings.llm.model_for(name, role)
+        if not model:
+            continue
+        requirement = llm_capability.requirement_for_role(role)
+        ok, reason = llm_capability.satisfies(llm_models.model_spec(name, model), requirement)
+        if not ok:
+            raise LLMConfigError(
+                f"{name} {role} model: {reason} (role needs {requirement.label()})"
+            )
+
+
 def _slot_secret_names(settings: Settings, name: str) -> list[str]:
     """Ordered keyring names to try for ``name``.
 
@@ -309,6 +332,7 @@ def build_provider_client(settings: Settings, store: ProviderKeyStore, name: str
     api_key = _credential_for(store, name, slot_secret_name(name, 1))
     planner, fast = _resolve_models(settings, name)
     _guard_free(settings, name, planner, fast)
+    _guard_capability(settings, name)
     try:
         return _FACTORIES[name](settings, planner, fast, api_key)
     except LLMConfigError:
@@ -339,6 +363,7 @@ def _build_provider_slots(
         raise LLMConfigError(problem)
     planner, fast = _resolve_models(settings, name)
     _guard_free(settings, name, planner, fast)
+    _guard_capability(settings, name)
     built: list[tuple[int, Any]] = []
     for slot, api_key in keys:
         try:

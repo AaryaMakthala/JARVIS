@@ -83,6 +83,10 @@ class ModelSpec:
     pricing_mode: PricingMode
     available: bool
     capabilities: Capabilities
+    #: Context window in tokens, when the provider documents it.  ``None`` means
+    #: "not known": a caller that demands a minimum context refuses the model
+    #: instead of assuming it fits (see :mod:`jarvis.llm.capability`).
+    context_tokens: int | None = None
     note: str = ""
 
 
