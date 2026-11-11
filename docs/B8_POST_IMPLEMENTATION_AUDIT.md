@@ -215,5 +215,4 @@ and the unchanged prompt-budget/shortlisting scope. No concrete blocker remains 
   non-text candidate skipped even as a fallback, exactly one event per attempt through the real
   factory, fallback attempts recorded at indexes 0 and 1 with no duplicates, no attribution without
   a task context, and the doctor client staying non-telemetry.
-* Combined focused regression: `` (pytest exit status `0`, wall time 24s). The
-  verdict above is unchanged: **B8 complete with limitations** - still no live verification.
+* Combined focused regression: `============================ 688 passed in 28.59s =============================` (pytest exit status `0`, wall time 31s). The verdict above is unchanged: **B8 complete with limitations** - still no live verification.
