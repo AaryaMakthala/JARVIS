@@ -46,6 +46,7 @@ from jarvis.tools.base import ToolSpec
 from jarvis.tools.registry import build_default_registry
 from support import (
     brain_action,
+    brain_clarify,
     brain_conversation,
     brain_steps,
     make_spec,
@@ -256,19 +257,76 @@ def test_d_unrelated_question_never_receives_the_python_fact(
     assert "my preferred coding language is Python" not in composed.user
 
 
+def test_d_preference_recall_uses_one_response_call(memory_store: SqliteMemory) -> None:
+    """Relevant memory is local context; it must not add a router LLM call."""
+    _remember_python(memory_store)
+    reader = _ctx(ScriptedLLM([]), memory=memory_store)
+    retrieved = memory_retrieve(_state("What is my preferred coding language?"), reader)
+    llm = ScriptedLLM([brain_conversation("Your preferred coding language is Python.")])
+    ctx = _ctx(llm, memory=memory_store)
+
+    out = brain(
+        _state(
+            "What is my preferred coding language?",
+            memory_context=retrieved["memory_context"],
+        ),
+        ctx,
+    )
+
+    assert len(llm.calls) == 1
+    assert "Python" in llm.prompts[0][1]
+    assert out["request_kind"] == "conversation"
+
+
 # ── E. tool-selection failure ───────────────────────────────────────────────
 
 
-def test_e_unknown_tool_name_is_rejected_before_execution() -> None:
+@pytest.mark.parametrize("tool_name", ["no_such_tool", "execute_arbitrary_command"])
+def test_e_unknown_tool_name_is_rejected_before_execution(tool_name: str) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     registry = registry_with(make_spec("fake_echo", base_tier=0, record=record))
-    ctx = _ctx(ScriptedLLM([brain_action("no_such_tool", {})]), registry=registry)
+    ctx = _ctx(ScriptedLLM([brain_action(tool_name, {})]), registry=registry)
+
+    out = brain(_state("echo hi"), ctx)
+    validated = validate({"plan": out["plan"]}, ctx)
+
+    assert ctx.registry.get_optional(tool_name) is None
+    assert record == []
+    assert "not available" in (validated.get("error") or "")
+
+
+def test_e_fabricated_schema_cannot_replace_the_canonical_args_model() -> None:
+    """Only the registered Pydantic model validates; model-defined schemas do not exist."""
+    record: list[tuple[str, dict[str, Any]]] = []
+    registry = registry_with(make_spec("fake_echo", base_tier=0, record=record))
+    llm = ScriptedLLM([brain_action("fake_echo", {"text": ["not", "a", "string"]})])
+    ctx = _ctx(llm, registry=registry)
 
     out = brain(_state("echo hi"), ctx)
     validated = validate({"plan": out["plan"]}, ctx)
 
     assert record == []
-    assert "not available" in (validated.get("error") or "")
+    assert "invalid args" in (validated.get("error") or "")
+    assert "args_schema" not in out["plan"].steps[0].model_dump()
+    canonical = registry.get("fake_echo").args_model.model_json_schema()
+    assert canonical["properties"]["text"]["type"] == "string"
+
+
+def test_e_ambiguous_discovery_is_a_shortlist_not_an_authorization() -> None:
+    """Lexical ambiguity may produce several candidates; only the brain decides."""
+    llm = ScriptedLLM([brain_clarify("Which file should I look for?")])
+    ctx = _ctx(llm)
+    composed = compose_brain_context(_state("Find my tax documents."), ctx)
+
+    assert {"browser_find", "file_search"} <= set(composed.candidate_names)
+    assert len(composed.candidate_names) <= 5
+    assert len(composed.schema_names) <= 4
+
+    out = brain(_state("Find my tax documents."), ctx)
+
+    assert len(llm.calls) == 1
+    assert out["request_kind"] == "clarification"
+    assert out["plan"].steps == []
 
 
 def test_e_registered_tool_without_schema_gets_one_bounded_expansion() -> None:
@@ -337,6 +395,48 @@ def test_f_clear_single_tool_graph_uses_one_brain_call() -> None:
     assert len(llm.calls) == 1
     assert record == [("fake_echo", {"text": "hi"})]
     assert out.interrupted is False
+
+
+def test_f_arithmetic_fastpath_makes_zero_llm_calls() -> None:
+    llm = ScriptedLLM([])
+    out = brain(_state("what is 2 times 2?"), _ctx(llm))
+
+    assert out["final_answer"] == "4"
+    assert out["api_calls"] == 0
+    assert llm.calls == []
+
+
+def test_f_policy_engine_owns_tiers_confirmation_and_hashes() -> None:
+    """Tier 0/1/2 come from the registry and engine, never from the model."""
+    record: list[tuple[str, dict[str, Any]]] = []
+    registry = registry_with(
+        *(make_spec(f"fake_tier_{tier}", base_tier=tier, record=record) for tier in (0, 1, 2))
+    )
+    ctx = _ctx(ScriptedLLM([]), registry=registry)
+    decisions = {}
+    for tier in (0, 1, 2):
+        step = Step(
+            id=f"s{tier}",
+            tool=f"fake_tier_{tier}",
+            args={"text": f"value-{tier}"},
+            rationale="test",
+        )
+        decision = ctx.engine.decide(step, ctx.policy_ctx)
+        decisions[tier] = decision
+        assert decision.tier == tier
+        assert decision.allowed is True
+        assert decision.needs_confirm is (tier >= 1)
+        assert decision.needs_unlock is (tier >= 2)
+        assert len(decision.action_hash) == 64
+
+    assert "tier" not in Step.model_fields
+    assert "action_hash" not in Step.model_fields
+    changed = ctx.engine.decide(
+        Step(id="s1", tool="fake_tier_1", args={"text": "different"}, rationale="test"),
+        ctx.policy_ctx,
+    )
+    assert changed.action_hash != decisions[1].action_hash
+    assert record == []  # deciding is pure; no tool side effect
 
 
 # ── G. multi-step planning ──────────────────────────────────────────────────
@@ -552,6 +652,58 @@ def test_j_capability_index_is_a_view_of_the_registry() -> None:
     assert "open_app" in directory
     assert "args_schema" not in directory  # no full schemas in the directory
     assert discover_candidates(index, "Open Notepad.", limit=5)[0] == "open_app"
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("Open Notepad.", "open_app"),
+        ("Search the web for recent AI research.", "browser_search"),
+        ("Read the file notes.txt.", "read_file"),
+        ("Create a new file called notes.txt.", "create_file"),
+        ("Send a WhatsApp message to mom.", "whatsapp_send_message"),
+        ("What is my CPU and RAM usage?", "system_info"),
+        ("Take a screenshot.", "take_screenshot"),
+        ("Set the volume to 50 percent.", "volume_control"),
+        ("List my open windows.", "list_windows"),
+        ("Read what is on my screen.", "read_screen"),
+    ],
+)
+def test_j_discovery_recall_matrix_keeps_the_relevant_tool(query: str, expected: str) -> None:
+    ctx = _ctx(ScriptedLLM([]))
+    composed = compose_brain_context(_state(query), ctx)
+
+    assert expected in composed.candidate_names
+    assert expected in composed.schema_names
+    assert len(composed.candidate_names) <= 5
+    assert len(composed.schema_names) <= 4
+    assert composed.system.count('"args_schema"') == len(composed.schema_names)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Explain Python decorators in simple language.",
+        "Open Notepad.",
+        "Search the web for recent AI research.",
+        "What is my preferred coding language?",
+        "Open Notepad and write buy milk, then save it to a file.",
+    ],
+)
+def test_j_prompt_trimming_reduces_estimated_tokens(query: str) -> None:
+    after = compose_brain_context(_state(query), _ctx(ScriptedLLM([])))
+    before = compose_brain_context(
+        _state(query),
+        _ctx(
+            ScriptedLLM([]),
+            settings=Settings(agent=AgentSettings(prompt_trim_enabled=False)),
+        ),
+    )
+
+    assert after.stats.fits is True
+    assert after.stats.estimated_input_tokens < before.stats.estimated_input_tokens
+    assert after.stats.estimated_input_tokens < 5000
+    assert len(after.schema_names) <= 4
 
 
 def test_j_replan_context_uses_compact_directory_and_bounded_schemas() -> None:
