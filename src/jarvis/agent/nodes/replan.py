@@ -14,11 +14,11 @@ from __future__ import annotations
 from typing import Any
 
 from jarvis.agent.context import AppContext
+from jarvis.agent.context_composer import CONTEXT_BUDGET_EXCEEDED, compose_replan_context
 from jarvis.agent.nodes.telemetry import llm_attempt_meta
 from jarvis.agent.nodes.util import truncate
 from jarvis.agent.schemas import ReplanDecision, ToolCall
 from jarvis.agent.state import StepResult
-from jarvis.llm.prompts import replan_system_prompt, replan_user_prompt
 
 _NO_LLM = "No LLM backend configured (run `jarvis init`)."
 
@@ -39,8 +39,15 @@ def replan(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     if ctx.llm is None:
         return {"halted_reason": _NO_LLM}
 
-    repair_error = state.get("error") if state.get("pending_replan") else None
-    catalogue = ctx.registry.catalogue_for_llm()
+    toolcalls = _toolcalls(state)
+    composed = compose_replan_context(
+        state,
+        ctx,
+        toolcalls=[call.model_dump() for call in toolcalls],
+        goal=_goal(state),
+    )
+    if not composed.stats.fits:
+        return {"halted_reason": CONTEXT_BUDGET_EXCEEDED}
     llm_budget: dict[str, Any] = {}
     if (state.get("source") or "terminal") == "voice":
         llm_budget = {
@@ -49,21 +56,13 @@ def replan(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         }
     # B8.5: the replanner's provider attempts belong to this task too, so a
     # fallback during replanning is visible in the task history.
-    attempt_meta = llm_attempt_meta(state, ctx, "action")
+    attempt_meta = llm_attempt_meta(state, ctx, "action", context_stats=composed.stats)
     if attempt_meta is not None:
         llm_budget["attempt_meta"] = attempt_meta
     try:
         model, usage = ctx.llm.structured(
-            system=replan_system_prompt(catalogue),
-            user=replan_user_prompt(
-                user_input=state.get("user_input") or "",
-                goal=_goal(state),
-                memory_context=[
-                    x if isinstance(x, dict) else {} for x in (state.get("memory_context") or [])
-                ],
-                toolcalls=_toolcalls(state),
-                repair_error=repair_error,
-            ),
+            system=composed.system,
+            user=composed.user,
             schema=ReplanDecision,
             model_role="planner",
             temperature=0.0,

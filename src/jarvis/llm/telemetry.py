@@ -37,6 +37,7 @@ __all__ = [
     "AttemptSink",
     "LLMAttemptMeta",
     "LLMAttemptRecord",
+    "LLMContextStats",
     "TaskStoreAttemptSink",
     "attempt_kwargs",
     "build_attempt_meta",
@@ -67,6 +68,22 @@ def new_attempt_id() -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class LLMContextStats:
+    """Safe, content-free context measurements for one model request (B9).
+
+    Every field is a count or a boolean: no prompt, history, memory, tool
+    argument or provider response can be represented here.
+    """
+
+    estimated_input_tokens: int = 0
+    candidate_tools: int = 0
+    schema_tools: int = 0
+    memory_candidates: int = 0
+    history_turns: int = 0
+    trimmed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class LLMAttemptRecord:
     """One real request sent to one provider/model for one role.
 
@@ -89,6 +106,7 @@ class LLMAttemptRecord:
     failure_category: str = ""
     cancelled: bool = False
     timed_out: bool = False
+    context: LLMContextStats | None = None
 
     def detail(self) -> dict[str, Any]:
         """The allow-listed ``llm_call`` detail payload (safe fields only)."""
@@ -111,6 +129,13 @@ class LLMAttemptRecord:
             detail["completion_tokens"] = max(int(self.completion_tokens), 0)
         if self.failure_category:
             detail["failure_category"] = self.failure_category
+        if self.context is not None and self.context.estimated_input_tokens:
+            detail["estimated_input_tokens"] = max(int(self.context.estimated_input_tokens), 0)
+            detail["candidate_tools"] = max(int(self.context.candidate_tools), 0)
+            detail["schema_tools"] = max(int(self.context.schema_tools), 0)
+            detail["memory_candidates"] = max(int(self.context.memory_candidates), 0)
+            detail["history_turns"] = max(int(self.context.history_turns), 0)
+            detail["context_trimmed"] = bool(self.context.trimmed)
         return detail
 
 
@@ -121,6 +146,7 @@ class LLMAttemptMeta:
     task_id: str
     task_class: str = ""
     sink: AttemptSink | None = None
+    context: LLMContextStats | None = None
 
     def emit(self, attempt: LLMAttemptRecord) -> None:
         """Forward one record; a sink failure is logged and never propagated."""
@@ -133,7 +159,12 @@ class LLMAttemptMeta:
 
 
 def build_attempt_meta(
-    client: Any, task_id: str, task_class: str, store: Any
+    client: Any,
+    task_id: str,
+    task_class: str,
+    store: Any,
+    *,
+    context: LLMContextStats | None = None,
 ) -> LLMAttemptMeta | None:
     """Per-request attempt metadata, or ``None`` when nothing can be recorded.
 
@@ -153,6 +184,7 @@ def build_attempt_meta(
         task_id=str(task_id),
         task_class=str(task_class or ""),
         sink=TaskStoreAttemptSink(store),
+        context=context,
     )
 
 

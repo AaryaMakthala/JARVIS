@@ -563,6 +563,7 @@ class MultiProviderClient:
                     failure_category=task_failure_category(failure_category, outcome),
                     cancelled=outcome is TaskAttemptOutcome.CANCELLED,
                     timed_out=outcome is TaskAttemptOutcome.TIMEOUT,
+                    context=meta.context,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - telemetry must never break a call

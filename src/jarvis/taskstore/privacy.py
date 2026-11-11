@@ -144,7 +144,13 @@ _DETAIL_POLICIES: dict[str, dict[str, str]] = {
     "llm_call": {
         "attempt_id": "attempt_id",
         "cancelled": "bool",
+        "candidate_tools": "count",
         "completion_tokens": "count",
+        "context_trimmed": "bool",
+        "estimated_input_tokens": "count",
+        "history_turns": "count",
+        "memory_candidates": "count",
+        "schema_tools": "count",
         "duration_ms": "duration",
         "failure_category": "failure_category",
         "fallback_index": "count",

@@ -135,13 +135,20 @@ class BrainDecision(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    request_type: Literal["conversation", "action", "clarification", "unsupported", "browse"]
+    request_type: Literal[
+        "conversation", "action", "clarification", "unsupported", "browse", "tool_schema"
+    ]
     goal: str = ""
     actions: list[ActionIntent] = Field(default_factory=list)
     response_text: str = ""
     clarification_question: str | None = None
     assumption: str = ""
     missing: list[str] = Field(default_factory=list)
+    #: B9 bounded schema-discovery continuation: the model names a registered
+    #: capability whose full schema was not in the compact prompt.  The brain
+    #: verifies the name against the canonical registry and re-asks exactly
+    #: once with that schema; the value never reaches execution.
+    requested_tool: str = ""
     response_hint: str = ""
     conversation_context: str = ""
 
@@ -177,6 +184,11 @@ class BrainDecision(BaseModel):
             raise ValueError("request_type='browse' requires a non-blank goal")
         if self.request_type == "browse" and self.actions:
             raise ValueError("request_type='browse' requires empty actions")
+        if self.request_type == "tool_schema":
+            if not (self.requested_tool or "").strip():
+                raise ValueError("request_type='tool_schema' requires a non-blank requested_tool")
+            if self.actions:
+                raise ValueError("request_type='tool_schema' requires empty actions")
         # Consistency (route contract, jarvis.agent.routing): a request that is
         # answered or refused must not carry tool steps - nothing would run
         # them, and a stale action list could otherwise be projected into a
@@ -288,13 +300,10 @@ class SpecialistDecision(BaseModel):
 
     @model_validator(mode="after")
     def _validate_kind(self) -> SpecialistDecision:
-        if self.kind == "act":
-            if not (self.tool or "").strip():
-                raise ValueError("act requires a tool")
-        if self.kind == "done":
-            if not (self.summary or "").strip():
-                raise ValueError("done requires a summary")
-        if self.kind == "give_up":
-            if not (self.summary or "").strip():
-                raise ValueError("give_up requires a reason in summary")
+        if self.kind == "act" and not (self.tool or "").strip():
+            raise ValueError("act requires a tool")
+        if self.kind == "done" and not (self.summary or "").strip():
+            raise ValueError("done requires a summary")
+        if self.kind == "give_up" and not (self.summary or "").strip():
+            raise ValueError("give_up requires a reason in summary")
         return self

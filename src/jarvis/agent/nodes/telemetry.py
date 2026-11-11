@@ -292,7 +292,13 @@ def record_route(
         ctx.logger.debug("task route not recorded: %s", exc)
 
 
-def llm_attempt_meta(state: dict[str, Any], ctx: AppContext, task_class: str) -> Any | None:
+def llm_attempt_meta(
+    state: dict[str, Any],
+    ctx: AppContext,
+    task_class: str,
+    *,
+    context_stats: Any | None = None,
+) -> Any | None:
     """Per-request attempt metadata for the LLM client (B8.5), or ``None``.
 
     Explicit by construction: the task id and class travel with *this* call
@@ -302,13 +308,24 @@ def llm_attempt_meta(state: dict[str, Any], ctx: AppContext, task_class: str) ->
     embedding without the composite client) or when observability is off, in
     which case the caller makes an ordinary call with no extra keyword.
     """
-    from jarvis.llm.telemetry import build_attempt_meta
+    from jarvis.llm.telemetry import LLMContextStats, build_attempt_meta
 
+    context = None
+    if context_stats is not None:
+        context = LLMContextStats(
+            estimated_input_tokens=int(context_stats.estimated_input_tokens),
+            candidate_tools=int(context_stats.candidate_tools),
+            schema_tools=int(context_stats.schema_tools),
+            memory_candidates=int(context_stats.memory_candidates),
+            history_turns=int(context_stats.history_turns),
+            trimmed=bool(context_stats.trimmed),
+        )
     return build_attempt_meta(
         getattr(ctx, "llm", None),
         str(state.get("task_id") or ""),
         str(task_class or ""),
         _task_store(ctx),
+        context=context,
     )
 
 
