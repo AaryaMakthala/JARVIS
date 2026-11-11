@@ -194,3 +194,10 @@ Maintained by the coding agent. Condensed from historical log.
 - **Measurements reproduced**: 57 tools/descriptors; directory 8,714 chars / 2,179 est. tokens; after prompts 13,197–16,735 chars / 3,300–4,184 est. tokens vs 48,668–48,847 / 12,168–12,213 before. Multi-step before is 48,847 / 12,213 (the historical 48,711 / 12,178 was stale). Actual provider tokens are reported separately above and are not tokenizer-equivalent to estimates.
 - **Commits**: `907b29d` test(llm), `0211c93` test(agent), plus the documentation commit. Report addendum: `docs/B9_CONTEXT_DISCOVERY_IMPLEMENTATION_REPORT.md`.
 - **Remaining limits**: no actual desktop/browser/WhatsApp execution, one live browser timeout, no live voice audio; unknown model context windows; lexical discovery; repository-wide Ruff/format findings and the full suite remain unaddressed. Nothing was pushed.
+- **B9 closure (2026-11-11)**: reconciled Notepad routing. `Open Notepad.` uses the zero-LLM `fastpath.brain_update` 
+  path; the decision-only test now uses `Please open Notepad for me.` and asserts one model call, because its old input 
+  (`Open Notepad.`) was intercepted by the fast path. Added one focused fast-path test proving canonical resolution, 
+  Pydantic validation, Tier 0 policy authorization and no execution before `act`. Budget ceiling is 19,376 estimated 
+  tokens (`24000×0.85−1024`), giving 2.76× headroom on the worst provider-reported input (7,017) and 4.72× on the largest 
+  estimate (4,109); no production change. `openrouter/free` is recorded as the requested alias only; no resolved model or 
+  context window is claimed. Focused: 70 passed in 12.47 s; ruff clean. Actual Notepad execution not live-verified. B9 frozen.

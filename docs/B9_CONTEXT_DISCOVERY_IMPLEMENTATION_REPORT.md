@@ -497,3 +497,90 @@ The documentation commit containing this addendum is the next commit. The five o
 ### 16. Addendum verdict
 
 **B9 RELEASE-READY WITH DOCUMENTED LIMITATIONS** — the architecture, security contracts, canonical schema validation, bounded discovery, prompt budgeting, call-count behavior and focused regressions pass. The remaining limitations are environment-dependent live execution (desktop/browser/WhatsApp/voice), one live browser timeout, unknown model context windows, lexical discovery, and the intentionally unrun full repository suite/repository-wide formatting.
+
+## 17. Final closure addendum (B9 freeze)
+
+### 17.1 Notepad routing reconciliation
+
+Notepad has two deliberately separate paths. The trigger decides which one runs; nothing falls back from one to the other at runtime.
+
+| Path | Exact test/input | Entry point | Model calls |
+|---|---|---|---|
+| Deterministic fast path | `Open Notepad.` / `open notepad` | `brain()` → `fastpath.brain_update()` (`src/jarvis/agent/nodes/brain.py:69`) → `fastpath.match()` (`src/jarvis/agent/fastpath.py:127`) | **0** |
+| Model decision path | `Please open Notepad for me.` | `brain()` → `ctx.llm.structured()` (`src/jarvis/agent/nodes/brain.py:145`) | **1** |
+
+The fast path is closed-vocabulary and whole-utterance only. After stripping one trailing `.?!`, `normalise()` lowercases and removes punctuation, so `Open Notepad.` becomes `open notepad`. `_OPEN_VERBS` (`fastpath.py:101`) accepts `open|launch|start`, and the remaining text must equal an exact normalised `[apps]` key (`fastpath.py:154-158`). On a hit it returns `Plan(kind="tool")` with `open_app` / `{"name": "notepad"}` (`plan_for`, `fastpath.py:162`); `brain_update` (`fastpath.py:182`) returns that plan and does not call a tool. The unchanged pipeline is `validate → policy_gate → act → verify`.
+
+**Reconciliation of the decision-only test.** `tests/unit/test_b9_context_discovery.py::test_b_brain_selects_open_app_and_policy_engine_still_decides` previously used the input `Open Notepad.` — the exact phrase the fast path intercepts in `brain()` *before* `ctx.llm.structured()`. The test therefore passed with zero model calls and did not exercise model selection, despite its name. It was not an intentional bypass; the live decision-only run recorded in §4 used `Please open Notepad for me.` precisely because that phrase is outside the closed fast-path vocabulary.
+
+This closure corrects the test input to `Please open Notepad for me.` and now asserts both `fastpath.match(...) is None` and exactly one `ScriptedLLM` call. No shortcut was removed, and no LLM call was added to the fast path.
+
+Focused evidence for the normal deterministic path, using `Open Notepad.`:
+
+| Contract | Evidence |
+|---|---|
+| 1. Canonical tool resolution | `tests/unit/test_fastpath.py::test_open_notepad_fastpath_is_resolved_validated_and_gated_before_running` asserts `ctx.registry.get(step.tool) is spec` (the registered `open_app` spec). `validate()` resolves through `registry.get_optional` and uses the registered args model. |
+| 2. Pydantic argument validation | The same test runs the real `validate` node, which calls `spec.args_model.model_validate(step.args)`; it asserts `error is None` and `halted_reason is None`. `test_plans_validate_with_expected_shape` also validates through the canonical `args_model`. |
+| 3. PolicyEngine authorization | The same test calls `ctx.engine.decide(...)` and asserts `allowed is True`. `tests/unit/test_notepad_flow.py::test_open_notepad_is_tier0_allowed_without_confirm` asserts the same for `open_app` / notepad. |
+| 4. No direct execution before authorization | The focused test registers a recording `open_app` spec whose `run()` raises if called, then asserts `executed == []` after `brain()`, `validate()` and `decide()`. `act` is not called. |
+| 5. Existing tier/confirmation behaviour | The focused test asserts `decision.tier == TIER_SAFE` and `decision.needs_confirm is False`; `test_notepad_flow.py:57-62` asserts Tier 0, allowed, no confirm. The Tier 1 counterpart (`type_text` into notepad) asserts `needs_confirm is True` at `test_notepad_flow.py:65-74`. |
+
+**Actual Notepad desktop execution was not live-verified.** The focused test uses a recording spec; it does not launch `notepad.exe`. No Windows process, window or dictation result was observed in this closure.
+
+### 17.2 Conservative token-budget headroom
+
+The application-controlled budget already provides more than the requested provisional 2.5× headroom, so no production correction was made.
+
+| Component | Exact location | Value |
+|---|---|---|
+| Estimator | `src/jarvis/agent/context_composer.py:121-123` (`estimate_tokens = ceil(chars / 4)`) | `_CHARS_PER_TOKEN = 4` at line 62 |
+| Budget arithmetic | `_effective_budget`, `src/jarvis/agent/context_composer.py:130-140` | `max(512, floor(budget × (1 − margin)) − reserved)` |
+| Defaults | `src/jarvis/config.py:428-430` (`AgentSettings`); generated template at lines 106-108 | `context_budget_tokens = 24000`, `context_reserved_output_tokens = 1024`, `context_safety_margin = 0.15` |
+| Enforcement | `compose_brain_context` line 291/341; `compose_replan_context` line 408/443 | oversized prompts fail closed with `CONTEXT_BUDGET_EXCEEDED` |
+
+Effective ceiling: `floor(24000 × 0.85) − 1024 = 20400 − 1024 = **19,376 estimated input tokens**`.
+
+Observed headroom against that ceiling:
+
+| Scenario | Estimated | Actual provider-reported | Ceiling ÷ estimate | Ceiling ÷ actual |
+|---|---:|---:|---:|---:|
+| Conversation / Groq | 3,310 | 3,073 | 5.85× | 6.31× |
+| Preference / Groq | 3,300 | 6,341 | 5.87× | 3.06× |
+| Preference / OpenRouter | 3,300 | 3,310 | 5.87× | 5.85× |
+| Browser / OpenRouter | 4,109 | 7,017 | 4.72× | 2.76× |
+| Notepad / OpenRouter (reference) | 3,936 | 3,532 | 4.92× | 5.49× |
+| Notepad write/save (reference) | 4,184 | not provided | 4.63× | — |
+
+The smallest margin is **2.76×** on the largest provider-reported input (browser, 7,017 actual) and **4.72×** on the largest estimate (browser, 4,109 estimated). Both exceed 2.5×.
+
+This is **provisional**, because `ceil(chars / 4)` is an estimate, not a model tokenizer. In these samples actual tokens were at most 1.71× the estimate (browser: 7,017 / 4,109). The 2.5× floor against the largest observed estimate would hold while that ratio stays at or below about 1.89×. Estimates remain estimates; no estimate was replaced with a provider count.
+
+This ceiling is JARVIS's own request cap. It is **not** a model context-window limit. `ModelSpec.context_tokens` remains `None` for every registered model, and actual model limits remain unknown.
+
+### 17.3 `openrouter/free` is a dynamic routing alias
+
+`openrouter/free` is the configured planner/fast value (`src/jarvis/config.py:84-85`) and is registered as a zero-cost endpoint (`src/jarvis/llm/models.py:126`), not a concrete backend. OpenRouter treats it as a dynamic routing alias and may resolve it to a different underlying model per request.
+
+JARVIS records the requested alias separately in `LLMAttemptRecord.provider` / `.model` (`src/jarvis/llm/telemetry.py:96-97`) and the `llm_call` detail. The OpenAI-compatible response parser currently reads only `choices` and `usage` (`src/jarvis/llm/openai_compat.py:206-210`); it does **not** read or persist the response body's `model` field. Consequently, every table entry saying `openrouter/free` is the **requested alias**, not a resolved-model claim. No resolved model and no context-window size are recorded or invented here. If a future telemetry change needs the provider-resolved model, it must add a separate field rather than overwrite the requested alias.
+
+### 17.4 Closure verification
+
+Focused only, in a temporary Python 3.14 Linux environment (the repository `.venv` is a Windows environment and cannot execute on this host):
+
+```text
+tests/unit/test_fastpath.py + tests/unit/test_b9_context_discovery.py
+70 passed, 13 warnings in 12.47s
+
+Explicit new/changed tests:
+tests/unit/test_fastpath.py::test_open_notepad_fastpath_is_resolved_validated_and_gated_before_running PASSED
+tests/unit/test_b9_context_discovery.py::test_b_brain_selects_open_app_and_policy_engine_still_decides PASSED
+
+ruff check <both files>        All checks passed
+ruff format --check <both>     2 files already formatted
+```
+
+The full suite was not run. No architecture, policy rule, provider order, pricing, free-tier rule, dependency or database was changed. No live external action was performed.
+
+### 17.5 Final verdict
+
+**B9 IS FROZEN.** The Notepad fast path and the model-proposal path are now separately evidenced; the deterministic path resolves canonically, validates with Pydantic, is authorized by `PolicyEngine`, and executes nothing before `act`. The application budget already has at least 2.76× provisional headroom against its own ceiling. Actual Notepad desktop execution and actual model context windows remain unverified and unknown.

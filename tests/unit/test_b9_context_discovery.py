@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field, create_model
 
+from jarvis.agent import fastpath
 from jarvis.agent.capability_index import (
     build_capability_index,
     discover_candidates,
@@ -148,17 +149,30 @@ def test_b_notepad_schema_is_present_and_browser_whatsapp_absent() -> None:
 
 
 def test_b_brain_selects_open_app_and_policy_engine_still_decides() -> None:
+    """Decision-only Notepad: the model call, then validate + engine.
+
+    "Please open Notepad for me." is deliberately outside the closed fast-path
+    vocabulary ("Open Notepad." never reaches the LLM), so this asserts the
+    model-proposal path rather than the deterministic shortcut.
+    """
+    assert fastpath.match("Please open Notepad for me.", Settings()) is None
     llm = ScriptedLLM([brain_action("open_app", {"name": "notepad"})])
     ctx = _ctx(llm)
-    out = brain(_state("Open Notepad."), ctx)
+    out = brain(_state("Please open Notepad for me."), ctx)
 
+    assert len(llm.calls) == 1
     assert out["plan"].steps[0].tool == "open_app"
+    assert out["plan"].steps[0].args == {"name": "notepad"}
+    assert out["api_calls"] == 1
     validated = validate({"plan": out["plan"]}, ctx)
     step = validated["plan"].steps[0]
     decision = ctx.engine.decide(step, ctx.policy_ctx)
     # The decision is computed by the engine, not carried in the brain output.
     assert len(decision.action_hash) == 64
     assert decision.step_id == step.id
+    assert decision.allowed is True
+    assert decision.tier == 0
+    assert decision.needs_confirm is False
 
 
 # ── C. browser ──────────────────────────────────────────────────────────────

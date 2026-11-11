@@ -10,6 +10,10 @@ from jarvis.agent.graph import build_graph
 from jarvis.agent.nodes.brain import LLM_NOT_CONFIGURED, brain
 from jarvis.agent.nodes.validate import validate as validate_fn
 from jarvis.config import AppSettings, Settings
+from jarvis.policy import tiers
+from jarvis.tools.apps import OpenAppArgs
+from jarvis.tools.base import ToolSpec
+from support import registry_with
 
 
 class _ExplodingLLM:
@@ -172,6 +176,46 @@ def test_plans_validate_with_expected_shape() -> None:
         out = validate_fn({"plan": plan}, ctx)
         assert out["error"] is None
         assert out["halted_reason"] is None
+
+
+def test_open_notepad_fastpath_is_resolved_validated_and_gated_before_running() -> None:
+    """The canonical Notepad chain: resolve -> validate -> decide -> (act later)."""
+    executed: list[dict[str, Any]] = []
+
+    def run(args: OpenAppArgs, ctx: Any) -> Any:
+        executed.append(args.model_dump())
+        raise AssertionError("open_app must not run before policy_gate/act")
+
+    spec = ToolSpec(
+        name="open_app",
+        description="Launch an allowlisted application.",
+        args_model=OpenAppArgs,
+        base_tier=0,
+        run=run,
+    )
+    ctx = make_app_context(Settings(), registry=registry_with(spec))
+
+    update = brain({"user_input": "Open Notepad.", "task_id": "fp-gate"}, ctx)
+    plan = update["plan"]
+    step = plan.steps[0]
+    assert plan.goal == "fastpath: open notepad"
+    assert step.tool == "open_app"
+    assert step.args == {"name": "notepad"}
+    assert update["api_calls"] == 0
+
+    # 1. canonical tool resolution (the registry, not model-supplied metadata)
+    assert ctx.registry.get(step.tool) is spec
+    # 2. canonical Pydantic argument validation through the real validate node
+    out = validate_fn({"plan": plan}, ctx)
+    assert out["error"] is None
+    assert out["halted_reason"] is None
+    # 3. and 5. the deterministic engine owns authorization, tier and confirmation
+    decision = ctx.engine.decide(out["plan"].steps[0], ctx.policy_ctx)
+    assert decision.allowed is True
+    assert decision.tier == tiers.TIER_SAFE
+    assert decision.needs_confirm is False
+    # 4. no direct execution before authorization (and no act call here at all)
+    assert executed == []
 
 
 # ── brain: LLM is never called on a hit; non-hits are unchanged ─────────────
