@@ -142,11 +142,19 @@ _DETAIL_POLICIES: dict[str, dict[str, str]] = {
         "task_class": "request_class",
     },
     "llm_call": {
+        "attempt_id": "attempt_id",
+        "cancelled": "bool",
+        "completion_tokens": "count",
         "duration_ms": "duration",
         "failure_category": "failure_category",
+        "fallback_index": "count",
         "model": "model",
+        "outcome": "attempt_outcome",
+        "prompt_tokens": "count",
         "provider": "provider",
         "role": "role",
+        "task_class": "request_class",
+        "timed_out": "bool",
     },
     "note": {
         "attempt": "count",
@@ -358,6 +366,13 @@ def safe_request_class(value: Any) -> str | None:
     return _enum_value(value, TaskRequestClass)
 
 
+def safe_attempt_outcome(value: Any) -> str | None:
+    """Return a supported LLM attempt outcome, or ``None``."""
+    from .vocabulary import TaskAttemptOutcome
+
+    return _enum_value(value, TaskAttemptOutcome)
+
+
 def safe_route_reason(value: Any) -> str | None:
     """Return a supported deterministic routing reason, or ``None``."""
     return _enum_value(value, TaskRouteReason)
@@ -528,6 +543,13 @@ def _validate_detail_value(
             return safe_step_id(value)
         except (TypeError, ValueError):
             return None
+    if kind == "attempt_id":
+        try:
+            return _canonical_uuid(value, field="attempt_id")
+        except (TypeError, ValueError):
+            return None
+    if kind == "attempt_outcome":
+        return safe_attempt_outcome(value)
     if kind == "provider":
         return safe_provider(value, vocabulary)
     if kind == "model":

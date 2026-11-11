@@ -25,7 +25,7 @@ from typing import Any
 from jarvis.agent import fastpath
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.clarify import MAX_CLARIFICATIONS
-from jarvis.agent.nodes.telemetry import record_route
+from jarvis.agent.nodes.telemetry import llm_attempt_meta, record_route
 from jarvis.agent.prompts import brain_system_prompt, brain_user_prompt
 from jarvis.agent.routing import UNSUPPORTED_ANSWER
 from jarvis.agent.schemas import BrainDecision
@@ -182,6 +182,12 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             "timeout_s": min(float(ctx.settings.llm.timeout_seconds), voice_deadline, 10.0),
         }
 
+    # B8.5: attach this request's task id/class so every *real* provider
+    # attempt is persisted as an LLM_CALL event bound to this task.  Clients
+    # that do not advertise support (test doubles) get no extra keyword.
+    attempt_meta = llm_attempt_meta(state, ctx, route.task_class.value)
+    if attempt_meta is not None:
+        llm_budget["attempt_meta"] = attempt_meta
     try:
         model, usage = ctx.llm.structured(
             system=system,

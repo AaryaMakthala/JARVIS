@@ -57,6 +57,7 @@ __all__ = [
     "discard_trace",
     "format_trace",
     "get_trace",
+    "llm_attempt_meta",
     "node_code",
     "record_finished",
     "record_route",
@@ -233,8 +234,7 @@ def format_trace(names: tuple[str, ...] | list[str]) -> str:
         else:
             runs.append((label, 1))
     path = ">".join(
-        f"{node_code(label)} x{count}" if count > 1 else node_code(label)
-        for label, count in runs
+        f"{node_code(label)} x{count}" if count > 1 else node_code(label) for label, count in runs
     )
     if len(path) <= MAX_PATH_CHARS:
         return path
@@ -290,6 +290,32 @@ def record_route(
         )
     except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
         ctx.logger.debug("task route not recorded: %s", exc)
+
+
+def llm_attempt_meta(state: dict[str, Any], ctx: AppContext, task_class: str) -> Any | None:
+    """Per-request attempt metadata for the LLM client (B8.5), or ``None``.
+
+    Explicit by construction: the task id and class travel with *this* call
+    instead of through a process-wide "current task" variable, so concurrent
+    tasks cannot attribute each other's model attempts.  Returns ``None`` when
+    the client does not advertise ``supports_attempt_meta`` (a test double, an
+    embedding without the composite client) or when observability is off, in
+    which case the caller makes an ordinary call with no extra keyword.
+    """
+    client = getattr(ctx, "llm", None)
+    if not getattr(client, "supports_attempt_meta", False):
+        return None
+    store = _task_store(ctx)
+    task_id = str(state.get("task_id") or "")
+    if store is None or not task_id:
+        return None
+    from jarvis.llm.telemetry import LLMAttemptMeta, TaskStoreAttemptSink
+
+    return LLMAttemptMeta(
+        task_id=task_id,
+        task_class=str(task_class or ""),
+        sink=TaskStoreAttemptSink(store, logger=ctx.logger),
+    )
 
 
 def record_stage(state: dict[str, Any], ctx: AppContext, node_name: str) -> None:
@@ -404,6 +430,7 @@ def task_status(state: dict[str, Any]) -> str:
     from jarvis.agent.compose_rules import task_status_for
 
     return task_status_for(state)
+
 
 def _write(
     state: dict[str, Any],

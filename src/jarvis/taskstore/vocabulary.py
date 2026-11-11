@@ -86,6 +86,20 @@ class TaskOutcome(str, Enum):
     UNKNOWN = "unknown"
 
 
+class TaskAttemptOutcome(str, Enum):
+    """Allowed outcomes of one real model attempt.
+
+    A *skipped* candidate (capability mismatch, no credential) is not an
+    attempt and is never recorded: only a request actually sent to a provider
+    produces one of these.
+    """
+
+    SUCCESS = "success"
+    ERROR = "error"
+    CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
+
+
 class TaskSeverity(str, Enum):
     """Allowed warning severities."""
 
