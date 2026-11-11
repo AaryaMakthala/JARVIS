@@ -35,6 +35,7 @@ from jarvis.taskstore.vocabulary import TaskRequestClass
 __all__ = [
     "CONVERSATION_REQUIREMENT",
     "PLANNER_REQUIREMENT",
+    "TEXT_REQUIREMENT",
     "VISION_REQUIREMENT",
     "CapabilityRequirement",
     "eligible_candidates",
@@ -59,6 +60,7 @@ class CapabilityRequirement:
     structured: bool = False
     tools: bool = False
     vision: bool = False
+    text: bool = False
     min_context_tokens: int | None = None
 
     def label(self) -> str:
@@ -70,6 +72,8 @@ class CapabilityRequirement:
             parts.append("tool-planning")
         if self.vision:
             parts.append("vision")
+        if self.text:
+            parts.append("text-completion")
         if self.min_context_tokens:
             parts.append(f"context>={self.min_context_tokens}")
         return "+".join(parts) or "text"
@@ -83,6 +87,11 @@ PLANNER_REQUIREMENT = CapabilityRequirement(structured=True, tools=True)
 
 #: Image understanding (screen/photo descriptions).
 VISION_REQUIREMENT = CapabilityRequirement(vision=True)
+
+#: An ordinary plain-text completion (``text()``).  Registration in the pricing
+#: registry is *not* treated as implicit proof that a model can answer a
+#: completion: the flag is declared on every registry entry and checked here.
+TEXT_REQUIREMENT = CapabilityRequirement(text=True)
 
 #: Unknown roles fail **closed** to the planner requirement: a typo must never
 #: widen what a model is trusted to do.
@@ -136,6 +145,8 @@ def satisfies(spec: ModelSpec, requirement: CapabilityRequirement) -> tuple[bool
         missing.append("tool planning")
     if requirement.vision and not caps.supports_vision:
         missing.append("vision")
+    if requirement.text and not caps.supports_text:
+        missing.append("plain text completion")
     if requirement.min_context_tokens is not None:
         window = spec.context_tokens
         if window is None:

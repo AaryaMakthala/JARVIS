@@ -67,11 +67,20 @@ PROVIDER_LABELS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class Capabilities:
-    """What an operation may demand of a model."""
+    """What an operation may demand of a model.
+
+    ``supports_text`` makes the *ordinary text-completion* contract explicit:
+    every model in this registry today is a chat model that can answer a plain
+    completion, and :func:`jarvis.llm.capability.satisfies` enforces the flag
+    for ``text()`` instead of assuming registration implies it.  It defaults to
+    ``True`` so existing capability constructions (and every registry entry via
+    :func:`_cap`) keep their meaning.
+    """
 
     supports_tools: bool
     supports_structured_output: bool
     supports_vision: bool
+    supports_text: bool = True
 
 
 @dataclass(frozen=True)
@@ -95,6 +104,9 @@ def _cap(tools: bool, structured: bool, vision: bool = False) -> Capabilities:
         supports_tools=tools,
         supports_structured_output=structured,
         supports_vision=vision,
+        # Every registered pair is a chat model; the flag is stated here, not
+        # inferred from the model name, and is gated for ``text()`` selection.
+        supports_text=True,
     )
 
 

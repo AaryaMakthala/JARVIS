@@ -4,9 +4,9 @@ Wraps the eligible free providers (configured order).  For every operation it
 walks the list and:
 
 * skips providers whose registry entry lacks the capability the operation
-  needs (structured output + tool planning for ``structured()``; plain text
-  generation for ``text()``) — checked against the model **for the requested
-  role**, not always the planner;
+  needs (structured output + tool planning for ``structured()``; a declared
+  plain-text completion capability for ``text()``) — checked against the model
+  **for the requested role**, not always the planner;
 * orders candidates by :class:`~jarvis.llm.health.ProviderHealth`, so a provider
   that just 503'd is deprioritised for the next interaction without being
   removed from the configuration.  Candidates are walked **provider-major**:
@@ -288,18 +288,26 @@ class MultiProviderClient:
     ) -> tuple[str, Usage]:
         """First healthy provider that can answer plain text for ``model_role``.
 
-        Plain text needs no registry capability (a completion request is the
-        lowest common denominator), so this walk does not gate on one.
+        ``TEXT_REQUIREMENT`` is enforced here: a registered model that does not
+        declare ordinary text completion is skipped, so "it is in the pricing
+        registry" is never used as an implicit proof that a completion request
+        will work.
         """
         failures: list[str] = []
         attempt_index = 0
         deadline_at, handed_deadline = self._deadline(timeout_s)
+        requirement = llm_capability.TEXT_REQUIREMENT
         for group in self._groups(model_role):
             for info, _spec, client in group:
                 # Between attempts, before any provider is called: a cancelled
                 # task stops here instead of starting one more request.
                 abort_if_cancelled()
                 remaining = self._remaining(deadline_at, model_role)
+                spec = _spec_for_role(info.name, _spec, client, model_role)
+                ok, why = llm_capability.satisfies(spec, requirement)
+                if not ok:
+                    failures.append(f"{info.name}: skipped ({why})")
+                    continue
                 started = self._clock()
                 try:
                     result = client.text(
