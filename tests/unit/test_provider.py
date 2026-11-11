@@ -427,7 +427,8 @@ def test_unregistered_vision_model_blocks_build() -> None:
     assert "not registered" in sel.reasons[0]
 
 
-def test_registered_vision_model_allows_build() -> None:
+def test_registered_non_vision_model_blocks_vision_role() -> None:
+    """A registered planner model must not become a vision model by config."""
     settings = Settings(
         llm=LLMSettings(
             provider_order=["groq"],
@@ -436,6 +437,27 @@ def test_registered_vision_model_allows_build() -> None:
         )
     )
     sel = build_llm_client(settings, MemoryKeyStore({"groq_api_key": "k"}))
+    assert sel.client is None
+    assert "vision model" in sel.reasons[0]
+    assert "lacks vision" in sel.reasons[0]
+
+
+def test_registered_vision_model_allows_build() -> None:
+    """A model with declared vision capability may fill the vision role."""
+    settings = Settings(
+        llm=LLMSettings(
+            provider_order=["gemini"],
+            strict_zero_cost=False,
+            models={
+                "gemini": ProviderModels(
+                    planner="gemini-3.8-flash",
+                    fast="gemini-3.7-flash",
+                    vision="gemini-3.8-flash",
+                )
+            },
+        )
+    )
+    sel = build_llm_client(settings, MemoryKeyStore({"gemini_api_key": "k"}))
     assert sel.client is not None
     assert sel.reasons == []
 
