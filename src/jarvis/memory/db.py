@@ -33,10 +33,12 @@ from typing import Any
 
 __all__ = [
     "SCHEMA_VERSION",
+    "TOKEN_SHAPE",
     "connect",
     "init_schema",
     "insert_task_log",
     "is_unverifiable_success_row",
+    "looks_like_token",
     "looks_secret",
     "migrate_failures",
     "prune_failures",
@@ -149,12 +151,13 @@ _SECRET_ASSIGNMENT = re.compile(
 
 
 def redact_secrets(text: str) -> str:
-    """Replace every credential-ish ``key=value`` pair in free text.
+    """Replace credential material in free text.
 
     Applied to any string that comes from outside our own code - tool error
     messages, goals, remembered prose.  A tool that echoes a password back in
-    its error string must not be able to persist it.  The key is kept (it is
-    useful context: "the *password* was wrong") and only the value is dropped.
+    its error string must not be able to persist it.  For a ``key=value`` pair
+    the key is kept (it is useful context: "the *password* was wrong") and only
+    the value is dropped; a bare vendor token is replaced entirely.
     """
     if not text:
         return ""
@@ -165,7 +168,8 @@ def redact_secrets(text: str) -> str:
             return match.group(0)
         return f"{match.group(0)[: match.start('value') - match.start(0)]}{_REDACTED}"
 
-    return _SECRET_ASSIGNMENT.sub(_sub, text)
+    # A bare token has no key to keep, so the whole match is replaced.
+    return TOKEN_SHAPE.sub(_REDACTED, _SECRET_ASSIGNMENT.sub(_sub, text))
 
 
 def secret_key(name: str) -> bool:
@@ -174,8 +178,36 @@ def secret_key(name: str) -> bool:
     return any(hint in low for hint in SECRET_KEY_HINTS)
 
 
+#: Standalone vendor credential shapes.  These carry no ``name=value`` pair,
+#: so :data:`_SECRET_ASSIGNMENT` cannot see them: a raw token pasted as a
+#: preference value, a remembered fact or a tool argument would otherwise be
+#: persisted verbatim.  Every alternative is anchored on a vendor prefix and a
+#: minimum body length, so ordinary words, identifiers and code snippets
+#: (``sk-learn``, ``task-queue``, ``jwt-notes``) do not match.
+TOKEN_SHAPE = re.compile(
+    r"\b(?:"
+    r"sk-[A-Za-z0-9_-]{8,}"  # OpenAI / OpenRouter style
+    r"|gh[pousr]_[A-Za-z0-9]{8,}"  # GitHub classic tokens (ghp_, gho_, ...)
+    r"|github_pat_[A-Za-z0-9_]{8,}"  # GitHub fine-grained token
+    r"|AKIA[0-9A-Z]{12,}"  # AWS access-key id
+    r"|AIza[0-9A-Za-z_-]{20,}"  # Google API key
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."  # JWT header.payload.
+    r")"
+)
+
+
+def looks_like_token(text: str) -> bool:
+    """True when ``text`` contains a standalone vendor credential shape.
+
+    The single detector shared by the conversational guard
+    (:mod:`jarvis.memory.intent`), the persistence guard (:func:`looks_secret`)
+    and redaction, so the two layers cannot diverge.
+    """
+    return bool(text) and TOKEN_SHAPE.search(text) is not None
+
+
 def looks_secret(text: str) -> bool:
-    """True when ``text`` pairs a credential-ish name with a real value.
+    """True when ``text`` carries a credential, by name/value pair or by shape.
 
     Used to fail closed on writes (:func:`secret_free_rows`) and to decide
     whether a remembered example is safe to show the planner.  A redacted
@@ -184,6 +216,8 @@ def looks_secret(text: str) -> bool:
     """
     if not text:
         return False
+    if looks_like_token(text):
+        return True
     for match in _SECRET_ASSIGNMENT.finditer(text):
         value = match.group("value")
         if value and value != _REDACTED:

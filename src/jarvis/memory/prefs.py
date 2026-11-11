@@ -21,7 +21,13 @@ import re
 import sqlite3
 from dataclasses import dataclass
 
-from jarvis.memory.db import looks_secret, now_iso, prune_preferences, secret_key
+from jarvis.memory.db import (
+    looks_like_token,
+    looks_secret,
+    now_iso,
+    prune_preferences,
+    secret_key,
+)
 
 __all__ = [
     "FACT_KEY_PREFIX",
@@ -73,7 +79,7 @@ def normalise_key(key: str) -> str:
         raise ValueError(
             "preference key must be lower-case letters, digits, dot, dash or underscore"
         )
-    if secret_key(value):
+    if secret_key(value) or looks_like_token(value):
         raise ValueError("preference key looks like a credential; refusing to store it")
     return value
 

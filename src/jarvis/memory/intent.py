@@ -66,8 +66,9 @@ _PROJECT = re.compile(
 )
 
 #: A credential word anywhere in a remembered fact is enough to refuse it.
-#: This is stricter than :func:`looks_secret` (which needs a name/value pair),
-#: because a remembered fact is replayed verbatim in later prompts.
+#: This is stricter than :func:`looks_secret` (which needs a name/value pair or
+#: a recognised token shape), because a remembered fact is replayed verbatim in
+#: later prompts.
 _SENSITIVE_FACT = re.compile(
     r"\b(?:password|passwd|passcode|passphrase|api[\s_-]?key|access[\s_-]?key|"
     r"secret[\s_-]?key|private[\s_-]?key|client[\s_-]?secret|token|otp|"
@@ -76,11 +77,6 @@ _SENSITIVE_FACT = re.compile(
     r"debit[\s-]?card|bank[\s-]?account|routing[\s-]?number|iban|ssn|"
     r"social[\s-]?security|passport[\s-]?number|aadhaar|aadhar|pin)\b",
     re.IGNORECASE,
-)
-_TOKEN_SHAPE = re.compile(
-    r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|"
-    r"AKIA[0-9A-Z]{12,}|AIza[0-9A-Za-z_-]{20,}|"
-    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.)"
 )
 _LONG_NUMBER = re.compile(r"\b(?:\d[ -]?){13,19}\b")
 
@@ -174,8 +170,7 @@ def _fact_key(subject: str) -> str:
 
 def _is_sensitive(content: str) -> bool:
     return bool(
-        looks_secret(content)
-        or _TOKEN_SHAPE.search(content)
+        looks_secret(content)  # includes the shared token-shape detector
         or _SENSITIVE_FACT.search(content)
         or _LONG_NUMBER.search(content)
     )
