@@ -22,6 +22,7 @@ class RequestKind(StrEnum):
     TOOL = "tool"
     CONVERSATION = "conversation"
     CLARIFICATION = "clarification"
+    EXPIRED = "expired"
     UNSUPPORTED = "unsupported"
     BROWSE = "browse"
 

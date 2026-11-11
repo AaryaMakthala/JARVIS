@@ -165,6 +165,7 @@ class AgentState(TypedDict, total=False):
     task_id: str
     source: Literal["terminal", "voice", "benchmark"]
     user_input: str
+    conversation_id: str  # B5: opaque conversation identity (history itself stays out of state)
     memory_context: list[dict]  # retrieved skills/failures/preferences (examples only)
     plan: Plan | None
     step_index: int
@@ -204,7 +205,7 @@ class AgentState(TypedDict, total=False):
 | Node | Responsibility | Notes |
 |------|----------------|-------|
 | `intake` | Normalise text, assign `task_id`, handle meta-commands ("cancel", "stop") | Cheap; no LLM |
-| `memory_retrieve` | Query the `MemoryBackend` for similar examples (capped by `[memory] retrieval_limit`, default 3) | Examples only, never executed directly; empty when no backend |
+| `memory_retrieve` | Query the `MemoryBackend` for similar examples (capped by `[memory] retrieval_limit`, default 3) | Examples only, never executed directly; one slot is reserved for explicit facts; empty when no backend |
 | `brain` | **Single structured LLM call** → transient `BrainDecision` (`tool` / `conversation` / `clarification` / `unsupported`); projects onto `Plan`/`Step`/`final_answer`/`halted_reason`; handles the re-run after a clarification and the repair re-run after plan rejection | Routing is deterministic code; failures map to fixed honest messages; a blank conversation answer halts (`LLM_NO_ANSWER`) |
 | `clarify` | Interrupts with a `ClarificationRequest`; validates the human's free text (non-blank, not a cancel word); bounds questions at `MAX_CLARIFICATIONS` (2) | No side effects before `interrupt()`; blank AI answer/resume → "No clarification received." |
 | `validate` | Check tools exist, args validate against Pydantic models, step count ≤ max (default 12) | Initial rejection → `brain` once (repair cue); replacement rejection → `replan` once; replanned plans re-snapshot TOCTOU paths and preserve completed results |
@@ -213,7 +214,7 @@ class AgentState(TypedDict, total=False):
 | `verify` | Tool-specific `verify()` + generic checks; decide `next` / `retry` (max 2) / `replan` / `fail` | Retries exhausted + replan budget left → `replan_now`; otherwise fail closed |
 | `replan` | LLM call with completed steps, failing step + error, remaining catalogue → `ReplanDecision` (`continue` + new plan, or `stop` + message) | Budget (`max_replans`, default 2) checked **in code**, never by prompt; `continue` keeps completed successes, drops failed attempts, resets step bookkeeping; `stop` halts honestly |
 | `respond` | Compose final text; passes through `final_answer` from a conversation `brain` result; halted/refused/cancelled → honest message; TTS if voice; task_log row | For `web_answer`, includes sources |
-| `memory_save` | If all steps ok and verified → save/update skill; bump counters | Skip if any step tainted-and-sensitive |
+| `memory_save` | Deterministic "remember/forget" commands write/delete one explicit fact; otherwise if all steps ok and verified → save/update skill; bump counters | Explicit facts only from a conversation plan; secret-shaped or oversized facts are refused; skip skills if any step tainted-and-sensitive |
 
 Flow (routers are all deterministic, no LLM):
 
@@ -284,7 +285,7 @@ Max message size 64 KB.
 Client → server:
 ```json
 {"type":"auth","token":"…"}
-{"type":"chat","id":"c1","text":"open notepad","source":"terminal"}
+{"type":"chat","id":"c1","text":"open notepad","source":"terminal","conversation":"…optional…"}
 {"type":"confirm_response","task_id":"t1","approved":true,"action_hash":"…","password":"…optional…"}
 {"type":"clarification_response","task_id":"t1","answer":"the report"}   // empty answer legal on the wire
 {"type":"cancel","task_id":"t1"}
@@ -307,6 +308,17 @@ is free text only (the clarify node fails closed on empty). Only one active task
 queued (max 5). Voice-sourced Tier-2+ confirmations are refused at the server boundary (`tier_requires_terminal`).
 Voice-initiated confirmations that need a password open a small tkinter dialog on the user's desktop (topmost) and
 never accept spoken passwords.
+
+**Conversations (B5).** A chat message may carry a `conversation` id (`[A-Za-z0-9_-]{1,64}`); a
+missing/invalid id falls back to one id per connection (minted lazily), and the daemon's voice
+pipeline owns one id for its lifetime (cleared on stop). `ConversationManager`
+(`agent/conversation.py`) keeps at most 12 recent finished turns per conversation (400 chars per
+field, 16 conversations LRU) **in memory only**, and the brain renders at most 6 of them as a
+`<untrusted_data>` JSON block so a follow-up ("what about Java?", "delete it") is resolvable without
+re-asking. Turns are recorded by the single writer for each channel — the daemon worker after the
+slot finishes (or is cancelled) and the CLI after `run_task` returns — using the same closed
+statuses as task events (`answered/completed/partial/failed/cancelled/halted`); error text is never
+stored. A task never writes another conversation's history, and history is never an approval.
 
 ## 7. LLM abstraction (`llm/client.py`, `llm/provider.py`)
 
@@ -394,6 +406,17 @@ CREATE TABLE IF NOT EXISTS task_log (
 Embeddings: local ONNX model via `fastembed` (small, CPU) or `sentence-transformers` MiniLM; stored as float32 bytes;
 cosine similarity in NumPy (fine for < 10k skills). Retrieval threshold configurable (default 0.75). Skills whose
 `fail_count` exceeds `success_count` are ignored.
+
+Explicit facts ("remember that my preferred coding language is Python") reuse the
+`preferences` table; no new table or schema migration is needed. The key is
+deterministic - `fact.<category>.<slug>_<hash>` - so the same subject overwrites
+in place and "forget ..." deletes exactly that row. Recognition is a pure,
+deterministic parser in `memory/intent.py`; `brain` answers the command without
+an LLM and `memory_save` is still the only writer. Content is capped at 400
+characters and credential-shaped text is refused before the store is touched.
+Retrieval labels facts as `Remembered fact (<category>): ...` and reserves one
+of the bounded memory slots for them; ordinary preferences never reserve a slot
+over skills.
 
 ## 10. Configuration (`config.py`)
 

@@ -1,18 +1,16 @@
-"""Math phrasings must work through the model, never through hard-coded code.
+"""Arithmetic is deterministic, bounded, and never uses dynamic evaluation.
 
-The reported issue was that "what is 2 times 2?" and the same question phrased
-as "what is 2 multiplied by 2?" behaved differently.  The correct fix is *not* a
-lookup table — understanding "multiplied by" is the planner's job, and a
-hard-coded arithmetic table would be a maintenance trap that silently answers
-only the phrases somebody thought of.
+The reported issue was that "what is 2 times 2?" and "what is 2 multiplied by
+2?" behaved differently.  The fast path now answers both through one small
+parser that accepts only digits, parentheses, signs, decimals and the four
+basic operators; every other request still goes to the planner.
 
-These tests therefore assert two things that do not depend on a live model:
+These tests pin two boundaries:
 
-1. **No arithmetic is hard-coded anywhere in the application.**  A structural
-   guard, so a future "quick fix" cannot sneak a phrase table in.
-2. **The phrasing reaches the planner verbatim and the answer comes back out
-   clean.**  If a normaliser mangled "multiplied by" on the way in, or the
-   response boundary mangled "4" on the way out, these fail.
+1. **No ``eval``/``exec``/``literal_eval`` or spoken-word dispatch table.**
+   A structural guard against a future "quick fix" that executes input.
+2. **The parser is exact, bounded, and fails closed.**  Division by zero,
+   malformed expressions and non-arithmetic questions never produce an answer.
 """
 
 from __future__ import annotations
@@ -23,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from jarvis.agent.answer import safe_final_answer
+from jarvis.agent.arithmetic import solve
 
 #: The phrasings that were reported to behave inconsistently.
 PHRASINGS: list[tuple[str, str]] = [
@@ -42,32 +41,69 @@ SUSPECT = re.compile(
     )\b
     \s*[:=]                  # ...used as a mapping key, e.g. {"times": ...}
     |
-    \beval\s*\(\s*["']       # eval() of a spoken expression
+    \beval\s*\(             # never execute user input
     |
-    \bast\.literal_eval\b    # parsing a spoken expression
+    \bexec\s*\(             # never execute user input
+    |
+    \bast\.literal_eval\b    # never parse user input as Python literal
     """
 )
 
 
-class TestNoHardCodedArithmetic:
-    def test_no_source_file_dispatches_on_arithmetic_words(self) -> None:
-        """A phrase table in the app would be the bug, not the fix."""
+class TestNoDynamicEvaluation:
+    def test_no_source_file_dispatches_on_arithmetic_words_or_eval(self) -> None:
+        """A phrase table or eval/exec in the app would be the bug, not the fix."""
         offenders: list[str] = []
         for path in SRC.rglob("*.py"):
             text = path.read_text(encoding="utf-8", errors="replace")
             for match in SUSPECT.finditer(text):
                 line = text[: match.start()].count("\n") + 1
                 offenders.append(f"{path.relative_to(SRC)}:{line}: {match.group(0)!r}")
-        assert offenders == [], "arithmetic must be the planner's job:\n" + "\n".join(offenders)
+        assert offenders == [], "unsafe arithmetic dispatch:\n" + "\n".join(offenders)
 
     def test_no_regex_substitutes_math_words(self) -> None:
-        """A rewritting of "multiplied by" -> "x" would be the same bug."""
+        """The bounded parser does not rewrite user text with a regex."""
         offenders: list[str] = []
         pattern = re.compile(r"""re\.sub\([^)]*(times|multiplied|divided)""", re.IGNORECASE)
         for path in SRC.rglob("*.py"):
             for match in pattern.finditer(path.read_text(encoding="utf-8", errors="replace")):
                 offenders.append(str(path.relative_to(SRC)))
         assert offenders == []
+
+
+class TestSafeArithmetic:
+    @pytest.mark.parametrize(
+        ("question", "answer"),
+        [
+            ("what is 2 times 2?", "4"),
+            ("what is 2 multiplied by 2?", "4"),
+            ("what is 10 divided by 2?", "5"),
+            ("what is (2 + 3) * 4?", "20"),
+            ("what is -2.5 + 1?", "-1.5"),
+            ("what is 0.1 + 0.2?", "0.3"),
+        ],
+    )
+    def test_exact_answers(self, question: str, answer: str) -> None:
+        result = solve(question)
+        assert result is not None
+        assert result.answer == answer
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "",
+            "what is 2 +",
+            "what is 1 / 0",
+            "what is 2(3)",
+            "what is 2 ** 3",
+            "__import__('os')",
+            "open 2 files",
+            "what is the date",
+            "what is 2",
+        ],
+    )
+    def test_fails_closed(self, question: str) -> None:
+        assert solve(question) is None
 
 
 class TestPhrasingsRoundTripCleanly:

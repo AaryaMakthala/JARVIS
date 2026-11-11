@@ -31,18 +31,6 @@ from jarvis.tools.screen import (
 _PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 16
 
 
-class _FakeLLM:
-    """Records ``describe_image`` calls and returns a fixed answer."""
-
-    def __init__(self, answer: str = "A news site with headlines.") -> None:
-        self.answer = answer
-        self.calls: list[dict[str, Any]] = []
-
-    def describe_image(self, **kwargs: Any) -> tuple[str, None]:
-        self.calls.append(kwargs)
-        return self.answer, None
-
-
 def _install(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -76,10 +64,11 @@ def _install(
         "jarvis.perception.ui_text.foreground_uia_text",
         lambda **_kw: UiaText(text=uia, controls=3, secure_controls=1),
     )
-    monkeypatch.setattr("jarvis.perception.ocr.ocr_available", lambda: ocr_available)
+    reason = None if ocr_available else "PaddleOCR is not installed"
+    monkeypatch.setattr("jarvis.perception.ocr.unavailable_reason", lambda _settings: reason)
     monkeypatch.setattr(
         "jarvis.perception.ocr.ocr_image_with_confidence",
-        lambda _b: OcrResult(ocr, (), None),
+        lambda _b, _settings: OcrResult(ocr, (), None),
     )
     return captures
 
@@ -145,7 +134,8 @@ class TestReadScreen:
 
         assert result.ok is True
         assert result.tainted is True
-        assert "Local OCR is not installed" in result.output
+        assert "Local OCR is unavailable" in result.output
+        assert "PaddleOCR is not installed" in result.output
 
     def test_denylisted_process_refuses_before_capture(
         self, monkeypatch: pytest.MonkeyPatch
@@ -211,66 +201,47 @@ class TestReadScreen:
 class TestDescribeScreen:
     def test_local_path_does_not_call_the_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install(monkeypatch, uia="A settings page with several options")
-        llm = _FakeLLM()
+        sent: list[dict[str, Any]] = []
 
-        result = _run_describe(_ctx(settings=Settings(), llm=llm))
+        class _VisionSpy:
+            def describe_image(self, **kwargs: Any) -> Any:
+                sent.append(kwargs)
+                return "should not happen", None
+
+        result = _run_describe(_ctx(settings=Settings(), llm=_VisionSpy()))
 
         assert result.ok is True
         assert result.tainted is True
         assert "A settings page with several options" in result.output
-        assert llm.calls == []
+        assert sent == []
         assert "cloud" not in result.data
 
-    def test_cloud_vision_is_off_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _install(monkeypatch, uia="")  # thin local text would otherwise allow cloud
-        llm = _FakeLLM()
-
-        result = _run_describe(_ctx(settings=Settings(), llm=llm))
-
-        assert result.ok is True
-        assert llm.calls == []
-
-    def test_cloud_vision_when_explicitly_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_no_local_text_reports_ocr_limitation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install(monkeypatch, uia="", ocr_available=False)
-        llm = _FakeLLM("A photo viewer showing a dog.")
-        settings = Settings(screen=ScreenSettings(allow_cloud_vision=True))
 
-        result = _run_describe(_ctx(settings=settings, llm=llm))
+        result = _run_describe(_ctx(settings=Settings()))
 
         assert result.ok is True
         assert result.tainted is True
-        assert result.output.startswith("Looking at your screen:")
-        assert len(llm.calls) == 1
-        assert llm.calls[0]["image_bytes"] == _PNG
-        assert result.data["source"] == "cloud_vision"
+        assert "PaddleOCR is not installed" in result.output
+        assert "cloud" not in result.data
 
-    def test_cloud_enabled_but_denylisted_still_refuses(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_denylisted_window_refuses(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install(monkeypatch, title="1Password", process="1Password.exe")
-        llm = _FakeLLM()
-        settings = Settings(screen=ScreenSettings(allow_cloud_vision=True))
 
-        result = _run_describe(_ctx(settings=settings, llm=llm))
+        result = _run_describe(_ctx(settings=Settings()))
 
         assert result.ok is False
-        assert llm.calls == []
+        assert "sensitive" in (result.error or "")
 
-    def test_cloud_falls_back_to_local_text_on_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _install(monkeypatch, uia="", ocr_available=True, ocr="Some short text")
+    def test_uses_local_ocr_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install(monkeypatch, uia="", ocr_available=True, ocr="Some local text")
 
-        class _Broken:
-            def describe_image(self, **_kw: Any) -> Any:
-                raise RuntimeError("vision unavailable")
-
-        settings = Settings(screen=ScreenSettings(allow_cloud_vision=True))
-        # local text ("Some short text") is below MIN_LOCAL_CHARS, so cloud is tried
-        result = _run_describe(_ctx(settings=settings, llm=_Broken()))
+        result = _run_describe(_ctx(settings=Settings()))
 
         assert result.ok is True
-        assert "Some short text" in result.output
+        assert result.data["source"] == "ocr"
+        assert "Some local text" in result.output
 
 
 class TestSpec:

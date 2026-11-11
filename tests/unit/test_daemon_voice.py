@@ -877,7 +877,10 @@ class TestSpokenStopCancellation:
         slot = server._active
         assert slot is not None
         assert slot.cancel.cancelled  # the graph's gate is armed
-        assert slot.cancelled and slot.done
+        assert slot.cancelled
+        # The slot is not free until the worker has actually stopped; only the
+        # worker may mark it done (C2 cancellation semantics).
+        assert not slot.done
         assert slot.result_text is None
         # The worker saw the token and stopped at its boundary.
         for _ in range(200):
@@ -885,6 +888,7 @@ class TestSpokenStopCancellation:
                 break
             time.sleep(0.005)
         assert server.worker_events == ["started", "cancelled"]
+        assert slot.done
         server._active = None  # cleanup, as the dispatch loop would do
 
     def test_a_watch_that_hears_nothing_cancels_nothing(self) -> None:

@@ -39,7 +39,7 @@ from jarvis.agent.nodes.policy_gate import policy_gate
 from jarvis.agent.nodes.prepare_readback import prepare_readback
 from jarvis.agent.nodes.replan import replan
 from jarvis.agent.nodes.respond import respond
-from jarvis.agent.nodes.telemetry import trace_node
+from jarvis.agent.nodes.telemetry import record_stage, trace_node
 from jarvis.agent.nodes.validate import validate
 from jarvis.agent.nodes.verify import verify
 from jarvis.agent.routing import route_for_brain_result
@@ -109,6 +109,7 @@ def wrap(
         def _plain(state: dict[str, Any]) -> dict[str, Any]:
             with cancelled_by(None):
                 trace_node(str(state.get("task_id") or ""), name)
+                record_stage(state, ctx, name)
                 return node(state, ctx)
 
         return _plain
@@ -117,6 +118,7 @@ def wrap(
         cancel.check()
         with cancelled_by(lambda: cancel.cancelled):
             trace_node(str(state.get("task_id") or ""), name)
+            record_stage(state, ctx, name)
             return node(state, ctx)
 
     return _gated

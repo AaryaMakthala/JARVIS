@@ -16,7 +16,13 @@ from pydantic import ValidationError
 from jarvis.config import Settings
 from jarvis.policy import rules
 from jarvis.tools.base import ToolContext
-from jarvis.tools.clock import GetTimeArgs, make_get_time_spec, spoken_time
+from jarvis.tools.clock import (
+    GetTimeArgs,
+    make_get_time_spec,
+    spoken_date,
+    spoken_datetime,
+    spoken_time,
+)
 from jarvis.tools.registry import _FORBIDDEN_RE, build_default_registry
 
 
@@ -82,7 +88,7 @@ class TestSpec:
         assert _FORBIDDEN_RE.search(f"{spec.name} {spec.description}") is None
 
     def test_description_states_the_limit(self) -> None:
-        """The planner must be told it cannot answer other time zones / the date."""
+        """The planner must be told the clock is local and date-capable."""
         text = make_get_time_spec().description.lower()
         assert "other time zones" in text
         assert "date" in text
@@ -95,12 +101,29 @@ class TestSpec:
 
     def test_args_model_accepts_empty_and_rejects_extras(self) -> None:
         assert GetTimeArgs() == GetTimeArgs()
+        assert GetTimeArgs(include_date=True) == GetTimeArgs(include_date=True)
         with pytest.raises(ValidationError):
             GetTimeArgs(what="time")  # type: ignore[call-arg]
 
     def test_describe(self) -> None:
         spec = make_get_time_spec()
         assert spec.describe(GetTimeArgs()) == "tell you the time"
+        assert spec.describe(GetTimeArgs(include_date=True)) == "tell you the date"
+        assert (
+            spec.describe(GetTimeArgs(include_date=True, include_time=True))
+            == "tell you the date and time"
+        )
+
+
+class TestSpokenDate:
+    def test_date_sentence(self) -> None:
+        assert spoken_date(_at(15, 45)) == "Today is Tuesday, 6 October 2026."
+
+    def test_datetime_sentence(self) -> None:
+        assert (
+            spoken_datetime(_at(15, 45))
+            == "It is 3:45 in the afternoon on Tuesday, 6 October 2026."
+        )
 
 
 class TestRun:
@@ -119,6 +142,19 @@ class TestRun:
         monkeypatch.setattr("jarvis.tools.clock.local_now", lambda: _at(9, 5))
         result = make_get_time_spec().run_verified(GetTimeArgs(), self._ctx())
         assert result.output == "It is 9:05 in the morning."
+
+    def test_date_run_returns_only_the_date(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("jarvis.tools.clock.local_now", lambda: _at(15, 45))
+        result = make_get_time_spec().run_verified(GetTimeArgs(include_date=True), self._ctx())
+        assert result.output == "Today is Tuesday, 6 October 2026."
+        assert result.data["day"] == 6
+
+    def test_datetime_run_returns_both_parts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("jarvis.tools.clock.local_now", lambda: _at(15, 45))
+        result = make_get_time_spec().run_verified(
+            GetTimeArgs(include_date=True, include_time=True), self._ctx()
+        )
+        assert result.output == "It is 3:45 in the afternoon on Tuesday, 6 October 2026."
 
     def test_dry_run_reads_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def _boom() -> datetime:

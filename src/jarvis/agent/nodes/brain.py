@@ -24,8 +24,12 @@ from typing import Any
 
 from jarvis.agent import fastpath
 from jarvis.agent.context import AppContext
+from jarvis.agent.context_composer import (
+    CONTEXT_BUDGET_EXCEEDED,
+    compose_brain_context,
+)
 from jarvis.agent.nodes.clarify import MAX_CLARIFICATIONS
-from jarvis.agent.prompts import brain_system_prompt, brain_user_prompt
+from jarvis.agent.nodes.telemetry import llm_attempt_meta, record_route
 from jarvis.agent.routing import UNSUPPORTED_ANSWER
 from jarvis.agent.schemas import BrainDecision
 from jarvis.agent.session_context import (
@@ -33,8 +37,9 @@ from jarvis.agent.session_context import (
     render_resolution,
 )
 from jarvis.agent.state import Plan, RequestKind, Step
-from jarvis.agent.tool_groups import select_catalogue, trim_site_catalogue
-from jarvis.browser.sites import render_site_catalogue, sites_from_settings
+from jarvis.llm.client import Usage
+from jarvis.llm.routing import route_request
+from jarvis.memory.intent import detect_memory_intent
 from jarvis.messaging.grounding import ground_brain_update
 
 #: Deterministic, user-facing halt reasons.  The LLM output never reaches the
@@ -64,6 +69,9 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     fp_update = fastpath.brain_update(state, ctx)
     if fp_update is not None:
         return fp_update
+    memory_update = _memory_command(state, ctx)
+    if memory_update is not None:
+        return memory_update
     if ctx.llm is None:
         # Fail immediately: there is nothing to wait for, so no retry, no
         # timeout, no provider probing may happen on this path.
@@ -81,62 +89,37 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
 
     ctx.logger.info("agent event=llm_start task_id=%s", task_id)
 
-    previous_error = state.get("error") if int(state.get("validate_attempts") or 0) > 0 else None
-    source = state.get("source") or "terminal"
-    agent_settings = getattr(getattr(ctx, "settings", None), "agent", None)
-    # Prompt trimming is opt-in (agent.prompt_trim_enabled, default false).  It
-    # only decides which tools/sites are *described*; the registry stays closed
-    # and validate/policy_gate/act judge every step exactly as before.  With the
-    # flag off the catalogue and site block are byte-identical to before.
-    prompt_trim = bool(getattr(agent_settings, "prompt_trim_enabled", False))
-    if prompt_trim:
-        catalogue = select_catalogue(ctx.registry, state)
-    else:
-        catalogue = ctx.registry.catalogue_for_llm()
-    system = brain_system_prompt(catalogue)
-    if getattr(agent_settings, "use_specialists", False):
-        system = system + "\n12b. If the task needs several browser steps that depend on what the page shows (searching, opening a result, reading a page, playing a video), return request_type 'browse' with a goal and no actions. Simple single actions stay 'action'."
-    session_block = _session_reference_block(state, ctx)
-    site_directory = sites_from_settings(ctx.settings)
-    sites_block = (
-        trim_site_catalogue(site_directory, state)
-        if prompt_trim
-        else render_site_catalogue(site_directory)
+    route = route_request(state.get("user_input") or "", has_image=bool(state.get("has_image")))
+    ctx.logger.info(
+        "agent event=llm_route task_id=%s class=%s role=%s reason=%s",
+        task_id,
+        route.task_class.value,
+        route.model_role,
+        route.reason_code.value,
     )
-    # build referent summary
-    referent_summary = None
-    try:
-        rr = state.get("resolved_refs") or {}
-        if isinstance(rr, dict):
-            parts = []
-            if rr.get("has_result_set") and rr.get("result_set_positions"):
-                parts.append("REFERENTS: result set positions: " + ",".join(str(x) for x in rr.get("result_set_positions", [])))
-            if rr.get("has_page") and rr.get("page_url"):
-                parts.append(f"REFERENTS: current page: <untrusted_data>{rr['page_url']}</untrusted_data>")
-            if rr.get("has_photo") and rr.get("photo_path"):
-                parts.append(f"REFERENTS: last photo: {rr['photo_path']}")
-            elif rr.get("has_file") and rr.get("file_path"):
-                parts.append(f"REFERENTS: last file: {rr['file_path']}")
-            if parts:
-                referent_summary = "\n".join(parts)
-                if len(referent_summary) > 1200:
-                    referent_summary = referent_summary[:1200]
-    except Exception:  # noqa: BLE001 - referent context must never block a task
-        referent_summary = None
-    user = brain_user_prompt(
-        state.get("user_input") or "",
-        memory_context=[
-            x if isinstance(x, dict) else {} for x in (state.get("memory_context") or [])
-        ],
-        clarification_question=state.get("clarification_question"),
-        clarification_answer=state.get("clarification_answer"),
-        repair_error=previous_error,
-        source=source,
-        clarification_count=int(state.get("clarification_count") or 0),
-        session_context=session_block,
-        clarification_history=state.get("clarification_history"),
-        sites=sites_block,
-        referent_summary=referent_summary,
+    record_route(
+        state,
+        ctx,
+        task_class=route.task_class.value,
+        model_role=route.model_role,
+        reason_code=route.reason_code.value,
+    )
+
+    source = state.get("source") or "terminal"
+    composed = compose_brain_context(state, ctx)
+    if not composed.stats.fits:
+        return {"halted_reason": CONTEXT_BUDGET_EXCEEDED}
+    system, user = composed.system, composed.user
+    ctx.logger.info(
+        "agent event=context task_id=%s candidates=%d schemas=%d memory=%d "
+        "history=%d est_input_tokens=%d trimmed=%s",
+        task_id,
+        composed.stats.candidate_tools,
+        composed.stats.schema_tools,
+        composed.stats.memory_candidates,
+        composed.stats.history_turns,
+        composed.stats.estimated_input_tokens,
+        composed.stats.trimmed,
     )
 
     llm_budget: dict[str, Any] = {}
@@ -144,21 +127,26 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         # No retry, and a per-call timeout the composite client recognises as
         # latency-sensitive: it then bounds the WHOLE walk by
         # llm.voice_deadline_seconds instead of the total deadline.
-        voice_deadline = float(
-            getattr(ctx.settings.llm, "voice_deadline_seconds", 12.0)
-            or 12.0
-        )
+        voice_deadline = float(getattr(ctx.settings.llm, "voice_deadline_seconds", 12.0) or 12.0)
         llm_budget = {
             "max_retries": 0,
             "timeout_s": min(float(ctx.settings.llm.timeout_seconds), voice_deadline, 10.0),
         }
 
+    # B8.5: attach this request's task id/class so every *real* provider
+    # attempt is persisted as an LLM_CALL event bound to this task.  Clients
+    # that do not advertise support (test doubles) get no extra keyword.
+    attempt_meta = llm_attempt_meta(
+        state, ctx, route.task_class.value, context_stats=composed.stats
+    )
+    if attempt_meta is not None:
+        llm_budget["attempt_meta"] = attempt_meta
     try:
         model, usage = ctx.llm.structured(
             system=system,
             user=user,
             schema=BrainDecision,
-            model_role="planner",
+            model_role=route.model_role,
             temperature=0.0,
             **llm_budget,
         )
@@ -170,6 +158,16 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     if not isinstance(model, BrainDecision):
         ctx.logger.warning("brain returned a non-BrainDecision: %s", type(model).__name__)
         return {"halted_reason": LLM_INVALID_OUTPUT}
+
+    # B9: one bounded schema-resolution pass.  A registered tool named without
+    # its canonical schema is never executed from memory: JARVIS reloads that
+    # schema from the registry and re-asks the model exactly once.  Anything
+    # still unresolved becomes a clarification, never a guessed call.
+    model, usage, composed, expansion_error = _resolve_schema_miss(
+        model, usage, composed, state, ctx
+    )
+    if expansion_error is not None:
+        return expansion_error
 
     ctx.logger.info(
         "agent event=brain task_id=%s request_type=%s actions=%d",
@@ -183,6 +181,237 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     # contact and the approval binds to it.  Deterministic resolution runs
     # first; only an unresolved reference may use the tool-free text model.
     return ground_brain_update(update, state, ctx)
+
+
+def _missing_registered_tools(
+    model: BrainDecision, schema_names: tuple[str, ...], registry: Any
+) -> list[str]:
+    """Registered tool names this decision uses without a supplied schema."""
+    provided = set(schema_names)
+    missing: list[str] = []
+    if model.request_type == "tool_schema":
+        name = (model.requested_tool or "").strip()
+        if registry.get_optional(name) is not None and name not in provided:
+            missing.append(name)
+    for action in model.actions:
+        if action.tool not in provided and registry.get_optional(action.tool) is not None:
+            missing.append(action.tool)
+    return list(dict.fromkeys(missing))
+
+
+def _merge_usage(first: Usage, second: Usage) -> Usage:
+    """Accumulate two real brain attempts into one task-level counter."""
+    return Usage(
+        calls=int(first.calls) + int(second.calls),
+        prompt_tokens=int(first.prompt_tokens) + int(second.prompt_tokens),
+        completion_tokens=int(first.completion_tokens) + int(second.completion_tokens),
+    )
+
+
+def _clarification_stop(state: dict[str, Any], question: str) -> dict[str, Any]:
+    """Ask once more when a tool choice cannot be resolved (bounded)."""
+    asked = int(state.get("clarification_count") or 0)
+    if asked >= MAX_CLARIFICATIONS:
+        return {
+            "halted_reason": (
+                f"Still unclear: {question} I have already asked {asked} question(s); "
+                "please start over with more detail."
+            )
+        }
+    return {
+        "plan": Plan(
+            kind="tool",
+            goal="resolve the tool choice",
+            steps=[],
+            needs_clarification=True,
+            clarification_question=question,
+        ),
+        "request_kind": "clarification",
+        "clarification_question": question,
+        "error": None,
+    }
+
+
+def _resolve_schema_miss(
+    model: BrainDecision,
+    usage: Usage,
+    composed: Any,
+    state: dict[str, Any],
+    ctx: AppContext,
+) -> tuple[BrainDecision, Usage, Any, dict[str, Any] | None]:
+    """One bounded schema-resolution retry for a registered, unseen tool.
+
+    The retry is paid only when the model names a tool that exists in the
+    canonical registry but whose schema was not in its prompt.  Unknown names
+    are never expanded: they fail closed (``validate`` would reject them too).
+    """
+    if model.request_type == "tool_schema":
+        requested = (model.requested_tool or "").strip()
+        if ctx.registry.get_optional(requested) is None:
+            return model, usage, composed, {"halted_reason": LLM_INVALID_OUTPUT}
+    missing = _missing_registered_tools(model, composed.schema_names, ctx.registry)
+    if not missing:
+        return model, usage, composed, None
+    pinned = tuple(dict.fromkeys([*composed.schema_names, *missing]))
+    expanded = compose_brain_context(state, ctx, pinned_schema_tools=pinned)
+    if not expanded.stats.fits:
+        return model, usage, composed, {"halted_reason": CONTEXT_BUDGET_EXCEEDED}
+    budget: dict[str, Any] = {}
+    if (state.get("source") or "terminal") == "voice":
+        budget = {
+            "max_retries": 0,
+            "timeout_s": min(float(ctx.settings.llm.timeout_seconds), 10.0),
+        }
+    try:
+        second, extra = ctx.llm.structured(
+            system=expanded.system,
+            user=expanded.user,
+            schema=BrainDecision,
+            model_role="planner",
+            temperature=0.0,
+            **budget,
+        )
+    except Exception as exc:  # noqa: BLE001 - only this task stops
+        ctx.logger.warning("brain schema-resolution call failed: %s", exc)
+        return model, usage, composed, {"halted_reason": _llm_halted_reason(exc)}
+    if not isinstance(second, BrainDecision):
+        return model, usage, composed, {"halted_reason": LLM_INVALID_OUTPUT}
+    still = _missing_registered_tools(second, expanded.schema_names, ctx.registry)
+    if still or second.request_type == "tool_schema":
+        # The second response must actually decide.  Asking for the same schema
+        # again means the model still cannot choose; ask the human instead of
+        # running anything.
+        return (
+            second,
+            _merge_usage(usage, extra),
+            expanded,
+            _clarification_stop(
+                state,
+                "I couldn't safely resolve which tool to use. Please rephrase the request.",
+            ),
+        )
+    return second, _merge_usage(usage, extra), expanded, None
+
+
+def _memory_command(state: dict[str, Any], ctx: AppContext) -> dict[str, Any] | None:
+    """Answer a clear remember/forget command without calling the LLM.
+
+    The deterministic parser only recognises imperative memory commands.  The
+    write itself happens in ``memory_save`` (the single memory-write node), so
+    this function has no side effects and cannot change the policy path.
+    """
+    intent = detect_memory_intent(str(state.get("user_input") or ""))
+    if intent is None:
+        return None
+    # Never hijack the answer to a pending clarification: that turn belongs to
+    # the original task, and a memory-like phrase may be its requested detail.
+    if state.get("clarification_question") or state.get("clarification_answer") is not None:
+        return None
+    task_id = state.get("task_id")
+    if intent.error == "sensitive":
+        ctx.logger.info(
+            "agent event=memory_command task_id=%s action=%s reason=sensitive",
+            task_id,
+            intent.action,
+        )
+        return _memory_answer(
+            "I won't remember that: it looks like a credential or other sensitive information.",
+            "refuse a sensitive memory",
+        )
+    if intent.error == "too_long":
+        ctx.logger.info(
+            "agent event=memory_command task_id=%s action=%s reason=too_long",
+            task_id,
+            intent.action,
+        )
+        return _memory_answer(
+            "I can only remember short facts (up to 400 characters), so I haven't stored that.",
+            "refuse an oversized memory",
+        )
+    if ctx.dry_run:
+        ctx.logger.info(
+            "agent event=memory_command task_id=%s action=%s reason=dry_run",
+            task_id,
+            intent.action,
+        )
+        verb = "store" if intent.action == "remember" else "forget"
+        return _memory_answer(f"This is a dry run, so I won't {verb} that.", "simulate memory")
+    preferences = getattr(ctx.memory, "preferences", None)
+    getter = getattr(preferences, "get", None)
+    setter = getattr(preferences, "set", None)
+    deleter = getattr(preferences, "delete", None)
+    if intent.action == "remember":
+        if not callable(setter):
+            return _memory_answer(
+                "I can't remember that because local memory isn't available.", "memory unavailable"
+            )
+        try:
+            existing = getter(intent.key) if callable(getter) else None
+        except Exception:  # noqa: BLE001 - reading memory must never break the turn
+            existing = None
+        answer = (
+            "I already have that stored, sir."
+            if existing == intent.content
+            else "Noted, sir. I'll remember that."
+        )
+        ctx.logger.info(
+            "agent event=memory_command task_id=%s action=remember reason=accepted",
+            task_id,
+        )
+        return _memory_answer(answer, "remember an explicit fact")
+    if not callable(getter) or not callable(deleter):
+        return _memory_answer(
+            "I can't forget that because local memory isn't available.", "memory unavailable"
+        )
+    try:
+        existing = getter(intent.key)
+    except Exception as exc:  # noqa: BLE001 - report honestly, never raise
+        ctx.logger.warning("memory lookup failed: %s", exc)
+        return _memory_answer(
+            "I couldn't check local memory, so I haven't forgotten anything.",
+            "memory unavailable",
+        )
+    answer = "I'll forget that, sir." if existing else "I don't have that stored, sir."
+    ctx.logger.info(
+        "agent event=memory_command task_id=%s action=forget reason=accepted",
+        task_id,
+    )
+    return _memory_answer(answer, "forget an explicit fact")
+
+
+def _memory_answer(answer: str, goal: str) -> dict[str, Any]:
+    """A conversation update with no tool steps and no LLM usage."""
+    return {
+        "plan": Plan(kind="conversation", goal=goal, steps=[], dialog_answer=answer),
+        "request_kind": "conversation",
+        "final_answer": answer,
+        "clarification_question": None,
+        "clarification_answer": None,
+        "error": None,
+    }
+
+
+def _conversation_history_block(state: dict[str, Any], ctx: AppContext) -> str | None:
+    """The bounded recent-turn block for this conversation (B5), or ``None``.
+
+    History is read-only prompt context from the caller's in-memory
+    :class:`~jarvis.agent.conversation.ConversationManager`; a missing manager,
+    an unknown conversation or a rendering failure must never break the task,
+    so every failure degrades to "no history".  The block itself is already
+    wrapped in ``<untrusted_data>`` by the manager.
+    """
+    manager = getattr(ctx, "conversations", None)
+    render = getattr(manager, "render_history", None)
+    if not callable(render):
+        return None
+    conversation_id = state.get("conversation_id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        return None
+    try:
+        return render(conversation_id)
+    except Exception:  # history must never break the brain
+        ctx.logger.debug("conversation history unavailable", exc_info=True)
+        return None
 
 
 def _session_reference_block(state: dict[str, Any], ctx: AppContext) -> str | None:
@@ -201,7 +430,9 @@ def _session_reference_block(state: dict[str, Any], ctx: AppContext) -> str | No
     return render_resolution(ctx.session_context.reference_resolution(SESSION_THREAD, text))
 
 
-def _project(decision: BrainDecision, state: dict[str, Any], usage: Any, ctx: AppContext | None = None) -> dict[str, Any]:
+def _project(
+    decision: BrainDecision, state: dict[str, Any], usage: Any, ctx: AppContext | None = None
+) -> dict[str, Any]:
     """Map the transient BrainDecision onto checkpointable state updates."""
     update: dict[str, Any] = {
         "api_calls": int(state.get("api_calls") or 0) + usage.calls,
@@ -209,6 +440,11 @@ def _project(decision: BrainDecision, state: dict[str, Any], usage: Any, ctx: Ap
         "clarification_question": None,
         "clarification_answer": None,
     }
+
+    if decision.request_type == "tool_schema":
+        # Defensive: a schema-resolution request that survived the bounded retry
+        # must never be projected into an executable (possibly empty) plan.
+        return {**update, "request_kind": "unsupported", "halted_reason": LLM_INVALID_OUTPUT}
 
     if decision.request_type == "conversation":
         answer = (decision.response_text or "").strip()
@@ -339,6 +575,11 @@ def _llm_halted_reason(exc: Exception) -> str:
     text = str(exc).lower()
     if "rate limit" in text:
         return LLM_RATE_LIMITED
+    if "context window" in text or "context length" in text:
+        # The provider refused the payload size.  Retrying the identical
+        # request can never help; report the controlled request-budget refusal
+        # instead of an endless compaction loop.
+        return CONTEXT_BUDGET_EXCEEDED
     if "timed out" in text or "timeout" in text:
         return LLM_TIMEOUT
     if any(

@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from jarvis.agent.capability_index import CapabilityIndex, build_capability_index
+from jarvis.agent.conversation import ConversationManager
 from jarvis.agent.session_context import SessionContext
 from jarvis.agent.target_binding import TargetBindingStore
 from jarvis.browser.results import BrowserResultStore
@@ -21,6 +23,7 @@ from jarvis.memory import MemoryBackend
 from jarvis.policy.browse_grant import BrowseGrantRegistry
 from jarvis.policy.engine import PolicyContext, PolicyEngine, RiskClassifier, UnlockManager
 from jarvis.policy.scope import ScopeRegistry
+from jarvis.taskstore import TaskStore
 from jarvis.tools.base import CancelToken, ToolContext
 from jarvis.tools.registry import ToolRegistry, build_default_registry
 
@@ -68,6 +71,11 @@ class AppContext:
     undo_log: Path | None = None  # override for the undo log path (tests)
     voice: VoiceToolsFacade | None = None  # live voice loop for dictation tools
     memory: MemoryBackend | None = None  # bounded, secret-free memory store
+    #: Independent durable task lifecycle store (B1).  ``None`` means the
+    #: caller did not wire observability; a :class:`NullTaskEventStore` is used
+    #: by the composition layer when the database cannot be opened.  It is
+    #: deliberately not part of ``ToolContext``: tools cannot read or write it.
+    tasks: TaskStore | None = None
     #: Managed Chrome session (Stage 7).  A passed-in ``BrowserSession`` is
     #: owned by the daemon and threaded to tools; construction never starts a
     #: browser, and tool calls fail cleanly when it is ``None``.
@@ -109,9 +117,25 @@ class AppContext:
     #: proposal: the policy gate and the target binding still authorize the
     #: action, and a stale, expired or navigated-away set is refused.
     browser_results: BrowserResultStore = field(default_factory=BrowserResultStore)
+    #: Unified conversation manager (B5): bounded, in-memory recent-turn
+    #: context per conversation id.  IN-MEMORY ONLY and never written to
+    #: ``AgentState`` or the checkpoint store, so a restart starts a fresh
+    #: conversation and no stale context can survive it.  It records nothing
+    #: itself - the daemon/CLI record finished turns, and the brain only
+    #: renders the untrusted-data history block.
+    conversations: ConversationManager = field(default_factory=ConversationManager)
+    #: B9 compact view of the canonical registry.  Built once per context; it
+    #: holds no authorization state and never replaces the registry.
+    capability_index: CapabilityIndex | None = None
 
-    def tool_context(self) -> ToolContext:
-        """Build a ToolContext for the current step (no secret leaks)."""
+    def tool_context(self, *, attempt_meta: Any | None = None) -> ToolContext:
+        """Build a ToolContext for the current step (no secret leaks).
+
+        ``attempt_meta`` is the explicit per-request LLM attempt metadata
+        (B8.5) that ``act`` attaches so a tool-layer model call records its
+        provider attempts against this task.  It carries a task id and a sink
+        only - never arguments, prompts or results.
+        """
         return ToolContext(
             settings=self.settings,
             dry_run=self.dry_run,
@@ -126,6 +150,7 @@ class AppContext:
             browser=self.browser,
             whatsapp_browser=self.whatsapp_browser,
             browser_results=self.browser_results,
+            attempt_meta=attempt_meta,
         )
 
 
@@ -141,6 +166,7 @@ def make_app_context(
     undo_log: Path | None = None,
     voice: VoiceToolsFacade | None = None,
     memory: MemoryBackend | None = None,
+    tasks: TaskStore | None = None,
     target_bindings: TargetBindingStore | None = None,
     browser: Any | None = None,
     whatsapp_browser: Any | None = None,
@@ -148,6 +174,7 @@ def make_app_context(
     browse_grants: BrowseGrantRegistry | None = None,
     session_context: SessionContext | None = None,
     browser_results: BrowserResultStore | None = None,
+    conversations: ConversationManager | None = None,
 ) -> AppContext:
     """Build a ready-to-use :class:`AppContext` with defaults."""
     settings = settings or load_settings()
@@ -177,6 +204,7 @@ def make_app_context(
         undo_log=undo_log,
         voice=voice,
         memory=memory,
+        tasks=tasks,
         target_bindings=target_bindings or TargetBindingStore(),
         browser=browser,
         whatsapp_browser=whatsapp_browser,
@@ -197,4 +225,6 @@ def make_app_context(
             ttl_seconds=float(settings.session.artifact_ttl_seconds),
         ),
         browser_results=browser_results if browser_results is not None else BrowserResultStore(),
+        conversations=conversations if conversations is not None else ConversationManager(),
+        capability_index=build_capability_index(registry),
     )

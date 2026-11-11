@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import getpass
 import logging
+import sys
 import traceback
 import unicodedata
+import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
@@ -77,6 +79,26 @@ voice_app = typer.Typer(help="Voice diagnostics and control.", no_args_is_help=T
 app.add_typer(password_app, name="password")
 app.add_typer(autostart_app, name="autostart")
 app.add_typer(voice_app, name="voice")
+
+def _utf8_stdout() -> Any:
+    """Return a stdout that can render any answer on a Windows console/pipe.
+
+    The live acceptance run crashed with ``UnicodeEncodeError: 'charmap' codec``
+    on the non-breaking hyphen in a web answer (U+2011).  Python 3.7+ text
+    streams can be reconfigured in place; ``errors="replace"`` is the final
+    guard for a stream that still cannot represent a character, so printing an
+    answer never kills the session.  When stdout is not reconfigurable (a test
+    capture object, an already-wrapped stream) it is returned unchanged.
+    """
+    stream = sys.stdout
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            logger.debug("stdout could not be switched to UTF-8", exc_info=True)
+    return stream
+
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -559,6 +581,27 @@ def _vision_check(
     return _check("vision", "WARN", f"no vision model configured - {note}")
 
 
+def _task_store_check(settings: config.Settings) -> Check:
+    """Doctor row for the independent task lifecycle store (B1).
+
+    Read-only: ``doctor`` never creates or migrates the database.  A missing
+    file is expected before the first task, so it is a WARN, not a failure.
+    """
+    path = config.task_events_db()
+    if not path.is_file():
+        return _check("task_store", "WARN", "not initialized yet; created on the first task")
+    from jarvis.taskstore.runtime import open_runtime_task_store
+
+    store = open_runtime_task_store(settings, path=path, create=False, read_only=True)
+    try:
+        status = store.status()
+    finally:
+        store.close()
+    if status.available:
+        return _check("task_store", "PASS", f"readable (schema v{status.schema_version})")
+    return _check("task_store", "WARN", f"unavailable ({status.reason})")
+
+
 def run_doctor(
     *,
     settings: config.Settings | None = None,
@@ -696,7 +739,8 @@ def run_doctor(
         checks.append(_check("llm_provider", "FAIL", "No free LLM provider configured"))
 
     checks.append(_vision_check(settings, store, providers))
-    checks.extend(optional_backend_checks())
+    checks.append(_task_store_check(settings))
+    checks.extend(optional_backend_checks(settings.perception))
     checks.extend(_health_checks(_daemon_llm_health()))
 
     if live:
@@ -734,7 +778,10 @@ def _main(
         ),
     ] = False,
 ) -> None:
-    pass  # option is handled by the eager callback above
+    # Reconfigure the *real* stdout once per process, before any command can
+    # print an answer.  ``console`` itself stays bound to the current
+    # ``sys.stdout`` so Click's/CliRunner's capture keeps working.
+    _utf8_stdout()
 
 
 # ── init ─────────────────────────────────────────────────────────────────
@@ -943,6 +990,12 @@ def status() -> None:
             console.print(f"[green]queue:[/green] {resp.queue}")
             if resp.active_task:
                 console.print(f"[green]active task:[/green] {resp.active_task}")
+                if resp.active_status:
+                    console.print(f"[green]active status:[/green] {resp.active_status}")
+                if resp.active_stage:
+                    console.print(f"[green]active stage:[/green] {resp.active_stage}")
+                if resp.active_elapsed_s is not None:
+                    console.print(f"[green]active elapsed:[/green] {resp.active_elapsed_s:.1f}s")
             console.print(f"[green]version:[/green] {resp.version}")
         finally:
             client.close()
@@ -1212,8 +1265,36 @@ def _tier2_unlock_or_refuse(ctx: AppContext, req: dict[str, Any]) -> tuple[bool,
     return False, None
 
 
+def _record_conversation_turn(
+    ctx: AppContext, conversation_id: str, request: str, outcome: Any
+) -> None:
+    """Record one finished in-process turn in its conversation (B5).
+
+    The daemon records turns in its worker; this is the identical path for
+    the in-process REPL/one-shot so both channels behave the same.  Status is
+    the same closed ``task_status`` vocabulary, and recording never raises.
+    """
+    from jarvis.agent.nodes.telemetry import task_status
+
+    manager = getattr(ctx, "conversations", None)
+    record = getattr(manager, "record", None)
+    if not callable(record) or not conversation_id:
+        return
+    try:
+        record(
+            conversation_id,
+            getattr(outcome, "task_id", ""),
+            request,
+            getattr(outcome, "spoken_answer", None) or getattr(outcome, "final_answer", None) or "",
+            task_status(getattr(outcome, "state", {}) or {}),
+        )
+    except Exception:
+        logging.getLogger("jarvis.cli").debug("conversation turn not recorded", exc_info=True)
+
+
 def chat_loop(ctx: AppContext, saver: SqliteSaver) -> None:
     """One interactive session over the Phase 1 agent (no daemon)."""
+    conversation_id = ctx.conversations.new_conversation()
     while True:
         try:
             line = _chat_prompt("[bold cyan]you>[/]")
@@ -1224,9 +1305,10 @@ def chat_loop(ctx: AppContext, saver: SqliteSaver) -> None:
         if not line:
             continue
 
-        outcome = run_task(ctx, saver, line)
+        outcome = run_task(ctx, saver, line, conversation_id=conversation_id)
         outcome = resolve_interrupts(outcome, ctx, saver)
         _print_outcome(outcome)
+        _record_conversation_turn(ctx, conversation_id, line, outcome)
 
 
 def resolve_interrupts(outcome: Any, ctx: AppContext, saver: SqliteSaver) -> Any:
@@ -1316,6 +1398,7 @@ _ABANDON_ACK_TIMEOUT = 2.0
 def _daemon_chat_loop(client: Any) -> None:
     """Interactive REPL that talks to the daemon over IPC."""
     console.print("[dim]JARVIS chat via daemon (Ctrl+C to exit)[/dim]")
+    conversation = uuid.uuid4().hex
     while True:
         try:
             line = _chat_prompt("[bold cyan]you>[/]")
@@ -1325,10 +1408,10 @@ def _daemon_chat_loop(client: Any) -> None:
         line = (line or "").strip()
         if not line:
             continue
-        _daemon_one_shot(client, line)
+        _daemon_one_shot(client, line, conversation=conversation)
 
 
-def _daemon_one_shot(client: Any, line: str) -> str:
+def _daemon_one_shot(client: Any, line: str, *, conversation: str = "") -> str:
     """Send one command to the daemon and print events until it finishes.
 
     Returns the final text (empty when the daemon reported an error, the wait
@@ -1336,6 +1419,10 @@ def _daemon_one_shot(client: Any, line: str) -> str:
     ``jarvis run`` so the one-shot command cannot be more permissive than the
     interactive session: both go through the same ``ConfirmRequest`` /
     ``ClarificationRequest`` handling and the same password prompt.
+
+    ``conversation`` (B5) is the caller's stable conversation id: the REPL
+    passes one id for the whole session; a one-shot ``run`` passes a fresh id
+    per invocation.  The daemon keeps the bounded recent-turn context per id.
 
     ``Ctrl+C`` anywhere in here - at a prompt, or while the daemon re-plans
     after an answer - returns to the caller instead of unwinding out of
@@ -1347,7 +1434,7 @@ def _daemon_one_shot(client: Any, line: str) -> str:
     from jarvis.daemon.client import DaemonError
 
     try:
-        task_id = client.send_chat(line)
+        task_id = client.send_chat(line, conversation=conversation)
     except DaemonError as exc:
         console.print(f"[red]{exc.message}[/red]")
         return ""
@@ -1517,6 +1604,8 @@ def _task_context(
 
     log = logging.getLogger("jarvis.cli")
     registry = build_default_registry(settings)
+    from jarvis.taskstore.runtime import open_runtime_task_store
+
     return make_app_context(
         settings,
         llm=llm,
@@ -1525,6 +1614,7 @@ def _task_context(
         unlock=UnlockManager(store, settings=settings),
         dry_run=dry_run,
         memory=open_memory(settings=settings, logger=log, dry_run=dry_run),
+        tasks=open_runtime_task_store(settings, registry, logger=log),
     )
 
 
@@ -1539,6 +1629,7 @@ def _run_no_daemon(command: str, *, dry_run: bool = False) -> None:
         raise typer.Exit(code=1)
 
     try:
+        conversation = uuid.uuid4().hex
         ctx = _task_context(settings, store, selection.client, dry_run=dry_run)
         saver = open_sqlite_checkpointer(str(config.checkpoints_db()))
     except LLMError as exc:
@@ -1546,13 +1637,15 @@ def _run_no_daemon(command: str, *, dry_run: bool = False) -> None:
         raise typer.Exit(code=1)
 
     try:
-        outcome = run_task(ctx, saver, command)
+        outcome = run_task(ctx, saver, command, conversation_id=conversation)
         outcome = resolve_interrupts(outcome, ctx, saver)
         _print_outcome(outcome)
+        _record_conversation_turn(ctx, conversation, command, outcome)
         if outcome.error or not outcome.final_answer:
             raise typer.Exit(code=1)
     finally:
         _close_memory_backend(ctx)
+        _close_task_store(ctx)
         _close_checkpointer(saver)
 
 
@@ -1578,7 +1671,10 @@ def _run_with_daemon(command: str) -> None:
         console.print("[dim]start it with `jarvis daemon --foreground`, or use --no-daemon[/dim]")
         raise typer.Exit(code=1) from exc
     try:
-        if not _daemon_one_shot(client, command):
+        # One ``run`` invocation is one conversation (B5): a fresh id per
+        # invocation, so a follow-up typed as a new command does not inherit
+        # the previous request's context.  Only ``jarvis chat`` keeps a session.
+        if not _daemon_one_shot(client, command, conversation=uuid.uuid4().hex):
             raise typer.Exit(code=1)
     finally:
         try:
@@ -1625,6 +1721,7 @@ def _chat_no_daemon() -> None:
         chat_loop(ctx, saver)
     finally:
         _close_memory_backend(ctx)
+        _close_task_store(ctx)
 
 
 def _chat_with_daemon() -> None:
@@ -2119,6 +2216,11 @@ def _close_memory_backend(ctx: Any) -> None:
     _close_store(getattr(ctx, "memory", None))
 
 
+def _close_task_store(ctx: Any) -> None:
+    """Release a context's independent task store, ignoring an absent one."""
+    _close_store(getattr(ctx, "tasks", None))
+
+
 def _quarantined_failures(memory: Any) -> int:
     """How many failure rows are withheld from the planner (0 if unknown)."""
     count = getattr(memory, "quarantined_failures", None)
@@ -2374,55 +2476,124 @@ def voice_doctor(
 def tasks(
     n: Annotated[int, typer.Option("--n", help="Number of recent tasks to show.")] = 20,
 ) -> None:
-    """Show recent tasks from the task log (with failure telemetry)."""
+    """Show recent tasks from the independent task-event store."""
     from jarvis import config
-    from jarvis.memory import store as memory_store
+    from jarvis.taskstore.runtime import open_runtime_task_store
+    from jarvis.tools.registry import build_default_registry
 
     settings = config.load_settings()
-    memory = memory_store.open_memory(settings)
+    path = config.task_events_db()
+    if not path.is_file():
+        console.print("[dim]no tasks[/dim]")
+        return
+
+    registry = build_default_registry(settings)
+    store = open_runtime_task_store(
+        settings, registry, path=path, create=False, read_only=True
+    )
     try:
-        rows = memory.task_log.recent(limit=int(n))
+        if not store.available:
+            reason = store.status().reason or "task store unavailable"
+            console.print(f"[yellow]task history unavailable: {reason}[/yellow]")
+            return
+        rows = store.recent(limit=int(n))
     except Exception as exc:
-        console.print(f"[red]could not read task log: {exc}[/red]")
+        console.print(f"[red]could not read task history: {exc}[/red]")
         raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
     if not rows:
         console.print("[dim]no tasks[/dim]")
+        return
+    if not console.is_terminal:
+        # A pipe/file has no usable width: Rich would shrink the table and
+        # truncate the headers ("task\u2026"/"stat\u2026"), losing data the user
+        # redirected on purpose.  Emit the same columns, tab-separated and
+        # untruncated, so ``jarvis tasks > tasks.txt`` is complete.
+        _print_tasks_plain(rows)
         return
     table = Table(show_header=True, box=None)
     table.add_column("task_id", style="dim")
     table.add_column("status")
+    table.add_column("stage")
     table.add_column("source")
-    table.add_column("api_calls")
-    table.add_column("tokens")
-    table.add_column("steps")
-    table.add_column("halt_reason")
-    table.add_column("failure_code")
-    table.add_column("first_failing_step")
-    table.add_column("tools_used")
-    table.add_column("error_text")
-    table.add_column("llm_ms")
-    table.add_column("llm_calls")
-    table.add_column("provider_chain")
-    table.add_column("tool_ms")
-    for r in rows:
-        table.add_row(
-            r.task_id[:12],
-            r.status,
-            r.source or "",
-            str(r.api_calls),
-            str(r.tokens),
-            str(r.steps),
-            r.halt_reason or "",
-            r.failure_code or "",
-            r.first_failing_step or "",
-            r.tools_used or "",
-            (r.error_text or "")[:60],
-            str(r.llm_ms) if r.llm_ms is not None else "",
-            str(r.llm_calls) if r.llm_calls is not None else "",
-            r.provider_chain or "",
-            str(r.tool_ms) if r.tool_ms is not None else "",
-        )
+    table.add_column("started")
+    table.add_column("elapsed")
+    table.add_column("retries")
+    table.add_column("failure")
+    table.add_column("tool")
+    table.add_column("approval")
+    table.add_column("events")
+    for row in rows:
+        table.add_row(*_task_row_values(row))
     console.print(table)
+
+
+TASK_COLUMNS = (
+    "task_id",
+    "status",
+    "stage",
+    "source",
+    "started",
+    "elapsed",
+    "retries",
+    "failure",
+    "tool",
+    "approval",
+    "events",
+)
+
+
+def _task_row_values(row: Any) -> tuple[str, ...]:
+    """The eleven cells of one task row (terminal table and plain output)."""
+    return (
+        row.task_id[:12],
+        row.status.value,
+        row.stage.value,
+        row.source,
+        _task_started(row),
+        _task_elapsed(row),
+        str(row.retry_count),
+        _task_failure(row),
+        row.active_tool or "",
+        row.approval_state or "",
+        str(row.event_count),
+    )
+
+
+def _print_tasks_plain(rows: list[Any]) -> None:
+    """Print task rows as complete, untruncated tab-separated lines.
+
+    Written straight to the console's stream: Rich re-wraps/expands tabs even
+    with ``soft_wrap``, which is exactly the truncation a redirected run must
+    not have.
+    """
+    lines = ["\t".join(TASK_COLUMNS)]
+    lines.extend("\t".join(_task_row_values(row)) for row in rows)
+    stream = console.file
+    stream.write("\n".join(lines) + "\n")
+    stream.flush()
+
+
+def _task_started(row: Any) -> str:
+    when = row.started_at or row.created_at
+    return when.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _task_elapsed(row: Any) -> str:
+    start = row.started_at or row.created_at
+    end = row.finished_at or row.updated_at
+    seconds = max((end - start).total_seconds(), 0.0)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, seconds = divmod(int(seconds), 60)
+    return f"{minutes}m{seconds:02d}s"
+
+
+def _task_failure(row: Any) -> str:
+    values = [value for value in (row.failure_code, row.failure_category) if value]
+    return "/".join(values)
 
 
 # ── benchmark (Phase 9) ───────────────────────────────────────────────────

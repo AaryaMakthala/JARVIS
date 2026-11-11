@@ -7,6 +7,7 @@ the user's answer.  No daemon/IPC yet (Phase 3); this is what the CLI drives.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -17,6 +18,7 @@ from jarvis.agent.context import AppContext
 from jarvis.agent.graph import build_graph
 from jarvis.agent.schemas import AgentResponse
 from jarvis.agent.state import Decision, StepResult
+from jarvis.taskstore.models import TERMINAL_STATUSES, TaskStatus, TaskStoreError
 from jarvis.tools.base import CancelToken
 
 __all__ = ["TaskOutcome", "extract_interrupt", "resume_task", "run_task"]
@@ -88,21 +90,35 @@ def run_task(
     source: str = "terminal",
     thread_id: str | None = None,
     cancel: CancelToken | None = None,
+    conversation_id: str | None = None,
 ) -> TaskOutcome:
     """Start a new task; returns a TaskOutcome, possibly awaiting confirmation.
 
     ``cancel`` is the caller's per-task :class:`CancelToken`; the graph checks it
     before entering every node, so a cancelled run stops at the next step.
+    ``conversation_id`` (B5) is the stable identity of the conversation this
+    request belongs to; it is stored in state (and therefore the checkpoint)
+    so a resumed task keeps it, while the *turns* themselves stay in the
+    caller's in-memory :class:`~jarvis.agent.conversation.ConversationManager`.
     """
-    task_id = thread_id or uuid4().hex[:12]
+    task_id = thread_id or str(uuid4())
     graph = build_graph(ctx, checkpointer, cancel)
     config = {"configurable": {"thread_id": task_id}}
     # Seed ``task_id`` so the graph and the outcome agree on one identifier.
     # Left to itself ``intake`` would mint a second, unrelated id, and the
     # per-task ``task_log`` row (and every ``agent event=... task_id=`` log
     # line) would be keyed on an id the caller never sees.
-    values = graph.invoke({"user_input": user_input, "source": source, "task_id": task_id}, config)
-    return _outcome(task_id, config, checkpointer, graph, values)
+    values: dict[str, Any] = {
+        "user_input": user_input,
+        "source": source,
+        "task_id": task_id,
+    }
+    if conversation_id:
+        values["conversation_id"] = conversation_id
+    values = graph.invoke(values, config)
+    outcome = _outcome(task_id, config, checkpointer, graph, values)
+    _mark_paused(ctx, outcome)
+    return outcome
 
 
 def resume_task(
@@ -114,10 +130,88 @@ def resume_task(
     cancel: CancelToken | None = None,
 ) -> TaskOutcome:
     """Resume a task at its interruption point with the user's answer."""
-    graph = build_graph(ctx, checkpointer, cancel)
     config = {"configurable": {"thread_id": thread_id}}
+    refusal = _resume_refusal(ctx, checkpointer, config)
+    if refusal is not None:
+        return TaskOutcome(
+            task_id=thread_id,
+            interrupted=False,
+            confirmation=None,
+            final_answer=None,
+            error=refusal,
+            halted_reason=refusal,
+            decisions={},
+            results=[],
+        )
+    graph = build_graph(ctx, checkpointer, cancel)
+    _mark_running(ctx, thread_id)
     values = graph.invoke(Command(resume=answer), config)
-    return _outcome(thread_id, config, checkpointer, graph, values)
+    outcome = _outcome(thread_id, config, checkpointer, graph, values)
+    _mark_paused(ctx, outcome)
+    return outcome
+
+
+def _mark_running(ctx: AppContext, task_id: str) -> None:
+    """Record that a paused task is running again (best-effort, B7)."""
+    _set_status(ctx, task_id, TaskStatus.RUNNING)
+
+
+def _mark_paused(ctx: AppContext, outcome: TaskOutcome) -> None:
+    """Record an honest ``awaiting_*`` status while the graph waits on a human.
+
+    Without this, the store (and therefore ``jarvis status``) called an
+    interrupted task "running" while it was actually waiting for an approval
+    or a clarification.  Best-effort: observability never changes the answer.
+    """
+    if not outcome.confirmation:
+        return
+    from jarvis.taskstore import TaskStatus as Status
+
+    status = (
+        Status.AWAITING_CLARIFICATION
+        if outcome.interrupt_kind == "clarification"
+        else Status.AWAITING_CONFIRMATION
+    )
+    _set_status(ctx, outcome.task_id, status)
+
+
+def _set_status(ctx: AppContext, task_id: str, status: Any) -> None:
+    tasks = getattr(ctx, "tasks", None)
+    if tasks is None or not getattr(tasks, "available", False) or not task_id:
+        return
+    try:
+        tasks.update_status(task_id, status)
+    except Exception:  # observability must never change the task's answer
+        ctx.logger.debug("task status %s not recorded", status, exc_info=True)
+
+
+def _resume_refusal(
+    ctx: AppContext,
+    checkpointer: Any,
+    config: dict[str, Any],
+) -> str | None:
+    """Refuse to resume when durable task state and the checkpoint disagree."""
+    tasks = getattr(ctx, "tasks", None)
+    if tasks is None or not getattr(tasks, "available", False):
+        return None
+    thread_id = config["configurable"]["thread_id"]
+    try:
+        snapshot = tasks.get(thread_id)
+    except TaskStoreError:
+        return "task lifecycle store is unavailable; refusing to resume"
+    if snapshot is None:
+        return "no durable task record matches this checkpoint; refusing to resume"
+    if snapshot.status in TERMINAL_STATUSES:
+        return f"task is already {snapshot.status.value}; refusing to resume"
+    if checkpointer is None:
+        return "task checkpoint is not available; refusing to resume"
+    try:
+        checkpoint = checkpointer.get_tuple(config)
+    except (sqlite3.Error, KeyError, ValueError, RuntimeError):
+        return "task checkpoint cannot be read; refusing to resume"
+    if checkpoint is None:
+        return "task checkpoint is missing; refusing to resume"
+    return None
 
 
 def extract_interrupt(values: dict[str, Any]) -> dict[str, Any] | None:

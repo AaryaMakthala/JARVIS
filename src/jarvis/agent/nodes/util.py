@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-import secrets
+import uuid
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -392,8 +392,8 @@ def truncate(text: str, limit: int = _SNIPPET) -> str:
 
 
 def new_task_id() -> str:
-    """Compact, collision-resistant task id for checkpointer thread_id."""
-    return secrets.token_hex(6)
+    """Canonical UUID used as the checkpointer thread_id and task-store key."""
+    return str(uuid.uuid4())
 
 
 def tainted_fragments(state: dict[str, Any]) -> tuple[str, ...]:

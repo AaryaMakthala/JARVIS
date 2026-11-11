@@ -9,19 +9,23 @@ from jarvis import doctor
 
 def test_all_backends_present(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor, "_has", lambda module: True)
-    monkeypatch.setattr(doctor, "backend_name", lambda: "rapidocr_onnxruntime")
+    monkeypatch.setattr(doctor, "backend_name", lambda: "paddleocr")
+    monkeypatch.setattr(doctor, "unavailable_reason", lambda _perception: None)
 
     checks = {check.name: check for check in doctor.optional_backend_checks()}
 
     assert set(checks) == {"screenshot", "ocr", "volume", "playwright"}
     assert all(check.status == "PASS" for check in checks.values())
-    assert checks["ocr"].detail == "ready (rapidocr_onnxruntime)"
+    assert checks["ocr"].detail == "ready (paddleocr, PP-OCRv6-small, local CPU)"
     assert "chromium" in checks["playwright"].detail
 
 
 def test_missing_backends_warn_but_never_fail(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor, "_has", lambda module: False)
     monkeypatch.setattr(doctor, "backend_name", lambda: None)
+    monkeypatch.setattr(
+        doctor, "unavailable_reason", lambda _perception: "PaddleOCR is not installed"
+    )
 
     checks = doctor.optional_backend_checks()
 
@@ -30,6 +34,7 @@ def test_missing_backends_warn_but_never_fail(monkeypatch: pytest.MonkeyPatch) -
     by_name = {check.name: check.detail for check in checks}
     assert "mss" in by_name["screenshot"]
     assert "PIL" in by_name["screenshot"]
+    assert "PaddleOCR is not installed" in by_name["ocr"]
     assert "read_screen" in by_name["ocr"]
     assert "pycaw" in by_name["volume"]
     assert ".[browser]" in by_name["playwright"]

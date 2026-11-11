@@ -4,9 +4,9 @@ Safety contract (stage 4.8; docs/03):
 
 * **Closed vocabulary, exact matches only.** Whole-utterance matches against
   fixed phrase sets plus ``open|launch|start <name>`` where ``<name>`` is an
-  exact normalised key of the ``[apps]`` allowlist. No fuzzy matching, no
-  substring matching, no arithmetic dispatch (the ``test_math_phrasings``
-  structural guard must stay green).
+  exact normalised key of the ``[apps]`` allowlist. No fuzzy matching and no
+  substring matching. Arithmetic is handled by the separate bounded parser in
+  :mod:`jarvis.agent.arithmetic`, never by ``eval`` or a phrase table.
 * **Only the LLM call is skipped.** The returned :class:`Plan` has the same
   shape the brain node projects (kind/tool/steps) and still runs the unchanged
   pipeline ``validate -> policy_gate -> act -> verify``. The deterministic
@@ -25,6 +25,7 @@ import re
 import string
 from typing import Any
 
+from jarvis.agent import arithmetic
 from jarvis.agent.context import AppContext
 from jarvis.agent.state import Plan, Step
 from jarvis.config import Settings
@@ -39,6 +40,30 @@ _TIME_PHRASES = frozenset(
     }
 )
 
+#: Whole-utterance phrases that ask for the local date only.
+_DATE_PHRASES = frozenset(
+    {
+        "what date is it",
+        "what is the date",
+        "whats the date",
+        "what day is it",
+        "what is today",
+        "what is todays date",
+        "whats todays date",
+        "tell me the date",
+    }
+)
+
+#: Whole-utterance phrases that ask for both local date and time.
+_DATETIME_PHRASES = frozenset(
+    {
+        "what is the date and time",
+        "whats the date and time",
+        "what is the time and date",
+        "whats the time and date",
+    }
+)
+
 #: Whole-utterance phrases (normalised) that map to ``list_windows``.
 _WINDOWS_PHRASES = frozenset(
     {
@@ -47,6 +72,30 @@ _WINDOWS_PHRASES = frozenset(
         "list the windows",
     }
 )
+
+#: Whole-utterance phrases (normalised) that map to ``system_info`` reads.
+_SYSTEM_PHRASES: dict[str, tuple[str, str]] = {
+    "how much battery is left": ("system_info", "battery"),
+    "what is my battery level": ("system_info", "battery"),
+    "whats my battery level": ("system_info", "battery"),
+    "battery level": ("system_info", "battery"),
+    "battery percentage": ("system_info", "battery"),
+    "what is my cpu usage": ("system_info", "cpu"),
+    "whats my cpu usage": ("system_info", "cpu"),
+    "cpu usage": ("system_info", "cpu"),
+    "how busy is the cpu": ("system_info", "cpu"),
+    "how much ram is used": ("system_info", "ram"),
+    "how much memory is used": ("system_info", "ram"),
+    "ram usage": ("system_info", "ram"),
+    "memory usage": ("system_info", "ram"),
+    "how much disk space is left": ("system_info", "disk"),
+    "how much disk space is used": ("system_info", "disk"),
+    "disk usage": ("system_info", "disk"),
+    "system uptime": ("system_info", "uptime"),
+    "how long has this computer been on": ("system_info", "uptime"),
+    "uptime": ("system_info", "uptime"),
+}
+
 
 #: Leading verbs for the allowlisted-app pattern (checked AFTER the phrases).
 _OPEN_VERBS = frozenset({"open", "launch", "start"})
@@ -91,8 +140,16 @@ def match(raw: str, settings: Settings) -> tuple[str, dict[str, Any], str] | Non
         return None
     if text in _TIME_PHRASES:
         return "get_time", {}, text
+    if text in _DATE_PHRASES:
+        return "get_time", {"include_date": True}, text
+    if text in _DATETIME_PHRASES:
+        return "get_time", {"include_date": True, "include_time": True}, text
     if text in _WINDOWS_PHRASES:
         return "list_windows", {}, text
+    system = _SYSTEM_PHRASES.get(text)
+    if system is not None:
+        tool, what = system
+        return tool, {"what": what}, text
     tokens = text.split()
     if len(tokens) >= 2 and tokens[0] in _OPEN_VERBS:
         name = " ".join(tokens[1:])
@@ -126,9 +183,29 @@ def brain_update(state: dict[str, Any], ctx: AppContext) -> dict[str, Any] | Non
     """State update mirroring brain's action path, or None to fall through.
 
     Mirrors ``jarvis.agent.nodes.brain`` exactly: same keys, ``api_calls`` and
-    ``tokens`` unchanged (+0), clarification fields cleared, ``request_kind``
-    set to ``"tool"``. The only difference is that no LLM call happens.
+    ``tokens`` unchanged (+0), clarification fields cleared. The only
+    difference is that no LLM call happens. Arithmetic is the one
+    conversation-shaped fast path; it still produces a checkpointable Plan.
     """
+    answer = arithmetic.solve(state.get("user_input") or "")
+    if answer is not None:
+        ctx.logger.info("agent event=fastpath task_id=%s tool=arithmetic", state.get("task_id"))
+        return {
+            "api_calls": int(state.get("api_calls") or 0),
+            "tokens": int(state.get("tokens") or 0),
+            "clarification_question": None,
+            "clarification_answer": None,
+            "plan": Plan(
+                kind="conversation",
+                goal="fastpath: arithmetic",
+                steps=[],
+                dialog_answer=answer.answer,
+            ),
+            "request_kind": "conversation",
+            "final_answer": answer.answer,
+            "error": None,
+        }
+
     # Referent-aware fast path (closed vocabulary)
     try:
         resolved_refs = state.get("resolved_refs") or {}
@@ -155,7 +232,7 @@ def brain_update(state: dict[str, Any], ctx: AppContext) -> dict[str, Any] | Non
                 if re.match(r"^open the (first|second|third|1st|2nd|3rd|\d+)( (result|link|one))?\.?$", t):
                     try:
                         p = int(pos)
-                    except Exception:
+                    except (TypeError, ValueError):
                         p = None
                     if p and resolved_refs.get("has_result_set") and p in (resolved_refs.get("result_set_positions") or []):
                         plan = Plan(kind="tool", steps=[Step(id="s1", tool="browser_open_result", args={"position": p})])
@@ -173,8 +250,8 @@ def brain_update(state: dict[str, Any], ctx: AppContext) -> dict[str, Any] | Non
                             "request_kind": "tool",
                             "error": None,
                         }
-    except Exception:
-        pass
+    except (KeyError, TypeError, ValueError) as exc:
+        ctx.logger.debug("referent fast path skipped: %s", exc)
     plan = plan_for(state.get("user_input") or "", ctx.settings)
     if plan is None:
         return None

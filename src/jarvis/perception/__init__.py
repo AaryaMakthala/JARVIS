@@ -8,7 +8,8 @@ with an injected fake:
 * :mod:`jarvis.perception.screen` - identify the foreground window and capture
   it in memory (``mss`` + Pillow);
 * :mod:`jarvis.perception.ui_text` - UI Automation text of that window;
-* :mod:`jarvis.perception.ocr` - optional local OCR (RapidOCR + ONNX Runtime).
+* :mod:`jarvis.perception.ocr` - optional local OCR (PaddleOCR PP-OCRv6-small,
+  CPU only).
 
 The heavy/Windows-only imports live *inside* the functions, so importing this
 package is safe on any OS and cheap.

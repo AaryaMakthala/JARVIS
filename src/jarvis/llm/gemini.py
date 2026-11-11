@@ -18,12 +18,14 @@ exceptions, or checkpointed: only the returned text moves on.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
+from jarvis.llm.abort import abort_if_cancelled
 from jarvis.llm.client import (
     LLMAuthError,
     LLMCapabilityError,
@@ -31,6 +33,8 @@ from jarvis.llm.client import (
     LLMModelError,
     LLMTransientError,
     Usage,
+    bounded_http_timeout,
+    post_with_deadline,
     sleep_within_deadline,
 )
 from jarvis.llm.failures import FailureCategory
@@ -74,7 +78,9 @@ class GeminiClient:
         self._timeout = timeout
         self._max_retries = max_retries
         self._logger = logger or logging.getLogger("llm.client")
-        self._http = http_client or httpx.Client(base_url=base_url, timeout=timeout)
+        self._http = http_client or httpx.Client(
+            base_url=base_url, timeout=bounded_http_timeout(timeout)
+        )
         self._owns_http = http_client is None
         self.usage = Usage()
 
@@ -134,12 +140,15 @@ class GeminiClient:
         backoff = 1.0
         attempts = 0
         while True:
+            abort_if_cancelled()
             try:
-                resp = self._http.post(
+                status, raw_body = post_with_deadline(
+                    self._http,
                     f"models/{model}:generateContent",
+                    body=body,
+                    timeout_s=request_timeout,
+                    deadline_at=deadline_at,
                     params={"key": self._api_key},
-                    json=body,
-                    timeout=request_timeout,
                 )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 attempts += 1
@@ -153,14 +162,15 @@ class GeminiClient:
                 )
                 backoff *= 2
                 continue
-            if resp.status_code == 429 or resp.status_code >= 500:
+            body_text = raw_body.decode("utf-8", "replace")
+            if status == 429 or status >= 500:
                 attempts += 1
                 if attempts > retry_budget:
                     raise LLMTransientError(
-                        f"Gemini transient failure (HTTP {resp.status_code}) "
+                        f"Gemini transient failure (HTTP {status}) "
                         f"persisted after {attempts} attempts"
                     )
-                self._logger.warning("Gemini HTTP %d; retrying in %.1fs", resp.status_code, backoff)
+                self._logger.warning("Gemini HTTP %d; retrying in %.1fs", status, backoff)
                 sleep_within_deadline(
                     backoff,
                     deadline_at,
@@ -169,10 +179,13 @@ class GeminiClient:
                 )
                 backoff *= 2
                 continue
-            if resp.status_code != 200:
-                raise self._status_for(model, resp.status_code, resp.text)
+            if status != 200:
+                raise self._status_for(model, status, body_text)
 
-            data = resp.json()
+            try:
+                data = json.loads(body_text)
+            except ValueError as exc:
+                raise LLMTransientError("Gemini returned an unreadable response") from exc
             content = ""
             candidates = data.get("candidates") or []
             if candidates:

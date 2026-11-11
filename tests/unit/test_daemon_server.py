@@ -25,6 +25,8 @@ from jarvis.daemon.server import (
     _parse_message,
 )
 
+TASK_1 = "00000000-0000-4000-8000-000000000001"
+
 # ── Message parsing (delegated from protocol.py) ─────────────────────────
 
 
@@ -329,18 +331,18 @@ class TestRequestAcks:
         writer = AsyncMock()
         conn = ClientConnection(writer=writer, reader=AsyncMock())
 
-        asyncio.run(server._handle_chat(ChatMessage(id="t1", text="lock my computer"), conn))
+        asyncio.run(server._handle_chat(ChatMessage(id=TASK_1, text="lock my computer"), conn))
 
         # The ack is sent synchronously, before any worker progress.
         written = writer.write.call_args[0][0].decode("utf-8")
         data = json.loads(written)
         assert data["type"] == "event"
-        assert data["task_id"] == "t1"
+        assert data["task_id"] == TASK_1
         # A dedicated kind, not a progress "log": the client has to be able to
         # tell the submission receipt from a message about the same task.
         assert data["kind"] == "ack"
         assert data["data"]["message"] == "started"
-        assert server._active is not None and server._active.task_id == "t1"
+        assert server._active is not None and server._active.task_id == TASK_1
 
     def test_delivered_confirm_response_sends_an_ack(self) -> None:
         from jarvis.daemon.protocol import ConfirmResponse
@@ -410,6 +412,59 @@ class TestRequestAcks:
         assert data["task_id"] == "t1"
         assert data["kind"] == "ack"
         assert data["data"]["message"] == "cancelled"
+
+    def test_late_cancel_does_not_overwrite_a_finished_result(self) -> None:
+        from jarvis.daemon.protocol import CancelMessage
+
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="setup", source="chat", owner_id="oid")
+        slot.done = True
+        slot.result_text = "done"
+        server._active = slot
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+
+        asyncio.run(server._handle_cancel(CancelMessage(task_id="t1"), conn))
+        data = json.loads(writer.write.call_args[0][0].decode("utf-8"))
+        assert data["data"]["message"] == "already finished"
+        assert slot.result_text == "done"
+        assert slot.error is None
+        assert slot.cancelled is False
+
+
+class TestWorkerCheckpointerCleanup:
+    def test_success_closes_the_per_task_saver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from types import SimpleNamespace
+
+        import jarvis.agent
+        import jarvis.config
+
+        closed: list[bool] = []
+
+        class _Conn:
+            def close(self) -> None:
+                closed.append(True)
+
+        class _Saver:
+            conn = _Conn()
+
+        monkeypatch.setattr(jarvis.agent, "open_sqlite_checkpointer", lambda path: _Saver())
+        monkeypatch.setattr(jarvis.config, "checkpoints_db", lambda: "/tmp/cp.db")
+        monkeypatch.setattr(
+            jarvis.agent,
+            "run_task",
+            lambda *args, **kwargs: SimpleNamespace(
+                final_answer="ok", spoken_answer=None, confirmation=None, error=None
+            ),
+        )
+        server = _server()
+        slot = TaskSlot(task_id="t1", text="hello", source="chat", owner_id="oid")
+
+        server._worker_run(slot)
+
+        assert slot.done is True
+        assert slot.result_text == "ok"
+        assert closed == [True]
 
 
 class TestAckPrecedesTheWorkerWakeup:
@@ -554,3 +609,70 @@ class TestHandleStatusLlmHealth:
         data = self._status_payload(server)
         assert data["llm_health"] == []
         assert data["daemon"] == "running"
+
+
+class TestHandleStatusProgress:
+    @staticmethod
+    def _payload(server: DaemonServer) -> dict:
+        writer = AsyncMock()
+        conn = ClientConnection(writer=writer, reader=AsyncMock())
+        asyncio.run(server._handle_status(conn))
+        return json.loads(writer.write.call_args[0][0].decode("utf-8"))
+
+    def test_projects_the_active_task_lifecycle(self) -> None:
+        from datetime import UTC, datetime, timedelta
+        from types import SimpleNamespace
+
+        class _Tasks:
+            def get(self, task_id: str) -> object:
+                assert task_id == TASK_1
+                start = datetime.now(UTC) - timedelta(seconds=3)
+                return SimpleNamespace(
+                    stage=SimpleNamespace(value="executing"),
+                    status=SimpleNamespace(value="running"),
+                    source="terminal",
+                    started_at=start,
+                    created_at=start,
+                    finished_at=None,
+                )
+
+        server = _server()
+        server._active = TaskSlot(task_id=TASK_1, text="go", source="terminal")
+        server._tasks = _Tasks()
+        data = self._payload(server)
+
+        assert data["active_task"] == TASK_1
+        assert data["active_stage"] == "executing"
+        assert data["active_status"] == "running"
+        assert data["active_source"] == "terminal"
+        assert data["active_elapsed_s"] >= 3.0
+
+    def test_missing_snapshot_stays_empty(self) -> None:
+        class _Tasks:
+            def get(self, task_id: str) -> None:
+                del task_id
+
+        server = _server()
+        server._active = TaskSlot(task_id=TASK_1, text="go", source="terminal")
+        server._tasks = _Tasks()
+        data = self._payload(server)
+
+        assert data["active_task"] == TASK_1
+        assert data["active_stage"] is None
+        assert data["active_status"] is None
+        assert data["active_elapsed_s"] is None
+
+    def test_a_broken_store_does_not_break_status(self) -> None:
+        class _Tasks:
+            def get(self, task_id: str) -> None:
+                del task_id
+                raise RuntimeError("boom")
+
+        server = _server()
+        server._active = TaskSlot(task_id=TASK_1, text="go", source="terminal")
+        server._tasks = _Tasks()
+        data = self._payload(server)
+
+        assert data["daemon"] == "running"
+        assert data["active_task"] == TASK_1
+        assert data["active_stage"] is None

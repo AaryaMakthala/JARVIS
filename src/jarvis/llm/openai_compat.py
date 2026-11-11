@@ -14,12 +14,14 @@ Error messages name the provider/model and status, never request bodies.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
+from jarvis.llm.abort import abort_if_cancelled
 from jarvis.llm.client import (
     LLMAuthError,
     LLMCapabilityError,
@@ -27,6 +29,8 @@ from jarvis.llm.client import (
     LLMModelError,
     LLMTransientError,
     Usage,
+    bounded_http_timeout,
+    post_with_deadline,
     sleep_within_deadline,
 )
 from jarvis.llm.failures import FailureCategory
@@ -74,7 +78,7 @@ class OpenAICompatClient:
         if provider == "openrouter":
             headers["X-Title"] = "JARVIS"
         self._http = http_client or httpx.Client(
-            base_url=base_url, timeout=timeout, headers=headers
+            base_url=base_url, timeout=bounded_http_timeout(timeout), headers=headers
         )
         self._owns_http = http_client is None
         self.usage = Usage()
@@ -144,8 +148,15 @@ class OpenAICompatClient:
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
         while True:
+            abort_if_cancelled()
             try:
-                resp = self._http.post("chat/completions", json=payload, timeout=request_timeout)
+                status, raw_body = post_with_deadline(
+                    self._http,
+                    "chat/completions",
+                    body=payload,
+                    timeout_s=request_timeout,
+                    deadline_at=deadline_at,
+                )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 attempts += 1
                 if attempts > retry_budget:
@@ -163,15 +174,16 @@ class OpenAICompatClient:
                 )
                 backoff *= 2
                 continue
-            if resp.status_code == 429 or resp.status_code >= 500:
+            body_text = raw_body.decode("utf-8", "replace")
+            if status == 429 or status >= 500:
                 attempts += 1
                 if attempts > retry_budget:
                     raise LLMTransientError(
-                        f"{self._provider} transient failure (HTTP {resp.status_code}) "
+                        f"{self._provider} transient failure (HTTP {status}) "
                         f"persisted after {attempts} attempts"
                     )
                 self._logger.warning(
-                    "%s HTTP %d; retrying in %.1fs", self._provider, resp.status_code, backoff
+                    "%s HTTP %d; retrying in %.1fs", self._provider, status, backoff
                 )
                 sleep_within_deadline(
                     backoff,
@@ -181,10 +193,15 @@ class OpenAICompatClient:
                 )
                 backoff *= 2
                 continue
-            if resp.status_code != 200:
-                raise self._status_for(model, resp.status_code, resp.text)
+            if status != 200:
+                raise self._status_for(model, status, body_text)
 
-            data = resp.json()
+            try:
+                data = json.loads(body_text)
+            except ValueError as exc:
+                raise LLMTransientError(
+                    f"{self._provider} returned an unreadable response"
+                ) from exc
             content = ""
             choices = data.get("choices") or []
             if choices:

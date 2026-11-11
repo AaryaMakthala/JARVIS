@@ -119,6 +119,38 @@ def _is_internal_object(payload: Any) -> bool:
     return len(INTERNAL_KEYS & set(payload)) >= MIN_INTERNAL_KEYS
 
 
+def delivered_answer(
+    *,
+    voice: bool,
+    final_answer: str | None,
+    screen_answer: str | None = None,
+    spoken_answer: str | None = None,
+) -> str:
+    """The answer a channel must actually deliver for one finished task.
+
+    The composed ``spoken_answer`` is a short courtesy ("Done.") built for the
+    audio device; it is never a replacement for the factual answer a terminal
+    user asked for.  The terminal therefore prefers the full final/screen
+    answer and only falls back to the courtesy when nothing else exists.  The
+    voice channel is the mirror image: speak the short form, then the full
+    answer, then the screen text.
+
+    Empty candidates are ignored.  When every candidate is empty the existing
+    honest refusal (:data:`NO_ANSWER_MESSAGE`) is returned rather than an empty
+    string, so no channel can deliver silence as if it were an answer.
+    """
+
+    def _clean(value: str | None) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    final = _clean(final_answer)
+    screen = _clean(screen_answer)
+    spoken = _clean(spoken_answer)
+    if voice:
+        return spoken or final or screen or NO_ANSWER_MESSAGE
+    return final or screen or spoken or NO_ANSWER_MESSAGE
+
+
 def strip_code_fence(text: str) -> str:
     """Remove a surrounding markdown fence, if the whole value is fenced."""
     stripped = text.strip()

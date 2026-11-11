@@ -44,19 +44,24 @@ from collections import OrderedDict
 from typing import Any
 
 from jarvis.agent.context import AppContext
-from jarvis.agent.state import Plan, StepResult
+from jarvis.agent.state import Plan
 from jarvis.memory.tasklog import STATUSES
+from jarvis.taskstore import TaskEventType, TaskStage, TaskStatus
 
 __all__ = [
     "MAX_PATH_CHARS",
     "MAX_TRACED_TASKS",
     "MAX_TRACE_ENTRIES",
     "NODE_CODES",
+    "NODE_STAGES",
     "discard_trace",
     "format_trace",
     "get_trace",
+    "llm_attempt_meta",
     "node_code",
     "record_finished",
+    "record_route",
+    "record_stage",
     "record_started",
     "task_status",
     "trace_node",
@@ -102,6 +107,40 @@ NODE_CODES: dict[str, str] = {
     "specialist_decide": "sd",
     "specialist_observe": "so",
 }
+
+#: Graph node -> closed lifecycle stage written to the independent task store.
+#: ``intake`` is absent on purpose: :func:`record_started` opens the task and
+#: moves it to ``running`` itself, so the entry hook would write a redundant
+#: event.  ``memory_save`` is reached after ``respond`` has already written the
+#: terminal event, so its write is expected to be refused and ignored.
+NODE_STAGES: dict[str, TaskStage] = {
+    "context_resolve": TaskStage.RECALLING,
+    "memory_retrieve": TaskStage.RECALLING,
+    "brain": TaskStage.PLANNING,
+    "validate": TaskStage.VALIDATING,
+    "prepare_readback": TaskStage.AUTHORIZING,
+    "policy_gate": TaskStage.AUTHORIZING,
+    "act": TaskStage.EXECUTING,
+    "verify": TaskStage.VERIFYING,
+    "replan": TaskStage.REPLANNING,
+    "clarify": TaskStage.CLARIFYING,
+    "compose": TaskStage.RESPONDING,
+    "respond": TaskStage.RESPONDING,
+    "memory_save": TaskStage.SAVING,
+    "specialist_decide": TaskStage.PLANNING,
+    "specialist_observe": TaskStage.VERIFYING,
+}
+
+#: Failure code recorded with a terminal status (the stored vocabulary is the
+#: closed :class:`~jarvis.agent.state.FailureCode` set).
+_FAILURE_CODES: dict[TaskStatus, str] = {
+    TaskStatus.FAILED: "failed",
+    TaskStatus.PARTIAL: "partial",
+    TaskStatus.CANCELLED: "cancelled",
+    TaskStatus.HALTED: "halted",
+}
+
+_SOURCES = ("terminal", "voice", "benchmark")
 
 
 class _NodeTraces:
@@ -195,8 +234,7 @@ def format_trace(names: tuple[str, ...] | list[str]) -> str:
         else:
             runs.append((label, 1))
     path = ">".join(
-        f"{node_code(label)} x{count}" if count > 1 else node_code(label)
-        for label, count in runs
+        f"{node_code(label)} x{count}" if count > 1 else node_code(label) for label, count in runs
     )
     if len(path) <= MAX_PATH_CHARS:
         return path
@@ -204,6 +242,148 @@ def format_trace(names: tuple[str, ...] | list[str]) -> str:
     if cut <= 0:
         return path[: MAX_PATH_CHARS - 1] + "…"
     return path[: cut + 1] + "…"
+
+
+def _task_store(ctx: AppContext) -> Any | None:
+    """The independent store, or ``None`` when observability is off."""
+    if bool(getattr(ctx, "dry_run", False)):
+        return None
+    store = getattr(ctx, "tasks", None)
+    if store is None or not getattr(store, "writable", False):
+        return None
+    return store
+
+
+def _safe_source(state: dict[str, Any]) -> str:
+    source = str(state.get("source") or "")
+    return source if source in _SOURCES else "terminal"
+
+
+def record_route(
+    state: dict[str, Any],
+    ctx: AppContext,
+    *,
+    task_class: str,
+    model_role: str,
+    reason_code: str,
+) -> None:
+    """Record the closed routing decision, never the user text behind it.
+
+    The task store validates every value against its own closed vocabularies.
+    Like the other telemetry writers, a store failure is swallowed: an
+    unreadable history must not change the task's answer.
+    """
+    store = _task_store(ctx)
+    task_id = str(state.get("task_id") or "")
+    if store is None or not task_id:
+        return
+    try:
+        store.ensure_task(task_id, source=_safe_source(state))
+        store.append_event(
+            task_id,
+            TaskEventType.ROUTE,
+            detail={
+                "task_class": task_class,
+                "model_role": model_role,
+                "reason_code": reason_code,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
+        ctx.logger.debug("task route not recorded: %s", exc)
+
+
+def llm_attempt_meta(
+    state: dict[str, Any],
+    ctx: AppContext,
+    task_class: str,
+    *,
+    context_stats: Any | None = None,
+) -> Any | None:
+    """Per-request attempt metadata for the LLM client (B8.5), or ``None``.
+
+    Explicit by construction: the task id and class travel with *this* call
+    instead of through a process-wide "current task" variable, so concurrent
+    tasks cannot attribute each other's model attempts.  Returns ``None`` when
+    the client does not advertise ``supports_attempt_meta`` (a test double, an
+    embedding without the composite client) or when observability is off, in
+    which case the caller makes an ordinary call with no extra keyword.
+    """
+    from jarvis.llm.telemetry import LLMContextStats, build_attempt_meta
+
+    context = None
+    if context_stats is not None:
+        context = LLMContextStats(
+            estimated_input_tokens=int(context_stats.estimated_input_tokens),
+            candidate_tools=int(context_stats.candidate_tools),
+            schema_tools=int(context_stats.schema_tools),
+            memory_candidates=int(context_stats.memory_candidates),
+            history_turns=int(context_stats.history_turns),
+            trimmed=bool(context_stats.trimmed),
+        )
+    return build_attempt_meta(
+        getattr(ctx, "llm", None),
+        str(state.get("task_id") or ""),
+        str(task_class or ""),
+        _task_store(ctx),
+        context=context,
+    )
+
+
+def record_stage(state: dict[str, Any], ctx: AppContext, node_name: str) -> None:
+    """Record that ``node_name`` was entered for this task.
+
+    Called from :func:`jarvis.agent.nodes.wrap`, the single choke point every
+    node passes through.  It writes only the closed stage vocabulary and the
+    task's own id - no user text, arguments or results.  Every store error is
+    swallowed: observability must never change the task's answer.
+    """
+    store = _task_store(ctx)
+    task_id = str(state.get("task_id") or "")
+    if store is None or not task_id:
+        return
+    stage = NODE_STAGES.get(node_name)
+    if stage is None:
+        return
+    try:
+        store.ensure_task(task_id, source=_safe_source(state))
+        store.update_stage(task_id, stage)
+    except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
+        ctx.logger.debug("task stage not recorded (%s): %s", node_name, exc)
+
+
+def _task_begin(state: dict[str, Any], ctx: AppContext) -> None:
+    """Open the task and move it to ``running`` (from ``intake``)."""
+    store = _task_store(ctx)
+    task_id = str(state.get("task_id") or "")
+    if store is None or not task_id:
+        return
+    try:
+        store.ensure_task(task_id, source=_safe_source(state))
+        store.update_status(task_id, TaskStatus.RUNNING)
+    except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
+        ctx.logger.debug("task start not recorded: %s", exc)
+
+
+def _task_finish(state: dict[str, Any], ctx: AppContext, status: str) -> None:
+    """Write the terminal event with the derived status and failure code."""
+    store = _task_store(ctx)
+    task_id = str(state.get("task_id") or "")
+    if store is None or not task_id:
+        return
+    try:
+        final = TaskStatus(status)
+        code = _FAILURE_CODES.get(final)
+        replans = int(state.get("replan_count") or 0)
+        store.ensure_task(task_id, source=_safe_source(state))
+        if replans > 0:
+            store.append_event(
+                task_id,
+                TaskEventType.NOTE,
+                detail={"event_code": "replan", "retry_count": replans},
+            )
+        store.finish(task_id, final, failure_code=code)
+    except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
+        ctx.logger.debug("task finish not recorded: %s", exc)
 
 
 def record_started(state: dict[str, Any], ctx: AppContext) -> None:
@@ -217,6 +397,7 @@ def record_started(state: dict[str, Any], ctx: AppContext) -> None:
         steps=0,
         replans=0,
     )
+    _task_begin(state, ctx)
 
 
 def record_finished(state: dict[str, Any], ctx: AppContext) -> None:
@@ -230,11 +411,12 @@ def record_finished(state: dict[str, Any], ctx: AppContext) -> None:
     plan: Plan | None = state.get("plan")
     task_id = str(state.get("task_id") or "")
     path = format_trace(get_trace(task_id)) if task_id else ""
+    status = task_status(state)
     try:
         _write(
             state,
             ctx,
-            status=task_status(state),
+            status=status,
             api_calls=int(state.get("api_calls") or 0),
             tokens=int(state.get("tokens") or 0),
             steps=len(plan.steps) if plan is not None else 0,
@@ -244,50 +426,21 @@ def record_finished(state: dict[str, Any], ctx: AppContext) -> None:
     finally:
         if task_id:
             discard_trace(task_id)
+    _task_finish(state, ctx, status)
 
 
 def task_status(state: dict[str, Any]) -> str:
     """The closed, honest status for a finished task.
 
-    A recorded ``StepResult`` is concrete evidence, so it is classified before
-    any ``halted_reason``: a task that failed a step and then ran out of replan
-    budget is logged as the failure it was, never as the halt that followed.
-    That ordering is what makes "logged as completed" mean *every* step
-    succeeded and verified.
-
-    ==========================  ==========  ==================================
-    Condition                   Status      Why
-    ==========================  ==========  ==================================
-    ``cancelled``               cancelled   the human stopped it
-    a failed/unverified step    failed      the work did not happen
-    any unproven step           partial     it worked but nothing proved it
-    clarification requested     halted      asked, not answered
-    a conversation answer       answered    an answer, not an action
-    ``halted_reason``           halted      refused / unsupported / no LLM
-    everything else             completed   the plan ran and verified
-    ==========================  ==========  ==================================
+    Delegates to the single classifier in :mod:`jarvis.agent.compose_rules`, so
+    the wording ``compose`` builds and the status the task store records can
+    never disagree.  In particular, a successful read-only observation
+    (``verified is None`` because there is no post-condition) is ``completed``,
+    not ``partial``; an unverified side effect is still ``partial``.
     """
-    if state.get("cancelled"):
-        return "cancelled"
+    from jarvis.agent.compose_rules import task_status_for
 
-    results: list[StepResult] = [
-        r for r in (state.get("results") or []) if isinstance(r, StepResult)
-    ]
-    if any(not r.ok or r.verified is False for r in results):
-        return "failed"
-    if any(r.verified is None for r in results):
-        return "partial"
-
-    plan: Plan | None = state.get("plan")
-    if plan is not None and plan.needs_clarification:
-        return "halted"
-    if state.get("final_answer") or (
-        plan is not None and getattr(plan, "kind", None) == "conversation" and not plan.steps
-    ):
-        return "answered"
-    if state.get("halted_reason"):
-        return "halted"
-    return "completed"
+    return task_status_for(state)
 
 
 def _write(

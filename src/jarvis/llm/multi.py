@@ -4,9 +4,9 @@ Wraps the eligible free providers (configured order).  For every operation it
 walks the list and:
 
 * skips providers whose registry entry lacks the capability the operation
-  needs (structured output + tool planning for ``structured()``; plain text
-  generation for ``text()``) — checked against the model **for the requested
-  role**, not always the planner;
+  needs (structured output + tool planning for ``structured()``; a declared
+  plain-text completion capability for ``text()``) — checked against the model
+  **for the requested role**, not always the planner;
 * orders candidates by :class:`~jarvis.llm.health.ProviderHealth`, so a provider
   that just 503'd is deprioritised for the next interaction without being
   removed from the configuration.  Candidates are walked **provider-major**:
@@ -66,6 +66,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from jarvis.llm import capability as llm_capability
 from jarvis.llm import models as llm_models
 from jarvis.llm.abort import abort_if_cancelled
 from jarvis.llm.client import CallMeta, LLMError, LLMTransientError, Usage
@@ -79,6 +80,12 @@ from jarvis.llm.failures import (
 from jarvis.llm.health import ProviderHealth
 from jarvis.llm.models import ModelSpec
 from jarvis.llm.provider import ProviderInfo
+from jarvis.llm.telemetry import (
+    LLMAttemptMeta,
+    LLMAttemptRecord,
+    task_failure_category,
+)
+from jarvis.taskstore.vocabulary import TaskAttemptOutcome
 
 Candidate = tuple[ProviderInfo, ModelSpec, Any]
 
@@ -128,6 +135,11 @@ def _spec_for_role(provider: str, candidate_spec: ModelSpec, client: Any, role: 
 
 class MultiProviderClient:
     """Fallback LLMClient over an ordered list of eligible free clients."""
+
+    #: Advertises support for the optional per-request ``attempt_meta`` keyword.
+    #: Callers (``brain``, ``replan``) only pass it when the client sets this, so
+    #: test doubles with the older signature keep working unchanged.
+    supports_attempt_meta = True
 
     def __init__(
         self,
@@ -206,10 +218,13 @@ class MultiProviderClient:
         temperature: float = 0.0,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        attempt_meta: LLMAttemptMeta | None = None,
     ) -> tuple[BaseModel, Usage]:
         """First provider that can produce ``schema`` for ``model_role`` wins."""
         failures: list[str] = []
+        attempt_index = 0
         deadline_at, handed_deadline = self._deadline(timeout_s)
+        requirement = llm_capability.PLANNER_REQUIREMENT
         for group in self._groups(model_role):
             for info, _spec, client in group:
                 # Between attempts, before any provider is called: a cancelled
@@ -217,13 +232,11 @@ class MultiProviderClient:
                 abort_if_cancelled()
                 remaining = self._remaining(deadline_at, model_role)
                 spec = _spec_for_role(info.name, _spec, client, model_role)
-                caps = spec.capabilities
-                if not (caps.supports_structured_output and caps.supports_tools):
-                    failures.append(
-                        f"{info.name}: skipped ({spec.model} lacks "
-                        "structured-output/tool-planning support)"
-                    )
+                ok, why = llm_capability.satisfies(spec, requirement)
+                if not ok:
+                    failures.append(f"{info.name}: skipped ({why})")
                     continue
+                started = self._clock()
                 try:
                     result = client.structured(
                         system=system,
@@ -239,10 +252,23 @@ class MultiProviderClient:
                     failure = self._note_failure(
                         info, model_role, client, exc, failures, structured=True
                     )
+                    self._emit_attempt(
+                        attempt_meta,
+                        info,
+                        model_role,
+                        client,
+                        attempt_index,
+                        started,
+                        failure_category=failure.category.value,
+                    )
+                    attempt_index += 1
                     if self._advance_after_failure(failure):
                         continue
                     break
                 self._note_success(info, model_role, client)
+                self._emit_attempt(
+                    attempt_meta, info, model_role, client, attempt_index, started, usage=result[1]
+                )
                 return result
         raise LLMError(
             "all free LLM providers failed for structured output: " + "; ".join(failures)
@@ -258,16 +284,31 @@ class MultiProviderClient:
         max_tokens: int | None = None,
         max_retries: int | None = None,
         timeout_s: float | None = None,
+        attempt_meta: LLMAttemptMeta | None = None,
     ) -> tuple[str, Usage]:
-        """First healthy provider that can answer plain text for ``model_role``."""
+        """First healthy provider that can answer plain text for ``model_role``.
+
+        ``TEXT_REQUIREMENT`` is enforced here: a registered model that does not
+        declare ordinary text completion is skipped, so "it is in the pricing
+        registry" is never used as an implicit proof that a completion request
+        will work.
+        """
         failures: list[str] = []
+        attempt_index = 0
         deadline_at, handed_deadline = self._deadline(timeout_s)
+        requirement = llm_capability.TEXT_REQUIREMENT
         for group in self._groups(model_role):
             for info, _spec, client in group:
                 # Between attempts, before any provider is called: a cancelled
                 # task stops here instead of starting one more request.
                 abort_if_cancelled()
                 remaining = self._remaining(deadline_at, model_role)
+                spec = _spec_for_role(info.name, _spec, client, model_role)
+                ok, why = llm_capability.satisfies(spec, requirement)
+                if not ok:
+                    failures.append(f"{info.name}: skipped ({why})")
+                    continue
+                started = self._clock()
                 try:
                     result = client.text(
                         system=system,
@@ -283,10 +324,23 @@ class MultiProviderClient:
                     failure = self._note_failure(
                         info, model_role, client, exc, failures, structured=False
                     )
+                    self._emit_attempt(
+                        attempt_meta,
+                        info,
+                        model_role,
+                        client,
+                        attempt_index,
+                        started,
+                        failure_category=failure.category.value,
+                    )
+                    attempt_index += 1
                     if self._advance_after_failure(failure):
                         continue
                     break
                 self._note_success(info, model_role, client)
+                self._emit_attempt(
+                    attempt_meta, info, model_role, client, attempt_index, started, usage=result[1]
+                )
                 return result
         raise LLMError("all free LLM providers failed: " + "; ".join(failures))
 
@@ -299,6 +353,7 @@ class MultiProviderClient:
         mime: str,
         model_role: str = "vision",
         temperature: float = 0.0,
+        attempt_meta: LLMAttemptMeta | None = None,
     ) -> tuple[str, Usage]:
         """First client that can read images for ``model_role`` wins.
 
@@ -308,17 +363,21 @@ class MultiProviderClient:
         only ever forwarded to a vision-capable client.
         """
         failures: list[str] = []
+        attempt_index = 0
+        requirement = llm_capability.VISION_REQUIREMENT
         for group in self._groups(model_role):
             for info, _spec, client in group:
                 abort_if_cancelled()
                 spec = _spec_for_role(info.name, _spec, client, model_role)
-                if not spec.capabilities.supports_vision:
-                    failures.append(f"{info.name}: skipped ({spec.model} lacks vision support)")
+                ok, why = llm_capability.satisfies(spec, requirement)
+                if not ok:
+                    failures.append(f"{info.name}: skipped ({why})")
                     continue
                 describe = getattr(client, "describe_image", None)
                 if not callable(describe):
                     failures.append(f"{info.name}: skipped (client has no vision method)")
                     continue
+                started = self._clock()
                 try:
                     result = describe(
                         system=system,
@@ -332,10 +391,23 @@ class MultiProviderClient:
                     failure = self._note_failure(
                         info, model_role, client, exc, failures, structured=False, kind="vision"
                     )
+                    self._emit_attempt(
+                        attempt_meta,
+                        info,
+                        model_role,
+                        client,
+                        attempt_index,
+                        started,
+                        failure_category=failure.category.value,
+                    )
+                    attempt_index += 1
                     if self._advance_after_failure(failure):
                         continue
                     break
                 self._note_success(info, model_role, client)
+                self._emit_attempt(
+                    attempt_meta, info, model_role, client, attempt_index, started, usage=result[1]
+                )
                 return result
         raise LLMError("all free LLM providers failed for vision: " + "; ".join(failures))
 
@@ -442,6 +514,60 @@ class MultiProviderClient:
             )
             return False
         return failure.category in ROTATION_CATEGORIES
+
+    def _emit_attempt(
+        self,
+        meta: LLMAttemptMeta | None,
+        info: ProviderInfo,
+        role: str,
+        client: Any,
+        index: int,
+        started: float,
+        *,
+        usage: Usage | None = None,
+        failure_category: str = "",
+    ) -> None:
+        """Record one *real* provider attempt (B8.5), never a skipped candidate.
+
+        The model is asked from the client for the requested role, so the event
+        names the model that actually served the attempt instead of the
+        provider's configured planner label.  Token counts come from the
+        provider's own usage report and stay ``0`` when it reported none.
+        """
+        if meta is None:
+            return
+        try:
+            duration_ms = int(max(self._clock() - started, 0.0) * 1000)
+            usage = usage or Usage()
+            if failure_category:
+                if failure_category == "timeout":
+                    outcome = TaskAttemptOutcome.TIMEOUT
+                elif failure_category == "cancelled":
+                    outcome = TaskAttemptOutcome.CANCELLED
+                else:
+                    outcome = TaskAttemptOutcome.ERROR
+            else:
+                outcome = TaskAttemptOutcome.SUCCESS
+            meta.emit(
+                LLMAttemptRecord(
+                    task_id=meta.task_id,
+                    provider=info.name,
+                    model=_role_model(client, role) or info.model,
+                    role=role,
+                    outcome=outcome,
+                    task_class=meta.task_class,
+                    fallback_index=index,
+                    duration_ms=duration_ms,
+                    prompt_tokens=int(usage.prompt_tokens),
+                    completion_tokens=int(usage.completion_tokens),
+                    failure_category=task_failure_category(failure_category, outcome),
+                    cancelled=outcome is TaskAttemptOutcome.CANCELLED,
+                    timed_out=outcome is TaskAttemptOutcome.TIMEOUT,
+                    context=meta.context,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry must never break a call
+            self._logger.debug("llm attempt telemetry skipped: %s", exc)
 
     def _label(self, info: ProviderInfo, role: str) -> str:
         cooling = self._health.is_cooling(info.name, role, info.slot)

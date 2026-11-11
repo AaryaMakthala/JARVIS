@@ -109,7 +109,7 @@ def test_conversation_answer_written_by_brain_skips_llm_and_runs_no_tools(
     assert out.agent_response.interrupted is False
 
 
-def test_conversation_blank_answer_halts_without_calling_fast_model(saver: Any) -> None:
+def test_conversation_blank_answer_halts_without_a_second_llm_call(saver: Any) -> None:
     record: list[tuple[str, dict[str, Any]]] = []
     llm = FakeLLM([brain_conversation("   ")])
     ctx = make_app_context(
@@ -121,7 +121,7 @@ def test_conversation_blank_answer_halts_without_calling_fast_model(saver: Any) 
     assert out.final_answer == "I couldn't produce an answer."
     assert record == []
     # the single-call design must not fall back to a second LLM call
-    assert llm.calls == [("structured", "planner", "BrainDecision")]
+    assert llm.calls == [("structured", "fast", "BrainDecision")]
 
 
 def test_no_llm_backend_halts_cleanly(saver: Any) -> None:

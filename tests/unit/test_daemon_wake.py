@@ -29,6 +29,12 @@ from jarvis.daemon.server import DaemonServer
 
 TEST_TOKEN = "wake-regression-token-0123456789"
 
+TASK_1 = "00000000-0000-4000-8000-000000000001"
+TASK_2 = "00000000-0000-4000-8000-000000000002"
+TASK_3 = "00000000-0000-4000-8000-000000000003"
+TASK_9 = "00000000-0000-4000-8000-000000000009"
+TASK_10 = "00000000-0000-4000-8000-000000000010"
+
 
 class _FakeStore:
     def __init__(self) -> None:
@@ -308,7 +314,7 @@ def test_confirm_flow_final_delivered_within_2s(harness: Any) -> None:
         assert hello and hello["type"] == "auth_ok"
 
         t0 = time.monotonic()
-        c.send(ChatMessage(text="echo hi", id="t1"))
+        c.send(ChatMessage(text="echo hi", id=TASK_1))
         req = c.recv_next(timeout=2)
         assert req is not None and req["type"] == "confirm_request", req
         assert req["action_hash"] == "a" * 64
@@ -339,7 +345,7 @@ def test_denied_confirmation_never_executes_and_arrives_promptly(harness: Any) -
     try:
         c.send(AuthMessage(token=TEST_TOKEN))
         c.recv_json(timeout=2)
-        c.send(ChatMessage(text="echo hi", id="t2"))
+        c.send(ChatMessage(text="echo hi", id=TASK_2))
         req = c.recv_next(timeout=2)
         assert req and req["type"] == "confirm_request"
         c.send(
@@ -371,7 +377,7 @@ def test_tampered_hash_cannot_drive_resume_to_execution(harness: Any) -> None:
     try:
         c.send(AuthMessage(token=TEST_TOKEN))
         c.recv_json(timeout=2)
-        c.send(ChatMessage(text="echo hi", id="t3"))
+        c.send(ChatMessage(text="echo hi", id=TASK_3))
         req = c.recv_next(timeout=2)
         assert req and req["type"] == "confirm_request"
         c.send(
@@ -390,7 +396,7 @@ def test_tampered_hash_cannot_drive_resume_to_execution(harness: Any) -> None:
 
         # Nothing executed: the tampered answer never reached the worker.
         slot = harness.server._active
-        assert slot is not None and slot.task_id == "t3"
+        assert slot is not None and slot.task_id == TASK_3
         assert slot.resume_answer is None
         assert slot.result_text is None  # "fake_echo ran hi" would prove a run
         assert slot.done is False
@@ -410,12 +416,12 @@ def test_queued_task_result_delivered_after_promotion(harness: Any) -> None:
             assert hello and hello["type"] == "auth_ok"
 
         # c1's task occupies the active slot and pauses at confirmation.
-        c1.send(ChatMessage(text="echo hi", id="t1"))
+        c1.send(ChatMessage(text="echo hi", id=TASK_1))
         req1 = c1.recv_next(timeout=2)
         assert req1 and req1["type"] == "confirm_request"
 
         # c2's task is queued while t1 is active.
-        c2.send(ChatMessage(text="echo hi", id="t2"))
+        c2.send(ChatMessage(text="echo hi", id=TASK_2))
         queued = c2.recv_json(timeout=2)
         assert queued and queued["type"] == "event"
         assert queued["data"]["message"] == "queued"
@@ -432,10 +438,10 @@ def test_queued_task_result_delivered_after_promotion(harness: Any) -> None:
             )
         )
         final1 = c1.recv_next(timeout=2.0)
-        assert final1 and final1["type"] == "final" and final1["task_id"] == "t1"
+        assert final1 and final1["type"] == "final" and final1["task_id"] == TASK_1
 
         req2 = c2.recv_next(timeout=2.0)
-        assert req2 and req2["type"] == "confirm_request" and req2["task_id"] == "t2", (
+        assert req2 and req2["type"] == "confirm_request" and req2["task_id"] == TASK_2, (
             "promoted task's confirm_request was not routed to its owner"
         )
         c2.send(
@@ -448,7 +454,7 @@ def test_queued_task_result_delivered_after_promotion(harness: Any) -> None:
             )
         )
         final2 = c2.recv_next(timeout=2.0)
-        assert final2 and final2["type"] == "final" and final2["task_id"] == "t2"
+        assert final2 and final2["type"] == "final" and final2["task_id"] == TASK_2
     finally:
         c1.close()
         c2.close()
@@ -461,13 +467,13 @@ def test_status_while_worker_running_uses_no_worker_wake(harness: Any) -> None:
     try:
         c.send(AuthMessage(token=TEST_TOKEN))
         c.recv_json(timeout=2)
-        c.send(ChatMessage(text="echo hi", id="t9"))
+        c.send(ChatMessage(text="echo hi", id=TASK_9))
         req = c.recv_next(timeout=2)
         assert req and req["type"] == "confirm_request"  # worker is paused now
         c.send(StatusRequest())
         resp = c.recv_next(timeout=2)
         assert resp and resp["type"] == "status_response"
-        assert resp["active_task"] == "t9"
+        assert resp["active_task"] == TASK_9
     finally:
         c.close()
 
@@ -496,14 +502,14 @@ def test_direct_completion_final_delivered_promptly(direct_harness: Any) -> None
         assert hello and hello["type"] == "auth_ok"
 
         t0 = time.monotonic()
-        c.send(ChatMessage(text="open notepad", id="t10"))
+        c.send(ChatMessage(text="open notepad", id=TASK_10))
         final = c.recv_next(timeout=2.0)
         elapsed = time.monotonic() - t0
         assert final is not None and final["type"] == "final", (
             f"final never arrived (after {elapsed:.2f}s) for a Tier-0 task"
         )
         assert final["text"] == "open_app ran notepad"
-        assert final["task_id"] == "t10"
+        assert final["task_id"] == TASK_10
         assert elapsed < 2.0, f"direct completion took {elapsed:.2f}s"
     finally:
         c.close()

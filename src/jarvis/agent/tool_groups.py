@@ -36,6 +36,7 @@ __all__ = [
     "DEFAULT_SITE_NAMES",
     "GROUPS",
     "MAX_TRIMMED_SITES",
+    "group_keywords",
     "groups_for",
     "select_catalogue",
     "tool_group_map",
@@ -249,6 +250,15 @@ def tool_group_map() -> dict[str, str]:
     return {name: group for group, names in GROUPS.items() for name in names}
 
 
+def group_keywords() -> dict[str, tuple[str, ...]]:
+    """Public read-only view of the group trigger words.
+
+    B9's capability index reuses the same vocabulary for candidate discovery so
+    there is one place to extend when a tool group grows.
+    """
+    return {group: tuple(words) for group, words in _GROUP_KEYWORDS.items()}
+
+
 def groups_for(state: dict[str, Any]) -> set[str]:
     """The group names to send for this request (always includes ``core``)."""
     text = _request_text(state).casefold()
@@ -268,9 +278,7 @@ def groups_for(state: dict[str, Any]) -> set[str]:
     return selected
 
 
-def select_catalogue(
-    registry: ToolRegistry, state: dict[str, Any]
-) -> list[dict[str, object]]:
+def select_catalogue(registry: ToolRegistry, state: dict[str, Any]) -> list[dict[str, object]]:
     """The tool catalogue for this request, or the full one (fail open).
 
     Full catalogue when a registered tool belongs to no group (the registry grew

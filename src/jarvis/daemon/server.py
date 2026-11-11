@@ -20,6 +20,7 @@ import asyncio
 import hmac
 import json
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -34,6 +35,7 @@ from typing import Any
 import psutil
 
 from jarvis import logging_setup
+from jarvis.agent.answer import delivered_answer
 from jarvis.browser.context import BrowserError, PlaywrightBrowser
 from jarvis.browser.lazy import LazyProfileBrowser
 from jarvis.config import Settings, daemon_runtime_file, load_settings, log_file
@@ -77,6 +79,11 @@ logger = get_logger("daemon.server")
 
 #: Maximum tasks waiting in the queue (not counting the active one).
 MAX_QUEUE_SIZE = 5
+
+#: Conversation ids (B5) are opaque bookkeeping keys: hex (a UUID minted by
+#: this daemon) or any client-supplied token of the same shape.  The charset
+#: is deliberately conservative so an id can never carry meaningful text.
+_CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 #: How often to check for stale confirmations (seconds).  The timeout value
 #: itself is owned by ``jarvis.daemon.task_runtime`` (D1): the worker and this
@@ -145,6 +152,10 @@ class ClientConnection:
     conn_id: str = ""  # stable identity used for task ownership
     authenticated: bool = False
     active_task: str | None = None  # task_id this client owns
+    #: Conversation id for this connection's requests (B5).  Minted lazily on
+    #: the first chat message that does not carry one, so one CLI session is
+    #: exactly one conversation even across reconnects that pass their own id.
+    conversation_id: str = ""
     closed: bool = False
 
     async def send(self, msg: Any) -> None:
@@ -185,6 +196,20 @@ class ClientConnection:
 # ── Task slot ────────────────────────────────────────────────────────────
 
 
+def _task_id(candidate: str = "") -> str:
+    """Return a canonical UUID task id, minting one when needed.
+
+    The task store keys on canonical UUIDs, and the daemon must never let two
+    requests share one.  A well-formed client id is honoured (useful for
+    callers that correlate their own requests); anything else, including the
+    old millisecond timestamp scheme, is replaced with a fresh UUID.
+    """
+    try:
+        return str(uuid.UUID(str(candidate)))
+    except (AttributeError, TypeError, ValueError):
+        return str(uuid.uuid4())
+
+
 @dataclass
 class TaskSlot:
     """Tracks one task's lifecycle: queued → active → (confirming) → done."""
@@ -192,6 +217,10 @@ class TaskSlot:
     task_id: str
     text: str
     source: str
+    #: Stable conversation identity (B5): one CLI session, one ``jarvis run``
+    #: invocation, or the daemon's live voice pipeline.  Empty means the task
+    #: runs without conversation history (legacy callers).
+    conversation_id: str = ""
     # conn_id of the client that submitted the task (set at acceptance so it
     # survives queueing and promotion — the dispatch loop uses it to route
     # confirm requests and final results back to the right client).
@@ -660,7 +689,18 @@ class DaemonServer:
         #: Human-readable reason the last :meth:`run` refused to start.
         self._startup_refusal_reason: str | None = None
         self._voice_service: Any = None  # VoiceService | None
+        #: Stable conversation id for the voice pipeline (B5).  Minted lazily
+        #: by :meth:`_voice_conversation_id` and reset when the pipeline stops,
+        #: so a restarted voice session starts with no stale request context.
+        self._voice_conversation = ""
         self._memory: Any = None  # SqliteMemory | None (Phase 8, opened lazily)
+        #: Independent task lifecycle store (B1).  Opened lazily with the first
+        #: context and closed at shutdown; a probe failure yields the no-op
+        #: store so task history never blocks the daemon.
+        self._tasks: Any = None  # TaskStore | None (opened lazily)
+        #: Identity for this serving process.  It is recorded on new task rows
+        #: so a later daemon can distinguish live work from abandoned work.
+        self._task_owner: Any = None  # TaskOwner | None
         self._app_registry: Any = None  # ToolRegistry | None (built with the context)
         #: The managed browser session (Stage 7, Slice 10).  Started lazily on
         #: the first call that needs a page, shared by every task, closed once
@@ -721,6 +761,7 @@ class DaemonServer:
                 return False
             self._pid_file = daemon_runtime_file()
             self._pid_file.parent.mkdir(parents=True, exist_ok=True)
+            self._prepare_task_lifecycle()
             try:
                 asyncio.run(self._serve())
             except KeyboardInterrupt:
@@ -731,6 +772,7 @@ class DaemonServer:
                 raise
             finally:
                 self._close_memory()
+                self._close_tasks()
                 self._close_browser()
                 self._close_whatsapp_browser()
                 self._cleanup_pid_file()
@@ -909,6 +951,8 @@ class DaemonServer:
         }
         if create_time is not None:
             data["process_create_time"] = create_time
+        if self._task_owner is not None:
+            data["instance_id"] = self._task_owner.instance_id
         _atomic_write_json(self._pid_file, data)
 
     def _cleanup_pid_file(self) -> None:
@@ -991,6 +1035,14 @@ class DaemonServer:
             self._stop_voice()
             logger.info("daemon shut down cleanly")
 
+    def _prepare_task_lifecycle(self) -> None:
+        """Establish instance ownership and expire abandoned tasks before serving."""
+        from jarvis.daemon.recovery import new_task_owner, reconcile_task_store
+
+        if self._task_owner is None:
+            self._task_owner = new_task_owner()
+        reconcile_task_store(self._open_tasks(), self._task_owner, logger=logger)
+
     def _initialize_runtime(self) -> None:
         """Build the agent context and wire the voice service safely."""
         if self._ctx is None:
@@ -1052,6 +1104,7 @@ class DaemonServer:
             llm=llm,
             registry=self._registry(),
             memory=self._open_memory(),
+            tasks=self._open_tasks(),
             unlock=self._unlock,
             classifier=build_classifier(self._settings, self._registry(), logger=logger),
             voice=VoiceToolsFacade(service=self._voice_service),
@@ -1100,6 +1153,33 @@ class DaemonServer:
                 close()
         except Exception:
             logger.debug("closing the memory store failed", exc_info=True)
+
+    def _open_tasks(self) -> Any:
+        """Open the independent task store once, for the daemon's lifetime."""
+        if self._tasks is None:
+            from jarvis.taskstore.runtime import open_runtime_task_store
+
+            try:
+                self._tasks = open_runtime_task_store(
+                    self._settings,
+                    self._registry(),
+                    owner=self._task_owner,
+                    logger=logger,
+                )
+            except Exception:
+                logger.warning("could not build the task store", exc_info=True)
+                self._tasks = None
+        return self._tasks
+
+    def _close_tasks(self) -> None:
+        """Close the task store if one was opened."""
+        tasks, self._tasks = self._tasks, None
+        if tasks is None:
+            return
+        try:
+            tasks.close()
+        except Exception:
+            logger.debug("closing the task store failed", exc_info=True)
 
     def _browser_start(self) -> Any | None:
         """Return the started managed-browser session, starting one on first use.
@@ -1281,6 +1361,11 @@ class DaemonServer:
         only unwinds once it can see the pipeline is going down.
         """
         self._voice_stopping.set()
+        # B5: the voice pipeline's conversation ends with it.  A restarted
+        # pipeline mints a fresh id, so no request context survives a voice
+        # stop/start round trip (fail closed, like every other transient).
+        with self._lock:
+            self._voice_conversation = ""
         if self._voice_service is None:
             return
         try:
@@ -1385,7 +1470,12 @@ class DaemonServer:
             slot.confirm_payload = None  # consumed
 
         elif slot.done:
-            if slot.error:
+            if slot.cancelled:
+                # The cancel acknowledgement was already the terminal answer;
+                # sending a second "no answer" FinalMessage would leave a stale
+                # message for the client's *next* request.
+                logger.info("task %s finished after cancellation", slot.task_id)
+            elif slot.error:
                 await owner.send(FinalMessage(task_id=slot.task_id, text=f"Error: {slot.error}"))
             elif slot.result_text:
                 await owner.send(FinalMessage(task_id=slot.task_id, text=slot.result_text))
@@ -1578,11 +1668,13 @@ class DaemonServer:
 
     async def _handle_chat(self, msg: ChatMessage, conn: ClientConnection) -> None:
         """Accept a new task or queue it."""
-        task_id = msg.id or f"t{int(time.time() * 1000)}"
+        task_id = _task_id(msg.id)
+        conversation_id = self._resolve_conversation(msg.conversation, conn)
         slot = TaskSlot(
             task_id=task_id,
             text=msg.text,
             source=msg.source,
+            conversation_id=conversation_id,
         )
 
         with self._lock:
@@ -1601,7 +1693,11 @@ class DaemonServer:
                     EventMessage(
                         task_id=task_id,
                         kind="ack",
-                        data={"message": "queued", "position": len(self._queue)},
+                        data={
+                            "message": "queued",
+                            "position": len(self._queue),
+                            "conversation": conversation_id,
+                        },
                     )
                 )
             else:
@@ -1621,11 +1717,51 @@ class DaemonServer:
                     EventMessage(
                         task_id=task_id,
                         kind="ack",
-                        data={"message": "started"},
+                        data={"message": "started", "conversation": conversation_id},
                     )
                 )
 
+    def _resolve_conversation(self, requested: str, conn: ClientConnection) -> str:
+        """One conversation id for a chat message (B5).
+
+        A well-formed client-supplied id wins (it survives reconnects and is
+        how one CLI session stays one conversation); otherwise the
+        connection's id is used, minting it on first use.  Bounded length and
+        a conservative charset keep the id opaque - it is only ever a
+        bookkeeping key for in-memory history, never an authorization.
+        """
+        candidate = (requested or "").strip()
+        if candidate and len(candidate) <= 64 and _CONVERSATION_ID_RE.match(candidate):
+            return candidate
+        if not conn.conversation_id:
+            manager = self._conversations()
+            conn.conversation_id = (
+                manager.new_conversation() if manager is not None else uuid.uuid4().hex
+            )
+        return conn.conversation_id
+
+    def _conversations(self) -> Any:
+        """The shared conversation manager, or ``None`` when ctx is missing."""
+        ctx = self._ctx
+        return getattr(ctx, "conversations", None) if ctx is not None else None
+
     # ── voice task submission (runs in the voice loop thread) ──────────
+
+    def _voice_conversation_id(self) -> str:
+        """The stable conversation id for the voice pipeline (B5).
+
+        One id per daemon voice pipeline: spoken requests share the same
+        bounded recent-turn context as each other, while staying separate
+        from every terminal conversation.  Minted lazily so importing or
+        running the daemon without voice allocates nothing.
+        """
+        with self._lock:
+            if not self._voice_conversation:
+                manager = self._conversations()
+                self._voice_conversation = (
+                    manager.new_conversation() if manager is not None else uuid.uuid4().hex
+                )
+            return self._voice_conversation
 
     def _voice_submit(self, text: str, source: str = "voice") -> Any:
         """Submit a task from the voice-loop thread and block until it finishes.
@@ -1639,8 +1775,15 @@ class DaemonServer:
         if self._ctx is None:
             logger.warning("voice task rejected: runtime context is not initialised")
             return _VoiceOutcome(error="AI backend is starting — try again")
-        task_id = f"v{int(time.time() * 1000)}"
-        slot = TaskSlot(task_id=task_id, text=text, source=source, owner_id=VOICE_OWNER)
+        task_id = _task_id()
+        conversation_id = self._voice_conversation_id()
+        slot = TaskSlot(
+            task_id=task_id,
+            text=text,
+            source=source,
+            owner_id=VOICE_OWNER,
+            conversation_id=conversation_id,
+        )
 
         with self._lock:
             if self._active is not None and not self._active.done:
@@ -1751,7 +1894,9 @@ class DaemonServer:
         """
         slot.cancelled = True
         slot.cancel.cancel()
-        slot.done = True
+        # Deliberately *not* ``done``: the slot stays occupied until the worker
+        # actually unwinds (``_finish_cancelled``).  Marking it free here let
+        # the next task start while the cancelled run was still executing.
         slot.event.set()
         self._wake_dispatch()
 
@@ -1981,6 +2126,7 @@ class DaemonServer:
         from jarvis.config import checkpoints_db
 
         task_id = slot.task_id
+        saver = None
 
         try:
             saver = open_sqlite_checkpointer(str(checkpoints_db()))
@@ -1991,6 +2137,7 @@ class DaemonServer:
                 source=slot.source,
                 thread_id=task_id,
                 cancel=slot.cancel,
+                conversation_id=slot.conversation_id or None,
             )
 
             while True:
@@ -2000,18 +2147,26 @@ class DaemonServer:
                 if outcome.error:
                     slot.error = outcome.error
                     slot.done = True
+                    self._record_turn(slot, outcome.state, answer="")
                     self._wake_dispatch()
                     if slot.owner_id == VOICE_OWNER:
                         slot.event.set()
                     return
 
-                # The voice channel speaks the composed short answer when the
-                # `compose` node produced one; otherwise it keeps the full
-                # final answer (the pre-compose behaviour).
-                spoken = getattr(outcome, "spoken_answer", None) or outcome.final_answer
-                if spoken and not outcome.confirmation:
-                    slot.result_text = spoken
+                # The channel decides what it receives: the voice device
+                # speaks the composed short answer, while a terminal client
+                # must get the factual final/screen answer ("Today is ..."),
+                # never the spoken courtesy ("Done.").
+                delivered = delivered_answer(
+                    voice=slot.source == "voice",
+                    final_answer=outcome.final_answer,
+                    screen_answer=getattr(outcome, "screen_answer", None),
+                    spoken_answer=getattr(outcome, "spoken_answer", None),
+                )
+                if delivered and not outcome.confirmation:
+                    slot.result_text = delivered
                     slot.done = True
+                    self._record_turn(slot, outcome.state, answer=delivered)
                     self._wake_dispatch()
                     if slot.owner_id == VOICE_OWNER:
                         slot.event.set()
@@ -2098,16 +2253,70 @@ class DaemonServer:
         except Exception as exc:  # noqa: BLE001
             slot.error = f"{type(exc).__name__}: {exc}"
             slot.done = True
+            self._record_turn(slot, None, answer="")
             self._wake_dispatch()
             if slot.owner_id == VOICE_OWNER:
                 slot.event.set()
             logger.error("worker for %s failed: %s", task_id, slot.error)
         finally:
+            # Release this task's SQLite handle before dropping its runtime
+            # state.  A leaked connection (worker exception/cancel) can block
+            # checkpoint maintenance and file operations on Windows.
+            if saver is not None:
+                try:
+                    saver.conn.close()
+                except Exception:
+                    logger.debug("checkpointer close for %s failed", task_id, exc_info=True)
             # The task is finished - success, error or cancellation - so its
             # in-memory transient runtime state (scope grant and target
             # bindings) must not outlive it: a later task, even one re-asking
             # the same goal, has to earn a fresh authorization (docs/03 §7).
             self._end_task_runtime(task_id)
+
+    def _record_turn(
+        self,
+        slot: TaskSlot,
+        state: Any,
+        *,
+        answer: str,
+        status: str | None = None,
+    ) -> None:
+        """Record one finished turn in its conversation (B5, best-effort).
+
+        The status is the same closed vocabulary as the task-event store
+        (:func:`jarvis.agent.nodes.telemetry.task_status`), so the in-memory
+        conversation history can never claim a failed request succeeded.  An
+        explicit ``status`` (the cancellation path) wins over derivation; no
+        state at all records ``failed``.  Recording never raises: history is
+        prompt context, not bookkeeping the task depends on.
+        """
+        manager = self._conversations()
+        record = getattr(manager, "record", None)
+        if not callable(record) or not slot.conversation_id:
+            return
+        resolved = status
+        if resolved is None:
+            # A failure path with no state at all (the graph raised before
+            # producing one) must not be derived as "completed": the closed
+            # vocabulary has an honest word for it.
+            resolved = "failed"
+            if isinstance(state, dict) and state:
+                try:
+                    from jarvis.agent.nodes.telemetry import task_status
+
+                    resolved = task_status(state)
+                except Exception:  # history must never fail a task
+                    logger.debug("conversation turn status unavailable", exc_info=True)
+        try:
+            record(
+                slot.conversation_id,
+                slot.task_id,
+                slot.text,
+                answer,
+                resolved,
+            )
+        except Exception:
+            logger.debug("conversation turn not recorded", exc_info=True)
 
     def _end_task_runtime(self, task_id: str) -> None:
         """Drop a finished task's scope grant and target bindings.
@@ -2147,7 +2356,10 @@ class DaemonServer:
         Deliberately does not touch ``slot.error`` / ``slot.result_text``: the
         canceller already decided the wording (the voice path answers with its
         own fixed acknowledgement, the IPC path with "cancelled by user").
+        The turn is still recorded in its conversation as ``cancelled`` so the
+        history stays honest about what happened.
         """
+        self._record_turn(slot, None, answer="", status="cancelled")
         slot.cancelled = True
         slot.done = True
         self._wake_dispatch()
@@ -2281,12 +2493,22 @@ class DaemonServer:
         """Cancel a running or queued task."""
         with self._lock:
             if self._active and self._active.task_id == msg.task_id:
+                if self._active.done:
+                    await conn.send(
+                        EventMessage(
+                            task_id=msg.task_id,
+                            kind="ack",
+                            data={"message": "already finished"},
+                        )
+                    )
+                    return
                 # Cancel this task's own token: the graph stops at its next node
                 # boundary, so the remaining steps of the plan never execute.
+                # The slot is *not* marked done here: it stays occupied until the
+                # worker has actually unwound (``_finish_cancelled``), so the
+                # queue cannot start the next task over a still-running one.
                 self._active.cancel.cancel()
                 self._active.cancelled = True
-                self._active.error = "cancelled by user"
-                self._active.done = True
                 # Ack before waking the worker - see the note in _handle_confirm.
                 await conn.send(
                     EventMessage(task_id=msg.task_id, kind="ack", data={"message": "cancelled"})
@@ -2312,6 +2534,35 @@ class DaemonServer:
         )
 
     # ── status ─────────────────────────────────────────────────────────
+
+    def _active_progress(self, task_id: str | None) -> dict[str, Any]:
+        """Project the live task's stage/status from the task store.
+
+        Observability is best-effort: a missing or broken store must never
+        stop ``status`` from answering.
+        """
+        if not task_id or self._tasks is None:
+            return {}
+        try:
+            snapshot = self._tasks.get(task_id)
+        except Exception:
+            logger.debug("active task progress unavailable", exc_info=True)
+            return {}
+        if snapshot is None:
+            return {}
+        start = snapshot.started_at or snapshot.created_at
+        end = snapshot.finished_at
+        if end is None:
+            from datetime import UTC, datetime
+
+            end = datetime.now(UTC)
+        elapsed = max((end - start).total_seconds(), 0.0)
+        return {
+            "active_stage": snapshot.stage.value,
+            "active_status": snapshot.status.value,
+            "active_source": snapshot.source,
+            "active_elapsed_s": round(elapsed, 1),
+        }
 
     async def _handle_status(self, conn: ClientConnection) -> None:
         with self._lock:
@@ -2350,6 +2601,7 @@ class DaemonServer:
             else:
                 if isinstance(rows, list):
                     llm_health = [row for row in rows if isinstance(row, dict)]
+        progress = self._active_progress(active_id)
         await conn.send(
             StatusResponse(
                 daemon="running",
@@ -2360,6 +2612,7 @@ class DaemonServer:
                 queue=queue_len,
                 active_task=active_id,
                 llm_health=llm_health,
+                **progress,
             )
         )
 

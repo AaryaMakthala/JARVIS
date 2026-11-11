@@ -1138,7 +1138,9 @@ def test_invariant_i1_screen_text_is_data_never_an_instruction(
         "jarvis.perception.ui_text.foreground_uia_text",
         lambda **_kw: UiaText(text=injection, controls=1, secure_controls=0),
     )
-    monkeypatch.setattr("jarvis.perception.ocr.ocr_available", lambda: False)
+    monkeypatch.setattr(
+        "jarvis.perception.ocr.unavailable_reason", lambda _settings: "PaddleOCR is not installed"
+    )
 
     result = make_read_screen_spec().run(ReadScreenArgs(), ToolContext(settings=Settings()))
 
@@ -1169,18 +1171,17 @@ def test_invariant_i1_screen_text_is_data_never_an_instruction(
 
 
 # ---------------------------------------------------------------------------
-# Invariant I11 (Stage 6): cloud screen content is opt-in; no screenshot is saved
+# Invariant I11 (Stage 6): screen content is local-only; no screenshot is saved
 # ---------------------------------------------------------------------------
 
 
-def test_invariant_i11_screenshots_never_leave_the_pc_by_default(
+def test_invariant_i11_screenshots_never_leave_the_pc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With the shipped config, no screenshot is sent and none is persisted.
+    """Screen perception never sends a screenshot or text to a vision client.
 
-    ``describe_screen`` with the default settings returns local text and never
-    calls a vision client; the shipped ``config.toml`` also pins
-    ``screen.allow_cloud_vision = false``.
+    ``describe_screen`` returns local UIA/OCR text only, and the shipped
+    ``config.toml`` has no cloud-vision option.
     """
     import tomllib
 
@@ -1190,8 +1191,8 @@ def test_invariant_i11_screenshots_never_leave_the_pc_by_default(
     from jarvis.tools.base import ToolContext
     from jarvis.tools.screen import DescribeScreenArgs, make_describe_screen_spec
 
-    assert ScreenSettings().allow_cloud_vision is False
-    assert tomllib.loads(DEFAULT_CONFIG_TOML)["screen"]["allow_cloud_vision"] is False
+    assert "allow_cloud_vision" not in ScreenSettings().model_dump()
+    assert "allow_cloud_vision" not in tomllib.loads(DEFAULT_CONFIG_TOML)["screen"]
 
     sent: list[dict[str, Any]] = []
 
@@ -1209,7 +1210,9 @@ def test_invariant_i11_screenshots_never_leave_the_pc_by_default(
         "jarvis.perception.ui_text.foreground_uia_text",
         lambda **_kw: UiaText(text="A short snippet", controls=1, secure_controls=0),
     )
-    monkeypatch.setattr("jarvis.perception.ocr.ocr_available", lambda: False)
+    monkeypatch.setattr(
+        "jarvis.perception.ocr.unavailable_reason", lambda _settings: "PaddleOCR is not installed"
+    )
 
     result = make_describe_screen_spec().run(
         DescribeScreenArgs(), ToolContext(settings=Settings(), llm=_VisionSpy())

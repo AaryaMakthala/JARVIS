@@ -42,6 +42,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from jarvis.agent.context import AppContext
+from jarvis.agent.nodes.telemetry import llm_attempt_meta
 from jarvis.agent.nodes.util import (
     active_scope_cid,
     browse_grant_check,
@@ -58,6 +59,23 @@ from jarvis.browser.final_click import FINAL_CLICK_TOOL, is_hex64
 from jarvis.policy.paths import ContentHashError, content_hash
 
 logger = logging.getLogger(__name__)
+
+#: Tool-layer model calls happen while an action runs; that is the closed task
+#: class they are reported under (never a free-form label).
+_TOOL_TASK_CLASS = "action"
+
+
+def _tool_ctx(state: dict[str, Any], ctx: AppContext) -> Any:
+    """Tool context carrying this dispatch's LLM attempt metadata (B8.5).
+
+    ``web_answer``, the WhatsApp summariser and contact grounding call the
+    model from inside a tool, so without this they would produce no
+    ``LLM_CALL`` event at all.  The metadata is built from *this* task's id
+    (never a process-wide "current task"), and is ``None`` when the client or
+    the store cannot attribute an attempt - the tool then calls the model
+    unchanged.
+    """
+    return ctx.tool_context(attempt_meta=llm_attempt_meta(state, ctx, _TOOL_TASK_CLASS))
 
 
 def _content_hashes_now(decision: Any) -> tuple[list[str] | None, str | None]:
@@ -205,7 +223,7 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         step=step,
         spec=spec,
         settings=ctx.settings,
-        tool_ctx=ctx.tool_context(),
+        tool_ctx=_tool_ctx(state, ctx),
         scope_registry=ctx.scope_registry,
         task_id=task_id,
         plan_hash_v=plan_hash_v,
@@ -286,7 +304,7 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     # close the window between the gate's check and dispatch.  It happens
     # before any target binding is consumed and before budget is reserved, so a
     # refused step never spends either.
-    precheck_error = step_precheck_error(spec, step, ctx.tool_context())
+    precheck_error = step_precheck_error(spec, step, _tool_ctx(state, ctx))
     if precheck_error is not None:
         return _refuse(
             state,
@@ -389,7 +407,7 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
                 "Refused: this task has reached its action limit.",
             )
 
-    tool_ctx = ctx.tool_context()
+    tool_ctx = _tool_ctx(state, ctx)
     # The stable identity of this approved dispatch, for operation-bound
     # duplicate-send guards.  It is derived from the same task id and action
     # hash act just re-checked, never from planner output.
@@ -461,15 +479,35 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
                 # defensive; the message carries no tool or page content.
                 logger.debug("referent action not recorded")
             # browser navigation -> set/update page; clear only if different origin? spec says clear only on nav to different origin or explicit/TTL
-            if tool_name in ("browser_goto", "browser_open_site", "browser_open_result") and isinstance(page_url, str) and page_url.strip():
+            if (
+                tool_name in ("browser_goto", "browser_open_site", "browser_open_result")
+                and isinstance(page_url, str)
+                and page_url.strip()
+            ):
                 prev = REFERENT_STORE.get(cid).page
                 new_origin = origin_from_url(page_url)
                 old_origin = origin_from_url(prev.url) if prev else None
                 if prev is None or old_origin != new_origin or prev.url != page_url:
                     # different origin or new page -> update page (and per spec clear only in those cases; just set)
-                    REFERENT_STORE.set_page(cid, PageRef(url=page_url, title=None, origin=new_origin, created_at=referents.now_ts()))
+                    REFERENT_STORE.set_page(
+                        cid,
+                        PageRef(
+                            url=page_url,
+                            title=None,
+                            origin=new_origin,
+                            created_at=referents.now_ts(),
+                        ),
+                    )
                 else:
-                    REFERENT_STORE.set_page(cid, PageRef(url=page_url, title=None, origin=new_origin, created_at=referents.now_ts()))
+                    REFERENT_STORE.set_page(
+                        cid,
+                        PageRef(
+                            url=page_url,
+                            title=None,
+                            origin=new_origin,
+                            created_at=referents.now_ts(),
+                        ),
+                    )
                 ctx.session_context.note_page(SESSION_THREAD, page_url)
             elif isinstance(page_url, str) and page_url.strip() and tool_name in ("browser_read",):
                 # reading doesn't necessarily change page; don't force clear
@@ -483,15 +521,30 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
                     items = []
                     for i, it in enumerate(results):
                         if isinstance(it, dict):
-                            items.append(ResultItem(
-                                position=int(it.get("position") or i + 1),
-                                title=str(it.get("title") or it.get("name") or ""),
-                                host=str(it.get("host") or it.get("origin") or origin_from_url(it.get("url") or page_url or "") or ""),
-                                url=str(it.get("url") or ""),
-                                ref=it.get("ref"),
-                            ))
+                            items.append(
+                                ResultItem(
+                                    position=int(it.get("position") or i + 1),
+                                    title=str(it.get("title") or it.get("name") or ""),
+                                    host=str(
+                                        it.get("host")
+                                        or it.get("origin")
+                                        or origin_from_url(it.get("url") or page_url or "")
+                                        or ""
+                                    ),
+                                    url=str(it.get("url") or ""),
+                                    ref=it.get("ref"),
+                                )
+                            )
                     if items and isinstance(page_url, str) and page_url.strip():
-                        REFERENT_STORE.set_result_set(cid, ResultSetRef(id=f"rs_{int(referents.now_ts())}", page_url=page_url, items=items, created_at=referents.now_ts()))
+                        REFERENT_STORE.set_result_set(
+                            cid,
+                            ResultSetRef(
+                                id=f"rs_{int(referents.now_ts())}",
+                                page_url=page_url,
+                                items=items,
+                                created_at=referents.now_ts(),
+                            ),
+                        )
             # browser_open_result may produce page_url
             # files/photos
             if tool_name in ("take_photo",):
@@ -499,13 +552,17 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
                 if isinstance(artifact, dict):
                     p = artifact.get("path") or result.data.get("path")
                 if isinstance(p, str) and p:
-                    REFERENT_STORE.set_file(cid, FileRef(path=p, kind="photo", created_at=referents.now_ts()))
+                    REFERENT_STORE.set_file(
+                        cid, FileRef(path=p, kind="photo", created_at=referents.now_ts())
+                    )
             if tool_name in ("create_file", "write_file", "append_file", "save_dictation"):
                 p = None
                 if isinstance(artifact, dict):
                     p = artifact.get("path") or result.data.get("path")
                 if isinstance(p, str) and p:
-                    REFERENT_STORE.set_file(cid, FileRef(path=p, kind="file", created_at=referents.now_ts()))
+                    REFERENT_STORE.set_file(
+                        cid, FileRef(path=p, kind="file", created_at=referents.now_ts())
+                    )
         except (ImportError, TypeError, ValueError):
             # Exactly what this block can raise: the optional import, a
             # page-supplied position that is not a number (``int(...)``), or a

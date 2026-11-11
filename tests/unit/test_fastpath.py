@@ -10,6 +10,10 @@ from jarvis.agent.graph import build_graph
 from jarvis.agent.nodes.brain import LLM_NOT_CONFIGURED, brain
 from jarvis.agent.nodes.validate import validate as validate_fn
 from jarvis.config import AppSettings, Settings
+from jarvis.policy import tiers
+from jarvis.tools.apps import OpenAppArgs
+from jarvis.tools.base import ToolSpec
+from support import registry_with
 
 
 class _ExplodingLLM:
@@ -41,6 +45,23 @@ def test_time_phrases_hit_get_time() -> None:
         assert args == {}
 
 
+def test_date_phrases_hit_get_time_with_date() -> None:
+    for text in ("what is the date", "what day is it", "what's today's date"):
+        hit = fastpath.match(text, Settings())
+        assert hit is not None, text
+        tool, args, _phrase = hit
+        assert tool == "get_time"
+        assert args == {"include_date": True}
+
+
+def test_datetime_phrases_request_both_parts() -> None:
+    hit = fastpath.match("what is the date and time", Settings())
+
+    assert hit is not None
+    assert hit[0] == "get_time"
+    assert hit[1] == {"include_date": True, "include_time": True}
+
+
 def test_windows_phrases_hit_list_windows() -> None:
     for text in ("what windows are open", "list windows", "list the windows"):
         hit = fastpath.match(text, Settings())
@@ -48,6 +69,22 @@ def test_windows_phrases_hit_list_windows() -> None:
         tool, args, _phrase = hit
         assert tool == "list_windows"
         assert args == {}
+
+
+def test_system_phrases_hit_read_only_system_info() -> None:
+    cases = {
+        "battery level": "battery",
+        "what is my cpu usage": "cpu",
+        "how much memory is used": "ram",
+        "disk usage": "disk",
+        "system uptime": "uptime",
+    }
+    for text, expected in cases.items():
+        hit = fastpath.match(text, Settings())
+        assert hit is not None, text
+        tool, args, _phrase = hit
+        assert tool == "system_info"
+        assert args == {"what": expected}
 
 
 def test_open_variants_hit_open_app_case_insensitive() -> None:
@@ -141,6 +178,46 @@ def test_plans_validate_with_expected_shape() -> None:
         assert out["halted_reason"] is None
 
 
+def test_open_notepad_fastpath_is_resolved_validated_and_gated_before_running() -> None:
+    """The canonical Notepad chain: resolve -> validate -> decide -> (act later)."""
+    executed: list[dict[str, Any]] = []
+
+    def run(args: OpenAppArgs, ctx: Any) -> Any:
+        executed.append(args.model_dump())
+        raise AssertionError("open_app must not run before policy_gate/act")
+
+    spec = ToolSpec(
+        name="open_app",
+        description="Launch an allowlisted application.",
+        args_model=OpenAppArgs,
+        base_tier=0,
+        run=run,
+    )
+    ctx = make_app_context(Settings(), registry=registry_with(spec))
+
+    update = brain({"user_input": "Open Notepad.", "task_id": "fp-gate"}, ctx)
+    plan = update["plan"]
+    step = plan.steps[0]
+    assert plan.goal == "fastpath: open notepad"
+    assert step.tool == "open_app"
+    assert step.args == {"name": "notepad"}
+    assert update["api_calls"] == 0
+
+    # 1. canonical tool resolution (the registry, not model-supplied metadata)
+    assert ctx.registry.get(step.tool) is spec
+    # 2. canonical Pydantic argument validation through the real validate node
+    out = validate_fn({"plan": plan}, ctx)
+    assert out["error"] is None
+    assert out["halted_reason"] is None
+    # 3. and 5. the deterministic engine owns authorization, tier and confirmation
+    decision = ctx.engine.decide(out["plan"].steps[0], ctx.policy_ctx)
+    assert decision.allowed is True
+    assert decision.tier == tiers.TIER_SAFE
+    assert decision.needs_confirm is False
+    # 4. no direct execution before authorization (and no act call here at all)
+    assert executed == []
+
+
 # ── brain: LLM is never called on a hit; non-hits are unchanged ─────────────
 
 
@@ -151,6 +228,17 @@ def test_brain_hit_skips_even_an_exploding_llm() -> None:
 
     assert update["plan"].steps[0].tool == "get_time"
     assert update["request_kind"] == "tool"
+    assert update["api_calls"] == 0
+    assert update["tokens"] == 0
+
+
+def test_system_query_hit_skips_even_an_exploding_llm() -> None:
+    ctx = make_app_context(Settings(), llm=_ExplodingLLM())
+
+    update = brain({"user_input": "battery level", "task_id": "t1"}, ctx)
+
+    assert update["plan"].steps[0].tool == "system_info"
+    assert update["plan"].steps[0].args == {"what": "battery"}
     assert update["api_calls"] == 0
     assert update["tokens"] == 0
 
@@ -178,6 +266,27 @@ def test_open_chrome_asks_nothing() -> None:
     assert update["plan"].steps[0].args == {"name": "chrome"}
     assert update["api_calls"] == 0
     assert update["tokens"] == 0
+
+
+def test_arithmetic_fastpath_skips_the_llm_and_answers_directly() -> None:
+    ctx = make_app_context(Settings(), llm=_ExplodingLLM())
+
+    update = brain({"user_input": "what is 2 times 2?", "task_id": "t1"}, ctx)
+
+    assert update["plan"].kind == "conversation"
+    assert update["plan"].steps == []
+    assert update["final_answer"] == "4"
+    assert update["request_kind"] == "conversation"
+    assert update["api_calls"] == 0
+    assert update["tokens"] == 0
+
+
+def test_arithmetic_fastpath_fails_closed_for_division_by_zero() -> None:
+    ctx = make_app_context(Settings(), llm=_ExplodingLLM())
+
+    update = fastpath.brain_update({"user_input": "what is 1 / 0", "task_id": "t1"}, ctx)
+
+    assert update is None
 
 
 def test_brain_hit_works_with_no_provider_configured() -> None:

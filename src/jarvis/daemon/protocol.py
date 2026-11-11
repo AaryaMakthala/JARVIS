@@ -60,12 +60,21 @@ class AuthMessage(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    """Submit a new task to the daemon's queue."""
+    """Submit a new task to the daemon's queue.
+
+    ``id`` is the client-generated correlation id (honoured when it is a valid
+    UUID, else the daemon mints one).  ``conversation`` (B5) is the stable
+    conversation identity: a client that sends the same opaque id on several
+    messages keeps them in one conversation, so follow-ups can use the bounded
+    recent-turn context.  Blank/unset mints one per connection, and the
+    daemon never trusts it for anything but history grouping.
+    """
 
     type: Literal["chat"] = "chat"
     id: str = ""  # client-generated correlation id
     text: str = Field(min_length=1, max_length=4096)
     source: Literal["terminal", "voice", "benchmark"] = "terminal"
+    conversation: str = Field(default="", max_length=64)
 
 
 class ConfirmResponse(BaseModel):
@@ -227,6 +236,9 @@ class StatusResponse(BaseModel):
     the last failure category only - never prompts, latencies or key
     material.  It defaults to empty so older clients and status tests keep
     validating unchanged; the daemon fills it in when an LLM context exists.
+    ``active_stage``/``active_status``/``active_source``/``active_elapsed_s``
+    project the live task's lifecycle from the independent task store.  They
+    stay ``None`` when no task is active or task history is unavailable.
     """
 
     type: Literal["status_response"] = "status_response"
@@ -237,6 +249,10 @@ class StatusResponse(BaseModel):
     unlocked: bool = False
     queue: int = 0
     active_task: str | None = None
+    active_stage: str | None = None
+    active_status: str | None = None
+    active_source: str | None = None
+    active_elapsed_s: float | None = None
     version: str = PROTOCOL_VERSION
     llm_health: list[dict[str, Any]] = Field(default_factory=list)
 
