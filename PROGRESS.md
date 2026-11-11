@@ -159,3 +159,13 @@ Maintained by the coding agent. Condensed from historical log.
 - **Known gaps**: `LLM_CALL` is wired for the brain call only (`replan`, `specialist`, `web_answer` and the WhatsApp summariser still call without attempt metadata); no live provider, browser, WhatsApp, voice or memory verification was performed; no new prompt composer or tool-shortlisting logic was added. Report: `docs/B8_IMPLEMENTATION_REPORT.md`.
 - **Next step**: instrument the remaining call sites with the same helper, then run one tiny live smoke test on a configured zero-cost provider.
 
+
+## B8 post-implementation audit (2026-11-11)
+
+- **Verified**: capability requirements/registry refusal, provider + composite-client guards, free-only qualification and provider order, per-attempt fallback records, per-request metadata (no global task id), and the allow-listed event payload.
+- **Fixed**: LLM_CALL covered only the brain call. Added a shared `build_attempt_meta`/`attempt_kwargs` helper, `ToolContext.attempt_meta` (set by `act` via one `_tool_ctx` helper) and wired `replan`, `specialist`, `web_answer`, the WhatsApp summariser and WhatsApp contact grounding (`messaging/grounding._interpret`, which the original report had omitted). New tests: `tests/unit/test_b8_telemetry_coverage.py` (9).
+- **Fixed**: `test_freeonly.py::test_langgraph_uses_four_provider_multi_client` sent an arithmetic question the fast path answers without the LLM; it now sends a conversational request and keeps its four-provider assertions. The zero-call arithmetic guarantee is asserted in `test_b8_acceptance.py` (structured and text calls both 0).
+- **Intentionally unchanged**: the arithmetic fast path, the `jarvis doctor` live probe (no task to attribute), local PaddleOCR (no graph caller of `describe_image`), and all free-only/pricing/topology behaviour.
+- **Verification**: capability 11 passed / 3 s; llm telemetry 9 / 3 s; acceptance 12 / 6 s; telemetry coverage 9 / 4 s; freeonly 35 / 5 s; web_answer 22 / 3 s; invariants 37; combined focused regression all passed; ruff + format clean on 13 changed files. All runs are mocked - no live provider, browser or WhatsApp session was used.
+- **Report**: `docs/B8_POST_IMPLEMENTATION_AUDIT.md`. Next: live smoke test on a configured zero-cost provider.
+
