@@ -17,7 +17,7 @@ Open apps and websites · Google search · answer current questions with sources
 confirmation) · audit the PC for security and performance problems · lock the PC · remember successful
 plans and get faster over time.
 
-## What makes it a strong final-year project
+## What makes it a strong project
 
 1. **Deterministic policy engine separated from the LLM**: prompt-injected content cannot authorise actions.
 2. **Verification + replan loop**: every step is checked; failures trigger retry or re-plan.
