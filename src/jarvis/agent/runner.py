@@ -23,7 +23,7 @@ from jarvis.agent.nodes.telemetry import (
 from jarvis.agent.schemas import AgentResponse
 from jarvis.agent.state import Decision, StepResult
 from jarvis.taskstore.models import TERMINAL_STATUSES, TaskStatus, TaskStoreError
-from jarvis.tools.base import CancelToken
+from jarvis.tools.base import Cancelled, CancelToken
 
 __all__ = ["TaskOutcome", "extract_interrupt", "resume_task", "run_task"]
 
@@ -119,7 +119,11 @@ def run_task(
     }
     if conversation_id:
         values["conversation_id"] = conversation_id
-    values = graph.invoke(values, config)
+    try:
+        values = graph.invoke(values, config)
+    except Cancelled:
+        _record_cancelled(ctx, task_id, source=source)
+        raise
     outcome = _outcome(task_id, config, checkpointer, graph, values)
     _mark_paused(ctx, outcome)
     return outcome
@@ -149,7 +153,11 @@ def resume_task(
         )
     graph = build_graph(ctx, checkpointer, cancel)
     _mark_running(ctx, thread_id)
-    values = graph.invoke(Command(resume=answer), config)
+    try:
+        values = graph.invoke(Command(resume=answer), config)
+    except Cancelled:
+        _record_cancelled(ctx, thread_id)
+        raise
     outcome = _outcome(thread_id, config, checkpointer, graph, values)
     _mark_paused(ctx, outcome)
     return outcome
@@ -214,6 +222,27 @@ def _set_status(ctx: AppContext, task_id: str, status: Any) -> None:
         tasks.update_status(task_id, status)
     except Exception:  # observability must never change the task's answer
         ctx.logger.debug("task status %s not recorded", status, exc_info=True)
+
+
+def _record_cancelled(ctx: AppContext, task_id: str, *, source: str | None = None) -> None:
+    """Persist a terminal cancellation when the graph run escapes cancelled.
+
+    Best-effort: task-store failures must never prevent cancellation semantics.
+    """
+    tasks = getattr(ctx, "tasks", None)
+    if tasks is None or not getattr(tasks, "available", False) or not task_id:
+        return
+    try:
+        if source is not None:
+            tasks.ensure_task(task_id, source=source)
+        tasks.finish(
+            task_id,
+            TaskStatus.CANCELLED,
+            failure_category="cancelled",
+            failure_code="cancelled",
+        )
+    except Exception:
+        ctx.logger.debug("task cancellation not recorded", exc_info=True)
 
 
 def _resume_refusal(
