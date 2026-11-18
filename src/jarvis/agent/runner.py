@@ -16,6 +16,10 @@ from langgraph.types import Command
 
 from jarvis.agent.context import AppContext
 from jarvis.agent.graph import build_graph
+from jarvis.agent.nodes.telemetry import (
+    record_clarification_requested,
+    record_confirmation_requested,
+)
 from jarvis.agent.schemas import AgentResponse
 from jarvis.agent.state import Decision, StepResult
 from jarvis.taskstore.models import TERMINAL_STATUSES, TaskStatus, TaskStoreError
@@ -161,18 +165,45 @@ def _mark_paused(ctx: AppContext, outcome: TaskOutcome) -> None:
 
     Without this, the store (and therefore ``jarvis status``) called an
     interrupted task "running" while it was actually waiting for an approval
-    or a clarification.  Best-effort: observability never changes the answer.
+    or a clarification.  The corresponding event is written here, after the
+    graph has paused, so an interrupted node's top-to-bottom re-run on resume
+    cannot duplicate it.  Best-effort: observability never changes the answer.
     """
     if not outcome.confirmation:
         return
     from jarvis.taskstore import TaskStatus as Status
 
-    status = (
-        Status.AWAITING_CLARIFICATION
-        if outcome.interrupt_kind == "clarification"
-        else Status.AWAITING_CONFIRMATION
-    )
+    if outcome.interrupt_kind == "clarification":
+        record_clarification_requested(outcome.state, ctx)
+        status = Status.AWAITING_CLARIFICATION
+    else:
+        step_id, tool = _confirmation_target(outcome)
+        record_confirmation_requested(outcome.state, ctx, step_id=step_id, tool=tool)
+        status = Status.AWAITING_CONFIRMATION
     _set_status(ctx, outcome.task_id, status)
+
+
+def _confirmation_target(outcome: TaskOutcome) -> tuple[str, str | None]:
+    """Return the step and tool named by a confirmation payload."""
+    payload = outcome.confirmation or {}
+    step_id = str(payload.get("step_id") or "").strip()
+    tool = str(payload.get("tool") or "").strip()
+    if not step_id:
+        eligible = payload.get("eligible")
+        if isinstance(eligible, (list, tuple)) and eligible:
+            first = eligible[0]
+            if isinstance(first, (list, tuple)) and first:
+                step_id = str(first[0] or "").strip()
+            elif isinstance(first, dict):
+                step_id = str(first.get("step_id") or "").strip()
+    plan = outcome.state.get("plan")
+    steps = getattr(plan, "steps", None) or ()
+    for step in steps:
+        if str(getattr(step, "id", "") or "") == step_id:
+            if not tool:
+                tool = str(getattr(step, "tool", "") or "").strip()
+            break
+    return step_id, tool or None
 
 
 def _set_status(ctx: AppContext, task_id: str, status: Any) -> None:

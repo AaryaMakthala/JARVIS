@@ -506,8 +506,10 @@ class _SqliteTaskEventStore:
         elif event_type is TaskEventType.CONFIRMATION_REQUESTED:
             approval_state = clean_detail["approval_state"]
             active_step_id = clean_detail["step_id"]
+            active_tool = clean_detail.get("tool")
         elif event_type is TaskEventType.CLARIFICATION_REQUESTED:
-            active_step_id = clean_detail["step_id"]
+            active_tool = None
+            active_step_id = None
         elif event_type is TaskEventType.FAILURE:
             failure_category = clean_detail["failure_category"]
             failure_code = clean_detail["failure_code"]
@@ -520,6 +522,9 @@ class _SqliteTaskEventStore:
             approval_state = None
             failure_category = clean_detail.get("failure_category")
             failure_code = clean_detail.get("failure_code")
+
+        if event_type is TaskEventType.STATUS_CHANGED and status_value is TaskStatus.RUNNING:
+            approval_state = None
 
         seq_row = self._conn.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM task_events WHERE task_id = ?",

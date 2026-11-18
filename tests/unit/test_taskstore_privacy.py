@@ -23,6 +23,7 @@ from jarvis.taskstore.privacy import (
     safe_owner_kind,
     safe_provider,
     safe_source,
+    safe_step_id,
     safe_task_id,
     safe_tool,
     sanitize_detail,
@@ -73,6 +74,28 @@ def _event(result):
     assert result.persisted is True
     assert result.value is not None
     return result.value
+
+
+@pytest.mark.parametrize("value", ["s1", "r1", "s2", STEP_1, STEP_2])
+def test_step_ids_accept_plan_labels_and_canonical_uuids(value: str) -> None:
+    assert safe_step_id(value) == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "sk_live_secret",
+        "ghp_abcdefgh",
+        "555-1234",
+        "C:\\Users\\aarya\\report.txt",
+        "../private/report.txt",
+        "do the thing",
+        "",
+    ],
+)
+def test_step_ids_reject_secrets_phones_paths_and_free_text(value: str) -> None:
+    with pytest.raises(ValueError):
+        safe_step_id(value)
 
 
 def test_taskstore_source_does_not_import_memory() -> None:

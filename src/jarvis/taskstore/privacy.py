@@ -231,7 +231,7 @@ _REQUIRED_DETAIL_KEYS: dict[str, frozenset[str]] = {
     "warning": frozenset({"severity", "reason_code"}),
     "failure": frozenset({"failure_code", "failure_category"}),
     "confirmation_requested": frozenset({"approval_state", "step_id"}),
-    "clarification_requested": frozenset({"step_id"}),
+    "clarification_requested": frozenset(),
     "tool_started": frozenset({"tool", "step_id"}),
     "tool_finished": frozenset({"tool", "step_id", "ok", "verified", "duration_ms"}),
     "task_finished": frozenset({"outcome"}),
@@ -308,8 +308,18 @@ def safe_task_id(value: str) -> str:
 
 
 def safe_step_id(value: str) -> str:
-    """Validate a caller-supplied step identifier as a canonical UUID."""
-    return _canonical_uuid(value, field="step_id")
+    """Validate a plan step identifier.
+
+    Production plans use short labels such as ``s1`` and ``r1``; older durable
+    rows use canonical UUIDs.  Both shapes are accepted, while secret-shaped,
+    phone-number-shaped, path-shaped and otherwise unsafe labels are rejected.
+    """
+    if not isinstance(value, str):
+        raise TypeError("step_id must be a string")
+    text = value.strip()
+    if _IDENTIFIER_RE.fullmatch(text) and not _unsafe_value(text):
+        return text
+    return _canonical_uuid(text, field="step_id")
 
 
 def _enum_value(value: Any, enum_type: type[Enum]) -> str | None:

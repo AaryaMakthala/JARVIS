@@ -514,6 +514,58 @@ def test_finish_clears_active_tool_and_step(store) -> None:
     assert finished.active_step_id is None
 
 
+def test_confirmation_event_sets_pending_approval_and_target(store) -> None:
+    store.ensure_task(TASK_1)
+    store.update_status(TASK_1, TaskStatus.RUNNING)
+    store.append_event(
+        TASK_1,
+        TaskEventType.CONFIRMATION_REQUESTED,
+        detail={
+            "approval_state": "pending",
+            "step_id": "s1",
+            "tool": "browser_goto",
+        },
+    )
+
+    snapshot = store.get(TASK_1)
+    assert snapshot is not None
+    assert snapshot.approval_state == "pending"
+    assert snapshot.active_step_id == "s1"
+    assert snapshot.active_tool == "browser_goto"
+
+
+def test_clarification_event_clears_active_tool_and_step(store) -> None:
+    store.ensure_task(TASK_1)
+    store.update_status(TASK_1, TaskStatus.RUNNING)
+    store.append_event(
+        TASK_1,
+        TaskEventType.TOOL_STARTED,
+        detail={"tool": "browser_goto", "step_id": STEP_1},
+    )
+    store.append_event(TASK_1, TaskEventType.CLARIFICATION_REQUESTED, detail={})
+
+    snapshot = store.get(TASK_1)
+    assert snapshot is not None
+    assert snapshot.active_tool is None
+    assert snapshot.active_step_id is None
+
+
+def test_resume_clears_pending_approval(store) -> None:
+    store.ensure_task(TASK_1)
+    store.update_status(TASK_1, TaskStatus.RUNNING)
+    store.append_event(
+        TASK_1,
+        TaskEventType.CONFIRMATION_REQUESTED,
+        detail={"approval_state": "pending", "step_id": STEP_1},
+    )
+    store.update_status(TASK_1, TaskStatus.AWAITING_CONFIRMATION)
+    store.update_status(TASK_1, TaskStatus.RUNNING)
+
+    snapshot = store.get(TASK_1)
+    assert snapshot is not None
+    assert snapshot.approval_state is None
+
+
 def test_done_stage_is_owned_by_finish(store) -> None:
     store.ensure_task(TASK_1)
     store.update_status(TASK_1, TaskStatus.RUNNING)

@@ -46,7 +46,7 @@ from typing import Any
 from jarvis.agent.context import AppContext
 from jarvis.agent.state import Plan
 from jarvis.memory.tasklog import STATUSES
-from jarvis.taskstore import TaskEventType, TaskStage, TaskStatus
+from jarvis.taskstore import TaskApprovalState, TaskEventType, TaskStage, TaskStatus
 
 __all__ = [
     "MAX_PATH_CHARS",
@@ -59,6 +59,8 @@ __all__ = [
     "get_trace",
     "llm_attempt_meta",
     "node_code",
+    "record_clarification_requested",
+    "record_confirmation_requested",
     "record_finished",
     "record_route",
     "record_stage",
@@ -290,6 +292,63 @@ def record_route(
         )
     except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
         ctx.logger.debug("task route not recorded: %s", exc)
+
+
+def _record_task_event(
+    state: dict[str, Any],
+    ctx: AppContext,
+    event_type: TaskEventType,
+    detail: dict[str, Any],
+    label: str,
+) -> None:
+    """Append one closed-detail event, never raising into the graph."""
+    store = _task_store(ctx)
+    task_id = str(state.get("task_id") or "")
+    if store is None or not task_id:
+        return
+    try:
+        store.ensure_task(task_id, source=_safe_source(state))
+        store.append_event(task_id, event_type, detail=detail)
+    except Exception as exc:  # noqa: BLE001 - telemetry must never break a task
+        ctx.logger.debug("task %s not recorded: %s", label, exc)
+
+
+def record_confirmation_requested(
+    state: dict[str, Any],
+    ctx: AppContext,
+    *,
+    step_id: str,
+    tool: str | None = None,
+) -> None:
+    """Record a paused task waiting for approval, without its summary or args."""
+    step_id = str(step_id or "").strip()
+    if not step_id:
+        return
+    detail: dict[str, Any] = {
+        "approval_state": TaskApprovalState.PENDING.value,
+        "step_id": step_id,
+    }
+    tool = str(tool or "").strip()
+    if tool:
+        detail["tool"] = tool
+    _record_task_event(
+        state,
+        ctx,
+        TaskEventType.CONFIRMATION_REQUESTED,
+        detail,
+        "confirmation request",
+    )
+
+
+def record_clarification_requested(state: dict[str, Any], ctx: AppContext) -> None:
+    """Record a paused clarification without the question or any answer."""
+    _record_task_event(
+        state,
+        ctx,
+        TaskEventType.CLARIFICATION_REQUESTED,
+        {"node": "clarify"},
+        "clarification request",
+    )
 
 
 def llm_attempt_meta(
