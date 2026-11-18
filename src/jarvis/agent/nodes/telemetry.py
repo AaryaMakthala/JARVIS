@@ -65,6 +65,8 @@ __all__ = [
     "record_route",
     "record_stage",
     "record_started",
+    "record_tool_finished",
+    "record_tool_started",
     "task_status",
     "trace_node",
 ]
@@ -348,6 +350,58 @@ def record_clarification_requested(state: dict[str, Any], ctx: AppContext) -> No
         TaskEventType.CLARIFICATION_REQUESTED,
         {"node": "clarify"},
         "clarification request",
+    )
+
+
+def record_tool_started(
+    state: dict[str, Any],
+    ctx: AppContext,
+    *,
+    tool: str,
+    step_id: str,
+) -> None:
+    """Record the start of an actual tool execution (no args/output)."""
+    tool = str(tool or "").strip()
+    step_id = str(step_id or "").strip()
+    if not tool or not step_id:
+        return
+    _record_task_event(
+        state,
+        ctx,
+        TaskEventType.TOOL_STARTED,
+        {"tool": tool, "step_id": step_id},
+        "tool start",
+    )
+
+
+def record_tool_finished(
+    state: dict[str, Any],
+    ctx: AppContext,
+    *,
+    tool: str,
+    step_id: str,
+    ok: bool,
+    verified: bool | None,
+    duration_ms: int,
+) -> None:
+    """Record tool completion/failure with bounded, non-sensitive detail."""
+    tool = str(tool or "").strip()
+    step_id = str(step_id or "").strip()
+    if not tool or not step_id:
+        return
+    detail: dict[str, Any] = {
+        "tool": tool,
+        "step_id": step_id,
+        "ok": bool(ok),
+        "verified": verified if isinstance(verified, bool) else None,
+        "duration_ms": max(int(duration_ms), 0),
+    }
+    _record_task_event(
+        state,
+        ctx,
+        TaskEventType.TOOL_FINISHED,
+        detail,
+        "tool finish",
     )
 
 

@@ -42,7 +42,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from jarvis.agent.context import AppContext
-from jarvis.agent.nodes.telemetry import llm_attempt_meta
+from jarvis.agent.nodes.telemetry import (
+    llm_attempt_meta,
+    record_tool_finished,
+    record_tool_started,
+)
 from jarvis.agent.nodes.util import (
     active_scope_cid,
     browse_grant_check,
@@ -441,9 +445,26 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
                 "Refused: I could not match your approval to the observed action — not clicking.",
             )
         tool_ctx.approved_final_click_readback_hash = str(bound_readback)
+    if not ctx.dry_run:
+        record_tool_started(
+            state,
+            ctx,
+            tool=str(getattr(step, "tool", "")),
+            step_id=str(getattr(step, "id", "")),
+        )
     start = time.perf_counter()
     result = spec.execute(args, tool_ctx)
     elapsed_ms = int((time.perf_counter() - start) * 1000)
+    if not ctx.dry_run:
+        record_tool_finished(
+            state,
+            ctx,
+            tool=str(getattr(step, "tool", "")),
+            step_id=str(getattr(step, "id", "")),
+            ok=bool(result.ok),
+            verified=result.verified if isinstance(result.verified, bool) else None,
+            duration_ms=elapsed_ms,
+        )
 
     # Session context (Stage 8, D19): remember the artifact a tool just produced
     # so a later "delete it"/"send it" can resolve to the real path.
