@@ -888,6 +888,110 @@ class TestTasksCommand:
         assert result.exit_code == 0
         assert "task history unavailable" in result.output
 
+    def test_task_timeline_shows_sanitized_events(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from jarvis.config import Settings
+        from jarvis.taskstore import TaskEventType, TaskStage, TaskStatus, open_task_store
+        from jarvis.taskstore.runtime import build_task_vocabulary
+
+        class _Registry:
+            def names(self) -> tuple[str, ...]:
+                return ("browser_goto",)
+
+        settings = Settings()
+        monkeypatch.setattr("jarvis.config.task_events_db", lambda: path)
+        monkeypatch.setattr("jarvis.config.load_settings", lambda: settings)
+        monkeypatch.setattr(
+            "jarvis.tools.registry.build_default_registry", lambda s: _Registry()
+        )
+
+        path = tmp_path / "task_events.db"
+        task_id = "a0000000-0000-4000-8000-0000000000a1"
+        vocab = build_task_vocabulary(settings, _Registry())
+        store = open_task_store(path, create=True, vocabulary=vocab)
+        try:
+            store.ensure_task(task_id, source="terminal")
+            store.update_status(task_id, TaskStatus.RUNNING)
+            store.update_stage(task_id, TaskStage.EXECUTING)
+            store.append_event(
+                task_id,
+                TaskEventType.TOOL_STARTED,
+                detail={"tool": "browser_goto", "step_id": "s1"},
+            )
+            store.append_event(
+                task_id,
+                TaskEventType.TOOL_FINISHED,
+                detail={
+                    "tool": "browser_goto",
+                    "step_id": "s1",
+                    "ok": True,
+                    "verified": None,
+                    "duration_ms": 12,
+                },
+            )
+            store.finish(task_id, TaskStatus.COMPLETED)
+        finally:
+            store.close()
+
+        result = runner.invoke(
+            cli.app, ["tasks", "--task", task_id], env={"COLUMNS": "200", "TERM": "dumb"}
+        )
+
+        assert result.exit_code == 0, result.output
+        assert task_id in result.output
+        assert "tool_started" in result.output
+        assert "tool_finished" in result.output
+        assert "browser_goto" in result.output
+        assert "s1" in result.output
+        assert "duration_ms" in result.output
+        assert "secret" not in result.output.lower()
+
+    def test_task_timeline_unknown_task_is_graceful(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from jarvis.config import Settings
+        from jarvis.taskstore import open_task_store
+        from jarvis.taskstore.runtime import build_task_vocabulary
+
+        path = tmp_path / "task_events.db"
+        store = open_task_store(path, create=True, vocabulary=build_task_vocabulary(Settings()))
+        store.close()
+        self._wire(monkeypatch, path)
+
+        missing = "ffffffff-0000-4000-8000-0000000000ff"
+        result = runner.invoke(cli.app, ["tasks", "--task", missing])
+
+        assert result.exit_code == 1
+        assert "task not found" in result.output
+        assert "Traceback" not in result.output
+
+    def test_task_timeline_unreadable_store_degrades_without_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "task_events.db"
+        path.write_bytes(b"this is not a sqlite database")
+        self._wire(monkeypatch, path)
+
+        task_id = "a0000000-0000-4000-8000-0000000000a1"
+        result = runner.invoke(cli.app, ["tasks", "--task", task_id])
+
+        assert result.exit_code == 0
+        assert "task history unavailable" in result.output
+        assert "Traceback" not in result.output
+
+    def test_task_timeline_missing_store_degrades_without_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._wire(monkeypatch, tmp_path / "missing.db")
+
+        task_id = "a0000000-0000-4000-8000-0000000000a1"
+        result = runner.invoke(cli.app, ["tasks", "--task", task_id])
+
+        assert result.exit_code == 0
+        assert "task history unavailable" in result.output
+        assert "Traceback" not in result.output
+
 
 def test_status_shows_live_task_progress(monkeypatch: pytest.MonkeyPatch) -> None:
     from jarvis.daemon.protocol import StatusResponse

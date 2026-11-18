@@ -1527,7 +1527,7 @@ def _handle_confirm_request(client: Any, msg: Any) -> None:
         # The observed readback, rendered exactly once and exactly as the gate
         # persisted it (the summary is built from the observed fields only).
         console.print("[bold]Readback (observed):[/bold]")
-        console.print(str(getattr(msg, "readback_summary") or ""))
+        console.print(str(msg.readback_summary or ""))
         proposed = str(getattr(msg, "readback_proposed", "") or "")
         if proposed:
             console.print(f"[dim]{proposed}[/dim]")
@@ -2474,15 +2474,26 @@ def voice_doctor(
 
 @app.command()
 def tasks(
+    task: Annotated[
+        str | None,
+        typer.Option(
+            "--task",
+            help="Show sanitized timeline for a task (full task id).",
+        ),
+    ] = None,
     n: Annotated[int, typer.Option("--n", help="Number of recent tasks to show.")] = 20,
 ) -> None:
-    """Show recent tasks from the independent task-event store."""
+    """Show recent tasks or a task event timeline from the task-event store."""
     from jarvis import config
     from jarvis.taskstore.runtime import open_runtime_task_store
     from jarvis.tools.registry import build_default_registry
 
     settings = config.load_settings()
     path = config.task_events_db()
+    if task is not None:
+        _show_task_timeline(path, settings, task)
+        return
+
     if not path.is_file():
         console.print("[dim]no tasks[/dim]")
         return
@@ -2597,6 +2608,110 @@ def _task_failure(row: Any) -> str:
 
 
 # ── benchmark (Phase 9) ───────────────────────────────────────────────────
+
+def _show_task_timeline(path: Path, settings: Any, task_id: str) -> None:
+    """Print one task's sanitized event timeline, failing softly on errors."""
+
+    from jarvis.taskstore.runtime import open_runtime_task_store
+    from jarvis.tools.registry import build_default_registry
+
+    if not task_id or not task_id.strip():
+        console.print("[red]task id must be a non-empty full task id[/red]")
+        raise typer.Exit(code=1)
+
+    registry = build_default_registry(settings)
+    store = open_runtime_task_store(
+        settings, registry, path=path, create=False, read_only=True
+    )
+    try:
+        if not store.available:
+            reason = store.status().reason or "task store unavailable"
+            console.print(f"[yellow]task history unavailable: {reason}[/yellow]")
+            return
+        try:
+            snapshot = store.get(task_id)
+        except Exception as exc:
+            console.print(f"[red]could not read task: {exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        if snapshot is None:
+            console.print(f"[red]task not found: {task_id}[/red]")
+            raise typer.Exit(code=1)
+        try:
+            events = store.events(task_id)
+        except Exception as exc:
+            console.print(f"[red]could not read task events: {exc}[/red]")
+            raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+    if not console.is_terminal:
+        _print_task_timeline_plain(snapshot, events)
+        return
+
+    console.print(
+        f"[bold]task[/bold] {snapshot.task_id}  "
+        f"[bold]status[/bold] {snapshot.status.value}  "
+        f"[bold]stage[/bold] {snapshot.stage.value}"
+    )
+    if not events:
+        console.print("[dim]no events[/dim]")
+        return
+    table = Table(show_header=True, box=None)
+    table.add_column("seq", justify="right", style="dim")
+    table.add_column("timestamp")
+    table.add_column("event")
+    table.add_column("stage")
+    table.add_column("status")
+    table.add_column("details")
+    for event in events:
+        table.add_row(*_task_event_row_values(event))
+    console.print(table)
+
+
+TASK_EVENT_COLUMNS = ("seq", "timestamp", "event", "stage", "status", "details")
+
+
+def _task_event_row_values(event: Any) -> tuple[str, ...]:
+    """The cells of one event row (terminal table and plain output)."""
+    return (
+        str(event.seq if event.seq is not None else ""),
+        _event_timestamp(event),
+        event.event_type.value,
+        event.stage.value if event.stage is not None else "",
+        event.status.value if event.status is not None else "",
+        _event_details(event.detail),
+    )
+
+
+def _print_task_timeline_plain(snapshot: Any, events: list[Any]) -> None:
+    lines = [f"task\t{snapshot.task_id}\t{snapshot.status.value}\t{snapshot.stage.value}"]
+    lines.append("\t".join(TASK_EVENT_COLUMNS))
+    lines.extend("\t".join(_task_event_row_values(event)) for event in events)
+    stream = console.file
+    stream.write("\n".join(lines) + "\n")
+    stream.flush()
+
+
+def _event_timestamp(event: Any) -> str:
+    created = getattr(event, "created_at", None)
+    if created is None:
+        return ""
+    try:
+        return created.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, TypeError, ValueError):
+        return str(created)
+
+
+def _event_details(detail: Any) -> str:
+    import json as _json
+
+    if not isinstance(detail, dict) or not detail:
+        return ""
+    try:
+        return _json.dumps(detail, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(detail)
+
 
 benchmark_app = typer.Typer(
     help="Run the task/red-team benchmark and summarise its results.",
