@@ -332,7 +332,7 @@ def test_retrieve_returns_skills_first_then_preferences_then_failures(
     memory: SqliteMemory,
 ) -> None:
     memory.skills.save("delete the downloads folder", plan=_plan(), tools_used=["delete_path"])
-    memory.preferences.set("units", "metric")
+    memory.preferences.set("delete_downloads_folder", "ask first")
     memory.failures.record("delete the downloads folder", {"tool": "delete_path"}, "denied")
 
     records = memory.retrieve("delete the downloads folder", limit=3)
@@ -344,8 +344,8 @@ def test_retrieve_returns_skills_first_then_preferences_then_failures(
 
 def test_retrieve_respects_the_limit(memory: SqliteMemory) -> None:
     for i in range(5):
-        memory.preferences.set(f"pref_{i}", str(i))
-    assert len(memory.retrieve("anything", limit=2)) == 2
+        memory.preferences.set(f"pref_{i}", f"delete downloads folder {i}")
+    assert len(memory.retrieve("delete the downloads folder", limit=2)) == 2
 
 
 def test_retrieve_ignores_untrusted_skill(memory: SqliteMemory) -> None:

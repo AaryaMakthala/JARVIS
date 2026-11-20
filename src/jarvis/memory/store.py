@@ -85,7 +85,9 @@ class SqliteMemory:
         Every source is *scoped to ``query``**.  Failures used to be the most
         recent N regardless of the request, which meant one remembered failure
         was injected into every prompt and could refuse an unrelated command;
-        they are now filtered by goal similarity like the skills.
+        they are now filtered by goal similarity like the skills.  Preferences
+        and facts are additionally emitted best-match first, so the bounded
+        slots go to the most relevant memories rather than the newest ones.
         """
         if limit <= 0 or not (query or "").strip():
             return []
@@ -207,14 +209,16 @@ class SqliteMemory:
         ]
 
     def _preference_records(self, query: str, limit: int) -> list[MemoryRecord]:
-        """Preferences relevant to this query (B9 relevance, bounded).
+        """Rank preferences/facts by relevance, then keep the best ``limit``.
 
         A stored fact used to be injected into every prompt merely because it
-        existed, which made an unrelated request carry the user's Python
-        preference.  Relevance is now lexical over the key slug and value, so
-        the explicit record is still retrieved for "preferred coding
-        language" while an unrelated question does not receive it.  No vector
-        database and no new dependency are involved.
+        existed, and later relevance filtering still emitted rows in recency
+        order.  A newer partial match could therefore crowd out the older fact
+        that actually answers the request.  Matching rows are now scored,
+        sorted best-first (recency remains the stable tie-break from
+        ``PreferenceStore.all``) and only then truncated.  The score travels in
+        ``meta["relevance"]`` so downstream trimming drops the least relevant
+        item first.  No vector database and no new dependency are involved.
         """
         if limit <= 0:
             return []
@@ -223,10 +227,14 @@ class SqliteMemory:
         except sqlite3.Error as exc:
             self._log.warning("preference retrieval failed: %s", exc)
             return []
-        records: list[MemoryRecord] = []
+        scored: list[tuple[float, Any]] = []
         for pref in prefs:
-            if _preference_relevance(query, pref) < _PREFERENCE_RELEVANCE:
-                continue
+            score = _preference_relevance(query, pref)
+            if score >= _PREFERENCE_RELEVANCE:
+                scored.append((score, pref))
+        scored.sort(key=lambda pair: -pair[0])
+        records: list[MemoryRecord] = []
+        for score, pref in scored[:limit]:
             records.append(
                 MemoryRecord(
                     kind="preference",
@@ -236,11 +244,10 @@ class SqliteMemory:
                         "category": pref.category,
                         "provenance": pref.provenance,
                         "fact": fact_details(pref.key) is not None,
+                        "relevance": round(score, 3),
                     },
                 )
             )
-            if len(records) >= limit:
-                break
         return records
 
     def _failure_records(self, query: str, limit: int) -> list[MemoryRecord]:
@@ -368,14 +375,28 @@ def _preference_tokens(text: str) -> set[str]:
 
 
 def _preference_relevance(query: str, pref: Any) -> float:
-    """Share of the query's content words present in the key or value."""
+    """How well the stored key/value covers this request, from 0.0 to 1.0.
+
+    Overlap is measured against the smaller token set so a long, chatty
+    request cannot dilute an otherwise exact match.  A multi-word query needs
+    at least two shared words: one common word in a longer request is not
+    enough to inject a memory.  A one-word query keeps the old exact-word
+    behaviour so "Python?" still recalls the Python preference.
+    """
     wanted = _preference_tokens(query)
     if not wanted:
         return 0.0
-    key_words = _preference_tokens(pref.key.replace(".", " ").replace("_", " "))
+    details = fact_details(pref.key)
+    key_text = details[0] if details is not None else pref.key
+    key_words = _preference_tokens(key_text.replace(".", " ").replace("_", " "))
     value_words = _preference_tokens(pref.value)
-    overlap = len(wanted & (key_words | value_words))
-    return overlap / len(wanted)
+    stored = key_words | value_words
+    if not stored:
+        return 0.0
+    overlap = len(wanted & stored)
+    if len(wanted) > 1 and overlap < 2:
+        return 0.0
+    return overlap / min(len(wanted), len(stored))
 
 
 #: Key that marks a ``MemoryRecord`` as belonging in the failure log rather

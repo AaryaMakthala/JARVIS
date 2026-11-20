@@ -11,7 +11,8 @@ example is third-party text that may quote a page, a tool error or an old goal:
 
 * **bounded**: each item is cut to ``memory.item_max_chars`` (300) and the whole
   block to ``memory.context_max_chars`` (1200), so retrieval can never flood a
-  prompt;
+  prompt.  An item that does not fit is skipped, not allowed to hide smaller
+  relevant items that follow it;
 * **filtered**: an item that trips the existing secret check is dropped, and a
   failure example older than ``memory.failure_max_age_days`` (30) is dropped -
   a stale failure is the one most likely to be wrong about today's world;
@@ -124,7 +125,7 @@ def _select(records: list[MemoryRecord], settings: Any) -> list[dict[str, Any]]:
         if meta:
             cost += len(json.dumps(meta, default=str))
         if used + cost > total_cap:
-            break
+            continue
         seen.add(key)
         used += cost
         chosen.append(item)
