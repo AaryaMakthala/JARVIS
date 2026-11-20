@@ -212,33 +212,6 @@ def _require_session(ctx: ToolContext) -> BrowserSession | None:
 
 
 
-def _note_navigation(ctx: ToolContext, session: Any, url: str = ""):
-    try:
-        page_url = url or _current_page_url(session)
-        if not page_url:
-            return
-        # get conversation id
-        cid = getattr(getattr(ctx, "run_id", None), "__str__", lambda: None)()
-        if cid is None:
-            # try from state
-            pass
-        # store in referents if possible
-        try:
-            from jarvis.agent.referents import origin_from_url
-            from jarvis.agent import referents as _ref
-            origin = origin_from_url(page_url)
-            REFERENT_STORE.set_page(str(getattr(ctx, "session_context", None) and getattr(ctx.session_context, "_id", None) or id(ctx)), PageRef(url=page_url, title=None, origin=origin, created_at=_ref.now_ts()))
-        except Exception:
-            pass
-        try:
-            if hasattr(ctx, "session_context") and ctx.session_context is not None:
-                from jarvis.agent.session_context import SESSION_THREAD
-                ctx.session_context.note_page(SESSION_THREAD, page_url)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
 def _safe_goto(url: str) -> str | None:
     """Return the canonical origin of a structurally safe URL, else ``None``.
 
@@ -476,10 +449,6 @@ def _run_browser_goto(args: BrowserGotoArgs, ctx: ToolContext) -> ToolResult:
     except BrowserError as exc:
         return ToolResult(ok=False, error=f"browser_goto failed: {exc}")
     _invalidate_results(ctx, session)  # every position from the old page is stale
-    try:
-        _note_navigation(ctx, session, str(data.get("url", url)))
-    except Exception:
-        pass
     return ToolResult(
         ok=True,
         output=f"navigated to {data.get('url', '')}",
@@ -666,10 +635,6 @@ def _run_browser_open_site(args: BrowserOpenSiteArgs, ctx: ToolContext) -> ToolR
     except BrowserError as exc:
         return ToolResult(ok=False, error=f"browser_goto failed: {exc}")
     _invalidate_results(ctx, session)  # every position from the old page is stale
-    try:
-        _note_navigation(ctx, session, str(data.get("url", url)))
-    except Exception:
-        pass
     return ToolResult(
         ok=True,
         output=f"opened {name} ({data.get('url', '')})",
@@ -803,15 +768,11 @@ def _run_browser_open_result(args: BrowserOpenResultArgs, ctx: ToolContext) -> T
             args.query,
             role=args.role,
             index=args.index,
-            expect_identity=expect_identity,
+            expect_identity=approved,
         )
     except BrowserError as exc:
         return ToolResult(ok=False, error=f"browser_open_result failed: {exc}")
     _invalidate_results(ctx, session)  # the click may navigate
-    try:
-        _note_navigation(ctx, session, str(data.get("url", "")))
-    except Exception:
-        pass
     return ToolResult(
         ok=True,
         output=(
@@ -1051,10 +1012,6 @@ def _run_browser_search(args: BrowserSearchArgs, ctx: ToolContext) -> ToolResult
     except BrowserError as exc:
         return ToolResult(ok=False, error=f"browser_search failed: {exc}")
     _invalidate_results(ctx, session)
-    try:
-        _note_navigation(ctx, session, str(data.get("url", url)))
-    except Exception:
-        pass
     # Try to find results on the page like browser_find does
     shown: list[ElementRef] = []
     try:
@@ -1101,10 +1058,6 @@ def _run_browser_press_key(args: BrowserPressKeyArgs, ctx: ToolContext) -> ToolR
         data = session.press_key(args.key)
     except BrowserError as exc:
         return ToolResult(ok=False, error=f"browser_press_key failed: {exc}")
-    try:
-        _note_navigation(ctx, session, _current_page_url(session))
-    except Exception:
-        pass
     return ToolResult(ok=True, output=f"pressed {args.key}", data=_with_page_url(dict(data), session), verified=None, tainted=True)
 
 
@@ -1139,10 +1092,6 @@ def _run_browser_back(args: BrowserBackArgs, ctx: ToolContext) -> ToolResult:
     except BrowserError as exc:
         return ToolResult(ok=False, error=f"browser_back failed: {exc}")
     _invalidate_results(ctx, session)
-    try:
-        _note_navigation(ctx, session, str(data.get("url", "")))
-    except Exception:
-        pass
     return ToolResult(ok=True, output="went back", data=_with_page_url(dict(data), session), verified=True, tainted=True)
 
 
@@ -1155,10 +1104,6 @@ def _run_browser_forward(args: BrowserForwardArgs, ctx: ToolContext) -> ToolResu
     except BrowserError as exc:
         return ToolResult(ok=False, error=f"browser_forward failed: {exc}")
     _invalidate_results(ctx, session)
-    try:
-        _note_navigation(ctx, session, str(data.get("url", "")))
-    except Exception:
-        pass
     return ToolResult(ok=True, output="went forward", data=_with_page_url(dict(data), session), verified=True, tainted=True)
 
 
@@ -1175,10 +1120,6 @@ def _run_browser_tabs(args: BrowserTabsArgs, ctx: ToolContext) -> ToolResult:
                 return ToolResult(ok=False, error="index required for switch")
             data = session.switch_tab(int(args.index))
             _invalidate_results(ctx, session)
-            try:
-                _note_navigation(ctx, session, str(data.get("url", "")))
-            except Exception:
-                pass
             return ToolResult(ok=True, output=f"switched to tab {args.index}", data=_with_page_url(dict(data), session), verified=True, tainted=True)
         elif args.action == "close_extra":
             data = session.close_extra_tab()
@@ -1409,7 +1350,7 @@ def _resolve_browser_press_key(args: BrowserPressKeyArgs, ctx: ToolContext) -> R
     live_url = _current_page_url(session)
     if not live_url:
         return None
-    host = (urlsplit(live_url).hostname or "").casefold().rstrip(".")
+    host = (urllib.parse.urlsplit(live_url).hostname or "").casefold().rstrip(".")
     if not host:
         return None
     origin = url_origin(live_url)
@@ -1423,17 +1364,18 @@ def _resolve_browser_press_key(args: BrowserPressKeyArgs, ctx: ToolContext) -> R
 
 
 def _run_browser_final_click(args: BrowserFinalClickArgs, ctx: ToolContext) -> ToolResult:
+    import uuid
+
     from jarvis.browser.final_click import (
         FinalClickJournalRow,
+        _now_iso,
         build_observed_readback,
         digests_equal,
         get_journal,
         is_hex64,
         readback_digest,
         sha256_hex,
-        _now_iso,
     )
-    import uuid
 
     session = _require_session(ctx)
     if session is None:

@@ -202,3 +202,25 @@ Maintained by the coding agent. Condensed from historical log.
   tokens (`24000×0.85−1024`), giving 2.76× headroom on the worst provider-reported input (7,017) and 4.72× on the largest
   estimate (4,109); no production change. `openrouter/free` is recorded as the requested alias only; no resolved model or
   context window is claimed. Focused: 70 passed in 12.47 s; ruff clean. Actual Notepad execution not live-verified. B9 frozen.
+
+## P3 referent continuity (2026-11-20, complete with documented limitations)
+
+- **Selection**: the two failing `tests/unit/test_browser_referents.py` acceptance tests showed that an unrelated
+  successful action left a stale page URL in the brain prompt ("open that page" after a time query). This was a real
+  multi-step context/reliability defect, not a reporting gap.
+- **Single writer**: removed the process-global `REFERENT_STORE` and the nine `_note_navigation` call sites in
+  `browser/tools.py`. Added a per-`AppContext` `ReferentStore`; `context_resolve` and `act` now use that instance.
+  Browser tools still return `page_url` in trusted tool data, but only `act` publishes referents after a successful step.
+- **Rules**: browser steps preserve/refresh the observed page; navigating to a different page clears the old result set;
+  `browser_find` results, photos and files keep their existing binding rules; unrelated successful steps clear the page in
+  both `SessionContext` and `ReferentStore`; failed and dry-run steps publish/invalidate nothing. Page URLs remain wrapped
+  as `<untrusted_data>` in prompts and are never written to state, checkpoints, task events or logs.
+- **Incidental fixes**: `browser_open_result` now passes the computed approved target identity instead of the undefined
+  `expect_identity`; `_resolve_browser_press_key` now uses `urllib.parse.urlsplit` instead of an undefined bare name.
+- **Verification**: focused milestone/regression set 269 passed; referent core 53 passed; `ruff format --check` clean on
+  eight changed Python files; `ruff check` has only nine pre-existing style findings (`BLE001`/`SIM102`/`PLR1716`) in
+  unchanged logic. A broader browser sweep was 275 passed / 6 failed in untouched press-key-name and site-directory
+  expectations. No live browser/desktop/WhatsApp/voice/provider verification.
+- **Report**: `docs/JARVIS_P3_REFERENT_CONTINUITY_IMPLEMENTATION_REPORT.md`.
+- **Known limits**: referents remain in-memory only; `SessionContext` keeps the shared `SESSION_THREAD = "local"` key
+  while `ReferentStore` is keyed by `conversation_id`; the stale browser test expectations are not part of this change.

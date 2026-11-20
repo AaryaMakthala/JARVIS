@@ -7,9 +7,6 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from jarvis.agent import referents
-from jarvis.agent.referents import REFERENT_STORE
-
 
 class ResolvedRefsState(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -58,7 +55,7 @@ def context_resolve(state: dict[str, Any], ctx: Any) -> dict[str, Any]:
     if not user_input.strip():
         return {"resolved_refs": ResolvedRefsState().model_dump()}
     cid = str(state.get("conversation_id") or "local")
-    refs = REFERENT_STORE.get(cid)
+    refs = ctx.referents.get(cid)
     resolved = ResolvedRefsState()
     if refs.result_set and refs.result_set.items:
         resolved.has_result_set = True
@@ -78,12 +75,16 @@ def context_resolve(state: dict[str, Any], ctx: Any) -> dict[str, Any]:
         if refs.last_action and refs.last_action.ok:
             resolved.resolved_action = f"repeat:{refs.last_action.tool}"
     # result set
-    if re.search(r"\b(first|second|third|fourth|fifth|\d+(?:st|nd|rd|th)?)\b.*\b(link|result|one)\b", t) or re.search(r"\bopen the (first|second|third)\b", t):
+    if re.search(
+        r"\b(first|second|third|fourth|fifth|\d+(?:st|nd|rd|th)?)\b.*\b(link|result|one)\b", t
+    ) or re.search(r"\bopen the (first|second|third)\b", t):
         pos = _extract_ordinal(t)
         if pos and resolved.has_result_set and pos in resolved.result_set_positions:
             resolved.resolved_action = f"open_result:{pos}"
     # picture/photo
-    if re.search(r"\b(the\s+)?(picture|photo|screenshot)\b", t) and ("open" in t or "show" in t or resolved.resolved_action is None):
+    if re.search(r"\b(the\s+)?(picture|photo|screenshot)\b", t) and (
+        "open" in t or "show" in t or resolved.resolved_action is None
+    ):
         if resolved.has_photo:
             resolved.resolved_action = "open_picture"
         elif resolved.has_file:

@@ -57,6 +57,15 @@ from jarvis.agent.nodes.util import (
     truncate,
 )
 from jarvis.agent.precheck import step_precheck_error
+from jarvis.agent.referents import (
+    ActionRef,
+    FileRef,
+    PageRef,
+    ResultItem,
+    ResultSetRef,
+    now_ts,
+    origin_from_url,
+)
 from jarvis.agent.session_context import SESSION_THREAD
 from jarvis.agent.state import StepResult
 from jarvis.browser.final_click import FINAL_CLICK_TOOL, is_hex64
@@ -80,6 +89,99 @@ def _tool_ctx(state: dict[str, Any], ctx: AppContext) -> Any:
     unchanged.
     """
     return ctx.tool_context(attempt_meta=llm_attempt_meta(state, ctx, _TOOL_TASK_CLASS))
+
+
+def _note_page_referent(ctx: AppContext, cid: str, page_url: object, previous_page: Any) -> Any:
+    """Publish a browser result's observed page, or ``None`` when unusable."""
+    if not isinstance(page_url, str):
+        return None
+    entry = ctx.session_context.note_page(SESSION_THREAD, page_url)
+    if entry is None:
+        return None
+    if previous_page is not None and previous_page.url != entry.url:
+        ctx.referents.clear_result_set(cid)
+    ctx.referents.set_page(
+        cid,
+        PageRef(
+            url=entry.url,
+            title=None,
+            origin=origin_from_url(entry.url),
+            created_at=entry.created_at,
+        ),
+    )
+    return entry
+
+
+def _note_result_set(refs: Any, cid: str, data: dict[str, Any], page_url: str) -> None:
+    """Remember a browser_find result set bound to the page it came from."""
+    raw_items = data.get("results") or data.get("items")
+    items = []
+    if isinstance(raw_items, list):
+        for index, item in enumerate(raw_items):
+            if isinstance(item, dict):
+                items.append(
+                    ResultItem(
+                        position=int(item.get("position") or index + 1),
+                        title=str(item.get("title") or item.get("name") or ""),
+                        host=str(
+                            item.get("host")
+                            or item.get("origin")
+                            or origin_from_url(str(item.get("url") or ""))
+                            or ""
+                        ),
+                        url=str(item.get("url") or ""),
+                        ref=item.get("ref"),
+                    )
+                )
+    if items:
+        refs.set_result_set(
+            cid,
+            ResultSetRef(
+                id=f"rs_{int(now_ts())}",
+                page_url=page_url,
+                items=items,
+                created_at=now_ts(),
+            ),
+        )
+
+
+def _note_file_referent(
+    refs: Any, cid: str, tool_name: str, artifact: object, data: dict[str, Any]
+) -> None:
+    """Remember a trusted file/photo artifact produced by a tool."""
+    if tool_name not in (
+        "take_photo",
+        "create_file",
+        "write_file",
+        "append_file",
+        "save_dictation",
+    ) or not isinstance(artifact, dict):
+        return
+    path = artifact.get("path") or data.get("path")
+    if isinstance(path, str) and path.strip():
+        kind = "photo" if tool_name == "take_photo" else "file"
+        refs.set_file(cid, FileRef(path=path.strip(), kind=kind, created_at=now_ts()))
+
+
+def _update_referents(state: dict[str, Any], ctx: AppContext, step: Any, result: Any) -> None:
+    """Publish trusted artifacts and expire stale page/result referents."""
+    tool_name = str(getattr(step, "tool", "") or "")
+    cid = str(state.get("conversation_id") or "local")
+    data = result.data if isinstance(result.data, dict) else {}
+    artifact = data.get("artifact")
+    is_browser = tool_name.startswith("browser_")
+    ctx.session_context.note_action(SESSION_THREAD, artifact, preserve_page=is_browser)
+    refs = ctx.referents
+    previous_page = refs.get(cid).page
+    refs.set_action(cid, ActionRef(tool=tool_name, ok=True, created_at=now_ts()))
+    page_entry = (
+        _note_page_referent(ctx, cid, data.get("page_url"), previous_page) if is_browser else None
+    )
+    if page_entry is None and not is_browser:
+        refs.clear_page(cid)
+    if tool_name == "browser_find" and page_entry is not None:
+        _note_result_set(refs, cid, data, page_entry.url)
+    _note_file_referent(refs, cid, tool_name, artifact, data)
 
 
 def _content_hashes_now(decision: Any) -> tuple[list[str] | None, str | None]:
@@ -466,133 +568,11 @@ def act(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
             duration_ms=elapsed_ms,
         )
 
-    # Session context (Stage 8, D19): remember the artifact a tool just produced
-    # so a later "delete it"/"send it" can resolve to the real path.
     if not ctx.dry_run and result.ok:
-        artifact = result.data.get("artifact") if isinstance(result.data, dict) else None
-        ctx.session_context.note_action(SESSION_THREAD, artifact)
-        page_url = result.data.get("page_url") if isinstance(result.data, dict) else None
-        # Phase 1: do NOT clear page referent on unrelated successful steps.
-        # Clear only on browser navigation to a different origin, explicit
-        # invalidation, or TTL. Keep SessionContext API working.
         try:
-            from jarvis.agent import referents
-            from jarvis.agent.referents import (
-                REFERENT_STORE,
-                ActionRef,
-                FileRef,
-                PageRef,
-                ResultItem,
-                ResultSetRef,
-                origin_from_url,
-            )
-
-            cid = str(state.get("conversation_id") or "local")
-            tool_name = str(getattr(step, "tool", "") or "")
-            # record action
-            try:
-                REFERENT_STORE.set_action(
-                    cid, ActionRef(tool=tool_name, ok=True, created_at=referents.now_ts())
-                )
-            except (TypeError, ValueError):
-                # Unreachable in practice: the store only takes a lock and
-                # assigns, and the ref model was just constructed.  Kept
-                # defensive; the message carries no tool or page content.
-                logger.debug("referent action not recorded")
-            # browser navigation -> set/update page; clear only if different origin? spec says clear only on nav to different origin or explicit/TTL
-            if (
-                tool_name in ("browser_goto", "browser_open_site", "browser_open_result")
-                and isinstance(page_url, str)
-                and page_url.strip()
-            ):
-                prev = REFERENT_STORE.get(cid).page
-                new_origin = origin_from_url(page_url)
-                old_origin = origin_from_url(prev.url) if prev else None
-                if prev is None or old_origin != new_origin or prev.url != page_url:
-                    # different origin or new page -> update page (and per spec clear only in those cases; just set)
-                    REFERENT_STORE.set_page(
-                        cid,
-                        PageRef(
-                            url=page_url,
-                            title=None,
-                            origin=new_origin,
-                            created_at=referents.now_ts(),
-                        ),
-                    )
-                else:
-                    REFERENT_STORE.set_page(
-                        cid,
-                        PageRef(
-                            url=page_url,
-                            title=None,
-                            origin=new_origin,
-                            created_at=referents.now_ts(),
-                        ),
-                    )
-                ctx.session_context.note_page(SESSION_THREAD, page_url)
-            elif isinstance(page_url, str) and page_url.strip() and tool_name in ("browser_read",):
-                # reading doesn't necessarily change page; don't force clear
-                pass
-            # browser_find results
-            if tool_name == "browser_find":
-                results = None
-                if isinstance(result.data, dict):
-                    results = result.data.get("results") or result.data.get("items")
-                if isinstance(results, list) and results:
-                    items = []
-                    for i, it in enumerate(results):
-                        if isinstance(it, dict):
-                            items.append(
-                                ResultItem(
-                                    position=int(it.get("position") or i + 1),
-                                    title=str(it.get("title") or it.get("name") or ""),
-                                    host=str(
-                                        it.get("host")
-                                        or it.get("origin")
-                                        or origin_from_url(it.get("url") or page_url or "")
-                                        or ""
-                                    ),
-                                    url=str(it.get("url") or ""),
-                                    ref=it.get("ref"),
-                                )
-                            )
-                    if items and isinstance(page_url, str) and page_url.strip():
-                        REFERENT_STORE.set_result_set(
-                            cid,
-                            ResultSetRef(
-                                id=f"rs_{int(referents.now_ts())}",
-                                page_url=page_url,
-                                items=items,
-                                created_at=referents.now_ts(),
-                            ),
-                        )
-            # browser_open_result may produce page_url
-            # files/photos
-            if tool_name in ("take_photo",):
-                p = None
-                if isinstance(artifact, dict):
-                    p = artifact.get("path") or result.data.get("path")
-                if isinstance(p, str) and p:
-                    REFERENT_STORE.set_file(
-                        cid, FileRef(path=p, kind="photo", created_at=referents.now_ts())
-                    )
-            if tool_name in ("create_file", "write_file", "append_file", "save_dictation"):
-                p = None
-                if isinstance(artifact, dict):
-                    p = artifact.get("path") or result.data.get("path")
-                if isinstance(p, str) and p:
-                    REFERENT_STORE.set_file(
-                        cid, FileRef(path=p, kind="file", created_at=referents.now_ts())
-                    )
-        except (ImportError, TypeError, ValueError):
-            # Exactly what this block can raise: the optional import, a
-            # page-supplied position that is not a number (``int(...)``), or a
-            # ref model that fails validation (``ValidationError`` IS a
-            # ``ValueError``).  Referent bookkeeping is convenience only - it can
-            # never fail the step - and nothing is logged in detail because the
-            # values are page and tool content.
+            _update_referents(state, ctx, step, result)
+        except (TypeError, ValueError):
             logger.debug("referent bookkeeping skipped")
-        # For non-browser unrelated steps, do NOT clear page referent (Phase 1 fix)
 
     step_result = StepResult(
         step_id=step.id,

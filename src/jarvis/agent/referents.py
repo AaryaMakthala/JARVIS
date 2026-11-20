@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -127,6 +126,11 @@ class ReferentStore:
             refs = self._data.setdefault(conversation_id, ResolvedRefs())
             refs.page = None
 
+    def clear_result_set(self, conversation_id: str) -> None:
+        with self._lock:
+            refs = self._data.setdefault(conversation_id, ResolvedRefs())
+            refs.result_set = None
+
     def _prune(self, refs: ResolvedRefs) -> None:
         now = time.time()
         if refs.result_set and now - refs.result_set.created_at > self.ttl_s:
@@ -141,10 +145,6 @@ class ReferentStore:
             refs.last_contact = None
         if refs.last_action and now - refs.last_action.created_at > self.ttl_s:
             refs.last_action = None
-
-
-# global store for process
-REFERENT_STORE = ReferentStore(ttl_s=600.0)
 
 
 def now_ts() -> float:

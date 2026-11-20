@@ -25,6 +25,8 @@ from jarvis.agent.context import make_app_context
 from jarvis.agent.graph import _ALLOWED_MSGPACK_TYPES
 from jarvis.agent.nodes.act import act
 from jarvis.agent.nodes.brain import brain
+from jarvis.agent.nodes.context_resolve import context_resolve
+from jarvis.agent.referents import ResultItem, ResultSetRef
 from jarvis.agent.schemas import BrainDecision
 from jarvis.agent.state import AgentState, Plan, Step
 from jarvis.browser.tools import make_browser_goto_spec
@@ -149,6 +151,8 @@ def test_a_successful_navigation_publishes_the_page() -> None:
     assert resolved.kind == "resolved"
     assert resolved.artifact is not None
     assert resolved.artifact.url == f"{_ORIGIN}/page"
+    assert ctx.referents.get("local").page is not None
+    assert ctx.referents.get("local").page.url == f"{_ORIGIN}/page"
 
 
 def test_a_failed_navigation_publishes_nothing() -> None:
@@ -156,12 +160,42 @@ def test_a_failed_navigation_publishes_nothing() -> None:
     session.goto_error = "the managed browser session is not started"
     ctx, _ = _navigate(session)
     assert ctx.session_context.resolve_page("local").kind == "none"
+    assert ctx.referents.get("local").page is None
 
 
 def test_a_dry_run_publishes_nothing() -> None:
     session = FakeSession()
     ctx, _ = _navigate(session, dry_run=True)
     assert ctx.session_context.resolve_page("local").kind == "none"
+    assert ctx.referents.get("local").page is None
+
+
+def test_navigation_to_a_new_page_clears_the_old_result_set() -> None:
+    session = FakeSession()
+    ctx, _ = _navigate(session)
+    ctx.referents.set_result_set(
+        "local",
+        ResultSetRef(
+            id="rs_old",
+            page_url=f"{_ORIGIN}/page",
+            items=[
+                ResultItem(
+                    position=1,
+                    title="Old result",
+                    host="example.com",
+                    url=f"{_ORIGIN}/old-result",
+                )
+            ],
+            created_at=0.0,
+        ),
+    )
+    step = _step(f"{_ORIGIN}/next")
+    _record_binding(ctx, step)
+    act(_state(step, approved=[_hash(ctx, step)]), ctx)
+
+    refs = ctx.referents.get("local")
+    assert refs.page is not None and refs.page.url == f"{_ORIGIN}/next"
+    assert refs.result_set is None
 
 
 # ── reference invalidation: unrelated action in between (Stage 8, P3) ──────
@@ -176,6 +210,9 @@ def test_an_unrelated_time_query_invalidates_the_page_referent() -> None:
     _run_time_query(ctx)
 
     assert ctx.session_context.resolve_page("local").kind == "none"
+    assert ctx.referents.get("local").page is None
+    update = context_resolve({"user_input": "open that page"}, ctx)
+    assert update["resolved_refs"]["has_page"] is False
 
 
 def test_after_an_unrelated_query_a_page_follow_up_asks() -> None:

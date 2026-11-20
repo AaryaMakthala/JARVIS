@@ -269,6 +269,18 @@ class TestPageReferents:
         assert store.resolve_page(SESSION_THREAD, now=0.0).kind == "none"
         assert store.reference_resolution(SESSION_THREAD, "open that page", now=0.0).kind == "none"
 
+    def test_an_unrelated_note_action_invalidates_the_page(self) -> None:
+        store = SessionContext()
+        store.note_page(SESSION_THREAD, _PAGE, now=0.0)
+        assert store.note_action(SESSION_THREAD, now=1.0) is None
+        assert store.resolve_page(SESSION_THREAD, now=1.0).kind == "none"
+
+    def test_a_browser_note_action_preserves_the_page(self) -> None:
+        store = SessionContext()
+        store.note_page(SESSION_THREAD, _PAGE, now=0.0)
+        assert store.note_action(SESSION_THREAD, now=1.0, preserve_page=True) is None
+        assert store.resolve_page(SESSION_THREAD, now=1.0).kind == "resolved"
+
     def test_a_page_referent_is_scoped_to_its_thread(self) -> None:
         store = SessionContext()
         store.note_page("thread-a", _PAGE, now=0.0)

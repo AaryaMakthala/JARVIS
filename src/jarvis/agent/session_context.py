@@ -197,19 +197,24 @@ class SessionContext:
         artifact: object = None,
         *,
         now: float | None = None,
+        preserve_page: bool = False,
     ) -> SessionArtifact | None:
         """Record a trusted artifact, or close the run on any other action.
 
         ``artifact`` must be the tool's ``result.data["artifact"]`` dict (with a
         non-empty string ``type`` and ``path``).  Anything else - ``None``, a
         string, a malformed dict - records nothing and closes the current run,
-        so untrusted text can never become a referent (I1).
+        so untrusted text can never become a referent (I1).  A browser step sets
+        ``preserve_page`` because it remains on the page it just observed; every
+        other completed action also invalidates the page referent.
         """
         moment = self._clock() if now is None else float(now)
         with self._lock:
             self._prune(thread_id, moment)
             if not self._is_trusted_artifact(artifact):
                 self._run[thread_id] = None
+                if not preserve_page:
+                    self._pages.pop(thread_id, None)
                 return None
             assert isinstance(artifact, dict)  # narrowed by _is_trusted_artifact
             run_id = self._run.get(thread_id)

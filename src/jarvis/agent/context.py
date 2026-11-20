@@ -13,6 +13,7 @@ from typing import Any
 
 from jarvis.agent.capability_index import CapabilityIndex, build_capability_index
 from jarvis.agent.conversation import ConversationManager
+from jarvis.agent.referents import ReferentStore
 from jarvis.agent.session_context import SessionContext
 from jarvis.agent.target_binding import TargetBindingStore
 from jarvis.browser.results import BrowserResultStore
@@ -117,6 +118,7 @@ class AppContext:
     #: proposal: the policy gate and the target binding still authorize the
     #: action, and a stale, expired or navigated-away set is refused.
     browser_results: BrowserResultStore = field(default_factory=BrowserResultStore)
+    referents: ReferentStore = field(default_factory=ReferentStore)
     #: Unified conversation manager (B5): bounded, in-memory recent-turn
     #: context per conversation id.  IN-MEMORY ONLY and never written to
     #: ``AgentState`` or the checkpoint store, so a restart starts a fresh
@@ -174,6 +176,7 @@ def make_app_context(
     browse_grants: BrowseGrantRegistry | None = None,
     session_context: SessionContext | None = None,
     browser_results: BrowserResultStore | None = None,
+    referents: ReferentStore | None = None,
     conversations: ConversationManager | None = None,
 ) -> AppContext:
     """Build a ready-to-use :class:`AppContext` with defaults."""
@@ -225,6 +228,7 @@ def make_app_context(
             ttl_seconds=float(settings.session.artifact_ttl_seconds),
         ),
         browser_results=browser_results if browser_results is not None else BrowserResultStore(),
+        referents=referents if referents is not None else ReferentStore(),
         conversations=conversations if conversations is not None else ConversationManager(),
         capability_index=build_capability_index(registry),
     )
