@@ -224,3 +224,30 @@ Maintained by the coding agent. Condensed from historical log.
 - **Report**: `docs/JARVIS_P3_REFERENT_CONTINUITY_IMPLEMENTATION_REPORT.md`.
 - **Known limits**: referents remain in-memory only; `SessionContext` keeps the shared `SESSION_THREAD = "local"` key
   while `ReferentStore` is keyed by `conversation_id`; the stale browser test expectations are not part of this change.
+
+## Browser specialist loop guard (2026-11-20, complete with unit verification)
+
+- **Selection**: the previous repeat guard only compared the last two history entries, so automatic page-refresh
+  steps and an intervening action allowed `search -> scroll -> search` cycles to consume the whole call budget.
+- **Implementation**: `specialist.decide` now scans the last 12 non-refresh history entries for repeated
+  `(tool, args-summary)` signatures before the LLM call and again against a proposed action before returning a step
+  to the graph. Automatic `r<call>` browser reads are marked `refresh`; policy-decision entries covered by a browsing
+  grant are marked `grant`. Grant-covered `browser_goto` is excluded because repeated navigation to an approved URL
+  is a legitimate bounded refresh pattern; all other grant-covered tools still count as actions.
+- **Flow preserved**: the check runs before `validate`/`act`, so a repeated action has no side effect. The existing
+  call cap, browser tool allowlist, policy tiers, confirmations, browsing grants, target binding, taint handling and
+  telemetry are unchanged. No new state type, database, tool or dependency was added.
+- **Regression found and fixed**: `test_first_prompt_text_and_grant_covers_the_next_step` legitimately repeats
+  `browser_goto` under one browsing grant and initially failed with `Specialist repeated an action.`; the narrow
+  grant-navigation exemption restored it.
+- **Verification**: focused specialist tests 18 passed; neighbour regression set (specialist, browse grants,
+  agent architecture, compose, replan, invariants) 140 passed; `mypy src/jarvis/policy` clean (11 files). Ruff on
+  changed Python files shows only findings that also exist at HEAD in `tests/unit/test_specialist.py`; source file
+  clean, added test hunks clean.
+- **Interrupted full suite**: no final summary was produced. The pytest cache had 145 stale node IDs, none in the
+  specialist files; sampled IDs do not resolve against the current tree. They are recorded as unrelated or
+  undetermined, not claimed to be fixed or proven pre-existing.
+- **Report**: `docs/JARVIS_SPECIALIST_LOOP_GUARD_IMPLEMENTATION_REPORT.md`.
+- **Known limits**: detection is bounded and lexical; semantically different argument text is not normalised.
+  Grant-covered navigation may repeat until the grant/call cap. No live browser, provider, desktop, WhatsApp or voice
+  verification was performed.

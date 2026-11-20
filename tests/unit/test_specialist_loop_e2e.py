@@ -334,3 +334,43 @@ def test_specialist_loop_halts_at_the_call_cap(tmp_path: Path) -> None:
         assert len(llm.calls) == 4
     finally:
         saver.conn.close()
+
+
+def test_specialist_loop_halts_on_nonconsecutive_cycle(tmp_path: Path) -> None:
+    """A→B→A stops before the repeated action is executed."""
+    session = _FakeSession()
+    scroll = SpecialistDecision(
+        kind="act",
+        tool="browser_scroll",
+        args={"direction": "down", "amount": 1},
+        rationale="scroll",
+    )
+    decisions = [
+        BrainDecision(request_type="browse", goal="cycle test", actions=[]),
+        _search("one"),
+        scroll,
+        _search("one"),
+        _search("never"),
+    ]
+    llm = FakeLLM(decisions)
+    ctx = make_app_context(
+        _settings(specialist_max_calls=10),
+        llm=llm,
+        registry=_browser_registry(),
+        browser=session,
+    )
+    saver = open_sqlite_checkpointer(str(tmp_path / "c.db"))
+    try:
+        out = _run_to_completion(ctx, saver, "cycle test")
+        assert out.interrupted is False
+        assert out.halted_reason == "Specialist repeated an action."
+        ids = [
+            getattr(r, "step_id", None)
+            for r in (out.state.get("results") or [])
+            if not str(getattr(r, "step_id", "")).startswith("r")
+        ]
+        assert ids == ["s0", "s1"], ids
+        assert out.state.get("specialist_phase") == "idle"
+        assert len(llm.calls) == 4
+    finally:
+        saver.conn.close()

@@ -117,6 +117,44 @@ def _trim_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+_LOOP_LOOKBACK = 12
+
+
+def _action_signature(entry: Any) -> tuple[str, str] | None:
+    """The repeat key, excluding refresh steps and grant-covered navigation."""
+    if not isinstance(entry, dict) or entry.get("refresh") is True:
+        return None
+    tool = str(entry.get("tool") or "").strip()
+    if not tool:
+        return None
+    if entry.get("grant") is True and tool == "browser_goto":
+        return None
+    return tool, str(entry.get("args-summary") or "")
+
+
+def _action_signatures(history: list[Any]) -> set[tuple[str, str]]:
+    """The distinct non-refresh actions seen in the bounded history window."""
+    signatures: set[tuple[str, str]] = set()
+    for entry in history[-_LOOP_LOOKBACK:]:
+        signature = _action_signature(entry)
+        if signature is not None:
+            signatures.add(signature)
+    return signatures
+
+
+def _history_has_loop(history: list[Any]) -> bool:
+    """Whether the bounded history already contains the same action twice."""
+    signatures: set[tuple[str, str]] = set()
+    for entry in history[-_LOOP_LOOKBACK:]:
+        signature = _action_signature(entry)
+        if signature is None:
+            continue
+        if signature in signatures:
+            return True
+        signatures.add(signature)
+    return False
+
+
 def decide(state: AgentState, ctx: AppContext) -> dict[str, Any]:
     goal = state.get("specialist_goal") or state.get("goal") or ""
     max_calls = (
@@ -131,21 +169,14 @@ def decide(state: AgentState, ctx: AppContext) -> dict[str, Any]:
             "final_answer": "I couldn't complete the browser task within the step limit.",
             "specialist_phase": "idle",
         }
-    history = _trim_history(list(state.get("specialist_history") or []))
-    if history:
-        # repeat guard: same (tool,args-summary) twice in a row
-        last = history[-1]
-        prev = history[-2] if len(history) >= 2 else None
-        if (
-            prev is not None
-            and prev.get("tool") == last.get("tool")
-            and prev.get("args-summary") == last.get("args-summary")
-        ):
-            return {
-                "halted_reason": "Specialist stuck in a loop.",
-                "final_answer": "I got stuck repeating the same action.",
-                "specialist_phase": "idle",
-            }
+    raw_history = list(state.get("specialist_history") or [])
+    if _history_has_loop(raw_history):
+        return {
+            "halted_reason": "Specialist stuck in a loop.",
+            "final_answer": "I got stuck repeating the same action.",
+            "specialist_phase": "idle",
+        }
+    history = _trim_history(raw_history)
     digest = _build_digest(state, ctx)
     # build allowed tools list (browser only)
     allowed = []
@@ -213,6 +244,12 @@ def decide(state: AgentState, ctx: AppContext) -> dict[str, Any]:
                 "specialist_phase": "idle",
             }
         args = decision.args or {}
+        if (tool, _args_summary(args)) in _action_signatures(raw_history):
+            return {
+                "halted_reason": "Specialist repeated an action.",
+                "final_answer": "I stopped because I was repeating an earlier browser action.",
+                "specialist_phase": "idle",
+            }
         # One step id per executed decision: ids must stay unique for the whole
         # task, because act's exactly-once guard skips a step whose id already
         # has a successful result.  ``calls`` increments once per act decision.
@@ -262,12 +299,16 @@ def _record_history(state: AgentState) -> list[dict[str, Any]]:
     if result.ok and result.verified is False and not note:
         note = "the step could not be verified"
     role, host = _typed_target_marker(step, result)
+    step_id = str(getattr(step, "id", "") or "")
+    step_tool = str(getattr(step, "tool", "") or "")
     history.append(
         {
-            "tool": str(getattr(step, "tool", "") or ""),
+            "tool": step_tool,
             "args-summary": _args_summary(getattr(step, "args", None) or {}),
             "ok": bool(result.ok and result.verified is not False),
             "note": note[:200],
+            "refresh": step_id.startswith("r") and step_tool == "browser_read",
+            "grant": _grant_covered(state, step_id),
             # Compact, non-sensitive marker of the element this step typed into
             # (empty for everything else).  ``browse_grant_check`` needs it to
             # decide whether a following Enter may be covered by the grant: the
@@ -313,6 +354,16 @@ def _typed_target_marker(step: Any, result: Any) -> tuple[str, str]:
     if not host or len(host) > 253:
         return "", ""
     return role, host
+
+
+def _grant_covered(state: AgentState, step_id: str) -> bool:
+    """Whether the recorded decision for ``step_id`` used a browsing grant."""
+    decisions = state.get("decisions") or {}
+    if not isinstance(decisions, dict):
+        return False
+    decision = decisions.get(step_id)
+    reasons = getattr(decision, "reasons", None) or []
+    return any(str(reason).startswith("browse grant ") for reason in reasons)
 
 
 def observe(state: AgentState, ctx: AppContext) -> dict[str, Any]:
