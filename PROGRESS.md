@@ -291,3 +291,15 @@ Maintained by the coding agent. Condensed from historical log.
 - **Known limits**: checks are generic and based on result shape, not arbitrary real-world semantics; the LLM still
   chooses the contract from the closed vocabulary; no per-tool typed adapters, ablation or live desktop/provider run.
 - **Next step**: typed per-tool evidence adapters and an ablation measurement, then the next P5 memory/skills milestone.
+
+## P6 relevance-ranked memory recall (2026-11-20)
+
+- **Commit**: `ed77da9 feat(memory): rank recalled preferences by relevance` (implementation only; docs recorded separately).
+- **Problem**: `_preference_records()` computed a relevance score but emitted rows in recency order, so a newer partial match could occupy a bounded slot ahead of the fact that actually answered the request. Long questions also diluted the old overlap score, and fact-key hash suffixes counted as stored words.
+- **Implementation**: `_preference_relevance()` now scores against the smaller query/stored token set, requires two shared words for multi-word queries, keeps one-word queries working, and uses the fact category instead of the raw hash-bearing key. `_preference_records()` sorts by score before truncating and emits `meta["relevance"]` for downstream ordering. `memory_retrieve._select()` now skips an oversized item instead of stopping.
+- **Preserved**: SQLite schema, existing APIs, PolicyEngine, tools, graph, serializer types, privacy guards, context caps, no new dependency and no extra LLM call.
+- **Verification**: new tests 8 passed; memory/context/invariants set 360 passed; agent/compose set 133 passed; Ruff check/format clean on four changed Python files; `mypy src/jarvis/policy` clean (11 files); targeted mypy clean (2 files).
+- **Report**: `docs/JARVIS_P6_MEMORY_INTELLIGENCE_IMPLEMENTATION_REPORT.md`.
+- **Actual fixes**: ignored fact-key hashes after a verbose-query test exposed score dilution; corrected two stale `test_memory.py` fixtures that expected unrelated preferences to be retrieved.
+- **Known limits**: lexical (not semantic) matching; no age-based staleness downgrade; rephrased subjects still create separate fact keys; replan memory block still lacks the brain path's untrusted wrapper; no live provider/desktop restart verification.
+- **Next step**: alias-aware/superseding fact updates so corrections overwrite rephrased subjects and old values are explicitly stale.
