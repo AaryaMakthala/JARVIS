@@ -30,7 +30,7 @@ from jarvis.memory import embeddings
 from jarvis.memory.base import MemoryRecord, NullMemory
 from jarvis.memory.db import open_db
 from jarvis.memory.failures import FAILURE_SIMILARITY, FailureStore
-from jarvis.memory.prefs import PreferenceStore, fact_details
+from jarvis.memory.prefs import PreferenceStore, fact_details, is_superseded
 from jarvis.memory.skills import SkillStore
 from jarvis.memory.tasklog import TaskLogStore
 
@@ -223,7 +223,7 @@ class SqliteMemory:
         if limit <= 0:
             return []
         try:
-            prefs = self.preferences.all(limit=limit)
+            prefs = self.preferences.active(limit=limit)
         except sqlite3.Error as exc:
             self._log.warning("preference retrieval failed: %s", exc)
             return []
@@ -384,7 +384,7 @@ def _preference_relevance(query: str, pref: Any) -> float:
     behaviour so "Python?" still recalls the Python preference.
     """
     wanted = _preference_tokens(query)
-    if not wanted:
+    if not wanted or is_superseded(getattr(pref, "key", "")):
         return 0.0
     details = fact_details(pref.key)
     key_text = details[0] if details is not None else pref.key

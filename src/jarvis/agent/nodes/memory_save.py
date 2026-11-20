@@ -46,9 +46,11 @@ from typing import Any
 from jarvis.agent.context import AppContext
 from jarvis.agent.state import Plan, StepResult
 from jarvis.memory.base import MemoryRecord
+from jarvis.memory.correction import detect_correction
 from jarvis.memory.db import looks_secret, safe_value
 from jarvis.memory.failures import failure_category
 from jarvis.memory.intent import detect_memory_intent
+from jarvis.memory.supersede import apply_correction
 
 __all__ = ["REASONS", "detect_name_statement", "memory_save"]
 
@@ -66,8 +68,11 @@ SKIPPED_TOO_LONG = "skipped_too_long"
 SKIPPED_CONVERSATION = "skipped_conversation"
 NAME_SAVED = "name_saved"
 FACT_SAVED = "fact_saved"
+FACT_SUPERSEDED = "fact_superseded"
 FACT_FORGOTTEN = "fact_forgotten"
 FACT_NOT_FOUND = "fact_not_found"
+FACT_UNCHANGED = "fact_unchanged"
+FACT_AMBIGUOUS = "fact_ambiguous"
 #: Nothing was recorded for a reason outside the task itself: no backend (or a
 #: disabled memory), ``--dry-run``, ``save_skills`` off, or a write that raised.
 ERROR = "error"
@@ -82,8 +87,11 @@ REASONS = (
     SKIPPED_CONVERSATION,
     NAME_SAVED,
     FACT_SAVED,
+    FACT_SUPERSEDED,
     FACT_FORGOTTEN,
     FACT_NOT_FOUND,
+    FACT_UNCHANGED,
+    FACT_AMBIGUOUS,
     ERROR,
 )
 
@@ -229,11 +237,14 @@ def memory_save(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
       ``"skipped_cancelled"``, ``"skipped_halted"``, ``"skipped_unverified"``,
       ``"skipped_sensitive"``, ``"skipped_too_long"``,
       ``"skipped_conversation"``, ``"error"``, ``"name_saved"``,
-      ``"fact_saved"``, ``"fact_forgotten"``, ``"fact_not_found"``), never
+      ``"fact_saved"``, ``"fact_superseded"``, ``"fact_forgotten"``,
+      ``"fact_not_found"``, ``"fact_unchanged"``, ``"fact_ambiguous"``), never
       ``None``;
     * ``memory_failure_logged`` - a failure example was written instead.
     """
     fact = _apply_fact_intent(state, ctx)
+    if fact is None:
+        fact = _apply_correction(state, ctx)
     if fact is not None:
         reason, saved = fact
         ctx.logger.debug("memory: %s", reason)
@@ -317,6 +328,54 @@ def _apply_fact_intent(state: dict[str, Any], ctx: AppContext) -> tuple[str, boo
         return FACT_NOT_FOUND, False
     ctx.logger.info("memory event=fact_forgotten category=%s", intent.category)
     return FACT_FORGOTTEN, False
+
+
+def _apply_correction(state: dict[str, Any], ctx: AppContext) -> tuple[str, bool] | None:
+    """Supersede an existing fact when a short correction statement resolves.
+
+    Returns ``None`` for ordinary conversation so the normal skill/failure path
+    still runs.  Correction writes happen after ``respond`` and never change
+    the answer to the turn that learned them.
+    """
+    intent = detect_correction(str(state.get("user_input") or ""))
+    if intent is None:
+        return None
+    if state.get("clarification_question") or state.get("clarification_answer") is not None:
+        return None
+    plan: Plan | None = state.get("plan")
+    if plan is None or plan.kind != "conversation" or plan.steps:
+        return None
+    if state.get("cancelled"):
+        return SKIPPED_CANCELLED, False
+    if state.get("halted_reason"):
+        return SKIPPED_HALTED, False
+    if intent.error == "sensitive":
+        ctx.logger.info("memory event=fact_refused reason=sensitive")
+        return SKIPPED_SENSITIVE, False
+    if intent.error == "too_long":
+        ctx.logger.info("memory event=fact_refused reason=too_long")
+        return SKIPPED_TOO_LONG, False
+    if intent.error == "ambiguous":
+        return FACT_AMBIGUOUS, False
+    if ctx.dry_run or ctx.memory is None:
+        return ERROR, False
+
+    preferences = getattr(ctx.memory, "preferences", None)
+    if not callable(getattr(preferences, "active", None)):
+        return ERROR, False
+    result = apply_correction(preferences, intent)
+    if result.status == "applied":
+        ctx.logger.info(
+            "memory event=fact_superseded topic=%s archived=%d", result.topic, result.archived
+        )
+        return FACT_SUPERSEDED, True
+    if result.status == "ambiguous":
+        return FACT_AMBIGUOUS, False
+    if result.status == "not_found":
+        return FACT_UNCHANGED, False
+    if result.status == "error":
+        return ERROR, False
+    return SKIPPED_SENSITIVE, False
 
 
 # --------------------------------------------------------------------- gate
@@ -495,7 +554,7 @@ def _failure_is_terminal(state: dict[str, Any], ctx: AppContext) -> bool:
     return not (state.get("retry_now") or state.get("replan_now"))
 
 
-def _safe_plan(plan: Plan) -> dict:
+def _safe_plan(plan: Plan) -> dict[str, Any]:
     """Plan as a plain dict with credential-looking argument values removed.
 
     Uses the same :func:`jarvis.memory.db.safe_value` the store uses, so a

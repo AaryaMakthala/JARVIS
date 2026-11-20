@@ -17,9 +17,11 @@ context, so the rules are strict:
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 from dataclasses import dataclass
+from typing import Any
 
 from jarvis.memory.db import (
     looks_like_token,
@@ -33,9 +35,12 @@ __all__ = [
     "FACT_KEY_PREFIX",
     "MAX_KEY_CHARS",
     "MAX_VALUE_CHARS",
+    "SUPERSEDED_PREFIX",
     "Preference",
     "PreferenceStore",
+    "archive_key_for",
     "fact_details",
+    "is_superseded",
     "normalise_key",
 ]
 
@@ -49,6 +54,11 @@ MAX_VALUE_CHARS = 400
 #: gives atomic overwrite, pruning and deletion.
 FACT_KEY_PREFIX = "fact."
 
+#: Prefix for value-only history rows.  They stay in SQLite for inspection but
+#: are never returned to the planner and never consume a retrieval slot.
+SUPERSEDED_PREFIX = "superseded."
+_ARCHIVED_AT = "1970-01-01T00:00:00+00:00"
+
 _KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 
 
@@ -61,6 +71,17 @@ def fact_details(key: str) -> tuple[str, str] | None:
     if not separator or not category or not slug:
         return None
     return category, slug
+
+
+def is_superseded(key: str) -> bool:
+    """True when ``key`` is an archived, non-retrievable history row."""
+    return (key or "").startswith(SUPERSEDED_PREFIX)
+
+
+def archive_key_for(key: str) -> str:
+    """Stable short key used to keep the old value of a superseded fact."""
+    digest = hashlib.sha256((key or "").encode("utf-8")).hexdigest()[:16]
+    return f"{SUPERSEDED_PREFIX}{digest}"
 
 
 def normalise_key(key: str) -> str:
@@ -111,6 +132,24 @@ class Preference:
         return f"User preference: {self.key} = {self.value}"
 
 
+def _validated_value(value: str) -> str:
+    """Apply the shared length and secret guards to a stored value."""
+    text = (value or "").strip()
+    if not text:
+        raise ValueError("preference value must not be blank")
+    if len(text) > MAX_VALUE_CHARS:
+        raise ValueError(f"preference value longer than {MAX_VALUE_CHARS} characters")
+    if looks_secret(text):
+        raise ValueError("preference value looks like a credential; refusing to store it")
+    return text
+
+
+def _preference(row: Any) -> Preference:
+    return Preference(
+        key=str(row["key"]), value=str(row["value"]), updated_at=str(row["updated_at"])
+    )
+
+
 class PreferenceStore:
     """Read/write access to the ``preferences`` table."""
 
@@ -137,13 +176,7 @@ class PreferenceStore:
     def set(self, key: str, value: str) -> Preference:
         """Store one preference; raises ``ValueError`` on an unusable key/value."""
         normalised = normalise_key(key)
-        text = (value or "").strip()
-        if not text:
-            raise ValueError("preference value must not be blank")
-        if len(text) > MAX_VALUE_CHARS:
-            raise ValueError(f"preference value longer than {MAX_VALUE_CHARS} characters")
-        if looks_secret(text):
-            raise ValueError("preference value looks like a credential; refusing to store it")
+        text = _validated_value(value)
         stamp = now_iso()
         self._conn.execute(
             "INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?) "
@@ -154,19 +187,41 @@ class PreferenceStore:
         return Preference(key=normalised, value=text, updated_at=stamp)
 
     def all(self, limit: int = 50) -> list[Preference]:
-        """Every stored preference, most recently updated first."""
+        """Every stored row, including archived history, newest first."""
         if limit <= 0:
             return []
         rows = self._conn.execute(
             "SELECT key, value, updated_at FROM preferences ORDER BY updated_at DESC, key ASC LIMIT ?",
             (limit,),
         )
-        return [
-            Preference(
-                key=str(row["key"]), value=str(row["value"]), updated_at=str(row["updated_at"])
-            )
-            for row in rows
-        ]
+        return [_preference(row) for row in rows]
+
+    def active(self, limit: int = 50) -> list[Preference]:
+        """Only retrievable rows; archived history is excluded."""
+        if limit <= 0:
+            return []
+        rows = self._conn.execute(
+            "SELECT key, value, updated_at FROM preferences "
+            "WHERE key NOT LIKE ? ORDER BY updated_at DESC, key ASC LIMIT ?",
+            (f"{SUPERSEDED_PREFIX}%", limit),
+        )
+        return [_preference(row) for row in rows]
+
+    def archive(self, key: str, value: str) -> str:
+        """Keep a superseded value under a stable, non-retrievable key.
+
+        The old timestamp keeps history out of the way of active rows when
+        ``set()`` prunes.  The same source key always reuses the same archive
+        row, so repeated corrections cannot grow the table without bound.
+        """
+        text = _validated_value(value)
+        target = archive_key_for(key)
+        self._conn.execute(
+            "INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (target, text, _ARCHIVED_AT),
+        )
+        return target
 
     def delete(self, key: str) -> bool:
         """Forget one preference; ``True`` when a row was removed."""

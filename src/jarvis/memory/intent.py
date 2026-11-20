@@ -23,7 +23,12 @@ from typing import Literal
 from jarvis.memory.db import looks_secret, secret_key
 from jarvis.memory.prefs import FACT_KEY_PREFIX
 
-__all__ = ["MAX_FACT_CHARS", "MemoryIntent", "detect_memory_intent"]
+__all__ = [
+    "MAX_FACT_CHARS",
+    "MemoryIntent",
+    "detect_memory_intent",
+    "is_sensitive_fact",
+]
 
 #: Bounded like ``PreferenceStore`` values (400 chars).  A longer statement is
 #: not truncated (which would silently lose content); the command is rejected
@@ -168,9 +173,14 @@ def _fact_key(subject: str) -> str:
     return f"{FACT_KEY_PREFIX}{_category(subject)}.{slug}_{digest}"
 
 
-def _is_sensitive(content: str) -> bool:
+def is_sensitive_fact(content: str) -> bool:
+    """Public form of the shared sensitive-fact guard used by correction parsing."""
     return bool(
         looks_secret(content)  # includes the shared token-shape detector
         or _SENSITIVE_FACT.search(content)
         or _LONG_NUMBER.search(content)
     )
+
+
+def _is_sensitive(content: str) -> bool:
+    return is_sensitive_fact(content)
