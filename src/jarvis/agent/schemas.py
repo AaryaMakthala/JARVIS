@@ -78,6 +78,7 @@ class ToolCall(BaseModel):
 
     tool: str
     args: dict = Field(default_factory=dict)
+    expect: str = ""
     status: Literal["succeeded", "failed", "unverified"] = "failed"
     output: str = ""
     error: str | None = None

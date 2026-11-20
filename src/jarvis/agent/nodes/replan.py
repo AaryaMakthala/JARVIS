@@ -21,6 +21,8 @@ from jarvis.agent.schemas import ReplanDecision, ToolCall
 from jarvis.agent.state import StepResult
 
 _NO_LLM = "No LLM backend configured (run `jarvis init`)."
+_MAX_REMAINING_STEPS = 8
+_REMAINING_TEXT_CHARS = 120
 
 
 def replan(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
@@ -44,6 +46,7 @@ def replan(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         state,
         ctx,
         toolcalls=[call.model_dump() for call in toolcalls],
+        remaining_steps=_remaining_steps(state),
         goal=_goal(state),
     )
     if not composed.stats.fits:
@@ -161,6 +164,7 @@ def _toolcalls(state: dict[str, Any]) -> list[ToolCall]:
             ToolCall(
                 tool=step.tool,
                 args=step.args,
+                expect=step.expect,
                 status=status,
                 output=truncate(r.output or ""),
                 error=r.error,
@@ -168,6 +172,25 @@ def _toolcalls(state: dict[str, Any]) -> list[ToolCall]:
             )
         )
     return calls
+
+
+def _remaining_steps(state: dict[str, Any]) -> list[dict[str, object]]:
+    """Bounded view of unfinished work; argument values stay out of the prompt."""
+    plan = state.get("plan")
+    if plan is None:
+        return []
+    idx = int(state.get("step_index") or 0)
+    steps = list(getattr(plan, "steps", None) or [])[idx : idx + _MAX_REMAINING_STEPS]
+    return [
+        {
+            "id": getattr(step, "id", ""),
+            "tool": getattr(step, "tool", ""),
+            "rationale": truncate(str(getattr(step, "rationale", "") or ""), _REMAINING_TEXT_CHARS),
+            "expect": truncate(str(getattr(step, "expect", "") or ""), _REMAINING_TEXT_CHARS),
+            "args_keys": sorted(str(key) for key in (getattr(step, "args", None) or {})),
+        }
+        for step in steps
+    ]
 
 
 def _stop(state: dict[str, Any], decision: ReplanDecision) -> dict[str, Any]:

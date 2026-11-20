@@ -50,6 +50,10 @@ def test_tool_call_rejects_secret_field_with_extra_forbid() -> None:
         ToolCall(tool="app_launch", args={}, status="succeeded", password="x")  # type: ignore[call-arg]
 
 
+def test_tool_call_expectation_defaults_to_empty() -> None:
+    assert ToolCall(tool="app_launch").expect == ""
+
+
 def test_replan_decision_stop_allows_message_without_plan() -> None:
     d = ReplanDecision(action="stop", message="give up")
     assert d.plan is None

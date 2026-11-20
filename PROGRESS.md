@@ -251,3 +251,22 @@ Maintained by the coding agent. Condensed from historical log.
 - **Known limits**: detection is bounded and lexical; semantically different argument text is not normalised.
   Grant-covered navigation may repeat until the grant/call cap. No live browser, provider, desktop, WhatsApp or voice
   verification was performed.
+
+## P4 privacy verification and expectation-aware replanning (2026-11-20)
+
+- **PreferenceStore concern**: no longer present. `PreferenceStore.set` centrally rejects credential-shaped keys and
+  values (including standalone vendor token shapes) before SQLite writes, and `SqliteMemory.remember` delegates every
+  preference record to that same guard. Focused privacy tests: 44 passed, 34 deselected. No privacy code was changed.
+- **Orchestration gap**: `Step.expect` was written by the planner but never read. Replanning saw only tool calls and
+  errors, without the intended success conditions or the unfinished part of the plan.
+- **Implementation**: transient `ToolCall` now carries `expect`; replan builds a bounded eight-step view of remaining
+  work with argument keys only and passes it through the context composer into a separately escaped
+  `<untrusted_data>` block. `verify` adds a constant note when an explicit expectation was not independently checked;
+  it never copies expectation text into state or answers.
+- **Controls preserved**: no graph rebuild, extra LLM call, policy change, tier change, confirmation/approval change,
+  target-binding change, new serialized state type or dependency. No tool argument values were added to prompts.
+- **Verification**: focused orchestration set 81 passed; neighbouring regression set 252 passed; `mypy src/jarvis/policy`
+  clean (11 files); Ruff check and format clean on seven changed Python files.
+- **Report**: `docs/JARVIS_P4_EXPECTATION_AWARE_REPLAN_IMPLEMENTATION_REPORT.md`.
+- **Known limits**: expectations are prose, not machine-checkable goals; remaining-work context is bounded and has no
+  dataflow values; no general per-step LLM loop was added; no live provider/desktop verification was performed.

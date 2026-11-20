@@ -21,6 +21,7 @@ from jarvis.tools.base import ToolResult
 # 4.17c: focus failures never improve on an identical second attempt (same
 # target, same window): skip retry_now and go straight to replan/fail-closed.
 _NON_RETRYABLE = ("failed to focus", "focus verification failed")
+_UNCHECKED_EXPECTATION = "Planned success condition was not independently checked."
 
 
 def verify(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
@@ -65,6 +66,8 @@ def verify(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
                 outcome = spec.apply_verify(args, synthetic, ctx.tool_context())
                 verified = outcome.verified
                 note = outcome.verify_note
+        if step.expect.strip() and verified is None and _UNCHECKED_EXPECTATION not in (note or ""):
+            note = f"{note} {_UNCHECKED_EXPECTATION}".strip()
 
     bumped = last.model_copy(update={"verified": verified, "verify_note": note})
     results[-1] = bumped

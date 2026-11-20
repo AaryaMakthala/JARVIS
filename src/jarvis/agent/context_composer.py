@@ -378,6 +378,7 @@ def compose_replan_context(
     *,
     toolcalls: list[dict[str, object]],
     goal: str,
+    remaining_steps: list[dict[str, object]] | None = None,
 ) -> ReplanContext:
     """Compose a bounded replanner prompt with compact capabilities."""
     agent = _agent_settings(ctx)
@@ -425,6 +426,7 @@ def compose_replan_context(
                     goal=goal,
                     memory_context=memory_all[:memory_limit],
                     toolcalls=toolcalls[:observation_limit],
+                    remaining_steps=remaining_steps,
                     repair_error=repair_error,
                 )
                 tokens = estimate_tokens(system) + estimate_tokens(user)
