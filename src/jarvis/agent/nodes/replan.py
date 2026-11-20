@@ -2,7 +2,8 @@
 
 Bounded by ``settings.agent.max_replans`` (checked in code, never by prompt).
 The LLM receives the completed steps, the failing step and its error, the
-remaining tool catalogue (no tiers) and returns a :class:`ReplanDecision`:
+remaining tool catalogue (no tiers), each step's closed evidence contract and
+its deterministic verdict, and returns a :class:`ReplanDecision`:
 either ``continue`` with a replacement :class:`Plan` for the *remaining* work,
 or ``stop`` with an honest message.  A stop / exhausted budget / LLM failure
 halts the task fail-closed; the ``respond`` node turns that into the final
@@ -15,6 +16,7 @@ from typing import Any
 
 from jarvis.agent.context import AppContext
 from jarvis.agent.context_composer import CONTEXT_BUDGET_EXCEEDED, compose_replan_context
+from jarvis.agent.evidence import normalise_kind
 from jarvis.agent.nodes.telemetry import llm_attempt_meta
 from jarvis.agent.nodes.util import truncate
 from jarvis.agent.schemas import ReplanDecision, ToolCall
@@ -166,12 +168,20 @@ def _toolcalls(state: dict[str, Any]) -> list[ToolCall]:
                 args=step.args,
                 expect=step.expect,
                 status=status,
+                evidence=normalise_kind(getattr(step, "evidence", None)),
+                evidence_status=_evidence_status(r),
                 output=truncate(r.output or ""),
                 error=r.error,
                 tainted=r.tainted,
             )
         )
     return calls
+
+
+def _evidence_status(result: StepResult) -> str:
+    """Return the closed evidence verdict, or ``""`` for legacy results."""
+    status = getattr(result, "evidence_status", None)
+    return status if status in ("confirmed", "contradicted", "inconclusive") else ""
 
 
 def _remaining_steps(state: dict[str, Any]) -> list[dict[str, object]]:
@@ -187,6 +197,7 @@ def _remaining_steps(state: dict[str, Any]) -> list[dict[str, object]]:
             "tool": getattr(step, "tool", ""),
             "rationale": truncate(str(getattr(step, "rationale", "") or ""), _REMAINING_TEXT_CHARS),
             "expect": truncate(str(getattr(step, "expect", "") or ""), _REMAINING_TEXT_CHARS),
+            "evidence": normalise_kind(getattr(step, "evidence", None)),
             "args_keys": sorted(str(key) for key in (getattr(step, "args", None) or {})),
         }
         for step in steps

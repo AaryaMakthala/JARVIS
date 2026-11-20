@@ -129,7 +129,7 @@ def replan_system_prompt(
             f"{entries}"
         )
         discovery_rule = (
-            "9. Use only names from the directory. If the corrected plan needs a listed\n"
+            "10. Use only names from the directory. If the corrected plan needs a listed\n"
             "   capability whose schema is not shown, prefer an approach with a shown\n"
             "   schema; never invent arguments for an unseen tool.\n"
         )
@@ -158,9 +158,14 @@ Replanning rules:
 8. Return valid JSON exactly matching the ReplanDecision schema:
    {{"action": "continue"|"stop", "message": str, "plan": Plan|null}}
    where Plan is {{"kind", "goal", "steps": [{{"id", "tool", "args",
-   "rationale", "expect"}}], "needs_clarification", "clarification_question",
-   "dialog_answer"}}.
-{discovery_rule}"""
+   "rationale", "expect", "evidence"}}], "needs_clarification",
+   "clarification_question", "dialog_answer"}}.
+ 9. For a checkable outcome set "evidence" to "resource" (a file/result must
+    exist), "information" (text/data must be retrieved), "state" (a tool
+    post-condition proves it), "unverifiable" (no observable check) or
+    "action" (execution alone is the expectation). If the observed evidence
+    was contradicted, change the approach; never repeat the same call.
+ {discovery_rule}"""
 
 
 def _untrusted_json(value: object) -> str:

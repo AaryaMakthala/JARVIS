@@ -114,12 +114,14 @@ def test_action_intent_defaults_and_extra_forbid() -> None:
     a = ActionIntent(tool="app_launch", args={"name": "notepad"})
     assert a.rationale == ""
     assert a.expect == ""
+    assert a.evidence is None
     assert a.depends_on_untrusted is False
     assert set(a.model_dump()) == {
         "tool",
         "args",
         "rationale",
         "expect",
+        "evidence",
         "depends_on_untrusted",
     }
     with pytest.raises(ValidationError):

@@ -552,6 +552,7 @@ def _project(
                 args=a.args,
                 rationale=a.rationale,
                 expect=a.expect,
+                evidence=a.evidence,
                 depends_on_untrusted=a.depends_on_untrusted,
             )
             for i, a in enumerate(decision.actions)

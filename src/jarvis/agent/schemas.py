@@ -24,7 +24,7 @@ from typing import Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from jarvis.agent.answer import describe_violation, looks_like_internal_payload
-from jarvis.agent.state import Decision, Plan, Step
+from jarvis.agent.state import Decision, EvidenceKind, EvidenceStatus, Plan, Step
 
 __all__ = [
     "ActionIntent",
@@ -82,6 +82,10 @@ class ToolCall(BaseModel):
     status: Literal["succeeded", "failed", "unverified"] = "failed"
     output: str = ""
     error: str | None = None
+    #: P5: declared evidence contract and deterministic verdict.  Closed
+    #: strings only; the replan prompt receives them as untrusted context.
+    evidence: EvidenceKind | Literal[""] = ""
+    evidence_status: EvidenceStatus | Literal[""] = ""
     tainted: bool = False
 
 
@@ -103,6 +107,7 @@ class ActionIntent(BaseModel):
     args: dict = Field(default_factory=dict)
     rationale: str = ""
     expect: str = ""
+    evidence: EvidenceKind | None = None
     depends_on_untrusted: bool = False
 
 

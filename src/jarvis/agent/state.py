@@ -17,6 +17,18 @@ from pydantic import BaseModel, Field
 
 Source = Literal["terminal", "voice", "benchmark"]
 
+EvidenceKind = Literal["action", "resource", "information", "state", "unverifiable"]
+"""Closed evidence contracts a step may declare (P5).
+
+``action`` asks only that the tool executed; ``resource`` needs a tool-reported
+artifact or result; ``information`` needs retrieved text/data; ``state`` relies
+on the tool's own ``verify()``; ``unverifiable`` declares that no independent
+check exists.  Plain strings keep the checkpoint serializer allowlist unchanged.
+"""
+
+EvidenceStatus = Literal["confirmed", "contradicted", "inconclusive"]
+"""Deterministic result of evaluating one declared evidence contract."""
+
 
 class RequestKind(StrEnum):
     TOOL = "tool"
@@ -45,6 +57,9 @@ class Step(BaseModel):
     args: dict[str, Any]  # validated against the tool's args model in `validate`
     rationale: str  # short, user-visible
     expect: str = ""  # human-readable success condition (used by verify + replan)
+    #: P5: optional, closed evidence contract for ``expect``.  ``None`` keeps
+    #: the pre-P5 behaviour exactly (tool verify, or an honest unchecked note).
+    evidence: EvidenceKind | None = None
     depends_on_untrusted: bool = False  # set when args derive from web/file text
     resolved_from_runtime: bool = False  # args depend on earlier runtime output (fail closed)
 
@@ -104,6 +119,11 @@ class StepResult(BaseModel):
     #: ``respond`` prefers it over the generic caveat so the final answer is
     #: accurate instead of implying a shortfall.
     verify_note: str = ""
+    #: P5: the declared evidence contract evaluated by ``verify`` and the
+    #: deterministic verdict.  Both are closed strings, so old results and
+    #: checkpoints validate with the defaults and the serde allowlist is intact.
+    evidence: EvidenceKind | None = None
+    evidence_status: EvidenceStatus | None = None
     tainted: bool = False  # output contains untrusted external text
     duration_ms: int = 0
 
