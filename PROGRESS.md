@@ -270,3 +270,24 @@ Maintained by the coding agent. Condensed from historical log.
 - **Report**: `docs/JARVIS_P4_EXPECTATION_AWARE_REPLAN_IMPLEMENTATION_REPORT.md`.
 - **Known limits**: expectations are prose, not machine-checkable goals; remaining-work context is bounded and has no
   dataflow values; no general per-step LLM loop was added; no live provider/desktop verification was performed.
+
+## P5 evidence-based step verification (2026-11-20)
+
+- **Commit**: `f15638d feat(agent): add evidence-based step verification` (implementation only; docs recorded separately).
+- **Improvement**: `Step` / `ActionIntent` can declare one closed evidence kind: `action`, `resource`, `information`,
+  `state`, or `unverifiable`. `verify.py` now evaluates that contract deterministically from the existing `ToolResult`
+  after the tool's own `verify()`; `confirmed -> verified=True`, `contradicted -> verified=False`,
+  `inconclusive -> verified=None`.
+- **Recovery**: contradicted evidence sets `non_retryable=True`, so there is no blind identical retry; the existing
+  route goes to replan/fail-closed (or specialist observe first in that flow). Inconclusive evidence keeps the constant
+  honest note. Legacy steps with no evidence keep the P4 behaviour exactly.
+- **Controls preserved**: PolicyEngine, tiers, confirmations, approval hashes, target binding, graph nodes/edges, tools,
+  dependencies, checkpointer types and LLM call count are unchanged. New state fields are optional plain literals, so
+  old checkpoints still load.
+- **Verification**: new evidence tests 16 passed; focused set 96 passed; neighbouring regressions 151 passed; Ruff
+  check/format clean on ten changed Python files; `mypy src/jarvis/policy` clean (11 files); targeted mypy on
+  `evidence.py` + `verify.py` clean (2 files).
+- **Report**: `docs/JARVIS_P5_EVIDENCE_VERIFICATION_IMPLEMENTATION_REPORT.md`.
+- **Known limits**: checks are generic and based on result shape, not arbitrary real-world semantics; the LLM still
+  chooses the contract from the closed vocabulary; no per-tool typed adapters, ablation or live desktop/provider run.
+- **Next step**: typed per-tool evidence adapters and an ablation measurement, then the next P5 memory/skills milestone.
