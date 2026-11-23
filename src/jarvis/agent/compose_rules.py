@@ -33,7 +33,8 @@ import hashlib
 import re
 from typing import Any
 
-from jarvis.agent.state import StepResult
+from jarvis.agent.results import effective_results
+from jarvis.agent.state import Plan, StepResult
 
 __all__ = [
     "MAX_SENTENCES",
@@ -44,6 +45,7 @@ __all__ = [
     "address_phrase",
     "classify_outcome",
     "first_sentences",
+    "limitation_note",
     "spoken_answer",
     "task_status_for",
 ]
@@ -160,6 +162,8 @@ def classify_outcome(state: dict[str, Any]) -> str:
     results = _results(state)
     if any(not r.ok or r.verified is False for r in results):
         return "failed"
+    if limitation_note(state):
+        return "partial"
     if any(r.verified is None for r in results):
         if _only_unverified_observations(state, results):
             return SUCCESS
@@ -201,8 +205,7 @@ def _only_unverified_observations(state: dict[str, Any], results: list[Any]) -> 
     if not isinstance(steps, list):
         return False
     tools = {
-        str(getattr(step, "id", "") or ""): str(getattr(step, "tool", "") or "")
-        for step in steps
+        str(getattr(step, "id", "") or ""): str(getattr(step, "tool", "") or "") for step in steps
     }
     unverified = [r for r in results if r.verified is None]
     return bool(unverified) and all(
@@ -269,6 +272,11 @@ def spoken_answer(state: dict[str, Any], outcome: str, *, address: str = "") -> 
             return first_sentences(f"I need one more detail{address}: {question}")
         return first_sentences(f"I need one more detail{address}.")
 
+    if outcome == "partial":
+        note = limitation_note(state)
+        if note:
+            return first_sentences(f"Done as much as I could. {note}")
+
     templates = _TEMPLATES.get(outcome)
     if templates is not None and outcome in _ADDRESSABLE:
         chosen = _pick(templates, str(state.get("task_id") or ""))
@@ -291,7 +299,16 @@ def _conversation_text(state: dict[str, Any]) -> str:
 
 
 def _results(state: dict[str, Any]) -> list[StepResult]:
-    return [r for r in (state.get("results") or []) if isinstance(r, StepResult)]
+    return effective_results(state)
+
+
+def limitation_note(state: dict[str, Any]) -> str:
+    """Deterministic partial-feasibility note carried on a tool plan."""
+    plan = state.get("plan")
+    if not isinstance(plan, Plan) or plan.kind != "tool" or not plan.steps:
+        return ""
+    note = (getattr(plan, "dialog_answer", "") or "").strip()
+    return note if note else ""
 
 
 def _pick(options: tuple[str, ...], task_id: str) -> str:

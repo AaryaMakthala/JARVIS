@@ -18,8 +18,10 @@ from __future__ import annotations
 from typing import Any
 
 from jarvis.agent.answer import safe_final_answer
+from jarvis.agent.compose_rules import limitation_note
 from jarvis.agent.context import AppContext
 from jarvis.agent.nodes.telemetry import record_finished
+from jarvis.agent.results import effective_results
 from jarvis.agent.routing import unsupported_answer
 from jarvis.agent.state import StepResult
 
@@ -109,7 +111,7 @@ def _answer_for(state: dict[str, Any]) -> dict[str, str]:
     if plan is not None and plan.kind == "tool":
         assumption = (getattr(plan, "assumption", "") or "").strip()
 
-    results: list[StepResult] = list(state.get("results") or [])
+    results: list[StepResult] = effective_results(state)
     if not results:
         return _answer(_assumption_prefix(assumption) + "No task performed.")
 
@@ -126,17 +128,28 @@ def _answer_for(state: dict[str, Any]) -> dict[str, str]:
         if last.ok and last.verified is False:
             detail = f"step {last.step_id} could not be verified"
             return _answer(
-                _assumption_prefix(assumption) + f"Could not complete the task: {detail}."
+                _assumption_prefix(assumption)
+                + f"Could not complete the task: {detail}."
+                + _limitation_suffix(state)
             )
         return _answer(
             _assumption_prefix(assumption)
             + f"Could not complete the task: {last.error or f'step {last.step_id} failed'}."
+            + _limitation_suffix(state)
         )
 
     unverified = [r for r in results if r.verified is None and r.ok]
     return _answer(
-        _assumption_prefix(assumption) + _success_text(results) + _unverified_hint(unverified)
+        _assumption_prefix(assumption)
+        + _success_text(results)
+        + _unverified_hint(unverified)
+        + _limitation_suffix(state)
     )
+
+
+def _limitation_suffix(state: dict[str, Any]) -> str:
+    note = limitation_note(state)
+    return f" Limitation: {note}" if note else ""
 
 
 def _assumption_prefix(assumption: str) -> str:

@@ -274,6 +274,7 @@ def compose_brain_context(
     ctx: Any,
     *,
     pinned_schema_tools: tuple[str, ...] = (),
+    feasibility_constraints: str | None = None,
 ) -> BrainContext:
     """Compose the smallest sufficient brain prompt within the request budget."""
     agent = _agent_settings(ctx)
@@ -301,6 +302,7 @@ def compose_brain_context(
                 system = brain_system_prompt(
                     catalogue_entries(_index, ctx.registry, schema_names[:schema_limit]),
                     capability_directory=directory if dynamic else None,
+                    feasibility_constraints=feasibility_constraints,
                 )
                 if getattr(agent, "use_specialists", False):
                     system += (

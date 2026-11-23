@@ -18,6 +18,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from jarvis.agent.context import AppContext
+from jarvis.agent.feasibility import tool_availability
 from jarvis.agent.nodes.util import policy_context_for, record_specialist_note, specialist_active
 from jarvis.agent.runtime_args import mark_runtime_args
 from jarvis.tools.default_dirs import resolve_location
@@ -77,6 +78,9 @@ def validate(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         if spec is None:
             errors.append(f"step {step.id}: tool {step.tool!r} is not available")
             continue
+        available, reason = tool_availability(step.tool, ctx)
+        if not available:
+            errors.append(f"step {step.id}: {reason}")
         try:
             spec.args_model.model_validate(step.args)
         except ValidationError as exc:

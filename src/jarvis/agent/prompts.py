@@ -47,13 +47,15 @@ def brain_system_prompt(
     catalogue: list[dict[str, object]],
     *,
     capability_directory: str | None = None,
+    feasibility_constraints: str | None = None,
 ) -> str:
     """Build the system prompt with either a compact directory or the full catalogue.
 
     ``capability_directory`` is the B9 compact view: every registered capability
     name + short description, while ``catalogue`` carries the complete canonical
-    JSON schemas for only the shortlisted candidates.  Omitting it preserves the
-    legacy full-catalogue prompt exactly.
+    JSON schemas for only the shortlisted candidates.  ``feasibility_constraints``
+    carries deterministic, code-owned limits for this request.  Omitting either
+    optional argument preserves the earlier prompt exactly.
     """
     entries = json.dumps(catalogue, indent=2)
     if capability_directory:
@@ -72,6 +74,12 @@ def brain_system_prompt(
     else:
         catalogue_block = f"Tool catalogue (name, description, JSON args schema):\n{entries}"
         discovery_rules = ""
+    feasibility_block = ""
+    if feasibility_constraints:
+        feasibility_block = (
+            "\n13. Feasibility constraints (decided by code, not by you): "
+            f"{' '.join(feasibility_constraints.split())}\n"
+        )
     return f"""You are the brain of "JARVIS", a safe desktop assistant.
 
 You handle one user request per call. Decide what it needs, then return a single
@@ -135,7 +143,7 @@ Decision rules:
    stated plainly - they are never nested JSON, never templates.
 11. When the user refers to 'the first link', 'that page' or 'the picture', use the referents block; for result sets use browser_open_result with position; never invent a URL.
 12. To search a site and read or open its results, use browser_search; use google_search or open_url only when the user wants it shown in their own browser. After browser_search you may use browser_open_result with a position.
-{discovery_rules}"""
+{discovery_rules}{feasibility_block}"""
 
 
 def brain_user_prompt(

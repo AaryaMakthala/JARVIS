@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 from jarvis.agent import fastpath
+from jarvis.agent import feasibility as feasibility_checks
 from jarvis.agent.context import AppContext
 from jarvis.agent.context_composer import (
     CONTEXT_BUDGET_EXCEEDED,
@@ -87,6 +88,21 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         )
         return {"halted_reason": LLM_NOT_CONFIGURED}
 
+    report = feasibility_checks.assess_request(state, ctx)
+    if report.status == feasibility_checks.NEEDS_CLARIFICATION:
+        ctx.logger.info("agent event=feasibility task_id=%s status=clarify", task_id)
+        return _clarification_stop(state, report.reason, goal="clarify the request")
+    if report.status == feasibility_checks.UNSUPPORTED:
+        ctx.logger.info("agent event=feasibility task_id=%s status=unsupported", task_id)
+        return {
+            "request_kind": "unsupported",
+            "halted_reason": report.reason,
+            "error": None,
+        }
+    constraints = feasibility_checks.constraint_text(report)
+    if constraints:
+        ctx.logger.info("agent event=feasibility task_id=%s status=partial", task_id)
+
     ctx.logger.info("agent event=llm_start task_id=%s", task_id)
 
     route = route_request(state.get("user_input") or "", has_image=bool(state.get("has_image")))
@@ -106,7 +122,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     )
 
     source = state.get("source") or "terminal"
-    composed = compose_brain_context(state, ctx)
+    composed = compose_brain_context(state, ctx, feasibility_constraints=constraints)
     if not composed.stats.fits:
         return {"halted_reason": CONTEXT_BUDGET_EXCEEDED}
     system, user = composed.system, composed.user
@@ -164,7 +180,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
     # schema from the registry and re-asks the model exactly once.  Anything
     # still unresolved becomes a clarification, never a guessed call.
     model, usage, composed, expansion_error = _resolve_schema_miss(
-        model, usage, composed, state, ctx
+        model, usage, composed, state, ctx, feasibility_constraints=constraints
     )
     if expansion_error is not None:
         return expansion_error
@@ -175,7 +191,7 @@ def brain(state: dict[str, Any], ctx: AppContext) -> dict[str, Any]:
         model.request_type,
         len(model.actions),
     )
-    update = _project(model, state, usage, ctx)
+    update = _project(model, state, usage, ctx, feasibility=report)
     # Ground WhatsApp contact references *before* validation, the policy gate
     # and the W4 action hash, so the confirmation names the canonical saved
     # contact and the approval binds to it.  Deterministic resolution runs
@@ -208,8 +224,10 @@ def _merge_usage(first: Usage, second: Usage) -> Usage:
     )
 
 
-def _clarification_stop(state: dict[str, Any], question: str) -> dict[str, Any]:
-    """Ask once more when a tool choice cannot be resolved (bounded)."""
+def _clarification_stop(
+    state: dict[str, Any], question: str, *, goal: str = "resolve the tool choice"
+) -> dict[str, Any]:
+    """Ask once more when a detail or tool choice cannot be resolved (bounded)."""
     asked = int(state.get("clarification_count") or 0)
     if asked >= MAX_CLARIFICATIONS:
         return {
@@ -221,7 +239,7 @@ def _clarification_stop(state: dict[str, Any], question: str) -> dict[str, Any]:
     return {
         "plan": Plan(
             kind="tool",
-            goal="resolve the tool choice",
+            goal=goal,
             steps=[],
             needs_clarification=True,
             clarification_question=question,
@@ -238,6 +256,8 @@ def _resolve_schema_miss(
     composed: Any,
     state: dict[str, Any],
     ctx: AppContext,
+    *,
+    feasibility_constraints: str | None = None,
 ) -> tuple[BrainDecision, Usage, Any, dict[str, Any] | None]:
     """One bounded schema-resolution retry for a registered, unseen tool.
 
@@ -253,7 +273,12 @@ def _resolve_schema_miss(
     if not missing:
         return model, usage, composed, None
     pinned = tuple(dict.fromkeys([*composed.schema_names, *missing]))
-    expanded = compose_brain_context(state, ctx, pinned_schema_tools=pinned)
+    expanded = compose_brain_context(
+        state,
+        ctx,
+        pinned_schema_tools=pinned,
+        feasibility_constraints=feasibility_constraints,
+    )
     if not expanded.stats.fits:
         return model, usage, composed, {"halted_reason": CONTEXT_BUDGET_EXCEEDED}
     budget: dict[str, Any] = {}
@@ -431,7 +456,12 @@ def _session_reference_block(state: dict[str, Any], ctx: AppContext) -> str | No
 
 
 def _project(
-    decision: BrainDecision, state: dict[str, Any], usage: Any, ctx: AppContext | None = None
+    decision: BrainDecision,
+    state: dict[str, Any],
+    usage: Any,
+    ctx: AppContext | None = None,
+    *,
+    feasibility: feasibility_checks.FeasibilityReport | None = None,
 ) -> dict[str, Any]:
     """Map the transient BrainDecision onto checkpointable state updates."""
     update: dict[str, Any] = {
@@ -541,10 +571,12 @@ def _project(
             ),
         }
 
+    limitation = feasibility_checks.partial_note(feasibility) if feasibility is not None else None
     plan = Plan(
         kind="tool",
         goal=decision.goal or "",
         assumption=(decision.assumption or "").strip(),
+        dialog_answer=limitation,
         steps=[
             Step(
                 id=f"s{i + 1}",

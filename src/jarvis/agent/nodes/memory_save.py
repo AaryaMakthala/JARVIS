@@ -44,6 +44,7 @@ import re
 from typing import Any
 
 from jarvis.agent.context import AppContext
+from jarvis.agent.results import effective_results
 from jarvis.agent.state import Plan, StepResult
 from jarvis.memory.base import MemoryRecord
 from jarvis.memory.correction import detect_correction
@@ -131,15 +132,11 @@ _DISCOURSE_WORDS = (
 _TRAILING_DISCOURSE = re.compile(rf"(?:\s+{_DISCOURSE_WORDS})+$", re.IGNORECASE)
 #: The same closed list after a comma: "Call me Bob, please."  Requiring the
 #: whole tail keeps "Call me Bob, please stop." invalid.
-_SEPARATED_DISCOURSE = re.compile(
-    rf"^\s*,\s*{_DISCOURSE_WORDS}(?:\s*[.!?]+)?\s*$", re.IGNORECASE
-)
+_SEPARATED_DISCOURSE = re.compile(rf"^\s*,\s*{_DISCOURSE_WORDS}(?:\s*[.!?]+)?\s*$", re.IGNORECASE)
 #: A comma may continue into a clause only when that clause contains another
 #: supported name statement.  This preserves the documented earliest-statement
 #: rule for "You can call me Bob, but my name is Alice."
-_COORDINATING_CLAUSE = re.compile(
-    r"^\s*,\s*(?:but|and|while|whereas)\b", re.IGNORECASE
-)
+_COORDINATING_CLAUSE = re.compile(r"^\s*,\s*(?:but|and|while|whereas)\b", re.IGNORECASE)
 _NAME_TERMINAL = ".!?\u2026"
 _NAME_CLOSING_WRAPPERS = "\"'\u201d\u2019`)]}>"
 _MAX_NAME_CHARS = 40
@@ -444,7 +441,7 @@ def _skill_gate(state: dict[str, Any], ctx: AppContext) -> str:
     if plan is None or plan.kind != "tool" or not plan.steps:
         return SKIPPED_CONVERSATION
 
-    results: list[StepResult] = list(state.get("results") or [])
+    results: list[StepResult] = effective_results(state)
     if not results:
         return SKIPPED_UNVERIFIED
     if len(results) != len(plan.steps):
@@ -508,7 +505,7 @@ def _failure_record(state: dict[str, Any], ctx: AppContext) -> MemoryRecord | No
     is spent or the task halted, so a retry still in flight is never archived as
     a dead end.
     """
-    results: list[StepResult] = list(state.get("results") or [])
+    results: list[StepResult] = effective_results(state)
     bad = next(
         (r for r in results if not r.ok or r.verified is False or r.tainted),
         None,
@@ -626,18 +623,12 @@ def detect_name_statement(user_input: str) -> tuple[str, bool] | None:
             prefix = text[max(0, match.start() - _MAX_PREFIX_CHARS) : match.start()]
             if _NON_DECLARATION.search(prefix) or _NEGATED_DECLARATION.search(prefix):
                 continue
-            name = _clean_name(
-                text[match.end() :], require_name_shape=require_name_shape
-            )
+            name = _clean_name(text[match.end() :], require_name_shape=require_name_shape)
             if name is not None:
-                candidates.append(
-                    (match.start(), match.end() - match.start(), strong, name)
-                )
+                candidates.append((match.start(), match.end() - match.start(), strong, name))
     if not candidates:
         return None
-    _, _, strong, name = min(
-        candidates, key=lambda item: (item[0], -item[1], not item[2])
-    )
+    _, _, strong, name = min(candidates, key=lambda item: (item[0], -item[1], not item[2]))
     return name, strong
 
 

@@ -19,6 +19,7 @@ from jarvis.agent.context_composer import CONTEXT_BUDGET_EXCEEDED, compose_repla
 from jarvis.agent.evidence import normalise_kind
 from jarvis.agent.nodes.telemetry import llm_attempt_meta
 from jarvis.agent.nodes.util import truncate
+from jarvis.agent.results import effective_results
 from jarvis.agent.schemas import ReplanDecision, ToolCall
 from jarvis.agent.state import StepResult
 
@@ -131,16 +132,17 @@ def _completed_results(state: dict[str, Any]) -> list[StepResult]:
     """Only keep results that already succeeded before the failing step.
 
     When the first replan is triggered ``step_index`` is the count of fully
-    verified successes, so ``results[:step_index]`` is exactly the completed
-    prefix (a failed attempt never advances the index).  On a repair call
+    verified successes.  :func:`~jarvis.agent.results.effective_results` first
+    collapses retries to the latest attempt per step, so a step that failed
+    once and then succeeded is kept as a completed success.  On a repair call
     (replan again because validate rejected the plan) results were already
     trimmed, so nothing is lost.
     """
+    effective = effective_results(state)
     if state.get("pending_replan"):
-        return list(state.get("results") or [])
+        return effective
     idx = int(state.get("step_index") or 0)
-    results = list(state.get("results") or [])
-    return [r for r in results if isinstance(r, StepResult)][:idx]
+    return effective[:idx]
 
 
 def _toolcalls(state: dict[str, Any]) -> list[ToolCall]:

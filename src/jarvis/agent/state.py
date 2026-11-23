@@ -69,9 +69,9 @@ class Plan(BaseModel):
 
     ``kind`` records *what* the request is (docs/02_ARCHITECTURE.md request
     classification): ``"tool"`` requests run desktop tools, ``"conversation"``
-    requests only need an answer.  ``dialog_answer`` is optional and ignored by
-    the dedicated ``converse`` node; the planner prompt keeps the catalogue
-    focused on tools.  Defaults keep old checkpoints and test fixtures valid.
+    requests only need an answer.  ``dialog_answer`` carries a conversation's
+    answer, or a deterministic partial-feasibility limitation on a tool plan.
+    Defaults keep old checkpoints and test fixtures valid.
     """
 
     kind: Literal["tool", "conversation"] = "tool"
